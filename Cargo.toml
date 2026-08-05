@@ -50,6 +50,10 @@ ark-ec = "0.5"
 ark-ff = "0.5"
 ark-poly = "0.5"
 ark-serialize = "0.5"
+# Explicitly reproducible/portable CsPRNG used to derive the global transparent
+# Dory setup deterministically (same seed => identical public parameters on
+# every node). ChaCha20Rng's stream is documented stable across releases.
+rand_chacha = "0.3"
 
 [features]
 noreadlock = []

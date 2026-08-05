@@ -973,9 +973,151 @@ pub mod commitment {
     use std::collections::{BTreeMap, BTreeSet};
     use std::convert::TryInto;
     use std::io;
+    use std::sync::OnceLock;
+
+    use ark_bn254::{G1Projective, G2Projective};
+    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+    use dory_pcs::backends::arkworks::{
+        ArkFr, ArkG1, ArkG2, ArkGT, ArkworksPolynomial, G1Routines, BN254,
+    };
+    use dory_pcs::primitives::arithmetic::{Field as DoryField, Group, PairingCurve};
+    use dory_pcs::primitives::poly::Polynomial;
+    use dory_pcs::setup::ProverSetup;
+    use dory_pcs::Transparent;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
 
     const COMMITMENT_MAGIC: &[u8; 8] = b"TSPCW0\0\0";
     pub const COMMITMENT_FORMAT_VERSION: u32 = 1;
+
+    /// Number of committed columns per layer: additions (S,P,O) then removals
+    /// (S,P,O), in that fixed order.
+    pub const COLUMN_COUNT: usize = 6;
+
+    /// Fixed size of the global transparent Dory setup. `max_log_n = 20` supports
+    /// polynomials of up to `2^20` coefficients, i.e. a padded per-column length of
+    /// up to ~1,048,576 dictionary ids. A single-layer delta whose additions or
+    /// removals exceed that count fails closed until the global setup is enlarged
+    /// (Phase 1b cap; cross-layer composition + larger setups are later phases).
+    pub const SETUP_MAX_LOG_N: usize = 20;
+
+    /// Domain-separated 32-byte seed for the transparent setup. Derived by hashing
+    /// a fixed public label ("nothing up my sleeve"), so it is fully reproducible.
+    fn setup_seed() -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"terminus-store/proof-of-woql/dory-transparent-setup/v0");
+        hasher.finalize().into()
+    }
+
+    /// Deterministically derive the transparent Dory prover setup.
+    ///
+    /// Determinism is load-bearing for the trustless model: every node must
+    /// derive byte-identical public parameters so a commitment is reproducible.
+    /// `dory_pcs::setup()` samples its generators from `OsRng` (non-deterministic),
+    /// so we bypass it and seed a portable `ChaCha20Rng` from a fixed hashed label,
+    /// then sample the G1/G2 generators via arkworks' `UniformRand`. The discrete
+    /// logs of the resulting points remain unknown (the seed only fixes *which*
+    /// random points are chosen, not their DL relations), so this is a valid
+    /// nothing-up-my-sleeve transparent setup.
+    // TODO(proof-of-woql): a production setup should use a standardized
+    // hash-to-curve derivation; a seeded CsPRNG is sufficient for this phase.
+    fn deterministic_prover_setup(max_log_n: usize) -> ProverSetup<BN254> {
+        use ark_ff::UniformRand;
+        let mut rng = ChaCha20Rng::from_seed(setup_seed());
+        let n = 1usize << max_log_n.div_ceil(2);
+        let g1_vec: Vec<ArkG1> = (0..n).map(|_| ArkG1(G1Projective::rand(&mut rng))).collect();
+        let g2_vec: Vec<ArkG2> = (0..n).map(|_| ArkG2(G2Projective::rand(&mut rng))).collect();
+        let h1 = ArkG1(G1Projective::rand(&mut rng));
+        let h2 = ArkG2(G2Projective::rand(&mut rng));
+        let ht = <BN254 as PairingCurve>::pair(&h1, &h2);
+        ProverSetup {
+            g1_vec,
+            g2_vec,
+            h1,
+            h2,
+            ht,
+        }
+    }
+
+    /// One global, lazily-derived, deterministic transparent prover setup.
+    fn dory_prover_setup() -> &'static ProverSetup<BN254> {
+        static SETUP: OnceLock<ProverSetup<BN254>> = OnceLock::new();
+        SETUP.get_or_init(|| deterministic_prover_setup(SETUP_MAX_LOG_N))
+    }
+
+    /// Commit to one dictionary-id column via Dory, returning its succinct GT
+    /// (tier-2) commitment. Empty columns get a canonical deterministic empty
+    /// commitment (the GT identity).
+    ///
+    /// The column is padded to a power-of-two length `2^m`; the matrix layout is
+    /// `sigma = ceil(m/2)`, `nu = m - sigma` (so `nu <= sigma`, matching Dory's
+    /// non-square constraint, and `2^sigma <= 2^ceil(SETUP_MAX_LOG_N/2)` fits the
+    /// global generator vectors). In Transparent mode the commitment carries no
+    /// blinding, so it is a deterministic function of the ids and the setup.
+    fn commit_id_column(ids: &[u64]) -> io::Result<ArkGT> {
+        if ids.is_empty() {
+            return Ok(<ArkGT as Group>::identity());
+        }
+        let padded_len = ids
+            .len()
+            .checked_next_power_of_two()
+            .ok_or_else(|| invalid("proof column length overflow"))?;
+        let m = padded_len.trailing_zeros() as usize;
+        if m > SETUP_MAX_LOG_N {
+            return Err(invalid(
+                "proof column exceeds the global Dory setup capacity",
+            ));
+        }
+        let sigma = m.div_ceil(2);
+        let nu = m - sigma;
+        let mut coefficients: Vec<ArkFr> = Vec::with_capacity(padded_len);
+        for id in ids {
+            coefficients.push(<ArkFr as DoryField>::from_u64(*id));
+        }
+        coefficients.resize(padded_len, <ArkFr as DoryField>::zero());
+        let poly = ArkworksPolynomial::new(coefficients);
+        let (tier_2, _row_commitments, _blind) = poly
+            .commit::<BN254, Transparent, G1Routines>(nu, sigma, dory_prover_setup())
+            .map_err(|error| invalid(format!("dory column commitment failed: {error}")))?;
+        Ok(tier_2)
+    }
+
+    /// Build the six per-column commitments for a layer delta, in fixed order:
+    /// additions (subject, predicate, object) then removals (subject, predicate,
+    /// object). Records are expected pre-sorted (SPO) so the columns are canonical.
+    // TODO(proof-of-woql): Phase 1c commits each column at its global absolute row
+    // offset and composes commitments across the layer chain; here every layer's
+    // delta is committed standalone at offset 0.
+    fn commit_delta_columns(
+        additions: &[ProofRecord],
+        removals: &[ProofRecord],
+    ) -> io::Result<[ArkGT; COLUMN_COUNT]> {
+        let subjects = |table: &[ProofRecord]| table.iter().map(|r| r.subject_id).collect::<Vec<_>>();
+        let predicates =
+            |table: &[ProofRecord]| table.iter().map(|r| r.predicate_id).collect::<Vec<_>>();
+        let objects = |table: &[ProofRecord]| table.iter().map(|r| r.object_id).collect::<Vec<_>>();
+        Ok([
+            commit_id_column(&subjects(additions))?,
+            commit_id_column(&predicates(additions))?,
+            commit_id_column(&objects(additions))?,
+            commit_id_column(&subjects(removals))?,
+            commit_id_column(&predicates(removals))?,
+            commit_id_column(&objects(removals))?,
+        ])
+    }
+
+    fn serialize_commitment(commitment: &ArkGT) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        commitment
+            .serialize_compressed(&mut bytes)
+            .map_err(|error| invalid(format!("commitment serialization failed: {error}")))?;
+        Ok(bytes)
+    }
+
+    fn deserialize_commitment(bytes: &[u8]) -> io::Result<ArkGT> {
+        ArkGT::deserialize_compressed(bytes)
+            .map_err(|error| invalid(format!("commitment deserialization failed: {error}")))
+    }
 
     /// Placeholder for the query-time argument produced by the Proof-of-WOQL
     /// scheme once query witnesses are implemented.
@@ -1022,14 +1164,16 @@ pub mod commitment {
     #[derive(Clone, Debug)]
     pub struct LayerCommitment {
         pub state: CommitmentState,
-        // TODO(proof-of-woql): Phase 1 attaches per-column homomorphic
-        // commitments over these dictionary-encoded triple columns. The tables
-        // are kept sorted (SPO for the delta, dictionary order for catalogs) so
-        // the commitment is deterministic.
+        // The dictionary-encoded triple columns, kept sorted (SPO for the delta,
+        // dictionary order for catalogs) so commitments are deterministic.
         pub additions: Vec<ProofRecord>,
         pub removals: Vec<ProofRecord>,
         pub predicate_catalog: Vec<ProofRecord>,
         pub node_value_catalog: Vec<ProofRecord>,
+        /// Per-column Dory (tier-2 GT) commitments over the id columns, in fixed
+        /// order: additions (S,P,O) then removals (S,P,O). `commitment_root`
+        /// binds these. Phase 1b commits each column standalone at offset 0.
+        pub column_commitments: [ArkGT; COLUMN_COUNT],
     }
 
     impl PartialEq for LayerCommitment {
@@ -1109,6 +1253,9 @@ pub mod commitment {
             additions.sort_by(|a, b| triple_cmp(a, b, ProofIndex::Spo));
             removals.sort_by(|a, b| triple_cmp(a, b, ProofIndex::Spo));
 
+            // Real per-column Dory commitments over the sorted id columns.
+            let column_commitments = commit_delta_columns(&additions, &removals)?;
+
             let state = CommitmentState {
                 parent_state_root,
                 addition_count: additions.len() as u64,
@@ -1125,6 +1272,7 @@ pub mod commitment {
                 removals,
                 predicate_catalog,
                 node_value_catalog,
+                column_commitments,
             };
             layer.state.commitment_root = layer.compute_commitment_root()?;
             layer.validate()?;
@@ -1271,6 +1419,12 @@ pub mod commitment {
             let removals = read_records(&mut r, PersistedTableKind::Delta)?;
             let predicate_records = read_records(&mut r, PersistedTableKind::PredicateCatalog)?;
             let object_records = read_records(&mut r, PersistedTableKind::ObjectCatalog)?;
+            let mut column_commitments: [ArkGT; COLUMN_COUNT] =
+                [<ArkGT as Group>::identity(); COLUMN_COUNT];
+            for slot in column_commitments.iter_mut() {
+                let bytes = r.bytes()?;
+                *slot = deserialize_commitment(&bytes)?;
+            }
             if !r.done() {
                 return Err(invalid("trailing commitment file bytes"));
             }
@@ -1322,13 +1476,38 @@ pub mod commitment {
                 removals,
                 predicate_catalog,
                 node_value_catalog,
+                column_commitments,
             };
             layer.validate()?;
             Ok(layer)
         }
 
+        /// The commitment root binds the parent root, the six counts, and the
+        /// canonical-serialized six per-column Dory commitments (NOT the raw
+        /// tables, which are separately bound by the file checksum and revalidated
+        /// on decode). The column commitments in turn bind the sorted id columns.
         fn compute_commitment_root(&self) -> io::Result<ProofHash> {
-            Ok(placeholder_commitment_root(&self.encode_body()?))
+            let mut hasher = Sha256::new();
+            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v0");
+            match self.state.parent_state_root {
+                Some(root) => {
+                    hasher.update([1u8]);
+                    hasher.update(root);
+                }
+                None => hasher.update([0u8]),
+            }
+            hasher.update(self.state.addition_count.to_be_bytes());
+            hasher.update(self.state.removal_count.to_be_bytes());
+            hasher.update(self.state.parent_node_value_count.to_be_bytes());
+            hasher.update(self.state.parent_predicate_count.to_be_bytes());
+            hasher.update(self.state.node_value_count.to_be_bytes());
+            hasher.update(self.state.predicate_count.to_be_bytes());
+            for commitment in &self.column_commitments {
+                let bytes = serialize_commitment(commitment)?;
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                hasher.update(&bytes);
+            }
+            Ok(hasher.finalize().into())
         }
 
         fn encode_body(&self) -> io::Result<Vec<u8>> {
@@ -1352,6 +1531,10 @@ pub mod commitment {
                 &self.node_value_catalog,
             ] {
                 put_records(&mut out, table);
+            }
+            for commitment in &self.column_commitments {
+                let bytes = serialize_commitment(commitment)?;
+                put_bytes(&mut out, &bytes);
             }
             Ok(out)
         }
@@ -1384,6 +1567,12 @@ pub mod commitment {
                     total = checked_proof_encoded_growth(total, record_len)?;
                 }
             }
+            for commitment in &self.column_commitments {
+                let commitment_len = 8usize
+                    .checked_add(commitment.compressed_size())
+                    .ok_or_else(|| invalid("commitment encoded length overflow"))?;
+                total = checked_proof_encoded_growth(total, commitment_len)?;
+            }
             // commitment_root + file checksum
             total = checked_proof_encoded_growth(total, 32)?;
             checked_proof_encoded_growth(total, 32)
@@ -1398,18 +1587,6 @@ pub mod commitment {
             put_u64(out, record.object_id);
             record.triple.encode_into(out);
         }
-    }
-
-    // TODO(proof-of-woql): replace this placeholder digest with the real
-    // homomorphic column commitment (Dory) computed over the dictionary-encoded
-    // triple columns. A single opaque digest over the encoded body is a stand-in
-    // only; it does NOT provide the homomorphic/openable properties Phase 1 needs.
-    fn placeholder_commitment_root(body: &[u8]) -> ProofHash {
-        let mut hasher = Sha256::new();
-        hasher.update(b"terminus-store/proof-of-woql/placeholder-commitment/v0");
-        hasher.update((body.len() as u64).to_be_bytes());
-        hasher.update(body);
-        hasher.finalize().into()
     }
 
     fn file_checksum(payload: &[u8]) -> ProofHash {
@@ -1696,6 +1873,29 @@ pub mod commitment {
             .unwrap()
         }
 
+        // Same two-node/one-predicate dictionary {a:1, b:2}, {p:1}, but the caller
+        // chooses whether the triple lands in additions and/or removals.
+        fn delta(
+            additions: Vec<ProofRecord>,
+            removals: Vec<ProofRecord>,
+        ) -> LayerCommitment {
+            LayerCommitment::from_native_delta(
+                None,
+                additions,
+                removals,
+                0,
+                0,
+                2,
+                1,
+                vec![
+                    (CanonicalObject::Node(b"a".to_vec()), 1),
+                    (CanonicalObject::Node(b"b".to_vec()), 2),
+                ],
+                vec![(b"p".to_vec(), 1)],
+            )
+            .unwrap()
+        }
+
         #[test]
         fn encode_decode_roundtrip_preserves_state_and_columns() {
             let commitment = sample();
@@ -1705,12 +1905,72 @@ pub mod commitment {
             assert_eq!(decoded.state, commitment.state);
             assert_eq!(decoded.additions, commitment.additions);
             assert_eq!(decoded.node_value_catalog, commitment.node_value_catalog);
+            assert_eq!(decoded.column_commitments, commitment.column_commitments);
+            assert_eq!(decoded.state.commitment_root, commitment.state.commitment_root);
         }
 
         #[test]
-        fn deterministic_placeholder_root() {
+        fn transparent_setup_is_deterministic_across_fresh_derivations() {
+            // Two independently-derived setups must produce byte-identical public
+            // parameters, so any node commits a given column to the same value.
+            let setup_a = deterministic_prover_setup(4);
+            let setup_b = deterministic_prover_setup(4);
+            assert_eq!(setup_a.g1_vec, setup_b.g1_vec);
+            assert_eq!(setup_a.g2_vec, setup_b.g2_vec);
+
+            let coefficients: Vec<ArkFr> =
+                (1..=4u64).map(<ArkFr as DoryField>::from_u64).collect();
+            let poly = ArkworksPolynomial::new(coefficients);
+            let (commitment_a, _, _) = poly
+                .commit::<BN254, Transparent, G1Routines>(1, 1, &setup_a)
+                .unwrap();
+            let (commitment_b, _, _) = poly
+                .commit::<BN254, Transparent, G1Routines>(1, 1, &setup_b)
+                .unwrap();
+            assert_eq!(commitment_a, commitment_b);
+        }
+
+        #[test]
+        fn commitment_root_is_stable_across_independent_calls() {
+            // End-to-end determinism: the same delta yields the same root.
             assert_eq!(sample().state.commitment_root, sample().state.commitment_root);
             assert_ne!(sample().state.commitment_root, [0u8; 32]);
+        }
+
+        #[test]
+        fn changing_one_record_id_changes_the_root() {
+            // a-p-b (subject 1, object 2) vs b-p-a (subject 2, object 1): identical
+            // dictionary/counts, but the id columns differ, so the commitments and
+            // hence the root must differ.
+            let a_p_b = delta(vec![record(1, 1, 2, "a", "p", "b")], vec![]);
+            let b_p_a = delta(vec![record(2, 1, 1, "b", "p", "a")], vec![]);
+            assert_ne!(a_p_b.state.commitment_root, b_p_a.state.commitment_root);
+        }
+
+        #[test]
+        fn empty_adds_only_removes_only_are_valid_and_distinct() {
+            let empty = LayerCommitment::from_native_delta(
+                None, vec![], vec![], 0, 0, 0, 0, vec![], vec![],
+            )
+            .unwrap();
+            let adds_only = delta(vec![record(1, 1, 2, "a", "p", "b")], vec![]);
+            let removes_only = delta(vec![], vec![record(1, 1, 2, "a", "p", "b")]);
+
+            // Empty columns use the canonical GT-identity commitment.
+            let identity = <ArkGT as Group>::identity();
+            assert!(empty.column_commitments.iter().all(|c| *c == identity));
+            // Adds-only: remove columns are empty; removes-only: add columns empty.
+            assert!(adds_only.column_commitments[3..].iter().all(|c| *c == identity));
+            assert!(removes_only.column_commitments[..3].iter().all(|c| *c == identity));
+
+            let roots = [
+                empty.state.commitment_root,
+                adds_only.state.commitment_root,
+                removes_only.state.commitment_root,
+            ];
+            assert_ne!(roots[0], roots[1]);
+            assert_ne!(roots[0], roots[2]);
+            assert_ne!(roots[1], roots[2]);
         }
 
         #[test]
@@ -1719,6 +1979,22 @@ pub mod commitment {
             let mut bytes = commitment.encode().unwrap();
             let mid = bytes.len() / 2;
             bytes[mid] ^= 1;
+            assert!(LayerCommitment::decode(&bytes).is_err());
+        }
+
+        #[test]
+        fn tampered_serialized_commitment_is_rejected_even_with_fixed_checksum() {
+            let commitment = sample();
+            let mut bytes = commitment.encode().unwrap();
+            // The serialized commitments sit immediately before the trailing 32-byte
+            // commitment_root and 32-byte file checksum. Flip a byte inside the last
+            // commitment blob, then repair the file checksum so the rejection is
+            // driven by the commitment_root binding, not the outer checksum.
+            let commitment_byte = bytes.len() - 64 - 1;
+            bytes[commitment_byte] ^= 1;
+            let payload_len = bytes.len() - 32;
+            let repaired = file_checksum(&bytes[..payload_len]);
+            bytes[payload_len..].copy_from_slice(&repaired);
             assert!(LayerCommitment::decode(&bytes).is_err());
         }
 
