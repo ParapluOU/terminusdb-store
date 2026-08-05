@@ -7,10 +7,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, ValueTriple};
+use crate::proof::{LayerRangeWitness, ProofHash, ProofLayerState, TriplePattern};
 use crate::storage::archive::{ArchiveLayerStore, DirectoryArchiveBackend, LruArchiveBackend};
 use crate::storage::directory::{DirectoryLabelStore, DirectoryLayerStore};
 use crate::storage::memory::{MemoryLabelStore, MemoryLayerStore};
-use crate::storage::{CachedLayerStore, LabelStore, LayerStore, LockingHashMapLayerCache};
+use crate::storage::{
+    CachedLayerStore, LabelStore, LayerStore, LockingHashMapLayerCache, PackImportLimits,
+};
 use tdb_succinct::TypedDictEntry;
 
 use std::io;
@@ -150,6 +153,55 @@ impl StoreLayerBuilder {
         }
     }
 
+    /// Commit a proof-enabled layer. The authenticated delta is built from the
+    /// just-written native delta before archive finalization/exposure.
+    pub async fn commit_no_load_with_proof(&self) -> io::Result<ProofLayerState> {
+        let mut builder = None;
+        {
+            let mut guard = self
+                .builder
+                .write()
+                .expect("rwlock write should always succeed");
+            std::mem::swap(&mut builder, &mut guard);
+        }
+        match builder {
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "builder has already been committed",
+            )),
+            Some(builder) => {
+                let id = builder.name();
+                let result = async {
+                    builder.commit_boxed().await.map_err(|error| {
+                        io::Error::new(error.kind(), format!("write native layer: {error}"))
+                    })?;
+                    let state = self
+                        .store
+                        .layer_store
+                        .prepare_proof_layer(id)
+                        .await
+                        .map_err(|error| {
+                            io::Error::new(error.kind(), format!("prepare proof layer: {error}"))
+                        })?
+                        .state;
+                    self.store
+                        .layer_store
+                        .finalize_layer(id)
+                        .await
+                        .map_err(|error| {
+                            io::Error::new(error.kind(), format!("finalize proof layer: {error}"))
+                        })?;
+                    Ok::<_, io::Error>(state)
+                }
+                .await;
+                if result.is_err() {
+                    let _ = self.store.layer_store.abort_layer(id).await;
+                }
+                result
+            }
+        }
+    }
+
     /// Commit the layer to storage.
     pub async fn commit(&self) -> io::Result<StoreLayer> {
         let name = self.name;
@@ -159,6 +211,20 @@ impl StoreLayerBuilder {
         Ok(StoreLayer::wrap(
             layer.expect("layer that was just created was not found in store"),
             self.store.clone(),
+        ))
+    }
+
+    /// Commit and load a proof-enabled layer.
+    pub async fn commit_with_proof(&self) -> io::Result<(StoreLayer, ProofLayerState)> {
+        let name = self.name;
+        let state = self.commit_no_load_with_proof().await?;
+        let layer = self.store.layer_store.get_layer(name).await?;
+        Ok((
+            StoreLayer::wrap(
+                layer.expect("layer that was just created was not found in store"),
+                self.store.clone(),
+            ),
+            state,
         ))
     }
 
@@ -258,6 +324,36 @@ impl StoreLayer {
             .await?;
 
         Ok(StoreLayerBuilder::wrap(layer, self.store.clone()))
+    }
+
+    /// Read the authenticated state root for this exact logical layer.
+    pub async fn proof_state(&self) -> io::Result<Option<ProofLayerState>> {
+        Ok(self
+            .store
+            .layer_store
+            .proof_layer(self.layer.name())
+            .await?
+            .map(|proof| proof.state.clone()))
+    }
+
+    /// Explicitly migrate this legacy layer and every legacy ancestor once.
+    pub async fn migrate_proof_chain(&self) -> io::Result<ProofLayerState> {
+        self.store
+            .layer_store
+            .migrate_proof_chain(self.layer.name())
+            .await
+    }
+
+    /// Generate compact per-layer Store evidence for a logical triple pattern.
+    /// Proof mode callers use this as their sole Store source.
+    pub async fn proof_range_witness(
+        &self,
+        pattern: &TriplePattern,
+    ) -> io::Result<(ProofHash, Vec<LayerRangeWitness>)> {
+        self.store
+            .layer_store
+            .proof_range_witness(self.layer.name(), pattern)
+            .await
     }
 
     /// Returns the parent of this layer, if any, or None if this layer has no parent.
@@ -896,6 +992,10 @@ impl Store {
         Ok(layer.map(|layer| StoreLayer::wrap(layer, self.clone())))
     }
 
+    pub async fn migrate_proof_chain(&self, layer: [u32; 5]) -> io::Result<ProofLayerState> {
+        self.layer_store.migrate_proof_chain(layer).await
+    }
+
     /// Create a base layer builder, unattached to any database label.
     ///
     /// After having committed it, use `set_head` on a `NamedGraph` to attach it.
@@ -919,17 +1019,60 @@ impl Store {
         self.layer_store.export_layers(layer_ids).await
     }
 
+    /// Export a proof-capable pack under caller-negotiated resource limits.
+    pub async fn export_layers_with_limits(
+        &self,
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+        limits: PackImportLimits,
+    ) -> io::Result<Vec<u8>> {
+        self.layer_store
+            .export_layers_with_limits(layer_ids, limits)
+            .await
+    }
+
+    /// Export a legacy pack without authenticated proof state.
+    pub async fn export_layers_legacy(
+        &self,
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+    ) -> io::Result<Vec<u8>> {
+        self.layer_store.export_layers_legacy(layer_ids).await
+    }
+
     /// Import the specified layers from the given pack, a byte slice that was previously generated with `export_layers`, on another store, and possibly even another machine).
     ///
-    /// After this operation, the specified layers will be retrievable
-    /// from this store, provided they existed in the pack. specified
-    /// layers that are not in the pack are silently ignored.
+    /// On success every requested layer is retrievable. Missing layers reject
+    /// the whole import before any requested layer becomes visible.
     pub async fn import_layers<'a>(
         &'a self,
         pack: &'a [u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<()> {
         self.layer_store.import_layers(pack, layer_ids).await
+    }
+
+    /// Import proof-enabled layers anchored to independently supplied roots.
+    pub async fn import_layers_with_expected_roots<'a>(
+        &'a self,
+        pack: &'a [u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+        expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
+    ) -> io::Result<()> {
+        self.layer_store
+            .import_layers_with_expected_roots(pack, layer_ids, expected_roots)
+            .await
+    }
+
+    /// Import with caller-selected parser and staging budgets.
+    pub async fn import_layers_with_limits<'a>(
+        &'a self,
+        pack: &'a [u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+        expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
+        limits: crate::storage::pack::PackImportLimits,
+    ) -> io::Result<()> {
+        self.layer_store
+            .import_layers_with_limits(pack, layer_ids, expected_roots, limits)
+            .await
     }
 
     /// Returns cache statistics: (total_entries, live_entries, dead_entries)
@@ -946,6 +1089,10 @@ impl Store {
     /// Returns bytes of backing data: (total_bytes, live_bytes, dead_bytes).
     pub fn layer_cache_memory_bytes(&self) -> (usize, usize, usize) {
         self.layer_store.layer_cache_memory_bytes()
+    }
+
+    pub fn proof_cache_memory_bytes(&self) -> usize {
+        self.layer_store.proof_cache_memory_bytes()
     }
 
     /// Returns the current LRU archive cache usage in bytes, or None if no LRU backend.
@@ -1031,6 +1178,13 @@ pub fn open_directory_store<P: Into<PathBuf>>(path: P) -> Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proof::{
+        verify_layer_chain, CanonicalObject, CanonicalTriple, CanonicalValueRange, ProofLayer,
+    };
+    use crate::storage::{consts::FILENAMES, name_to_string};
+    use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+    use std::io::{Cursor, Read};
+    use tdb_succinct::TdbDataType;
     use tempfile::tempdir;
 
     async fn create_and_manipulate_database(store: Store) {
@@ -1068,6 +1222,654 @@ mod tests {
         let store = open_memory_store();
 
         create_and_manipulate_database(store).await;
+    }
+
+    async fn create_proof_stack(store: &Store) -> (StoreLayer, ProofLayerState) {
+        let builder = store.create_base_layer().await.unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node("a", "p", "one"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("a", "label", "alpha"))
+            .unwrap();
+        let (base, _) = builder.commit_with_proof().await.unwrap();
+
+        let child = base.open_write().await.unwrap();
+        child
+            .remove_value_triple(ValueTriple::new_node("a", "p", "one"))
+            .unwrap();
+        child
+            .add_value_triple(ValueTriple::new_node("b", "p", "two"))
+            .unwrap();
+        child.commit_with_proof().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn proof_enabled_memory_stack_matches_normal_store_results() {
+        let store = open_memory_store();
+        let (head, state) = create_proof_stack(&store).await;
+        let pattern = TriplePattern {
+            subject: None,
+            predicate: Some(b"p".to_vec()),
+            object: None,
+            ..TriplePattern::default()
+        };
+        let (root, witness) = head.proof_range_witness(&pattern).await.unwrap();
+        assert_eq!(root, state.state_root);
+        assert_eq!(
+            verify_layer_chain(root, &pattern, &witness).unwrap(),
+            vec![CanonicalTriple::node(
+                b"b".to_vec(),
+                b"p".to_vec(),
+                b"two".to_vec()
+            )]
+        );
+
+        let all_pattern = TriplePattern::default();
+        let (root, witness) = head.proof_range_witness(&all_pattern).await.unwrap();
+        let proved = verify_layer_chain(root, &all_pattern, &witness).unwrap();
+        let mut ordinary: Vec<_> = head
+            .triples()
+            .map(|id| CanonicalTriple::from_value_triple(&head.id_triple_to_string(&id).unwrap()))
+            .collect();
+        ordinary.sort();
+        assert_eq!(proved, ordinary);
+        assert!(proved
+            .iter()
+            .any(|triple| matches!(triple.object, CanonicalObject::Value { .. })));
+    }
+
+    #[tokio::test]
+    async fn proof_order_matches_native_ids_across_layers_and_limits() {
+        let store = open_memory_store();
+        let base = store.create_base_layer().await.unwrap();
+        // Deliberately make lexical order disagree with dictionary/native-id order.
+        base.add_value_triple(ValueTriple::new_node("z-subject", "p", "z-object"))
+            .unwrap();
+        base.add_value_triple(ValueTriple::new_node("a-subject", "p", "a-object"))
+            .unwrap();
+        base.add_value_triple(ValueTriple::new_node("m-subject", "q", "m-object"))
+            .unwrap();
+        let (base, _) = base.commit_with_proof().await.unwrap();
+        let child = base.open_write().await.unwrap();
+        child
+            .remove_value_triple(ValueTriple::new_node("a-subject", "p", "a-object"))
+            .unwrap();
+        child
+            .add_value_triple(ValueTriple::new_node("b-subject", "p", "b-object"))
+            .unwrap();
+        let (head, _) = child.commit_with_proof().await.unwrap();
+
+        let ordinary: Vec<_> = head
+            .triples()
+            .map(|id| CanonicalTriple::from_value_triple(&head.id_triple_to_string(&id).unwrap()))
+            .collect();
+        let pattern = TriplePattern::default();
+        let (root, witness) = head.proof_range_witness(&pattern).await.unwrap();
+        let proved = verify_layer_chain(root, &pattern, &witness).unwrap();
+        assert_eq!(proved, ordinary);
+        assert_eq!(
+            proved.iter().take(1).collect::<Vec<_>>(),
+            ordinary.iter().take(1).collect::<Vec<_>>()
+        );
+
+        let reverse = TriplePattern {
+            reverse: true,
+            ..TriplePattern::default()
+        };
+        assert!(head.proof_range_witness(&reverse).await.is_err());
+
+        let predicate_id = head.predicate_id("p").unwrap();
+        let ordinary_p: Vec<_> = head
+            .triples_p(predicate_id)
+            .map(|id| CanonicalTriple::from_value_triple(&head.id_triple_to_string(&id).unwrap()))
+            .collect();
+        let predicate = TriplePattern {
+            predicate: Some(b"p".to_vec()),
+            ..TriplePattern::default()
+        };
+        let (root, witness) = head.proof_range_witness(&predicate).await.unwrap();
+        assert_eq!(
+            verify_layer_chain(root, &predicate, &witness).unwrap(),
+            ordinary_p
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_predicate_scan_uses_native_subject_then_object_order() {
+        let store = open_memory_store();
+        let base = store.create_base_layer().await.unwrap();
+        // Subject and object order are deliberately inverted. P-O-S would put
+        // the second row first; Store's fixed-P IdTriple merge is P-S-O.
+        base.add_value_triple(ValueTriple::new_node("a-subject", "p", "z-object"))
+            .unwrap();
+        base.add_value_triple(ValueTriple::new_node("b-subject", "p", "a-object"))
+            .unwrap();
+        let (head, _) = base.commit_with_proof().await.unwrap();
+        let predicate_id = head.predicate_id("p").unwrap();
+        let ordinary: Vec<_> = head
+            .triples_p(predicate_id)
+            .map(|id| CanonicalTriple::from_value_triple(&head.id_triple_to_string(&id).unwrap()))
+            .collect();
+        let pattern = TriplePattern {
+            predicate: Some(b"p".to_vec()),
+            ..TriplePattern::default()
+        };
+        let (root, witness) = head.proof_range_witness(&pattern).await.unwrap();
+        assert_eq!(
+            verify_layer_chain(root, &pattern, &witness).unwrap(),
+            ordinary
+        );
+        assert_eq!(ordinary[0].subject, b"a-subject".to_vec());
+    }
+
+    #[tokio::test]
+    async fn proof_typed_half_open_range_matches_native_forward_and_reverse() {
+        let store = open_memory_store();
+        let base = store.create_base_layer().await.unwrap();
+        base.add_value_triple(ValueTriple::new_string_value("z", "label", "zeta"))
+            .unwrap();
+        base.add_value_triple(ValueTriple::new_string_value("a", "label", "alpha"))
+            .unwrap();
+        base.add_value_triple(ValueTriple::new_string_value("x", "label", "outside"))
+            .unwrap();
+        let (base, _) = base.commit_with_proof().await.unwrap();
+        let child = base.open_write().await.unwrap();
+        child
+            .add_value_triple(ValueTriple::new_string_value("b", "label", "beta"))
+            .unwrap();
+        let (head, _) = child.commit_with_proof().await.unwrap();
+
+        let low = String::make_entry(&"alpha");
+        let high = String::make_entry(&"outside");
+        let ordinary: Vec<_> = head
+            .triples_value_range(&low, &high)
+            .map(|id| CanonicalTriple::from_value_triple(&head.id_triple_to_string(&id).unwrap()))
+            .collect();
+        let pattern = TriplePattern {
+            value_range: Some(CanonicalValueRange::from_store_bounds(&low, &high).unwrap()),
+            ..TriplePattern::default()
+        };
+        let (root, witness) = head.proof_range_witness(&pattern).await.unwrap();
+        assert_eq!(
+            verify_layer_chain(root, &pattern, &witness).unwrap(),
+            ordinary
+        );
+
+        let ordinary_reverse: Vec<_> = head
+            .triples_value_range_rev(&low, &high)
+            .map(|id| CanonicalTriple::from_value_triple(&head.id_triple_to_string(&id).unwrap()))
+            .collect();
+        let reverse = TriplePattern {
+            reverse: true,
+            ..pattern
+        };
+        let (root, witness) = head.proof_range_witness(&reverse).await.unwrap();
+        assert_eq!(
+            verify_layer_chain(root, &reverse, &witness).unwrap(),
+            ordinary_reverse
+        );
+
+        assert!(CanonicalValueRange::from_store_bounds(&low, &low).is_err());
+        assert!(CanonicalValueRange::from_store_bounds(
+            &i32::make_entry(&-2),
+            &i32::make_entry(&3)
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn proof_u32_half_open_range_matches_native_forward_and_reverse() {
+        let store = open_memory_store();
+        let base = store.create_base_layer().await.unwrap();
+        base.add_value_triple(ValueTriple::new_value("z", "score", u32::make_entry(&40)))
+            .unwrap();
+        base.add_value_triple(ValueTriple::new_value("a", "score", u32::make_entry(&10)))
+            .unwrap();
+        base.add_value_triple(ValueTriple::new_value("x", "score", u32::make_entry(&50)))
+            .unwrap();
+        let (base, _) = base.commit_with_proof().await.unwrap();
+        let child = base.open_write().await.unwrap();
+        child
+            .add_value_triple(ValueTriple::new_value("b", "score", u32::make_entry(&20)))
+            .unwrap();
+        child
+            .add_value_triple(ValueTriple::new_value("c", "score", u32::make_entry(&30)))
+            .unwrap();
+        let (head, _) = child.commit_with_proof().await.unwrap();
+
+        let low = u32::make_entry(&20);
+        let high = u32::make_entry(&50);
+        let pattern = TriplePattern {
+            value_range: Some(CanonicalValueRange::from_store_bounds(&low, &high).unwrap()),
+            ..TriplePattern::default()
+        };
+        let ordinary: Vec<_> = head
+            .triples_value_range(&low, &high)
+            .map(|id| CanonicalTriple::from_value_triple(&head.id_triple_to_string(&id).unwrap()))
+            .collect();
+        let (root, witness) = head.proof_range_witness(&pattern).await.unwrap();
+        assert_eq!(
+            verify_layer_chain(root, &pattern, &witness).unwrap(),
+            ordinary
+        );
+
+        let reverse = TriplePattern {
+            reverse: true,
+            ..pattern
+        };
+        let ordinary_reverse: Vec<_> = head
+            .triples_value_range_rev(&low, &high)
+            .map(|id| CanonicalTriple::from_value_triple(&head.id_triple_to_string(&id).unwrap()))
+            .collect();
+        let (root, witness) = head.proof_range_witness(&reverse).await.unwrap();
+        assert_eq!(
+            verify_layer_chain(root, &reverse, &witness).unwrap(),
+            ordinary_reverse
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_squash_and_squash_upto_regenerate_valid_proof_state() {
+        let store = open_memory_store();
+        let base_builder = store.create_base_layer().await.unwrap();
+        base_builder
+            .add_value_triple(ValueTriple::new_node("a", "p", "one"))
+            .unwrap();
+        let (base, _) = base_builder.commit_with_proof().await.unwrap();
+        let middle_builder = base.open_write().await.unwrap();
+        middle_builder
+            .add_value_triple(ValueTriple::new_node("b", "p", "two"))
+            .unwrap();
+        let (middle, _) = middle_builder.commit_with_proof().await.unwrap();
+        let head_builder = middle.open_write().await.unwrap();
+        head_builder
+            .remove_value_triple(ValueTriple::new_node("a", "p", "one"))
+            .unwrap();
+        head_builder
+            .add_value_triple(ValueTriple::new_node("c", "p", "three"))
+            .unwrap();
+        let (head, head_state) = head_builder.commit_with_proof().await.unwrap();
+
+        let squashed = head.squash().await.unwrap();
+        let squashed_state = squashed.proof_state().await.unwrap().unwrap();
+        assert_ne!(head_state.state_root, squashed_state.state_root);
+
+        let squashed_upto = head.squash_upto(&base).await.unwrap();
+        let upto_state = squashed_upto.proof_state().await.unwrap().unwrap();
+        assert_ne!(head_state.state_root, upto_state.state_root);
+        assert_eq!(
+            squashed_upto.parent().await.unwrap().unwrap().name(),
+            base.name()
+        );
+
+        for candidate in [&squashed, &squashed_upto] {
+            let ordinary: Vec<_> = candidate
+                .triples()
+                .map(|id| {
+                    CanonicalTriple::from_value_triple(&candidate.id_triple_to_string(&id).unwrap())
+                })
+                .collect();
+            let pattern = TriplePattern::default();
+            let (root, witness) = candidate.proof_range_witness(&pattern).await.unwrap();
+            assert_eq!(
+                verify_layer_chain(root, &pattern, &witness).unwrap(),
+                ordinary
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn proof_rollup_keeps_original_proof_identity() {
+        let store = open_memory_store();
+        let (head, before) = create_proof_stack(&store).await;
+        head.rollup().await.unwrap();
+        let after = head.proof_state().await.unwrap().unwrap();
+        assert_eq!(before, after);
+        let pattern = TriplePattern::default();
+        let (root, witness) = head.proof_range_witness(&pattern).await.unwrap();
+        assert_eq!(root, before.state_root);
+        assert!(!verify_layer_chain(root, &pattern, &witness)
+            .unwrap()
+            .is_empty());
+
+        store.invalidate_layer(head.name());
+        let reloaded = store.get_layer_from_id(head.name()).await.unwrap().unwrap();
+        let squashed = reloaded.squash().await.unwrap();
+        assert!(squashed.proof_state().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn proof_merge_regenerates_only_when_every_base_is_proof_enabled() {
+        let store = open_memory_store();
+        let first_builder = store.create_base_layer().await.unwrap();
+        first_builder
+            .add_value_triple(ValueTriple::new_node("a", "p", "one"))
+            .unwrap();
+        let (first, _) = first_builder.commit_with_proof().await.unwrap();
+        let second_builder = store.create_base_layer().await.unwrap();
+        second_builder
+            .add_value_triple(ValueTriple::new_node("b", "p", "two"))
+            .unwrap();
+        let (second, _) = second_builder.commit_with_proof().await.unwrap();
+        let temp = tempdir().unwrap();
+        let merged_id = store
+            .merge_base_layers(&[first.name(), second.name()], temp.path())
+            .await
+            .unwrap();
+        let merged = store.get_layer_from_id(merged_id).await.unwrap().unwrap();
+        assert!(merged.proof_state().await.unwrap().is_some());
+        let pattern = TriplePattern::default();
+        let (root, witness) = merged.proof_range_witness(&pattern).await.unwrap();
+        let ordinary: Vec<_> = merged
+            .triples()
+            .map(|id| CanonicalTriple::from_value_triple(&merged.id_triple_to_string(&id).unwrap()))
+            .collect();
+        assert_eq!(
+            verify_layer_chain(root, &pattern, &witness).unwrap(),
+            ordinary
+        );
+
+        let legacy_builder = store.create_base_layer().await.unwrap();
+        legacy_builder
+            .add_value_triple(ValueTriple::new_node("c", "p", "three"))
+            .unwrap();
+        let legacy = legacy_builder.commit().await.unwrap();
+        let mixed_temp = tempdir().unwrap();
+        let mixed_id = store
+            .merge_base_layers(&[first.name(), legacy.name()], mixed_temp.path())
+            .await
+            .unwrap();
+        let mixed = store.get_layer_from_id(mixed_id).await.unwrap().unwrap();
+        assert!(mixed.proof_state().await.unwrap().is_none());
+        assert!(mixed.proof_range_witness(&pattern).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn proof_enabled_archive_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let store = open_raw_archive_store(dir.path());
+        let (head, state) = create_proof_stack(&store).await;
+        let name = head.name();
+        drop(head);
+        drop(store);
+
+        let reopened = open_raw_archive_store(dir.path());
+        let head = reopened.get_layer_from_id(name).await.unwrap().unwrap();
+        assert_eq!(head.proof_state().await.unwrap().unwrap(), state);
+        let pattern = TriplePattern::default();
+        let (root, witness) = head.proof_range_witness(&pattern).await.unwrap();
+        assert_eq!(root, state.state_root);
+        assert_eq!(
+            verify_layer_chain(root, &pattern, &witness).unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_enabled_directory_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let store = open_directory_store(dir.path());
+        let (head, state) = create_proof_stack(&store).await;
+        let name = head.name();
+        drop(head);
+        drop(store);
+
+        let reopened = open_directory_store(dir.path());
+        let head = reopened.get_layer_from_id(name).await.unwrap().unwrap();
+        assert_eq!(head.proof_state().await.unwrap().unwrap(), state);
+        let pattern = TriplePattern::default();
+        let (root, witness) = head.proof_range_witness(&pattern).await.unwrap();
+        assert_eq!(root, state.state_root);
+        assert_eq!(
+            verify_layer_chain(root, &pattern, &witness).unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_child_of_legacy_parent_fails_closed() {
+        let store = open_memory_store();
+        let builder = store.create_base_layer().await.unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node("a", "p", "one"))
+            .unwrap();
+        let legacy = builder.commit().await.unwrap();
+        assert!(legacy
+            .proof_range_witness(&TriplePattern::default())
+            .await
+            .is_err());
+        let child = legacy.open_write().await.unwrap();
+        let child_name = child.name();
+        child
+            .add_value_triple(ValueTriple::new_node("b", "p", "two"))
+            .unwrap();
+        assert!(child.commit_with_proof().await.is_err());
+        assert!(store.get_layer_from_id(child_name).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn proof_dictionary_covers_shared_nodes_and_compact_unknown_terms() {
+        let store = open_memory_store();
+        let (head, _) = create_proof_stack(&store).await;
+
+        // "one" was introduced only as an object, but Store's node dictionary
+        // also makes it a valid subject id. The complete catalog must prove that
+        // binding even though no delta record uses it as a subject.
+        let known_but_empty = TriplePattern {
+            subject: Some(b"one".to_vec()),
+            ..TriplePattern::default()
+        };
+        let (root, witness) = head.proof_range_witness(&known_but_empty).await.unwrap();
+        assert!(witness[0].dictionary[0]
+            .verify(witness[0].state.dictionary_roots[0])
+            .unwrap()
+            .is_some());
+        assert!(witness
+            .iter()
+            .all(|layer| layer.additions.is_some() && layer.removals.is_some()));
+        assert!(verify_layer_chain(root, &known_but_empty, &witness)
+            .unwrap()
+            .is_empty());
+
+        let unknown = TriplePattern {
+            subject: Some(b"definitely-absent".to_vec()),
+            ..TriplePattern::default()
+        };
+        let (root, witness) = head.proof_range_witness(&unknown).await.unwrap();
+        assert!(witness
+            .iter()
+            .all(|layer| layer.additions.is_none() && layer.removals.is_none()));
+        assert!(verify_layer_chain(root, &unknown, &witness)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_archive_migration_indexes_legacy_chain_once() {
+        let dir = tempdir().unwrap();
+        let store = open_raw_archive_store(dir.path());
+        let base = store.create_base_layer().await.unwrap();
+        base.add_value_triple(ValueTriple::new_node("z", "p", "one"))
+            .unwrap();
+        let base = base.commit().await.unwrap();
+        let child = base.open_write().await.unwrap();
+        child
+            .add_value_triple(ValueTriple::new_node("a", "p", "two"))
+            .unwrap();
+        let head = child.commit().await.unwrap();
+        let name = head.name();
+        assert!(head.proof_state().await.unwrap().is_none());
+        let migrated = head.migrate_proof_chain().await.unwrap();
+        assert_eq!(head.migrate_proof_chain().await.unwrap(), migrated);
+        drop(head);
+        drop(store);
+
+        let reopened = open_raw_archive_store(dir.path());
+        let head = reopened.get_layer_from_id(name).await.unwrap().unwrap();
+        assert_eq!(head.proof_state().await.unwrap().unwrap(), migrated);
+        let pattern = TriplePattern::default();
+        let (root, witness) = head.proof_range_witness(&pattern).await.unwrap();
+        let proved = verify_layer_chain(root, &pattern, &witness).unwrap();
+        let ordinary: Vec<_> = head
+            .triples()
+            .map(|id| CanonicalTriple::from_value_triple(&head.id_triple_to_string(&id).unwrap()))
+            .collect();
+        assert_eq!(proved, ordinary);
+    }
+
+    #[tokio::test]
+    async fn lru_archive_migration_replaces_cached_legacy_bytes_immediately() {
+        let dir = tempdir().unwrap();
+        let store = open_archive_store(dir.path(), 16);
+        let base = store.create_base_layer().await.unwrap();
+        base.add_value_triple(ValueTriple::new_node("z", "p", "one"))
+            .unwrap();
+        let base = base.commit().await.unwrap();
+        let child = base.open_write().await.unwrap();
+        child
+            .add_value_triple(ValueTriple::new_node("a", "p", "two"))
+            .unwrap();
+        let head = child.commit().await.unwrap();
+        let name = head.name();
+
+        // Force both legacy archives through the LRU before the sidecar rewrite.
+        assert!(head.proof_state().await.unwrap().is_none());
+        assert_eq!(head.triples().count(), 2);
+        let migrated = head.migrate_proof_chain().await.unwrap();
+
+        // No reopen/invalidation is allowed here: these reads must observe the
+        // atomically replaced archive bytes rather than a stale LRU entry.
+        let same_process = store.get_layer_from_id(name).await.unwrap().unwrap();
+        assert_eq!(same_process.proof_state().await.unwrap().unwrap(), migrated);
+        let pattern = TriplePattern::default();
+        let (root, witness) = same_process.proof_range_witness(&pattern).await.unwrap();
+        assert_eq!(root, migrated.state_root);
+        assert_eq!(
+            verify_layer_chain(root, &pattern, &witness).unwrap().len(),
+            2
+        );
+    }
+
+    fn forge_proof_delta_in_pack(pack: &[u8], layer: [u32; 5]) -> Vec<u8> {
+        let mut source = tar::Archive::new(GzDecoder::new(Cursor::new(pack)));
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut destination = tar::Builder::new(encoder);
+        let target = format!("{}/{}", name_to_string(layer), FILENAMES.proof_state);
+        for entry in source.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if path.to_string_lossy() == target {
+                let proof = ProofLayer::decode(&bytes).unwrap();
+                let mut additions = proof.additions().to_vec();
+                additions.push(CanonicalTriple::node(
+                    b"forged".to_vec(),
+                    b"p".to_vec(),
+                    b"row".to_vec(),
+                ));
+                bytes = ProofLayer::new(
+                    proof.state.parent_state_root,
+                    additions,
+                    proof.removals().to_vec(),
+                )
+                .unwrap()
+                .encode()
+                .unwrap();
+            }
+            let mut header = entry.header().clone();
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            destination
+                .append_data(&mut header, path, Cursor::new(bytes))
+                .unwrap();
+        }
+        let encoder = destination.into_inner().unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proof_pack_import_validates_before_exposure() {
+        let source = open_memory_store();
+        let (head, state) = create_proof_stack(&source).await;
+        let base = head.parent().await.unwrap().unwrap();
+        let ids = vec![base.name(), head.name()];
+        let pack = source
+            .export_layers(Box::new(ids.clone().into_iter()))
+            .await
+            .unwrap();
+        let expected_roots = std::collections::HashMap::from([
+            (
+                base.name(),
+                base.proof_state().await.unwrap().unwrap().state_root,
+            ),
+            (head.name(), state.state_root),
+        ]);
+
+        let unanchored = open_memory_store();
+        assert!(unanchored
+            .import_layers(&pack, Box::new(ids.clone().into_iter()))
+            .await
+            .is_err());
+        assert!(unanchored
+            .get_layer_from_id(head.name())
+            .await
+            .unwrap()
+            .is_none());
+
+        let target = open_memory_store();
+        target
+            .import_layers_with_expected_roots(
+                &pack,
+                Box::new(ids.clone().into_iter()),
+                expected_roots.clone(),
+            )
+            .await
+            .unwrap();
+        let imported = target
+            .get_layer_from_id(head.name())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported.proof_state().await.unwrap().unwrap(), state);
+
+        let forged = forge_proof_delta_in_pack(&pack, head.name());
+        let rejected = open_memory_store();
+        assert!(rejected
+            .import_layers_with_expected_roots(
+                &forged,
+                Box::new(ids.clone().into_iter()),
+                expected_roots.clone(),
+            )
+            .await
+            .is_err());
+        assert!(rejected
+            .get_layer_from_id(head.name())
+            .await
+            .unwrap()
+            .is_none());
+
+        let forged_parent = forge_proof_delta_in_pack(&pack, base.name());
+        let rejected = open_memory_store();
+        assert!(rejected
+            .import_layers_with_expected_roots(
+                &forged_parent,
+                Box::new(ids.into_iter()),
+                expected_roots,
+            )
+            .await
+            .is_err());
+        assert!(rejected
+            .get_layer_from_id(base.name())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(rejected
+            .get_layer_from_id(head.name())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

@@ -1,11 +1,17 @@
 use super::layer::*;
 use crate::layer::*;
+use crate::proof::ProofLayer;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use tdb_succinct::{StringDict, TypedDict};
+
+const DEFAULT_PROOF_CACHE_ENTRIES: usize = 64;
+const DEFAULT_PROOF_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_INFLIGHT_PROOF_LOADS: usize = 2;
 
 pub trait LayerCache: 'static + Send + Sync {
     fn get_layer_from_cache(&self, name: [u32; 5]) -> Option<Arc<InternalLayer>>;
@@ -184,22 +190,126 @@ impl LayerCache for LockingHashMapLayerCache {
     }
 }
 
+struct ProofLayerCache {
+    entries: lru::LruCache<[u32; 5], Arc<tokio::sync::OnceCell<Option<Arc<ProofLayer>>>>>,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl ProofLayerCache {
+    fn new(max_entries: usize, max_bytes: usize, max_inflight: usize) -> Self {
+        // Unresolved single-flight cells are never eviction candidates. Leave
+        // bounded room for them in addition to the configured resident set so
+        // LruCache's own capacity eviction cannot discard an active load.
+        let physical_entries = max_entries.saturating_add(max_inflight).max(1);
+        Self {
+            entries: lru::LruCache::new(NonZeroUsize::new(physical_entries).unwrap()),
+            bytes: 0,
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    fn recompute_and_evict(&mut self) {
+        loop {
+            self.bytes = self
+                .entries
+                .iter()
+                .filter_map(|(_, cell)| cell.get().and_then(|proof| proof.as_ref()))
+                .map(|proof| proof.estimated_cache_bytes())
+                .fold(0usize, usize::saturating_add);
+            let settled = self
+                .entries
+                .iter()
+                .filter(|(_, cell)| cell.get().is_some())
+                .count();
+            if settled <= self.max_entries && self.bytes <= self.max_bytes {
+                break;
+            }
+            let victim = self
+                .entries
+                .iter()
+                .filter_map(|(name, cell)| cell.get().is_some().then_some(*name))
+                .last();
+            let Some(victim) = victim else {
+                // Every remaining cell is an unresolved load and must stay
+                // resident until its semaphore-protected initialization ends.
+                break;
+            };
+            self.entries.pop(&victim);
+        }
+    }
+
+    fn settle_loaded(
+        &mut self,
+        name: [u32; 5],
+        cell: &Arc<tokio::sync::OnceCell<Option<Arc<ProofLayer>>>>,
+        load_succeeded: bool,
+    ) {
+        let resident = self
+            .entries
+            .peek(&name)
+            .map_or(false, |candidate| Arc::ptr_eq(candidate, cell));
+        if resident {
+            let exceeds_limit = !load_succeeded
+                || self.max_entries == 0
+                || cell
+                    .get()
+                    .and_then(|proof| proof.as_ref())
+                    .map_or(false, |proof| {
+                        proof.estimated_cache_bytes() > self.max_bytes
+                    });
+            if exceeds_limit {
+                self.entries.pop(&name);
+            }
+            self.recompute_and_evict();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CachedLayerStore {
     pub(crate) inner: Arc<dyn LayerStore>,
     pub(crate) cache: Arc<dyn LayerCache>,
+    proof_cache: Arc<Mutex<ProofLayerCache>>,
+    proof_loads: Arc<tokio::sync::Semaphore>,
 }
 
 impl CachedLayerStore {
     pub fn new<S: LayerStore, C: LayerCache>(inner: S, cache: C) -> CachedLayerStore {
+        Self::new_with_proof_cache_limits(
+            inner,
+            cache,
+            DEFAULT_PROOF_CACHE_ENTRIES,
+            DEFAULT_PROOF_CACHE_BYTES,
+        )
+    }
+
+    pub fn new_with_proof_cache_limits<S: LayerStore, C: LayerCache>(
+        inner: S,
+        cache: C,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> CachedLayerStore {
+        let max_inflight = max_entries.max(1).min(MAX_INFLIGHT_PROOF_LOADS);
         CachedLayerStore {
             inner: Arc::new(inner),
             cache: Arc::new(cache),
+            proof_cache: Arc::new(Mutex::new(ProofLayerCache::new(
+                max_entries,
+                max_bytes,
+                max_inflight,
+            ))),
+            proof_loads: Arc::new(tokio::sync::Semaphore::new(max_inflight)),
         }
     }
 
     pub fn invalidate(&self, name: [u32; 5]) {
         self.cache.invalidate(name);
+        let mut proof_cache = self.proof_cache.lock().unwrap();
+        proof_cache.entries.pop(&name);
+        proof_cache.recompute_and_evict();
     }
 
     /// Returns cache statistics: (total_entries, live_entries, dead_entries)
@@ -238,8 +348,78 @@ impl LayerStore for CachedLayerStore {
         self.inner.get_layer_with_cache(name, cache).await
     }
 
+    async fn get_unrolled_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<InternalLayer>>> {
+        self.inner.get_unrolled_layer(name).await
+    }
+
     async fn finalize_layer(&self, name: [u32; 5]) -> io::Result<()> {
         self.inner.finalize_layer(name).await
+    }
+
+    async fn abort_layer(&self, name: [u32; 5]) -> io::Result<()> {
+        {
+            let mut proof_cache = self.proof_cache.lock().unwrap();
+            proof_cache.entries.pop(&name);
+            proof_cache.recompute_and_evict();
+        }
+        self.inner.abort_layer(name).await
+    }
+
+    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<ProofLayer>>> {
+        let existing = {
+            let mut cache = self.proof_cache.lock().unwrap();
+            cache.entries.get(&name).cloned()
+        };
+        let (cell, _permit) = if let Some(cell) = existing {
+            (cell, None)
+        } else {
+            let permit = self
+                .proof_loads
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "proof load gate closed"))?;
+            let mut cache = self.proof_cache.lock().unwrap();
+            if let Some(cell) = cache.entries.get(&name) {
+                (cell.clone(), None)
+            } else {
+                let cell = Arc::new(tokio::sync::OnceCell::new());
+                cache.entries.put(name, cell.clone());
+                cache.recompute_and_evict();
+                (cell, Some(permit))
+            }
+        };
+        let result = cell
+            .get_or_try_init(|| self.inner.proof_layer(name))
+            .await
+            .cloned();
+        let mut cache = self.proof_cache.lock().unwrap();
+        cache.settle_loaded(name, &cell, result.is_ok());
+        result
+    }
+
+    async fn write_proof_layer(&self, name: [u32; 5], proof: &ProofLayer) -> io::Result<()> {
+        self.inner.write_proof_layer(name, proof).await?;
+        let cell = Arc::new(tokio::sync::OnceCell::new());
+        cell.set(Some(Arc::new(proof.clone()))).map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "new proof cache cell was already set")
+        })?;
+        let mut cache = self.proof_cache.lock().unwrap();
+        if cache.max_entries != 0 {
+            if cache.entries.len() == cache.entries.cap().get() {
+                if let Some(victim) = cache
+                    .entries
+                    .iter()
+                    .filter_map(|(candidate, value)| value.get().is_some().then_some(*candidate))
+                    .last()
+                {
+                    cache.entries.pop(&victim);
+                }
+            }
+            cache.entries.put(name, cell.clone());
+            cache.settle_loaded(name, &cell, true);
+        }
+        Ok(())
     }
 
     async fn get_layer_parent_name(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
@@ -684,6 +864,19 @@ impl LayerStore for CachedLayerStore {
     fn layer_cache_memory_bytes(&self) -> (usize, usize, usize) {
         self.cache.cache_memory_bytes()
     }
+
+    fn proof_cache_memory_bytes(&self) -> usize {
+        self.proof_cache.lock().unwrap().bytes
+    }
+
+    fn invalidate(&self, name: [u32; 5]) {
+        self.cache.invalidate(name);
+        let mut proof_cache = self.proof_cache.lock().unwrap();
+        proof_cache.entries.pop(&name);
+        proof_cache.recompute_and_evict();
+        std::mem::drop(proof_cache);
+        self.inner.invalidate(name);
+    }
 }
 
 #[cfg(test)]
@@ -796,6 +989,175 @@ pub mod tests {
 
         // and only has one weak pointer pointing to it, the newly cached one
         assert_eq!(1, Arc::weak_count(&layer));
+    }
+
+    #[tokio::test]
+    async fn proof_layers_are_decoded_once_until_explicit_invalidation() {
+        let store = CachedLayerStore::new(MemoryLayerStore::new(), LockingHashMapLayerCache::new());
+        let mut builder = store.create_base_layer().await.unwrap();
+        let name = builder.name();
+        builder.add_value_triple(ValueTriple::new_node("a", "p", "b"));
+        builder.commit_boxed().await.unwrap();
+        store.prepare_proof_layer(name).await.unwrap();
+
+        let first = store.proof_layer(name).await.unwrap().unwrap();
+        let second = store.proof_layer(name).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        LayerStore::invalidate(&store, name);
+        let (reloaded, concurrent) = tokio::join!(store.proof_layer(name), store.proof_layer(name));
+        let reloaded = reloaded.unwrap().unwrap();
+        let concurrent = concurrent.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&reloaded, &concurrent));
+        assert!(!Arc::ptr_eq(&first, &reloaded));
+        assert_eq!(*first, *reloaded);
+    }
+
+    async fn memory_store_with_two_proof_layers() -> (MemoryLayerStore, [u32; 5], [u32; 5]) {
+        let store = MemoryLayerStore::new();
+        let mut first = store.create_base_layer().await.unwrap();
+        let first_name = first.name();
+        first.add_value_triple(ValueTriple::new_node("first", "p", "value"));
+        first.commit_boxed().await.unwrap();
+        store.prepare_proof_layer(first_name).await.unwrap();
+        let mut second = store.create_base_layer().await.unwrap();
+        let second_name = second.name();
+        second.add_value_triple(ValueTriple::new_node("second", "p", "value"));
+        second.commit_boxed().await.unwrap();
+        store.prepare_proof_layer(second_name).await.unwrap();
+        (store, first_name, second_name)
+    }
+
+    #[tokio::test]
+    async fn proof_cache_evicts_lru_entry_at_entry_capacity() {
+        let (inner, first_name, second_name) = memory_store_with_two_proof_layers().await;
+        let store = CachedLayerStore::new_with_proof_cache_limits(
+            inner,
+            LockingHashMapLayerCache::new(),
+            1,
+            usize::MAX,
+        );
+        let first = store.proof_layer(first_name).await.unwrap().unwrap();
+        store.proof_layer(second_name).await.unwrap().unwrap();
+        assert_eq!(store.proof_cache.lock().unwrap().entries.len(), 1);
+        let reloaded = store.proof_layer(first_name).await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &reloaded));
+    }
+
+    #[tokio::test]
+    async fn proof_cache_evicts_by_bytes_and_reports_an_upper_bound() {
+        let (inner, first_name, second_name) = memory_store_with_two_proof_layers().await;
+        let first_bytes = inner
+            .proof_layer(first_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .estimated_cache_bytes();
+        let second_bytes = inner
+            .proof_layer(second_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .estimated_cache_bytes();
+        let limit = first_bytes.max(second_bytes);
+        let store = CachedLayerStore::new_with_proof_cache_limits(
+            inner,
+            LockingHashMapLayerCache::new(),
+            8,
+            limit,
+        );
+        store.proof_layer(first_name).await.unwrap().unwrap();
+        store.proof_layer(second_name).await.unwrap().unwrap();
+        let cache = store.proof_cache.lock().unwrap();
+        assert!(cache.entries.len() <= 1);
+        assert!(cache.bytes <= limit);
+        let retained = cache.bytes;
+        std::mem::drop(cache);
+        assert_eq!(retained, LayerStore::proof_cache_memory_bytes(&store));
+    }
+
+    #[tokio::test]
+    async fn oversized_proof_is_served_but_not_retained() {
+        let (inner, first_name, _) = memory_store_with_two_proof_layers().await;
+        let proof = inner.proof_layer(first_name).await.unwrap().unwrap();
+        let store = CachedLayerStore::new_with_proof_cache_limits(
+            inner,
+            LockingHashMapLayerCache::new(),
+            8,
+            proof.estimated_cache_bytes().saturating_sub(1),
+        );
+        assert_eq!(
+            store.proof_layer(first_name).await.unwrap().unwrap().state,
+            proof.state
+        );
+        let cache = store.proof_cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 0);
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn zero_entry_proof_cache_preserves_single_call_but_retains_nothing() {
+        let (inner, first_name, _) = memory_store_with_two_proof_layers().await;
+        let store = CachedLayerStore::new_with_proof_cache_limits(
+            inner,
+            LockingHashMapLayerCache::new(),
+            0,
+            usize::MAX,
+        );
+        assert!(store.proof_layer(first_name).await.unwrap().is_some());
+        assert_eq!(store.proof_cache.lock().unwrap().entries.len(), 0);
+    }
+
+    #[test]
+    fn unresolved_proof_cells_are_not_evicted_and_loads_are_bounded() {
+        let mut cache = ProofLayerCache::new(0, 0, 1);
+        let unresolved = Arc::new(tokio::sync::OnceCell::new());
+        let name = [7, 7, 7, 7, 7];
+        cache.entries.put(name, unresolved.clone());
+        cache.recompute_and_evict();
+        assert!(cache
+            .entries
+            .peek(&name)
+            .map_or(false, |cell| Arc::ptr_eq(cell, &unresolved)));
+
+        let store = CachedLayerStore::new_with_proof_cache_limits(
+            MemoryLayerStore::new(),
+            LockingHashMapLayerCache::new(),
+            100,
+            usize::MAX,
+        );
+        let first = store.proof_loads.clone().try_acquire_owned().unwrap();
+        let second = store.proof_loads.clone().try_acquire_owned().unwrap();
+        assert!(store.proof_loads.clone().try_acquire_owned().is_err());
+        drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn failed_proof_load_can_retry_after_storage_is_repaired() {
+        let directory = tempdir().unwrap();
+        let inner = DirectoryLayerStore::new(directory.path());
+        let mut builder = inner.create_base_layer().await.unwrap();
+        let name = builder.name();
+        builder.add_value_triple(ValueTriple::new_node("a", "p", "b"));
+        builder.commit_boxed().await.unwrap();
+        inner
+            .write_proof_state_bytes(name, b"invalid")
+            .await
+            .unwrap();
+        let store = CachedLayerStore::new(inner.clone(), LockingHashMapLayerCache::new());
+        assert!(store.proof_layer(name).await.is_err());
+
+        let name_text = name_to_string(name);
+        let proof_path = directory
+            .path()
+            .join(&name_text[..3])
+            .join(&name_text)
+            .join(crate::storage::consts::FILENAMES.proof_state);
+        tokio::fs::remove_file(proof_path).await.unwrap();
+        inner.prepare_proof_layer(name).await.unwrap();
+
+        assert!(store.proof_layer(name).await.unwrap().is_some());
+        assert_eq!(store.proof_cache.lock().unwrap().entries.len(), 1);
     }
 
     #[test]

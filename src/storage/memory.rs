@@ -5,6 +5,7 @@ use std::io;
 
 use async_trait::async_trait;
 
+use super::consts::FILENAMES;
 use super::file::*;
 use super::label::*;
 use super::layer::*;
@@ -33,6 +34,12 @@ impl PersistentLayerStore for MemoryLayerStore {
 
     async fn create_named_directory(&self, name: [u32; 5]) -> io::Result<[u32; 5]> {
         let mut guard = self.layers.write().await;
+        if guard.contains_key(&name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "layer already exists",
+            ));
+        }
         guard.insert(name, HashMap::new());
 
         Ok(name)
@@ -73,6 +80,69 @@ impl PersistentLayerStore for MemoryLayerStore {
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "layer not found"))
         }
+    }
+
+    async fn abort_directory(&self, directory: [u32; 5]) -> io::Result<()> {
+        self.layers.write().await.remove(&directory);
+        Ok(())
+    }
+
+    async fn publish_imported_layers_shared(
+        &self,
+        layers: Vec<([u32; 5], HashMap<String, bytes::Bytes>)>,
+    ) -> io::Result<()> {
+        let mut ids = std::collections::HashSet::with_capacity(layers.len());
+        if layers.iter().any(|(id, _)| !ids.insert(*id)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "duplicate imported layer id",
+            ));
+        }
+        let mut prepared = Vec::with_capacity(layers.len());
+        for (id, files) in layers {
+            let mut prepared_files = HashMap::with_capacity(files.len());
+            for (name, bytes) in files {
+                let file = MemoryBackedStore::new();
+                let mut writer = file.open_write().await?;
+                tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes).await?;
+                tokio::io::AsyncWriteExt::flush(&mut writer).await?;
+                writer.sync_all().await?;
+                prepared_files.insert(name, file);
+            }
+            prepared.push((id, prepared_files));
+        }
+        let mut guard = self.layers.write().await;
+        if prepared.iter().any(|(id, _)| guard.contains_key(id)) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to publish over an existing layer",
+            ));
+        }
+        for (id, files) in prepared {
+            guard.insert(id, files);
+        }
+        Ok(())
+    }
+
+    async fn write_proof_state_bytes(&self, directory: [u32; 5], bytes: &[u8]) -> io::Result<()> {
+        let file = MemoryBackedStore::new();
+        let mut writer = file.open_write().await?;
+        tokio::io::AsyncWriteExt::write_all(&mut writer, bytes).await?;
+        tokio::io::AsyncWriteExt::flush(&mut writer).await?;
+        writer.sync_all().await?;
+
+        let mut guard = self.layers.write().await;
+        let files = guard
+            .get_mut(&directory)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "layer not found"))?;
+        if files.contains_key(FILENAMES.proof_state) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "proof state already exists",
+            ));
+        }
+        files.insert(FILENAMES.proof_state.to_string(), file);
+        Ok(())
     }
 }
 
@@ -371,6 +441,51 @@ mod tests {
         assert!(layer.value_triple_exists(&ValueTriple::new_string_value("pig", "says", "oink")));
         assert!(layer.value_triple_exists(&ValueTriple::new_node("cow", "likes", "pig")));
         assert!(!layer.value_triple_exists(&ValueTriple::new_string_value("duck", "says", "quack")));
+    }
+
+    #[tokio::test]
+    async fn memory_proof_publication_is_single_assignment() {
+        let store = MemoryLayerStore::new();
+        let id = store.create_directory().await.unwrap();
+        store.write_proof_state_bytes(id, b"first").await.unwrap();
+        assert_eq!(
+            store
+                .write_proof_state_bytes(id, b"second")
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            store
+                .get_file(id, FILENAMES.proof_state)
+                .await
+                .unwrap()
+                .map()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"first"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_batch_rejects_duplicate_ids_without_publication() {
+        let store = MemoryLayerStore::new();
+        let id = [1, 2, 3, 4, 5];
+        let mut first = HashMap::new();
+        first.insert("a".to_string(), vec![1]);
+        let mut second = HashMap::new();
+        second.insert("b".to_string(), vec![2]);
+        assert_eq!(
+            store
+                .publish_imported_layers(vec![(id, first), (id, second)])
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!store.directory_exists(id).await.unwrap());
     }
 
     #[tokio::test]

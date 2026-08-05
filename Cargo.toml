@@ -1,6 +1,6 @@
 [package]
 name = "terminus-store"
-version = "0.21.7"
+version = "0.22.0"
 authors = ["Matthijs van Otterdijk <matthijs@datachemist.com>", "Philippe Höij <philippe.hoij@dfrnt.com>"]
 edition = "2018"
 license = "Apache-2.0"
@@ -36,9 +36,20 @@ regex = "1.5"
 lru = "0.10"
 bitvec = "1.0"
 tempfile = "3.1"
-tdb-succinct = "0.1.1"
+tdb-succinct = "0.1.2"
+sha2 = "0.10"
+libc = "0.2"
 
 [features]
 noreadlock = []
 eprint_log = []
 rollup_metadata_experimental = []
+
+[workspace]
+
+# Keep standalone Store builds on the exact succinct implementation used by
+# TerminusDB.  The dependency itself remains a crates.io dependency so a
+# TerminusDB workspace patch produces one Cargo source identity, rather than a
+# second incompatible copy reached through a direct git dependency.
+[patch.crates-io]
+tdb-succinct = { git = "https://github.com/terminusdb-org/tdb-succinct", rev = "ec1519923e44e73cad17264f21534065855be6e0" }

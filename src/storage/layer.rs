@@ -15,6 +15,11 @@ use crate::layer::{
     OptInternalLayerTriplePredicateIterator, OptInternalLayerTripleSubjectIterator, RollupLayer,
     SimpleLayerBuilder,
 };
+use crate::proof::{
+    validate_witness_limits, CanonicalObject, CanonicalTriple, LayerRangeWitness,
+    ProofConstructionBudget, ProofHash, ProofLayer, ProofLayerState, ProofRecord, ResolvedPattern,
+    TriplePattern, WitnessBudget,
+};
 use crate::Layer;
 use tdb_succinct::bitarray::bitarray_len_from_file;
 use tdb_succinct::dict_file_get_count;
@@ -24,6 +29,7 @@ use tdb_succinct::TypedDict;
 use tdb_succinct::{util, AdjacencyList, BitIndex, LogArray, MonotonicLogArray, WaveletTree};
 
 use bitvec::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::io;
 use std::path::Path;
@@ -33,28 +39,57 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use async_trait::async_trait;
 
+pub const MAX_LAYER_CHAIN_DEPTH: usize = 1024;
+
 macro_rules! walk_backwards_from_disk {
     ($store:ident, $name:ident, $current:ident, $body:block) => {
         let mut $current = $name;
+        let mut seen = std::collections::HashSet::new();
         loop {
+            if !seen.insert($current) {
+                break Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cycle in layer parent chain",
+                ));
+            }
+            if seen.len() > $crate::storage::layer::MAX_LAYER_CHAIN_DEPTH {
+                break Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "layer parent chain exceeds depth limit",
+                ));
+            }
             $body
 
             if let Some(parent) = $store.get_layer_parent_name($current).await? {
                 $current = parent;
             }
             else {
-                break;
+                break Ok(());
             }
-        }
+        }?
     }
 }
 
 macro_rules! walk_backwards_from_disk_upto {
     ($store:ident, $name:ident, $upto:ident, $current:ident, $body:block) => {
         let mut $current = $name;
+        let mut seen = std::collections::HashSet::new();
         loop {
             if $current == $upto {
                 break Ok(());
+            }
+
+            if !seen.insert($current) {
+                break Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cycle in layer parent chain",
+                ));
+            }
+            if seen.len() > $crate::storage::layer::MAX_LAYER_CHAIN_DEPTH {
+                break Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "layer parent chain exceeds depth limit",
+                ));
             }
 
             $body
@@ -81,8 +116,261 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         self.get_layer_with_cache(name, NOCACHE.clone()).await
     }
 
+    /// Load the original physical layer chain without substituting a rollup.
+    /// Proof admission must resolve ids from the original delta files, not an
+    /// equivalent but potentially remapped rollup representation.
+    async fn get_unrolled_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<InternalLayer>>> {
+        self.get_layer(name).await
+    }
+
     async fn finalize_layer(&self, _name: [u32; 5]) -> io::Result<()> {
         Ok(())
+    }
+
+    async fn abort_layer(&self, name: [u32; 5]) -> io::Result<()>;
+
+    /// Load and fully validate the optional authenticated logical delta for a layer.
+    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<ProofLayer>>>;
+
+    /// Persist a validated proof layer before the physical layer is exposed.
+    async fn write_proof_layer(&self, name: [u32; 5], proof: &ProofLayer) -> io::Result<()>;
+
+    /// Rebuild proof state from the complete native delta and the complete set of
+    /// dictionary mappings introduced by this layer. This is an admission-time
+    /// operation, never a proof-query operation.
+    async fn rebuild_proof_layer(&self, name: [u32; 5]) -> io::Result<ProofLayer> {
+        let layer = self
+            .get_unrolled_layer(name)
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "layer not found"))?;
+        let parent_state_root = match layer.parent_name() {
+            None => None,
+            Some(parent) => Some(
+                self.proof_layer(parent)
+                    .await?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "proof migration required for parent layer",
+                        )
+                    })?
+                    .state
+                    .state_root,
+            ),
+        };
+        let mut budget = ProofConstructionBudget::new();
+        let mut additions = Vec::new();
+        for triple in self.triple_additions(name).await? {
+            let value = layer.id_triple_to_string(&triple).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot resolve addition into canonical proof bytes",
+                )
+            })?;
+            let record = ProofRecord {
+                subject_id: triple.subject,
+                predicate_id: triple.predicate,
+                object_id: triple.object,
+                triple: CanonicalTriple::from_value_triple(&value),
+            };
+            budget.record(&record)?;
+            additions.try_reserve(1).map_err(io::Error::other)?;
+            additions.push(record);
+        }
+        let mut removals = Vec::new();
+        for triple in self.triple_removals(name).await? {
+            let value = layer.id_triple_to_string(&triple).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot resolve removal into canonical proof bytes",
+                )
+            })?;
+            let record = ProofRecord {
+                subject_id: triple.subject,
+                predicate_id: triple.predicate,
+                object_id: triple.object,
+                triple: CanonicalTriple::from_value_triple(&value),
+            };
+            budget.record(&record)?;
+            removals.try_reserve(1).map_err(io::Error::other)?;
+            removals.push(record);
+        }
+        let mut node_value_mappings = Vec::new();
+        for id in (layer.parent_node_value_count() as u64 + 1)..=layer.node_and_value_count() as u64
+        {
+            let object = layer.id_object(id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot resolve native node/value dictionary entry",
+                )
+            })?;
+            let object = CanonicalObject::from_store_object(&object);
+            budget.node_value(&object)?;
+            node_value_mappings
+                .try_reserve(1)
+                .map_err(io::Error::other)?;
+            node_value_mappings.push((object, id));
+        }
+        let mut predicate_mappings = Vec::new();
+        for id in (layer.parent_predicate_count() as u64 + 1)..=layer.predicate_count() as u64 {
+            let predicate = layer.id_predicate(id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot resolve native predicate dictionary entry",
+                )
+            })?;
+            let predicate = predicate.into_bytes();
+            budget.predicate(&predicate)?;
+            predicate_mappings
+                .try_reserve(1)
+                .map_err(io::Error::other)?;
+            predicate_mappings.push((predicate, id));
+        }
+        let parent_node_value_count = layer.parent_node_value_count() as u64;
+        let parent_predicate_count = layer.parent_predicate_count() as u64;
+        let node_value_count = layer.node_and_value_count() as u64;
+        let predicate_count = layer.predicate_count() as u64;
+        tokio::task::spawn_blocking(move || {
+            ProofLayer::new_native_with_catalog(
+                parent_state_root,
+                additions,
+                removals,
+                parent_node_value_count,
+                parent_predicate_count,
+                node_value_count,
+                predicate_count,
+                node_value_mappings,
+                predicate_mappings,
+            )
+        })
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+    }
+
+    /// Build proof state once, during commit/migration, from this layer's native delta.
+    /// A child fails closed when its parent has not been migrated.
+    async fn prepare_proof_layer(&self, name: [u32; 5]) -> io::Result<ProofLayer> {
+        let proof = self.rebuild_proof_layer(name).await?;
+        self.write_proof_layer(name, &proof).await?;
+        Ok(proof)
+    }
+
+    /// Recompute roots and counts from the native delta. This is required before
+    /// admitting migrated or imported proof state as a trusted compact-proof root.
+    async fn validate_proof_layer_against_store(
+        &self,
+        name: [u32; 5],
+    ) -> io::Result<ProofLayerState> {
+        let stored = self
+            .proof_layer(name)
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "proof state not found"))?;
+        let rebuilt = self.rebuild_proof_layer(name).await?;
+        if rebuilt != *stored {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "proof state differs from native layer delta",
+            ));
+        }
+        Ok(stored.state.clone())
+    }
+
+    async fn validate_proof_chain_against_store(
+        &self,
+        name: [u32; 5],
+    ) -> io::Result<ProofLayerState> {
+        let mut top = None;
+        for layer_name in self.retrieve_layer_stack_names(name).await? {
+            top = Some(self.validate_proof_layer_against_store(layer_name).await?);
+        }
+        top.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty proof layer chain"))
+    }
+
+    /// Explicit one-time legacy migration. No query path calls this method.
+    async fn migrate_proof_chain(&self, name: [u32; 5]) -> io::Result<ProofLayerState> {
+        let mut top = None;
+        for layer_name in self.retrieve_layer_stack_names(name).await? {
+            let state = match self.proof_layer(layer_name).await? {
+                Some(_) => self.validate_proof_layer_against_store(layer_name).await?,
+                None => self.prepare_proof_layer(layer_name).await?.state,
+            };
+            top = Some(state);
+        }
+        top.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty migration chain"))
+    }
+
+    /// Produce one compact authenticated range witness per layer, base to head.
+    /// This fails closed for legacy layers rather than silently scanning them.
+    async fn proof_range_witness(
+        &self,
+        name: [u32; 5],
+        pattern: &TriplePattern,
+    ) -> io::Result<(ProofHash, Vec<LayerRangeWitness>)> {
+        let mut proof_layers = Vec::new();
+        let layer_names = self.retrieve_layer_stack_names(name).await?;
+        if layer_names.len() > crate::proof::MAX_WITNESS_LAYERS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "proof layer chain exceeds witness budget",
+            ));
+        }
+        for layer_name in layer_names {
+            let layer = self.proof_layer(layer_name).await?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy layer is not proof-enabled",
+                )
+            })?;
+            proof_layers.push(layer);
+        }
+        let pattern = pattern.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut budget = WitnessBudget::new(proof_layers.len())?;
+            let mut resolved = ResolvedPattern::default();
+            for layer in &proof_layers {
+                layer.contribute_resolution(&pattern, &mut resolved)?;
+            }
+            let mut witnesses = Vec::with_capacity(proof_layers.len());
+            let missing_binding = (pattern.subject.is_some() && resolved.subject.is_none())
+                || (pattern.predicate.is_some() && resolved.predicate.is_none())
+                || (pattern.object.is_some() && resolved.object.is_none());
+            for layer in proof_layers {
+                witnesses.push(LayerRangeWitness {
+                    state: layer.state.clone(),
+                    dictionary: layer
+                        .prove_dictionary_bindings_with_budget(&pattern, &mut budget)?,
+                    additions: if missing_binding {
+                        None
+                    } else {
+                        Some(layer.prove_resolved_with_budget(
+                            true,
+                            &pattern,
+                            &resolved,
+                            &mut budget,
+                        )?)
+                    },
+                    removals: if missing_binding {
+                        None
+                    } else {
+                        Some(layer.prove_resolved_with_budget(
+                            false,
+                            &pattern,
+                            &resolved,
+                            &mut budget,
+                        )?)
+                    },
+                });
+            }
+            let root = witnesses
+                .last()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty layer stack"))?
+                .state
+                .state_root;
+            validate_witness_limits(&witnesses)?;
+            Ok((root, witnesses))
+        })
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
     }
 
     async fn get_layer_parent_name(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
@@ -140,7 +428,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         layer: Arc<InternalLayer>,
         upto: [u32; 5],
     ) -> io::Result<[u32; 5]> {
-        self.perform_rollup_upto_with_cache(layer, upto, NOCACHE.clone())
+        self.perform_imprecise_rollup_upto_with_cache(layer, upto, NOCACHE.clone())
             .await
     }
     async fn register_rollup(&self, layer: [u32; 5], rollup: [u32; 5]) -> io::Result<()>;
@@ -369,6 +657,11 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         (0, 0, 0)
     }
 
+    /// Approximate retained bytes in the decoded authenticated-index cache.
+    fn proof_cache_memory_bytes(&self) -> usize {
+        0
+    }
+
     /// Invalidate a specific layer from the cache, forcing reload from disk on next access.
     /// Default implementation does nothing for stores without caching.
     fn invalidate(&self, _name: [u32; 5]) {}
@@ -387,6 +680,43 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
     async fn directory_exists(&self, name: [u32; 5]) -> io::Result<bool>;
     async fn get_file(&self, directory: [u32; 5], name: &str) -> io::Result<Self::File>;
     async fn file_exists(&self, directory: [u32; 5], file: &str) -> io::Result<bool>;
+
+    /// Remove a layer that has not been exposed. Used to abort validated imports.
+    async fn abort_directory(&self, directory: [u32; 5]) -> io::Result<()>;
+
+    /// Publish fully extracted and transitively validated pack layers. Backends
+    /// must reject collisions and must not expose construction files.
+    async fn publish_imported_layers(
+        &self,
+        layers: Vec<([u32; 5], HashMap<String, Vec<u8>>)>,
+    ) -> io::Result<()> {
+        self.publish_imported_layers_shared(
+            layers
+                .into_iter()
+                .map(|(id, files)| {
+                    (
+                        id,
+                        files
+                            .into_iter()
+                            .map(|(name, bytes)| (name, bytes::Bytes::from(bytes)))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+        .await
+    }
+
+    /// Zero-copy publication path used by bounded pack admission. Backends
+    /// consume ref-counted immutable entry bytes after validation.
+    async fn publish_imported_layers_shared(
+        &self,
+        layers: Vec<([u32; 5], HashMap<String, bytes::Bytes>)>,
+    ) -> io::Result<()>;
+
+    /// Publish proof bytes with single-assignment semantics. Implementations
+    /// must never inherit an overwrite-capable generic file writer here.
+    async fn write_proof_state_bytes(&self, directory: [u32; 5], bytes: &[u8]) -> io::Result<()>;
 
     async fn finalize(&self, _directory: [u32; 5]) -> io::Result<()> {
         Ok(())
@@ -752,10 +1082,16 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
         }?;
 
         let layer_dir = self.create_directory().await?;
-        self.write_parent_file(layer_dir, parent).await?;
-        let child_layer_files = self.child_layer_files(layer_dir).await?;
-
-        Ok((layer_dir, parent_layer, child_layer_files))
+        let result = async {
+            self.write_parent_file(layer_dir, parent).await?;
+            let child_layer_files = self.child_layer_files(layer_dir).await?;
+            Ok((layer_dir, parent_layer, child_layer_files))
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.abort_layer(layer_dir).await;
+        }
+        result
     }
 
     async fn node_dictionary_files(
@@ -1470,6 +1806,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
 
         // find an ancestor in cache
         let mut ancestor = None;
+        let mut visited = HashSet::new();
         loop {
             let (original_layer, rollup_option) = *layers_to_load.last().unwrap();
             let current_layer;
@@ -1477,6 +1814,18 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                 current_layer = rollup;
             } else {
                 current_layer = original_layer;
+            }
+            if !visited.insert(current_layer) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cycle in layer or rollup chain",
+                ));
+            }
+            if visited.len() > MAX_LAYER_CHAIN_DEPTH {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "layer or rollup chain exceeds depth limit",
+                ));
             }
 
             match cache.get_layer_from_cache(current_layer) {
@@ -1608,8 +1957,82 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         Ok(Some(ancestor))
     }
 
+    async fn get_unrolled_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<InternalLayer>>> {
+        if !self.directory_exists(name).await? {
+            return Ok(None);
+        }
+        let mut names = vec![name];
+        let mut visited = std::collections::HashSet::from([name]);
+        let mut current = name;
+        while self.layer_has_parent(current).await? {
+            current = self.read_parent_file(current).await?;
+            if !visited.insert(current) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cycle in unrolled layer ancestry",
+                ));
+            }
+            if visited.len() > MAX_LAYER_CHAIN_DEPTH {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unrolled layer ancestry exceeds depth limit",
+                ));
+            }
+            names.push(current);
+        }
+        names.reverse();
+        let mut names = names.into_iter();
+        let base_name = names
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty layer chain"))?;
+        let base_files = self.base_layer_files(base_name).await?;
+        let mut layer: Arc<InternalLayer> = Arc::new(
+            BaseLayer::load_from_files(base_name, &base_files)
+                .await?
+                .into(),
+        );
+        for child_name in names {
+            let child_files = self.child_layer_files(child_name).await?;
+            layer = Arc::new(
+                ChildLayer::load_from_files(child_name, layer, &child_files)
+                    .await?
+                    .into(),
+            );
+        }
+        Ok(Some(layer))
+    }
+
     async fn finalize_layer(&self, name: [u32; 5]) -> io::Result<()> {
         self.finalize(name).await
+    }
+
+    async fn abort_layer(&self, name: [u32; 5]) -> io::Result<()> {
+        self.abort_directory(name).await
+    }
+
+    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<ProofLayer>>> {
+        if !self.file_exists(name, FILENAMES.proof_state).await? {
+            return Ok(None);
+        }
+        let bytes = self.get_file(name, FILENAMES.proof_state).await?;
+        if bytes.size().await? > crate::proof::MAX_PROOF_LAYER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "proof layer exceeds decode budget",
+            ));
+        }
+        let bytes = bytes.map().await?;
+        tokio::task::spawn_blocking(move || ProofLayer::decode(&bytes).map(Arc::new).map(Some))
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+    }
+
+    async fn write_proof_layer(&self, name: [u32; 5], proof: &ProofLayer) -> io::Result<()> {
+        let proof = proof.clone();
+        let bytes = tokio::task::spawn_blocking(move || proof.encode())
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))??;
+        self.write_proof_state_bytes(name, &bytes).await
     }
 
     async fn get_layer_parent_name(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
@@ -1726,8 +2149,15 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
 
     async fn create_base_layer(&self) -> io::Result<Box<dyn LayerBuilder>> {
         let dir_name = self.create_directory().await?;
-        let files = self.base_layer_files(dir_name).await?;
-        Ok(Box::new(SimpleLayerBuilder::new(dir_name, files)) as Box<dyn LayerBuilder>)
+        match self.base_layer_files(dir_name).await {
+            Ok(files) => {
+                Ok(Box::new(SimpleLayerBuilder::new(dir_name, files)) as Box<dyn LayerBuilder>)
+            }
+            Err(error) => {
+                let _ = self.abort_layer(dir_name).await;
+                Err(error)
+            }
+        }
     }
 
     async fn create_child_layer_with_cache(
@@ -1764,11 +2194,17 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         }
 
         let dir_name = self.create_directory().await?;
-        let files = self.base_layer_files(dir_name).await?;
-        delta_rollup(&layer, files).await?;
-        self.finalize(dir_name).await?;
-
-        Ok(dir_name)
+        let result = async {
+            let files = self.base_layer_files(dir_name).await?;
+            delta_rollup(&layer, files).await?;
+            self.finalize(dir_name).await?;
+            Ok(dir_name)
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.abort_layer(dir_name).await;
+        }
+        result
     }
 
     async fn perform_rollup_upto_with_cache(
@@ -1801,9 +2237,16 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let (layer_dir, _parent_layer, child_layer_files) = self
             .create_child_layer_files_with_cache(upto, cache)
             .await?;
-        delta_rollup_upto(self, &layer, upto, child_layer_files).await?;
-        self.finalize(layer_dir).await?;
-        Ok(layer_dir)
+        let result = async {
+            delta_rollup_upto(self, &layer, upto, child_layer_files).await?;
+            self.finalize(layer_dir).await?;
+            Ok(layer_dir)
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.abort_layer(layer_dir).await;
+        }
+        result
     }
 
     async fn perform_imprecise_rollup_upto_with_cache(
@@ -1836,9 +2279,16 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let (layer_dir, _parent_layer, child_layer_files) = self
             .create_child_layer_files_with_cache(upto, cache)
             .await?;
-        imprecise_delta_rollup_upto(self, &layer, upto, child_layer_files).await?;
-        self.finalize(layer_dir).await?;
-        Ok(layer_dir)
+        let result = async {
+            imprecise_delta_rollup_upto(self, &layer, upto, child_layer_files).await?;
+            self.finalize(layer_dir).await?;
+            Ok(layer_dir)
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.abort_layer(layer_dir).await;
+        }
+        result
     }
 
     async fn register_rollup(&self, layer: [u32; 5], rollup: [u32; 5]) -> io::Result<()> {
@@ -1858,6 +2308,11 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         // sort the mapped triples, insert them
         // finalize
 
+        let proof_enabled = self.proof_layer(layer.name()).await?.is_some();
+        if proof_enabled {
+            self.validate_proof_chain_against_store(layer.name())
+                .await?;
+        }
         let stack = layer.immediate_layers();
         let node_count: usize = stack
             .iter()
@@ -1958,31 +2413,46 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         }
 
         let layer_name = self.create_directory().await?;
-        let base_layer_files = self.base_layer_files(layer_name).await?;
-        let mut builder = BaseLayerFileBuilder::from_files(&base_layer_files).await?;
-        builder.add_nodes_bytes(nodes.into_iter().map(|(x, _)| x.to_bytes()));
-        builder.add_predicates_bytes(predicates.into_iter().map(|(x, _)| x.to_bytes()));
-        builder.add_values(values.into_iter().map(|(x, _)| x));
-        let mut builder = builder.into_phase2().await?;
-        let mut triples = Vec::with_capacity(num_triples);
-        triples.extend(layer.triples().map(move |t| {
-            IdTriple::new(
-                node_value_map[t.subject as usize],
-                pred_map[t.predicate as usize],
-                node_value_map[t.object as usize],
-            )
-        }));
-        triples.sort();
+        let finish = async {
+            let base_layer_files = self.base_layer_files(layer_name).await?;
+            let mut builder = BaseLayerFileBuilder::from_files(&base_layer_files).await?;
+            builder.add_nodes_bytes(nodes.into_iter().map(|(x, _)| x.to_bytes()));
+            builder.add_predicates_bytes(predicates.into_iter().map(|(x, _)| x.to_bytes()));
+            builder.add_values(values.into_iter().map(|(x, _)| x));
+            let mut builder = builder.into_phase2().await?;
+            let mut triples = Vec::with_capacity(num_triples);
+            triples.extend(layer.triples().map(move |t| {
+                IdTriple::new(
+                    node_value_map[t.subject as usize],
+                    pred_map[t.predicate as usize],
+                    node_value_map[t.object as usize],
+                )
+            }));
+            triples.sort();
 
-        builder.add_id_triples(triples.into_iter()).await?;
-        builder.finalize().await?;
-
-        self.finalize_layer(layer_name).await?;
+            builder.add_id_triples(triples.into_iter()).await?;
+            builder.finalize().await?;
+            if proof_enabled {
+                self.prepare_proof_layer(layer_name).await?;
+            }
+            self.finalize_layer(layer_name).await?;
+            Ok::<(), io::Error>(())
+        }
+        .await;
+        if let Err(error) = finish {
+            let _ = self.abort_layer(layer_name).await;
+            return Err(error);
+        }
 
         Ok(layer_name)
     }
 
     async fn squash_upto(&self, layer: Arc<InternalLayer>, upto: [u32; 5]) -> io::Result<[u32; 5]> {
+        let proof_enabled = self.proof_layer(layer.name()).await?.is_some();
+        if proof_enabled {
+            self.validate_proof_chain_against_store(layer.name())
+                .await?;
+        }
         let mut base_node_count = 0;
         let mut base_pred_count = 0;
         let mut base_value_count = 0;
@@ -2135,76 +2605,87 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
 
         let upto_layer = self.get_layer(upto).await?.expect("expected upto to exist");
         let layer_name = self.create_directory().await?;
-        let child_layer_files = self.child_layer_files(layer_name).await?;
-        let mut builder = DictionarySetFileBuilder::from_files(
-            child_layer_files.node_dictionary_files.clone(),
-            child_layer_files.predicate_dictionary_files.clone(),
-            child_layer_files.value_dictionary_files.clone(),
-        )
-        .await?;
+        let finish = async {
+            let child_layer_files = self.child_layer_files(layer_name).await?;
+            let mut builder = DictionarySetFileBuilder::from_files(
+                child_layer_files.node_dictionary_files.clone(),
+                child_layer_files.predicate_dictionary_files.clone(),
+                child_layer_files.value_dictionary_files.clone(),
+            )
+            .await?;
 
-        builder.add_nodes_bytes(nodes.into_iter().map(|(x, _)| x.to_bytes()));
-        builder.add_predicates_bytes(predicates.into_iter().map(|(x, _)| x.to_bytes()));
-        builder.add_values(values.into_iter().map(|(x, _)| x));
-        builder.finalize().await?;
+            builder.add_nodes_bytes(nodes.into_iter().map(|(x, _)| x.to_bytes()));
+            builder.add_predicates_bytes(predicates.into_iter().map(|(x, _)| x.to_bytes()));
+            builder.add_values(values.into_iter().map(|(x, _)| x));
+            builder.finalize().await?;
 
-        // TODO use more inner stuff to avoid parent checks as they are unnecessary here
-        let mut builder = ChildLayerFileBuilderPhase2::new(
-            upto_layer,
-            child_layer_files,
-            node_count,
-            predicate_count,
-            value_count,
-        )
-        .await?;
-        let mut triple_changes = Vec::with_capacity(num_triple_changes);
-        for (change_type, t) in layer_changes_upto {
-            let mapped_subject = if t.subject <= base_node_value_count {
-                t.subject
-            } else {
-                node_value_map[(t.subject - base_node_value_count) as usize]
-            };
-            let mapped_predicate = if t.predicate <= base_pred_count {
-                t.predicate
-            } else {
-                pred_map[(t.predicate - base_pred_count) as usize]
-            };
-            let mapped_object = if t.object <= base_node_value_count {
-                t.object
-            } else {
-                node_value_map[(t.object - base_node_value_count) as usize]
-            };
-            triple_changes.push((
-                change_type,
-                IdTriple::new(mapped_subject, mapped_predicate, mapped_object),
-            ));
-        }
-        triple_changes.sort();
-        for (change_type, mapped_triple) in triple_changes.into_iter() {
-            match change_type {
-                TripleChange::Addition => {
-                    builder
-                        .add_triple_unchecked(
-                            mapped_triple.subject,
-                            mapped_triple.predicate,
-                            mapped_triple.object,
-                        )
-                        .await?
-                }
-                TripleChange::Removal => {
-                    builder
-                        .remove_triple_unchecked(
-                            mapped_triple.subject,
-                            mapped_triple.predicate,
-                            mapped_triple.object,
-                        )
-                        .await?
+            // TODO use more inner stuff to avoid parent checks as they are unnecessary here
+            let mut builder = ChildLayerFileBuilderPhase2::new(
+                upto_layer,
+                child_layer_files,
+                node_count,
+                predicate_count,
+                value_count,
+            )
+            .await?;
+            let mut triple_changes = Vec::with_capacity(num_triple_changes);
+            for (change_type, t) in layer_changes_upto {
+                let mapped_subject = if t.subject <= base_node_value_count {
+                    t.subject
+                } else {
+                    node_value_map[(t.subject - base_node_value_count) as usize]
+                };
+                let mapped_predicate = if t.predicate <= base_pred_count {
+                    t.predicate
+                } else {
+                    pred_map[(t.predicate - base_pred_count) as usize]
+                };
+                let mapped_object = if t.object <= base_node_value_count {
+                    t.object
+                } else {
+                    node_value_map[(t.object - base_node_value_count) as usize]
+                };
+                triple_changes.push((
+                    change_type,
+                    IdTriple::new(mapped_subject, mapped_predicate, mapped_object),
+                ));
+            }
+            triple_changes.sort();
+            for (change_type, mapped_triple) in triple_changes.into_iter() {
+                match change_type {
+                    TripleChange::Addition => {
+                        builder
+                            .add_triple_unchecked(
+                                mapped_triple.subject,
+                                mapped_triple.predicate,
+                                mapped_triple.object,
+                            )
+                            .await?
+                    }
+                    TripleChange::Removal => {
+                        builder
+                            .remove_triple_unchecked(
+                                mapped_triple.subject,
+                                mapped_triple.predicate,
+                                mapped_triple.object,
+                            )
+                            .await?
+                    }
                 }
             }
+            builder.finalize().await?;
+            self.write_parent_file(layer_name, upto).await?;
+            if proof_enabled {
+                self.prepare_proof_layer(layer_name).await?;
+            }
+            self.finalize_layer(layer_name).await?;
+            Ok::<(), io::Error>(())
         }
-        builder.finalize().await?;
-        self.write_parent_file(layer_name, upto).await?;
-        self.finalize_layer(layer_name).await?;
+        .await;
+        if let Err(error) = finish {
+            let _ = self.abort_layer(layer_name).await;
+            return Err(error);
+        }
 
         Ok(layer_name)
     }
@@ -2214,6 +2695,18 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         layers: &[[u32; 5]],
         temp_path: &Path,
     ) -> io::Result<[u32; 5]> {
+        let mut proof_layers = 0usize;
+        for layer in layers {
+            if self.proof_layer(*layer).await?.is_some() {
+                proof_layers += 1;
+            }
+        }
+        let proof_enabled = !layers.is_empty() && proof_layers == layers.len();
+        if proof_enabled {
+            for layer in layers {
+                self.validate_proof_chain_against_store(*layer).await?;
+            }
+        }
         let mut layer_files = Vec::with_capacity(layers.len());
         for layer in layers {
             if self.layer_has_parent(*layer).await? {
@@ -2229,11 +2722,20 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         }
 
         let output_name = self.create_directory().await?;
-        let output_layer_files = self.base_layer_files(output_name).await?;
-
-        merge_base_layers(&layer_files, output_layer_files, temp_path).await?;
-
-        self.finalize(output_name).await?;
+        let finish = async {
+            let output_layer_files = self.base_layer_files(output_name).await?;
+            merge_base_layers(&layer_files, output_layer_files, temp_path).await?;
+            if proof_enabled {
+                self.prepare_proof_layer(output_name).await?;
+            }
+            self.finalize(output_name).await?;
+            Ok::<(), io::Error>(())
+        }
+        .await;
+        if let Err(error) = finish {
+            let _ = self.abort_layer(output_name).await;
+            return Err(error);
+        }
 
         Ok(output_name)
     }
@@ -2243,7 +2745,20 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         mut descendant: [u32; 5],
         ancestor: [u32; 5],
     ) -> io::Result<bool> {
+        let mut visited = std::collections::HashSet::new();
         loop {
+            if !visited.insert(descendant) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cycle in layer ancestry",
+                ));
+            }
+            if visited.len() > MAX_LAYER_CHAIN_DEPTH {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "layer ancestry exceeds depth limit",
+                ));
+            }
             if ancestor == descendant {
                 return Ok(true);
             }
@@ -2509,10 +3024,29 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
 
     async fn retrieve_layer_stack_names(&self, name: [u32; 5]) -> io::Result<Vec<[u32; 5]>> {
         let mut result = vec![name];
+        let mut seen = HashSet::from([name]);
 
         loop {
             if self.layer_has_parent(*result.last().unwrap()).await? {
                 let parent = self.read_parent_file(*result.last().unwrap()).await?;
+                if !self.directory_exists(parent).await? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "parent layer is missing from layer chain",
+                    ));
+                }
+                if !seen.insert(parent) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "cycle in layer parent chain",
+                    ));
+                }
+                if seen.len() > MAX_LAYER_CHAIN_DEPTH {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "layer parent chain exceeds depth limit",
+                    ));
+                }
                 result.push(parent);
             } else {
                 result.reverse();
@@ -2528,12 +3062,31 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         upto: [u32; 5],
     ) -> io::Result<Vec<[u32; 5]>> {
         let mut result = vec![name];
+        let mut seen = HashSet::from([name]);
 
         loop {
             if self.layer_has_parent(*result.last().unwrap()).await? {
                 let parent = self.read_parent_file(*result.last().unwrap()).await?;
+                if !self.directory_exists(parent).await? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "parent layer is missing from layer chain",
+                    ));
+                }
                 if parent == upto {
                     break;
+                }
+                if !seen.insert(parent) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "cycle in layer parent chain",
+                    ));
+                }
+                if seen.len() > MAX_LAYER_CHAIN_DEPTH {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "layer parent chain exceeds depth limit",
+                    ));
                 }
                 result.push(parent);
             } else {
@@ -2675,9 +3228,172 @@ mod tests {
     use super::*;
     use crate::layer::{ObjectType, ValueTriple};
     use crate::storage::directory::DirectoryLayerStore;
-    use crate::storage::memory::MemoryLayerStore;
+    use crate::storage::memory::{MemoryBackedStore, MemoryLayerStore};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicIsize, Ordering};
     use tempfile::{tempdir, TempDir};
+
+    fn trip_once(counter: &AtomicIsize) -> bool {
+        loop {
+            let current = counter.load(Ordering::SeqCst);
+            if current < 0 {
+                return false;
+            }
+            let next = if current == 0 { -1 } else { current - 1 };
+            if counter
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return current == 0;
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct FaultFile {
+        inner: MemoryBackedStore,
+        fail_write_after: Arc<AtomicIsize>,
+    }
+
+    #[async_trait]
+    impl FileLoad for FaultFile {
+        type Read = <MemoryBackedStore as FileLoad>::Read;
+
+        async fn exists(&self) -> io::Result<bool> {
+            self.inner.exists().await
+        }
+
+        async fn size(&self) -> io::Result<usize> {
+            self.inner.size().await
+        }
+
+        async fn open_read_from(&self, offset: usize) -> io::Result<Self::Read> {
+            self.inner.open_read_from(offset).await
+        }
+
+        async fn map(&self) -> io::Result<bytes::Bytes> {
+            self.inner.map().await
+        }
+    }
+
+    #[async_trait]
+    impl FileStore for FaultFile {
+        type Write = <MemoryBackedStore as FileStore>::Write;
+
+        async fn open_write(&self) -> io::Result<Self::Write> {
+            if trip_once(&self.fail_write_after) {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected writer acquisition failure",
+                ))
+            } else {
+                self.inner.open_write().await
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct FaultLayerStore {
+        inner: MemoryLayerStore,
+        fail_get_after: Arc<AtomicIsize>,
+        fail_write_after: Arc<AtomicIsize>,
+        fail_finalize_after: Arc<AtomicIsize>,
+    }
+
+    impl FaultLayerStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryLayerStore::new(),
+                fail_get_after: Arc::new(AtomicIsize::new(-1)),
+                fail_write_after: Arc::new(AtomicIsize::new(-1)),
+                fail_finalize_after: Arc::new(AtomicIsize::new(-1)),
+            }
+        }
+
+        fn fail_next_get(&self) {
+            self.fail_get_after.store(0, Ordering::SeqCst);
+        }
+
+        fn fail_write_after(&self, successful_writes: isize) {
+            self.fail_write_after
+                .store(successful_writes, Ordering::SeqCst);
+        }
+
+        fn fail_next_finalize(&self) {
+            self.fail_finalize_after.store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl PersistentLayerStore for FaultLayerStore {
+        type File = FaultFile;
+
+        async fn directories(&self) -> io::Result<Vec<[u32; 5]>> {
+            self.inner.directories().await
+        }
+
+        async fn create_named_directory(&self, id: [u32; 5]) -> io::Result<[u32; 5]> {
+            self.inner.create_named_directory(id).await
+        }
+
+        async fn directory_exists(&self, id: [u32; 5]) -> io::Result<bool> {
+            self.inner.directory_exists(id).await
+        }
+
+        async fn get_file(&self, id: [u32; 5], name: &str) -> io::Result<Self::File> {
+            if trip_once(&self.fail_get_after) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected file acquisition failure",
+                ));
+            }
+            Ok(FaultFile {
+                inner: self.inner.get_file(id, name).await?,
+                fail_write_after: self.fail_write_after.clone(),
+            })
+        }
+
+        async fn file_exists(&self, id: [u32; 5], name: &str) -> io::Result<bool> {
+            self.inner.file_exists(id, name).await
+        }
+
+        async fn abort_directory(&self, id: [u32; 5]) -> io::Result<()> {
+            self.inner.abort_directory(id).await
+        }
+
+        async fn publish_imported_layers(
+            &self,
+            layers: Vec<([u32; 5], HashMap<String, Vec<u8>>)>,
+        ) -> io::Result<()> {
+            self.inner.publish_imported_layers(layers).await
+        }
+
+        async fn publish_imported_layers_shared(
+            &self,
+            layers: Vec<([u32; 5], HashMap<String, bytes::Bytes>)>,
+        ) -> io::Result<()> {
+            self.inner.publish_imported_layers_shared(layers).await
+        }
+
+        async fn write_proof_state_bytes(
+            &self,
+            directory: [u32; 5],
+            bytes: &[u8],
+        ) -> io::Result<()> {
+            self.inner.write_proof_state_bytes(directory, bytes).await
+        }
+
+        async fn finalize(&self, _id: [u32; 5]) -> io::Result<()> {
+            if trip_once(&self.fail_finalize_after) {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected finalize failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
     // these tests are for both the memory store and the directory store
     // They test functionality that should really work for both
 
@@ -3725,5 +4441,174 @@ mod tests {
     async fn uncached_child_layer_removals_o() {
         let (_dir, store) = make_cached_store();
         child_layer_removals_o(&store, true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn layer_name_traversal_rejects_cycles_and_missing_parents_early() {
+        let self_cycle = MemoryLayerStore::new();
+        let a = [1, 0, 0, 0, 0];
+        self_cycle.create_named_directory(a).await.unwrap();
+        self_cycle.write_parent_file(a, a).await.unwrap();
+        assert_eq!(
+            io::ErrorKind::InvalidData,
+            self_cycle
+                .retrieve_layer_stack_names(a)
+                .await
+                .unwrap_err()
+                .kind()
+        );
+        assert_eq!(
+            io::ErrorKind::InvalidData,
+            self_cycle.get_unrolled_layer(a).await.err().unwrap().kind()
+        );
+        assert_eq!(
+            io::ErrorKind::InvalidData,
+            self_cycle
+                .layer_is_ancestor_of(a, [99, 0, 0, 0, 0])
+                .await
+                .unwrap_err()
+                .kind()
+        );
+
+        let two_cycle = MemoryLayerStore::new();
+        let b = [2, 0, 0, 0, 0];
+        two_cycle.create_named_directory(a).await.unwrap();
+        two_cycle.create_named_directory(b).await.unwrap();
+        two_cycle.write_parent_file(a, b).await.unwrap();
+        two_cycle.write_parent_file(b, a).await.unwrap();
+        assert_eq!(
+            io::ErrorKind::InvalidData,
+            two_cycle
+                .retrieve_layer_stack_names(a)
+                .await
+                .unwrap_err()
+                .kind()
+        );
+
+        let missing = MemoryLayerStore::new();
+        missing.create_named_directory(a).await.unwrap();
+        missing.write_parent_file(a, b).await.unwrap();
+        assert_eq!(
+            io::ErrorKind::NotFound,
+            missing
+                .retrieve_layer_stack_names(a)
+                .await
+                .unwrap_err()
+                .kind()
+        );
+    }
+
+    #[tokio::test]
+    async fn layer_name_traversal_rejects_depth_before_unbounded_growth() {
+        let store = MemoryLayerStore::new();
+        let ids: Vec<_> = (0..=MAX_LAYER_CHAIN_DEPTH)
+            .map(|position| [3, 0, 0, 0, position as u32])
+            .collect();
+        for id in &ids {
+            store.create_named_directory(*id).await.unwrap();
+        }
+        for pair in ids.windows(2) {
+            store.write_parent_file(pair[0], pair[1]).await.unwrap();
+        }
+        assert_eq!(
+            io::ErrorKind::InvalidData,
+            store
+                .retrieve_layer_stack_names(ids[0])
+                .await
+                .unwrap_err()
+                .kind()
+        );
+    }
+
+    async fn fault_store_chain() -> (
+        FaultLayerStore,
+        Arc<InternalLayer>,
+        Arc<InternalLayer>,
+        Vec<[u32; 5]>,
+    ) {
+        let store = FaultLayerStore::new();
+        let mut base = store.create_base_layer().await.unwrap();
+        let base_name = base.name();
+        base.add_value_triple(ValueTriple::new_node("base", "p", "value"));
+        base.commit_boxed().await.unwrap();
+        let mut middle = store.create_child_layer(base_name).await.unwrap();
+        let middle_name = middle.name();
+        middle.add_value_triple(ValueTriple::new_node("middle", "p", "value"));
+        middle.commit_boxed().await.unwrap();
+        let mut head = store.create_child_layer(middle_name).await.unwrap();
+        let head_name = head.name();
+        head.add_value_triple(ValueTriple::new_node("head", "p", "value"));
+        head.commit_boxed().await.unwrap();
+        let base = store.get_layer(base_name).await.unwrap().unwrap();
+        let head = store.get_layer(head_name).await.unwrap().unwrap();
+        let mut original = store.directories().await.unwrap();
+        original.sort();
+        (store, base, head, original)
+    }
+
+    async fn assert_fault_store_unchanged(store: &FaultLayerStore, expected: &[[u32; 5]]) {
+        let mut actual = store.directories().await.unwrap();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn base_builder_file_acquisition_failure_aborts_construction_directory() {
+        let store = FaultLayerStore::new();
+        store.fail_next_get();
+        assert!(store.create_base_layer().await.is_err());
+        assert!(store.directories().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_rollup_failures_abort_construction_directory() {
+        for phase in 0..3 {
+            let (store, _, head, original) = fault_store_chain().await;
+            match phase {
+                0 => store.fail_next_get(),
+                1 => store.fail_write_after(0),
+                _ => store.fail_next_finalize(),
+            }
+            assert!(store.perform_rollup(head).await.is_err());
+            assert_fault_store_unchanged(&store, &original).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn precise_rollup_upto_failures_abort_construction_directory() {
+        for phase in 0..3 {
+            let (store, base, head, original) = fault_store_chain().await;
+            let cache = Arc::new(LockingHashMapLayerCache::new());
+            cache.cache_layer(base.clone());
+            match phase {
+                0 => store.fail_next_get(),
+                1 => store.fail_write_after(1),
+                _ => store.fail_next_finalize(),
+            }
+            assert!(store
+                .perform_rollup_upto_with_cache(head, base.name(), cache)
+                .await
+                .is_err());
+            assert_fault_store_unchanged(&store, &original).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn imprecise_rollup_upto_failures_abort_construction_directory() {
+        for phase in 0..3 {
+            let (store, base, head, original) = fault_store_chain().await;
+            let cache = Arc::new(LockingHashMapLayerCache::new());
+            cache.cache_layer(base.clone());
+            match phase {
+                0 => store.fail_next_get(),
+                1 => store.fail_write_after(1),
+                _ => store.fail_next_finalize(),
+            }
+            assert!(store
+                .perform_imprecise_rollup_upto_with_cache(head, base.name(), cache)
+                .await
+                .is_err());
+            assert_fault_store_unchanged(&store, &original).await;
+        }
     }
 }

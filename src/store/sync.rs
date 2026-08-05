@@ -12,6 +12,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, ValueTriple};
+use crate::proof::{LayerRangeWitness, ProofHash, ProofLayerState, TriplePattern};
+use crate::storage::PackImportLimits;
 use crate::store::{
     open_directory_store, open_memory_store, NamedGraph, Store, StoreLayer, StoreLayerBuilder,
 };
@@ -93,11 +95,20 @@ impl SyncStoreLayerBuilder {
         task_sync(self.inner.commit_no_load())
     }
 
+    pub fn commit_no_load_with_proof(&self) -> Result<ProofLayerState, io::Error> {
+        task_sync(self.inner.commit_no_load_with_proof())
+    }
+
     /// Commit the layer to storage.
     pub fn commit(&self) -> Result<SyncStoreLayer, io::Error> {
         let inner = task_sync(self.inner.commit());
 
         inner.map(SyncStoreLayer::wrap)
+    }
+
+    pub fn commit_with_proof(&self) -> Result<(SyncStoreLayer, ProofLayerState), io::Error> {
+        task_sync(self.inner.commit_with_proof())
+            .map(|(layer, state)| (SyncStoreLayer::wrap(layer), state))
     }
 
     /// Apply all triples added and removed by a layer to this builder.
@@ -134,6 +145,21 @@ pub struct SyncStoreLayer {
 impl SyncStoreLayer {
     fn wrap(inner: StoreLayer) -> Self {
         Self { inner }
+    }
+
+    pub fn proof_state(&self) -> io::Result<Option<ProofLayerState>> {
+        task_sync(self.inner.proof_state())
+    }
+
+    pub fn migrate_proof_chain(&self) -> io::Result<ProofLayerState> {
+        task_sync(self.inner.migrate_proof_chain())
+    }
+
+    pub fn proof_range_witness(
+        &self,
+        pattern: &TriplePattern,
+    ) -> io::Result<(ProofHash, Vec<LayerRangeWitness>)> {
+        task_sync(self.inner.proof_range_witness(pattern))
     }
 
     /// Create a layer builder based on this layer.
@@ -608,17 +634,67 @@ impl SyncStore {
         task_sync(self.inner.layer_store.export_layers(layer_ids))
     }
 
+    /// Export a proof-capable pack under caller-negotiated resource limits.
+    pub fn export_layers_with_limits(
+        &self,
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+        limits: PackImportLimits,
+    ) -> io::Result<Vec<u8>> {
+        task_sync(
+            self.inner
+                .layer_store
+                .export_layers_with_limits(layer_ids, limits),
+        )
+    }
+
+    /// Export a legacy pack without authenticated proof state.
+    pub fn export_layers_legacy(
+        &self,
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+    ) -> io::Result<Vec<u8>> {
+        task_sync(self.inner.layer_store.export_layers_legacy(layer_ids))
+    }
+
     /// Import the specified layers from the given pack, a byte slice that was previously generated with `export_layers`, on another store, and possibly even another machine).
     ///
-    /// After this operation, the specified layers will be retrievable
-    /// from this store, provided they existed in the pack. specified
-    /// layers that are not in the pack are silently ignored.
+    /// On success every requested layer is retrievable. Missing layers reject
+    /// the whole import before any requested layer becomes visible.
     pub fn import_layers(
         &self,
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<()> {
         task_sync(self.inner.layer_store.import_layers(pack, layer_ids))
+    }
+
+    /// Import proof-enabled layers anchored to independently supplied roots.
+    pub fn import_layers_with_expected_roots(
+        &self,
+        pack: &[u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+        expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
+    ) -> io::Result<()> {
+        task_sync(self.inner.layer_store.import_layers_with_expected_roots(
+            pack,
+            layer_ids,
+            expected_roots,
+        ))
+    }
+
+    /// Import with caller-selected parser and staging budgets.
+    pub fn import_layers_with_limits(
+        &self,
+        pack: &[u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+        expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
+        limits: crate::storage::pack::PackImportLimits,
+    ) -> io::Result<()> {
+        task_sync(self.inner.layer_store.import_layers_with_limits(
+            pack,
+            layer_ids,
+            expected_roots,
+            limits,
+        ))
     }
 
     /// Returns cache statistics: (total_entries, live_entries, dead_entries)
@@ -635,6 +711,10 @@ impl SyncStore {
     /// Returns bytes of backing data: (total_bytes, live_bytes, dead_bytes).
     pub fn layer_cache_memory_bytes(&self) -> (usize, usize, usize) {
         self.inner.layer_cache_memory_bytes()
+    }
+
+    pub fn proof_cache_memory_bytes(&self) -> usize {
+        self.inner.proof_cache_memory_bytes()
     }
 
     /// Returns the current LRU archive cache usage in bytes, or None if no LRU backend.

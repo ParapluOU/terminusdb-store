@@ -90,6 +90,7 @@ pub struct Filenames {
 
     pub parent: &'static str,
     pub rollup: &'static str,
+    pub proof_state: &'static str,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, FromPrimitive)]
@@ -156,6 +157,8 @@ pub enum LayerFileEnum {
 
     Parent,
     Rollup,
+    // Appended: archive presence bits are persistent format identifiers.
+    ProofState,
 }
 
 pub const FILENAMES: Filenames = Filenames {
@@ -254,6 +257,7 @@ pub const FILENAMES: Filenames = Filenames {
 
     parent: "parent.hex",
     rollup: "rollup.hex",
+    proof_state: "proof_state.pf4",
 };
 
 lazy_static! {
@@ -502,6 +506,7 @@ lazy_static! {
         ),
         ("parent.hex", LayerFileEnum::Parent),
         ("rollup.hex", LayerFileEnum::Rollup),
+        ("proof_state.pf4", LayerFileEnum::ProofState),
     ]);
 }
 
@@ -516,7 +521,7 @@ pub const SHARED_REQUIRED_FILES: [&'static str; 8] = [
     FILENAMES.value_dictionary_offsets,
 ];
 
-pub const SHARED_OPTIONAL_FILES: [&'static str; 7] = [
+pub const SHARED_OPTIONAL_FILES: [&'static str; 8] = [
     FILENAMES.node_value_idmap_bits,
     FILENAMES.node_value_idmap_bit_index_blocks,
     FILENAMES.node_value_idmap_bit_index_sblocks,
@@ -524,6 +529,7 @@ pub const SHARED_OPTIONAL_FILES: [&'static str; 7] = [
     FILENAMES.predicate_idmap_bit_index_blocks,
     FILENAMES.predicate_idmap_bit_index_sblocks,
     FILENAMES.rollup,
+    FILENAMES.proof_state,
 ];
 
 pub const BASE_LAYER_REQUIRED_FILES: [&'static str; 15] = [
