@@ -675,7 +675,7 @@ async fn load_staged_layer_without_panicking(
 async fn validate_staged_proof_without_panicking(
     staging: &PackValidationStore,
     id: [u32; 5],
-) -> io::Result<crate::proof::ProofLayerState> {
+) -> io::Result<crate::proof::CommitmentState> {
     std::panic::AssertUnwindSafe(staging.validate_proof_chain_against_store(id))
         .catch_unwind()
         .await
@@ -1064,7 +1064,7 @@ async fn import_pack<S: PersistentLayerStore>(
             peak.set_transient(crate::proof::MAX_DECODED_PROOF_BYTES)?;
             let validated = validate_staged_proof_without_panicking(&staging, *id).await?;
             peak.set_transient(0)?;
-            if &validated.state_root != expected {
+            if &validated.commitment_root != expected {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "imported proof state does not match expected root",
@@ -1622,7 +1622,7 @@ mod tests {
             .import_layers_with_expected_roots(
                 &proof_pack,
                 Box::new(vec![id].into_iter()),
-                HashMap::from([(id, state.state_root)]),
+                HashMap::from([(id, state.commitment_root)]),
             )
             .await
             .unwrap();
@@ -1636,8 +1636,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .state_root,
-            state.state_root
+                .commitment_root,
+            state.commitment_root
         );
 
         let legacy_pack = source
@@ -1744,7 +1744,7 @@ mod tests {
             .await
             .unwrap();
         let limits = PackImportLimits {
-            // Deliberately below two maximum decoded ProofLayers. Admission
+            // Deliberately below two maximum decoded commitments. Admission
             // drops the root-validated stored object before native rebuild.
             max_peak_bytes: crate::proof::MAX_DECODED_PROOF_BYTES + 64 * 1024 * 1024,
             ..PackImportLimits::default()
@@ -1754,7 +1754,7 @@ mod tests {
             .import_layers_with_limits(
                 &pack,
                 Box::new(vec![id].into_iter()),
-                HashMap::from([(id, state.state_root)]),
+                HashMap::from([(id, state.commitment_root)]),
                 limits,
             )
             .await

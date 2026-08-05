@@ -16,9 +16,8 @@ use crate::layer::{
     SimpleLayerBuilder,
 };
 use crate::proof::{
-    validate_witness_limits, CanonicalObject, CanonicalTriple, LayerRangeWitness,
-    ProofConstructionBudget, ProofHash, ProofLayer, ProofLayerState, ProofRecord, ResolvedPattern,
-    TriplePattern, WitnessBudget,
+    CanonicalObject, CanonicalTriple, CommitmentState, LayerCommitment, ProofConstructionBudget,
+    ProofRecord, QueryProof, TriplePattern,
 };
 use crate::Layer;
 use tdb_succinct::bitarray::bitarray_len_from_file;
@@ -184,15 +183,15 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     async fn abort_layer(&self, name: [u32; 5]) -> io::Result<()>;
 
     /// Load and fully validate the optional authenticated logical delta for a layer.
-    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<ProofLayer>>>;
+    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<LayerCommitment>>>;
 
     /// Persist a validated proof layer before the physical layer is exposed.
-    async fn write_proof_layer(&self, name: [u32; 5], proof: &ProofLayer) -> io::Result<()>;
+    async fn write_proof_layer(&self, name: [u32; 5], proof: &LayerCommitment) -> io::Result<()>;
 
     /// Rebuild proof state from the complete native delta and the complete set of
     /// dictionary mappings introduced by this layer. This is an admission-time
     /// operation, never a proof-query operation.
-    async fn rebuild_proof_layer(&self, name: [u32; 5]) -> io::Result<ProofLayer> {
+    async fn rebuild_proof_layer(&self, name: [u32; 5]) -> io::Result<LayerCommitment> {
         let layer = self
             .get_unrolled_layer(name)
             .await?
@@ -209,7 +208,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
                         )
                     })?
                     .state
-                    .state_root,
+                    .commitment_root,
             ),
         };
         let mut budget = ProofConstructionBudget::new();
@@ -285,7 +284,10 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         let node_value_count = layer.node_and_value_count() as u64;
         let predicate_count = layer.predicate_count() as u64;
         tokio::task::spawn_blocking(move || {
-            ProofLayer::new_native_with_catalog(
+            // TODO(proof-of-woql): from_native_delta currently builds a
+            // placeholder-committed sidecar; the real homomorphic column
+            // commitment (Dory) attaches here.
+            LayerCommitment::from_native_delta(
                 parent_state_root,
                 additions,
                 removals,
@@ -303,7 +305,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
 
     /// Build proof state once, during commit/migration, from this layer's native delta.
     /// A child fails closed when its parent has not been migrated.
-    async fn prepare_proof_layer(&self, name: [u32; 5]) -> io::Result<ProofLayer> {
+    async fn prepare_proof_layer(&self, name: [u32; 5]) -> io::Result<LayerCommitment> {
         let proof = self.rebuild_proof_layer(name).await?;
         self.write_proof_layer(name, &proof).await?;
         Ok(proof)
@@ -314,15 +316,15 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     async fn validate_proof_layer_against_store(
         &self,
         name: [u32; 5],
-    ) -> io::Result<ProofLayerState> {
+    ) -> io::Result<CommitmentState> {
         let stored = self
             .proof_layer(name)
             .await?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "proof state not found"))?;
         // Decoding has already independently checked that every stored table
-        // reconstructs the roots committed by this state. Retain only that
+        // reconstructs the root committed by this state. Retain only that
         // commitment while rebuilding so admission never holds two maximum-
-        // sized decoded ProofLayers at once.
+        // sized decoded commitments at once.
         let stored_state = stored.state.clone();
         drop(stored);
         let rebuilt = self.rebuild_proof_layer(name).await?;
@@ -338,7 +340,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     async fn validate_proof_chain_against_store(
         &self,
         name: [u32; 5],
-    ) -> io::Result<ProofLayerState> {
+    ) -> io::Result<CommitmentState> {
         let mut top = None;
         for layer_name in self.retrieve_layer_stack_names(name).await? {
             top = Some(self.validate_proof_layer_against_store(layer_name).await?);
@@ -347,7 +349,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     }
 
     /// Explicit one-time legacy migration. No query path calls this method.
-    async fn migrate_proof_chain(&self, name: [u32; 5]) -> io::Result<ProofLayerState> {
+    async fn migrate_proof_chain(&self, name: [u32; 5]) -> io::Result<CommitmentState> {
         let mut top = None;
         for layer_name in self.retrieve_layer_stack_names(name).await? {
             let state = match self.proof_layer(layer_name).await? {
@@ -359,78 +361,21 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         top.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty migration chain"))
     }
 
-    /// Produce one compact authenticated range witness per layer, base to head.
-    /// This fails closed for legacy layers rather than silently scanning them.
+    /// Produce a query-time proof for a logical triple pattern.
+    ///
+    /// STUB: the commitment scheme's query argument (a sumcheck over the
+    /// committed columns) is not implemented yet, so this fails closed.
+    // TODO(proof-of-woql): generate the QueryProof (sumcheck/opening argument)
+    // against the per-layer column commitments for the given pattern.
     async fn proof_range_witness(
         &self,
-        name: [u32; 5],
-        pattern: &TriplePattern,
-    ) -> io::Result<(ProofHash, Vec<LayerRangeWitness>)> {
-        let mut proof_layers = Vec::new();
-        let layer_names = self.retrieve_layer_stack_names(name).await?;
-        if layer_names.len() > crate::proof::MAX_WITNESS_LAYERS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "proof layer chain exceeds witness budget",
-            ));
-        }
-        for layer_name in layer_names {
-            let layer = self.proof_layer(layer_name).await?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "legacy layer is not proof-enabled",
-                )
-            })?;
-            proof_layers.push(layer);
-        }
-        let pattern = pattern.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut budget = WitnessBudget::new(proof_layers.len())?;
-            let mut resolved = ResolvedPattern::default();
-            for layer in &proof_layers {
-                layer.contribute_resolution(&pattern, &mut resolved)?;
-            }
-            let mut witnesses = Vec::with_capacity(proof_layers.len());
-            let missing_binding = (pattern.subject.is_some() && resolved.subject.is_none())
-                || (pattern.predicate.is_some() && resolved.predicate.is_none())
-                || (pattern.object.is_some() && resolved.object.is_none());
-            for layer in proof_layers {
-                witnesses.push(LayerRangeWitness {
-                    state: layer.state.clone(),
-                    dictionary: layer
-                        .prove_dictionary_bindings_with_budget(&pattern, &mut budget)?,
-                    additions: if missing_binding {
-                        None
-                    } else {
-                        Some(layer.prove_resolved_with_budget(
-                            true,
-                            &pattern,
-                            &resolved,
-                            &mut budget,
-                        )?)
-                    },
-                    removals: if missing_binding {
-                        None
-                    } else {
-                        Some(layer.prove_resolved_with_budget(
-                            false,
-                            &pattern,
-                            &resolved,
-                            &mut budget,
-                        )?)
-                    },
-                });
-            }
-            let root = witnesses
-                .last()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty layer stack"))?
-                .state
-                .state_root;
-            validate_witness_limits(&witnesses)?;
-            Ok((root, witnesses))
-        })
-        .await
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+        _name: [u32; 5],
+        _pattern: &TriplePattern,
+    ) -> io::Result<QueryProof> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "query-proof witness not implemented for commitment scheme yet",
+        ))
     }
 
     async fn get_layer_parent_name(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
@@ -2073,7 +2018,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         self.abort_directory(name).await
     }
 
-    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<ProofLayer>>> {
+    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<LayerCommitment>>> {
         if !self.file_exists(name, FILENAMES.proof_state).await? {
             return Ok(None);
         }
@@ -2085,12 +2030,12 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             ));
         }
         let bytes = bytes.map().await?;
-        tokio::task::spawn_blocking(move || ProofLayer::decode(&bytes).map(Arc::new).map(Some))
+        tokio::task::spawn_blocking(move || LayerCommitment::decode(&bytes).map(Arc::new).map(Some))
             .await
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
     }
 
-    async fn write_proof_layer(&self, name: [u32; 5], proof: &ProofLayer) -> io::Result<()> {
+    async fn write_proof_layer(&self, name: [u32; 5], proof: &LayerCommitment) -> io::Result<()> {
         let proof = proof.clone();
         let bytes = tokio::task::spawn_blocking(move || proof.encode())
             .await

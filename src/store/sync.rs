@@ -12,7 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, ValueTriple};
-use crate::proof::{LayerRangeWitness, ProofHash, ProofLayerState, TriplePattern};
+use crate::proof::{CommitmentState, ProofHash, QueryProof, TriplePattern};
 use crate::storage::PackImportLimits;
 use crate::store::{
     open_directory_store, open_memory_store, NamedGraph, Store, StoreLayer, StoreLayerBuilder,
@@ -95,7 +95,7 @@ impl SyncStoreLayerBuilder {
         task_sync(self.inner.commit_no_load())
     }
 
-    pub fn commit_no_load_with_proof(&self) -> Result<ProofLayerState, io::Error> {
+    pub fn commit_no_load_with_proof(&self) -> Result<CommitmentState, io::Error> {
         task_sync(self.inner.commit_no_load_with_proof())
     }
 
@@ -106,7 +106,7 @@ impl SyncStoreLayerBuilder {
         inner.map(SyncStoreLayer::wrap)
     }
 
-    pub fn commit_with_proof(&self) -> Result<(SyncStoreLayer, ProofLayerState), io::Error> {
+    pub fn commit_with_proof(&self) -> Result<(SyncStoreLayer, CommitmentState), io::Error> {
         task_sync(self.inner.commit_with_proof())
             .map(|(layer, state)| (SyncStoreLayer::wrap(layer), state))
     }
@@ -147,18 +147,15 @@ impl SyncStoreLayer {
         Self { inner }
     }
 
-    pub fn proof_state(&self) -> io::Result<Option<ProofLayerState>> {
+    pub fn proof_state(&self) -> io::Result<Option<CommitmentState>> {
         task_sync(self.inner.proof_state())
     }
 
-    pub fn migrate_proof_chain(&self) -> io::Result<ProofLayerState> {
+    pub fn migrate_proof_chain(&self) -> io::Result<CommitmentState> {
         task_sync(self.inner.migrate_proof_chain())
     }
 
-    pub fn proof_range_witness(
-        &self,
-        pattern: &TriplePattern,
-    ) -> io::Result<(ProofHash, Vec<LayerRangeWitness>)> {
+    pub fn proof_range_witness(&self, pattern: &TriplePattern) -> io::Result<QueryProof> {
         task_sync(self.inner.proof_range_witness(pattern))
     }
 

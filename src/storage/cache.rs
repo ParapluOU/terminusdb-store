@@ -1,6 +1,6 @@
 use super::layer::*;
 use crate::layer::*;
-use crate::proof::ProofLayer;
+use crate::proof::LayerCommitment;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io;
@@ -13,10 +13,10 @@ const DEFAULT_PROOF_CACHE_ENTRIES: usize = 64;
 const DEFAULT_PROOF_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_INFLIGHT_PROOF_LOADS: usize = 2;
 // LRU node/key, OnceCell, Arc control blocks, and allocator bookkeeping that
-// live outside ProofLayer's own conservative accounting weight.
+// live outside LayerCommitment's own conservative accounting weight.
 const PROOF_CACHE_ENTRY_ACCOUNTING_OVERHEAD: usize = 512;
 
-fn proof_cache_weight(proof: &ProofLayer) -> usize {
+fn proof_cache_weight(proof: &LayerCommitment) -> usize {
     proof
         .estimated_cache_bytes()
         .saturating_add(PROOF_CACHE_ENTRY_ACCOUNTING_OVERHEAD)
@@ -200,7 +200,7 @@ impl LayerCache for LockingHashMapLayerCache {
 }
 
 struct ProofLayerCache {
-    entries: lru::LruCache<[u32; 5], Arc<tokio::sync::OnceCell<Option<Arc<ProofLayer>>>>>,
+    entries: lru::LruCache<[u32; 5], Arc<tokio::sync::OnceCell<Option<Arc<LayerCommitment>>>>>,
     bytes: usize,
     max_entries: usize,
     max_bytes: usize,
@@ -253,7 +253,7 @@ impl ProofLayerCache {
     fn settle_loaded(
         &mut self,
         name: [u32; 5],
-        cell: &Arc<tokio::sync::OnceCell<Option<Arc<ProofLayer>>>>,
+        cell: &Arc<tokio::sync::OnceCell<Option<Arc<LayerCommitment>>>>,
         load_succeeded: bool,
     ) {
         let resident = self
@@ -375,7 +375,7 @@ impl LayerStore for CachedLayerStore {
         self.inner.abort_layer(name).await
     }
 
-    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<ProofLayer>>> {
+    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<LayerCommitment>>> {
         let existing = {
             let mut cache = self.proof_cache.lock().unwrap();
             cache.entries.get(&name).cloned()
@@ -408,7 +408,7 @@ impl LayerStore for CachedLayerStore {
         result
     }
 
-    async fn write_proof_layer(&self, name: [u32; 5], proof: &ProofLayer) -> io::Result<()> {
+    async fn write_proof_layer(&self, name: [u32; 5], proof: &LayerCommitment) -> io::Result<()> {
         self.inner.write_proof_layer(name, proof).await?;
         let cell = Arc::new(tokio::sync::OnceCell::new());
         cell.set(Some(Arc::new(proof.clone()))).map_err(|_| {
