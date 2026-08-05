@@ -99,7 +99,7 @@ page-addressable and still reconstructs every projection on a cold proof read.
 ### Packs, roots, and publication visibility
 
 Pack v2 bounds parsing and aggregate peak memory, validates native layers and
-proof chains in zero-copy private staging, requires an independently supplied
+proof chains in shared-byte private staging, requires an independently supplied
 expected root for every requested proof layer, rejects collisions, and
 provides `export_layers_legacy` for explicit no-proof compatibility. The pack
 is transport, not a trust source: a root received from the same untrusted pack
@@ -107,13 +107,18 @@ does not authenticate anything. The root must come from a trusted commit
 record, independently replicated node, signed deployment metadata, or the
 request/protocol context.
 
-Directory and archive publication is now an atomic visibility transaction.
+Export streams compressed bytes through a bounded temporary file, and import
+gzip/tar parsing runs in a peak-charged blocking worker. Directory and archive
+publication is an atomic visibility transaction.
 Imported physical targets carry a transaction marker and remain invisible
 until one durable global commit marker exists. Cross-process and per-layer
 locks serialize recovery and conflicting publication; rollback first moves
-uncommitted targets to hidden quarantine. Exact subprocess crash-point tests,
-reopen recovery, overlapping-batch races, and two-process same-ID races cover
-both filesystem backends. Custom archive backends must implement the required
+uncommitted targets to hidden quarantine. `Ok` is returned only after the
+commit-marker directory fsync; a failure after logical visibility is a typed
+indeterminate, no-blind-retry result. Exact multi-layer subprocess crash-point
+tests, crash-during-quarantine restart, reader all-or-none checks,
+overlapping-batch races, and two-process same-ID races cover both filesystem
+backends. Custom archive backends must implement the required
 atomic batch, write-if-absent, compare-and-swap, recovery, and visibility
 operations rather than inheriting an unsafe fallback.
 
@@ -147,9 +152,9 @@ sidecar is authoritative.
 
 ### Current status and honest limits
 
-On 2026-08-05 the Store suite passed all 318 tests plus doc tests, the focused
-proof-name filter passed 25 tests, the `proof::tests` module passed 14 tests,
-and the pack filter passed 12 tests. This includes adversarial proof/pack
+On 2026-08-05 the Store suite passed all 330 tests plus doc tests, the focused
+proof-name filter passed 27 tests, the `proof::tests` module passed 14 tests,
+and the pack filter passed 15 tests. This includes adversarial proof/pack
 mutations, bounded-resource cases, subprocess crash recovery, and
 cross-process publication races. A release
 diagnostic using 2,000 base triples, 100 child triples, and 16 child layers

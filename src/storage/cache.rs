@@ -12,6 +12,15 @@ use tdb_succinct::{StringDict, TypedDict};
 const DEFAULT_PROOF_CACHE_ENTRIES: usize = 64;
 const DEFAULT_PROOF_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_INFLIGHT_PROOF_LOADS: usize = 2;
+// LRU node/key, OnceCell, Arc control blocks, and allocator bookkeeping that
+// live outside ProofLayer's own conservative accounting weight.
+const PROOF_CACHE_ENTRY_ACCOUNTING_OVERHEAD: usize = 512;
+
+fn proof_cache_weight(proof: &ProofLayer) -> usize {
+    proof
+        .estimated_cache_bytes()
+        .saturating_add(PROOF_CACHE_ENTRY_ACCOUNTING_OVERHEAD)
+}
 
 pub trait LayerCache: 'static + Send + Sync {
     fn get_layer_from_cache(&self, name: [u32; 5]) -> Option<Arc<InternalLayer>>;
@@ -217,7 +226,7 @@ impl ProofLayerCache {
                 .entries
                 .iter()
                 .filter_map(|(_, cell)| cell.get().and_then(|proof| proof.as_ref()))
-                .map(|proof| proof.estimated_cache_bytes())
+                .map(|proof| proof_cache_weight(proof))
                 .fold(0usize, usize::saturating_add);
             let settled = self
                 .entries
@@ -257,9 +266,7 @@ impl ProofLayerCache {
                 || cell
                     .get()
                     .and_then(|proof| proof.as_ref())
-                    .map_or(false, |proof| {
-                        proof.estimated_cache_bytes() > self.max_bytes
-                    });
+                    .map_or(false, |proof| proof_cache_weight(proof) > self.max_bytes);
             if exceeds_limit {
                 self.entries.pop(&name);
             }
@@ -292,6 +299,9 @@ impl CachedLayerStore {
         max_entries: usize,
         max_bytes: usize,
     ) -> CachedLayerStore {
+        // max_entries and the derived in-flight semaphore are hard caps.
+        // max_bytes bounds a conservative logical accounting weight, including
+        // container/capacity/fixed allocator overhead; it is not an OS RSS cap.
         let max_inflight = max_entries.max(1).min(MAX_INFLIGHT_PROOF_LOADS);
         CachedLayerStore {
             inner: Arc::new(inner),
@@ -884,6 +894,7 @@ pub mod tests {
     use super::*;
     use crate::storage::directory::*;
     use crate::storage::memory::*;
+    use crate::storage::{FileLoad, FileStore};
     use tempfile::tempdir;
 
     fn cached_layer_eq(layer1: &dyn Layer, layer2: &dyn Layer) -> bool {
@@ -1028,6 +1039,180 @@ pub mod tests {
         (store, first_name, second_name)
     }
 
+    #[derive(Clone)]
+    struct SlowProofFile {
+        inner: MemoryBackedStore,
+        slow: bool,
+        loads: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl FileStore for SlowProofFile {
+        type Write = <MemoryBackedStore as FileStore>::Write;
+
+        async fn open_write(&self) -> io::Result<Self::Write> {
+            self.inner.open_write().await
+        }
+    }
+
+    #[async_trait]
+    impl FileLoad for SlowProofFile {
+        type Read = <MemoryBackedStore as FileLoad>::Read;
+
+        async fn exists(&self) -> io::Result<bool> {
+            self.inner.exists().await
+        }
+
+        async fn size(&self) -> io::Result<usize> {
+            self.inner.size().await
+        }
+
+        async fn open_read_from(&self, offset: usize) -> io::Result<Self::Read> {
+            self.inner.open_read_from(offset).await
+        }
+
+        async fn map(&self) -> io::Result<bytes::Bytes> {
+            if self.slow {
+                self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Retain a notification permit if the test observer has not
+                // started waiting yet; notify_waiters would make that race
+                // capable of hanging the regression test.
+                self.started.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "test gate closed"))?
+                    .forget();
+            }
+            self.inner.map().await
+        }
+    }
+
+    #[derive(Clone)]
+    struct SlowProofStore {
+        inner: MemoryLayerStore,
+        loads: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl SlowProofStore {
+        fn new(inner: MemoryLayerStore) -> Self {
+            Self {
+                inner,
+                loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                started: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+            }
+        }
+
+        async fn wait_for_loads(&self, count: usize) {
+            loop {
+                if self.loads.load(std::sync::atomic::Ordering::SeqCst) >= count {
+                    return;
+                }
+                self.started.notified().await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PersistentLayerStore for SlowProofStore {
+        type File = SlowProofFile;
+
+        async fn directories(&self) -> io::Result<Vec<[u32; 5]>> {
+            self.inner.directories().await
+        }
+
+        async fn create_named_directory(&self, id: [u32; 5]) -> io::Result<[u32; 5]> {
+            self.inner.create_named_directory(id).await
+        }
+
+        async fn directory_exists(&self, id: [u32; 5]) -> io::Result<bool> {
+            self.inner.directory_exists(id).await
+        }
+
+        async fn get_file(&self, id: [u32; 5], name: &str) -> io::Result<Self::File> {
+            Ok(SlowProofFile {
+                inner: self.inner.get_file(id, name).await?,
+                slow: name == crate::storage::consts::FILENAMES.proof_state,
+                loads: self.loads.clone(),
+                started: self.started.clone(),
+                release: self.release.clone(),
+            })
+        }
+
+        async fn file_exists(&self, id: [u32; 5], name: &str) -> io::Result<bool> {
+            self.inner.file_exists(id, name).await
+        }
+
+        async fn abort_directory(&self, id: [u32; 5]) -> io::Result<()> {
+            self.inner.abort_directory(id).await
+        }
+
+        async fn publish_imported_layers_shared(
+            &self,
+            layers: Vec<([u32; 5], HashMap<String, bytes::Bytes>)>,
+        ) -> io::Result<()> {
+            self.inner.publish_imported_layers_shared(layers).await
+        }
+
+        async fn write_proof_state_bytes(&self, id: [u32; 5], bytes: &[u8]) -> io::Result<()> {
+            self.inner.write_proof_state_bytes(id, bytes).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_slow_proof_loads_share_same_key_and_queue_different_keys() {
+        let (inner, first_name, second_name) = memory_store_with_two_proof_layers().await;
+
+        let slow = SlowProofStore::new(inner.clone());
+        let same_key = CachedLayerStore::new_with_proof_cache_limits(
+            slow.clone(),
+            LockingHashMapLayerCache::new(),
+            8,
+            usize::MAX,
+        );
+        let first_store = same_key.clone();
+        let first = tokio::spawn(async move { first_store.proof_layer(first_name).await });
+        slow.wait_for_loads(1).await;
+        let second_store = same_key.clone();
+        let second = tokio::spawn(async move { second_store.proof_layer(first_name).await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(slow.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        slow.release.add_permits(1);
+        let first = first.await.unwrap().unwrap().unwrap();
+        let second = second.await.unwrap().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let queued = SlowProofStore::new(inner);
+        let different_keys = CachedLayerStore::new_with_proof_cache_limits(
+            queued.clone(),
+            LockingHashMapLayerCache::new(),
+            1,
+            usize::MAX,
+        );
+        let first_store = different_keys.clone();
+        let first = tokio::spawn(async move { first_store.proof_layer(first_name).await });
+        queued.wait_for_loads(1).await;
+        let second_store = different_keys.clone();
+        let second = tokio::spawn(async move { second_store.proof_layer(second_name).await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queued.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        queued.release.add_permits(1);
+        first.await.unwrap().unwrap().unwrap();
+        queued.wait_for_loads(2).await;
+        queued.release.add_permits(1);
+        second.await.unwrap().unwrap().unwrap();
+        assert_eq!(queued.loads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn proof_cache_evicts_lru_entry_at_entry_capacity() {
         let (inner, first_name, second_name) = memory_store_with_two_proof_layers().await;
@@ -1047,18 +1232,10 @@ pub mod tests {
     #[tokio::test]
     async fn proof_cache_evicts_by_bytes_and_reports_an_upper_bound() {
         let (inner, first_name, second_name) = memory_store_with_two_proof_layers().await;
-        let first_bytes = inner
-            .proof_layer(first_name)
-            .await
-            .unwrap()
-            .unwrap()
-            .estimated_cache_bytes();
-        let second_bytes = inner
-            .proof_layer(second_name)
-            .await
-            .unwrap()
-            .unwrap()
-            .estimated_cache_bytes();
+        let first_proof = inner.proof_layer(first_name).await.unwrap().unwrap();
+        let second_proof = inner.proof_layer(second_name).await.unwrap().unwrap();
+        let first_bytes = proof_cache_weight(&first_proof);
+        let second_bytes = proof_cache_weight(&second_proof);
         let limit = first_bytes.max(second_bytes);
         let store = CachedLayerStore::new_with_proof_cache_limits(
             inner,
@@ -1084,7 +1261,7 @@ pub mod tests {
             inner,
             LockingHashMapLayerCache::new(),
             8,
-            proof.estimated_cache_bytes().saturating_sub(1),
+            proof_cache_weight(&proof).saturating_sub(1),
         );
         assert_eq!(
             store.proof_layer(first_name).await.unwrap().unwrap().state,

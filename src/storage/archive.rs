@@ -41,9 +41,13 @@ use tdb_succinct::{
 
 use super::{
     consts::{LayerFileEnum, FILENAMES, FILENAME_ENUM_MAP},
+    indeterminate_import_commit_error,
     locking::{ExclusiveLockedFile, LockedFile},
     name_to_string, string_to_name, FileLoad, FileStore, PersistentLayerStore, SyncableFile,
 };
+
+#[cfg(test)]
+use super::is_indeterminate_import_commit;
 
 const PREFIX_DIR_SIZE: usize = 3;
 const ARCHIVE_IMPORT_MARKER_SUFFIX: &str = "larch.import-tx";
@@ -251,6 +255,8 @@ impl DirectoryArchiveBackend {
         let moved = match rename_archive_noreplace(layer, trash.clone()).await {
             Ok(()) => {
                 Self::sync_directory(&parent).await?;
+                #[cfg(test)]
+                injected_crash("during_quarantine");
                 true
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -315,7 +321,11 @@ impl DirectoryArchiveBackend {
                 let Some(name) = name.to_str() else {
                     continue;
                 };
-                if name.contains(".import-") && name.starts_with('.') {
+                if name.starts_with('.')
+                    && (name.contains(".import-")
+                        || name.contains(".marker-")
+                        || name.contains(".recovery-"))
+                {
                     fs::remove_file(entry.path()).await?;
                     Self::sync_directory(&prefix.path()).await?;
                     continue;
@@ -620,6 +630,12 @@ impl ArchiveBackend for DirectoryArchiveBackend {
                 rename_archive_noreplace(marker_temp.clone(), marker.clone()).await?;
                 #[cfg(test)]
                 injected_crash("after_visibility_marker_rename");
+                let parent = marker.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "archive marker has no parent")
+                })?;
+                Self::sync_directory(parent).await?;
+                #[cfg(test)]
+                injected_crash("after_visibility_marker_fsync");
                 rename_archive_noreplace(archive_temp.clone(), target.clone()).await?;
                 Ok::<_, io::Error>(())
             }
@@ -670,12 +686,12 @@ impl ArchiveBackend for DirectoryArchiveBackend {
         rename_archive_noreplace(commit_temp, commit).await?;
         #[cfg(test)]
         injected_crash("after_commit_marker_rename");
-        // Logical visibility begins at the commit-marker rename. Do not return
-        // an ordinary retryable error after that point: a retry could collide
-        // with an already-visible batch. Recovery handles whether the marker
-        // survived a crash if this best-effort durability sync fails.
+        // Logical visibility begins at the commit-marker rename, but success is
+        // reported only after its parent directory is durable. A failure after
+        // this point is explicitly typed as indeterminate so callers do not
+        // mistake it for a retry-safe pre-commit failure.
         #[cfg(test)]
-        let _post_commit_durability =
+        let post_commit_durability =
             if std::env::var_os("TERMINUS_STORE_ARCHIVE_FAIL_POST_COMMIT_FSYNC").is_some() {
                 Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -685,9 +701,10 @@ impl ArchiveBackend for DirectoryArchiveBackend {
                 Self::sync_directory(&commit_dir).await
             };
         #[cfg(not(test))]
-        let _post_commit_durability = Self::sync_directory(&commit_dir).await;
+        let post_commit_durability = Self::sync_directory(&commit_dir).await;
         std::mem::drop(layer_locks);
-        Ok(())
+        post_commit_durability
+            .map_err(|error| indeterminate_import_commit_error("directory-archive", error))
     }
 
     async fn remove_layer_file(&self, id: [u32; 5]) -> io::Result<()> {
@@ -2448,6 +2465,7 @@ mod tests {
 
     const PROCESS_ROOT: &str = "TERMINUS_STORE_ARCHIVE_PROCESS_ROOT";
     const PROCESS_ID: &str = "TERMINUS_STORE_ARCHIVE_PROCESS_ID";
+    const PROCESS_IDS: &str = "TERMINUS_STORE_ARCHIVE_PROCESS_IDS";
     const PROCESS_PAYLOAD: &str = "TERMINUS_STORE_ARCHIVE_PROCESS_PAYLOAD";
 
     fn test_id(n: u32) -> [u32; 5] {
@@ -2471,16 +2489,47 @@ mod tests {
         let Ok(root) = std::env::var(PROCESS_ROOT) else {
             return;
         };
-        let id = string_to_name(&std::env::var(PROCESS_ID).unwrap()).unwrap();
+        let ids = match std::env::var(PROCESS_IDS) {
+            Ok(value) => value
+                .split(',')
+                .map(string_to_name)
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap(),
+            Err(_) => vec![string_to_name(&std::env::var(PROCESS_ID).unwrap()).unwrap()],
+        };
         let payload = std::env::var(PROCESS_PAYLOAD).unwrap();
         let backend = DirectoryArchiveBackend::new(root.into());
-        let result = backend
-            .publish_layer_files_atomically(vec![(id, test_archive(payload.as_bytes()))])
-            .await;
+        let multiple = ids.len() > 1;
+        let layers = ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let payload = if multiple {
+                    format!("{payload}{index}")
+                } else {
+                    payload.clone()
+                };
+                (id, test_archive(payload.as_bytes()))
+            })
+            .collect();
+        let result = backend.publish_layer_files_atomically(layers).await;
         println!(
             "PROCESS_RESULT={}",
-            if result.is_ok() { "won" } else { "lost" }
+            match result {
+                Ok(()) => "won",
+                Err(ref error) if is_indeterminate_import_commit(error) => "indeterminate",
+                Err(_) => "lost",
+            }
         );
+    }
+
+    #[tokio::test]
+    async fn archive_recovery_process_child() {
+        let Ok(root) = std::env::var(PROCESS_ROOT) else {
+            return;
+        };
+        let backend = DirectoryArchiveBackend::new(root.into());
+        let _ = backend.get_layer_names().await;
     }
 
     fn publication_child(
@@ -2500,6 +2549,40 @@ mod tests {
             .env("RUST_TEST_THREADS", "1")
             .env_remove("TERMINUS_STORE_ARCHIVE_CRASH_POINT")
             .env_remove("TERMINUS_STORE_ARCHIVE_FAIL_POST_COMMIT_FSYNC")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(point) = crash {
+            command.env("TERMINUS_STORE_ARCHIVE_CRASH_POINT", point);
+        }
+        command
+    }
+
+    fn batch_publication_child(
+        root: &std::path::Path,
+        ids: &[[u32; 5]],
+        payload: &str,
+        crash: Option<&str>,
+    ) -> Command {
+        let mut command = publication_child(root, ids[0], payload, crash);
+        command.env(
+            PROCESS_IDS,
+            ids.iter()
+                .map(|id| name_to_string(*id))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        command
+    }
+
+    fn recovery_child(root: &std::path::Path, crash: Option<&str>) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("storage::archive::tests::archive_recovery_process_child")
+            .arg("--nocapture")
+            .env(PROCESS_ROOT, root)
+            .env("RUST_TEST_THREADS", "1")
+            .env_remove("TERMINUS_STORE_ARCHIVE_CRASH_POINT")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(point) = crash {
@@ -2541,6 +2624,7 @@ mod tests {
         for (point, committed) in [
             ("after_staging_fsync", false),
             ("after_visibility_marker_rename", false),
+            ("after_visibility_marker_fsync", false),
             ("after_target_rename", false),
             ("after_commit_marker_rename", true),
         ] {
@@ -2562,7 +2646,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archive_post_commit_fsync_failure_has_success_semantics() {
+    async fn archive_multi_layer_process_crashes_are_all_or_none_to_readers() {
+        let ids = [test_id(1001), test_id(1002), test_id(1003)];
+        for (point, committed) in [
+            ("after_staging_fsync", false),
+            ("after_visibility_marker_fsync", false),
+            ("after_target_rename", false),
+            ("after_commit_marker_rename", true),
+        ] {
+            let root = tempdir().unwrap();
+            let output = batch_publication_child(root.path(), &ids, "batch", Some(point))
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "crash hook {} did not fire",
+                point
+            );
+            let backend = DirectoryArchiveBackend::new(root.path().to_path_buf());
+            let visible_before_recovery =
+                futures::future::try_join_all(ids.iter().map(|id| backend.layer_is_visible(*id)))
+                    .await
+                    .unwrap();
+            let visible_count = visible_before_recovery
+                .iter()
+                .filter(|visible| **visible)
+                .count();
+            assert_eq!(visible_count, if committed { ids.len() } else { 0 });
+            let listed = backend.get_layer_names().await.unwrap();
+            assert_eq!(
+                ids.iter().filter(|id| listed.contains(id)).count(),
+                if committed { ids.len() } else { 0 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_overlapping_batches_have_one_cross_process_winner() {
+        let root = tempdir().unwrap();
+        let first_ids = [test_id(1011), test_id(1012)];
+        let second_ids = [test_id(1012), test_id(1013)];
+        let first = batch_publication_child(root.path(), &first_ids, "first", None)
+            .spawn()
+            .unwrap();
+        let second = batch_publication_child(root.path(), &second_ids, "second", None)
+            .spawn()
+            .unwrap();
+        let first = first.wait_with_output().unwrap();
+        let second = second.wait_with_output().unwrap();
+        assert!(first.status.success());
+        assert!(second.status.success());
+        let outputs = [first.stdout, second.stdout];
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|bytes| String::from_utf8_lossy(bytes).contains("PROCESS_RESULT=won"))
+                .count(),
+            1
+        );
+        let backend = DirectoryArchiveBackend::new(root.path().to_path_buf());
+        let listed = backend.get_layer_names().await.unwrap();
+        assert!(listed.contains(&first_ids[1]));
+        assert_eq!(
+            listed.contains(&first_ids[0]),
+            !listed.contains(&second_ids[1])
+        );
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn archive_crash_during_quarantine_cleans_hidden_and_marker_temps() {
+        let root = tempdir().unwrap();
+        let ids = [test_id(1021), test_id(1022)];
+        let publication =
+            batch_publication_child(root.path(), &ids, "batch", Some("after_target_rename"))
+                .output()
+                .unwrap();
+        assert!(!publication.status.success());
+        let recovery = recovery_child(root.path(), Some("during_quarantine"))
+            .output()
+            .unwrap();
+        assert!(!recovery.status.success());
+
+        let backend = DirectoryArchiveBackend::new(root.path().to_path_buf());
+        assert!(backend.get_layer_names().await.unwrap().is_empty());
+        for prefix in std::fs::read_dir(root.path()).unwrap() {
+            let prefix = prefix.unwrap();
+            if !prefix.file_type().unwrap().is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(prefix.path()).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(
+                    !name.contains(".recovery-")
+                        && !name.contains(".import-")
+                        && !name.contains(".marker-")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_post_commit_fsync_failure_is_explicitly_indeterminate() {
         let root = tempdir().unwrap();
         let id = test_id(999);
         let output = publication_child(root.path(), id, "payload", None)
@@ -2570,7 +2755,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout).contains("PROCESS_RESULT=won"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("PROCESS_RESULT=indeterminate"));
         let backend = DirectoryArchiveBackend::new(root.path().to_path_buf());
         assert!(backend.layer_is_visible(id).await.unwrap());
     }

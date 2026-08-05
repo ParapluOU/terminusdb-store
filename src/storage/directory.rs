@@ -132,6 +132,8 @@ impl DirectoryLayerStore {
                 // The visible name is gone before the marker-containing tree is
                 // destroyed. Persist that fact before deleting the quarantine.
                 Self::sync_directory(parent).await?;
+                #[cfg(test)]
+                injected_crash("during_quarantine");
                 fs::remove_dir_all(&trash).await?;
                 Self::sync_directory(parent).await
             }
@@ -198,6 +200,11 @@ impl DirectoryLayerStore {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with('.') && name.contains(".import-") {
+                    fs::remove_dir_all(path).await?;
+                    Self::sync_directory(&prefix.path()).await?;
+                    continue;
+                }
+                if name.starts_with('.') && name.contains(".recovery-") {
                     fs::remove_dir_all(path).await?;
                     Self::sync_directory(&prefix.path()).await?;
                     continue;
@@ -498,14 +505,12 @@ impl PersistentLayerStore for DirectoryLayerStore {
         rename_directory_noreplace(temporary_commit, commit).await?;
         #[cfg(test)]
         injected_crash("after_commit_marker_rename");
-        // The commit marker rename is the logical commit point. If the
-        // following directory fsync reports an error, returning an ordinary
-        // failure would invite callers to retry a batch that is already
-        // visible. Treat that post-commit durability result as success; startup
-        // recovery still distinguishes a marker that survived from one that
-        // did not.
+        // The commit-marker rename is the logical commit point, but success is
+        // reported only after its parent directory is durable. A failure after
+        // this point is explicitly typed as indeterminate so callers do not
+        // mistake it for a retry-safe pre-commit failure.
         #[cfg(test)]
-        let _post_commit_durability =
+        let post_commit_durability =
             if std::env::var_os("TERMINUS_STORE_DIRECTORY_FAIL_POST_COMMIT_FSYNC").is_some() {
                 Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -515,9 +520,10 @@ impl PersistentLayerStore for DirectoryLayerStore {
                 Self::sync_directory(&commit_dir).await
             };
         #[cfg(not(test))]
-        let _post_commit_durability = Self::sync_directory(&commit_dir).await;
+        let post_commit_durability = Self::sync_directory(&commit_dir).await;
         std::mem::drop(layer_locks);
-        Ok(())
+        post_commit_durability
+            .map_err(|error| indeterminate_import_commit_error("directory", error))
     }
 
     async fn write_proof_state_bytes(&self, directory: [u32; 5], bytes: &[u8]) -> io::Result<()> {
@@ -931,6 +937,7 @@ mod tests {
 
     const PROCESS_ROOT: &str = "TERMINUS_STORE_DIRECTORY_PROCESS_ROOT";
     const PROCESS_ID: &str = "TERMINUS_STORE_DIRECTORY_PROCESS_ID";
+    const PROCESS_IDS: &str = "TERMINUS_STORE_DIRECTORY_PROCESS_IDS";
     const PROCESS_PAYLOAD: &str = "TERMINUS_STORE_DIRECTORY_PROCESS_PAYLOAD";
 
     #[tokio::test]
@@ -938,16 +945,48 @@ mod tests {
         let Ok(root) = std::env::var(PROCESS_ROOT) else {
             return;
         };
-        let id = string_to_name(&std::env::var(PROCESS_ID).unwrap()).unwrap();
+        let ids = match std::env::var(PROCESS_IDS) {
+            Ok(value) => value
+                .split(',')
+                .map(string_to_name)
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap(),
+            Err(_) => vec![string_to_name(&std::env::var(PROCESS_ID).unwrap()).unwrap()],
+        };
         let payload = std::env::var(PROCESS_PAYLOAD).unwrap().into_bytes();
-        let mut files = HashMap::new();
-        files.insert(FILENAMES.proof_state.to_string(), payload);
+        let multiple = ids.len() > 1;
+        let layers = ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut files = HashMap::new();
+                let mut bytes = payload.clone();
+                if multiple {
+                    bytes.extend_from_slice(index.to_string().as_bytes());
+                }
+                files.insert(FILENAMES.proof_state.to_string(), bytes);
+                (id, files)
+            })
+            .collect();
         let store = DirectoryLayerStore::new(root);
-        let result = store.publish_imported_layers(vec![(id, files)]).await;
+        let result = store.publish_imported_layers(layers).await;
         println!(
             "PROCESS_RESULT={}",
-            if result.is_ok() { "won" } else { "lost" }
+            match result {
+                Ok(()) => "won",
+                Err(ref error) if is_indeterminate_import_commit(error) => "indeterminate",
+                Err(_) => "lost",
+            }
         );
+    }
+
+    #[tokio::test]
+    async fn directory_recovery_process_child() {
+        let Ok(root) = std::env::var(PROCESS_ROOT) else {
+            return;
+        };
+        let store = DirectoryLayerStore::new(root);
+        let _ = store.directories().await;
     }
 
     fn publication_child(
@@ -967,6 +1006,40 @@ mod tests {
             .env("RUST_TEST_THREADS", "1")
             .env_remove("TERMINUS_STORE_DIRECTORY_CRASH_POINT")
             .env_remove("TERMINUS_STORE_DIRECTORY_FAIL_POST_COMMIT_FSYNC")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(point) = crash {
+            command.env("TERMINUS_STORE_DIRECTORY_CRASH_POINT", point);
+        }
+        command
+    }
+
+    fn batch_publication_child(
+        root: &std::path::Path,
+        ids: &[[u32; 5]],
+        payload: &str,
+        crash: Option<&str>,
+    ) -> Command {
+        let mut command = publication_child(root, ids[0], payload, crash);
+        command.env(
+            PROCESS_IDS,
+            ids.iter()
+                .map(|id| name_to_string(*id))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        command
+    }
+
+    fn recovery_child(root: &std::path::Path, crash: Option<&str>) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("storage::directory::tests::directory_recovery_process_child")
+            .arg("--nocapture")
+            .env(PROCESS_ROOT, root)
+            .env("RUST_TEST_THREADS", "1")
+            .env_remove("TERMINUS_STORE_DIRECTORY_CRASH_POINT")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(point) = crash {
@@ -1034,7 +1107,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_commit_fsync_failure_has_success_semantics() {
+    async fn multi_layer_process_crashes_are_all_or_none_to_readers() {
+        let ids = [
+            [201, 202, 203, 204, 205],
+            [211, 212, 213, 214, 215],
+            [221, 222, 223, 224, 225],
+        ];
+        for (point, committed) in [
+            ("after_staging_fsync", false),
+            ("after_target_rename", false),
+            ("after_commit_marker_rename", true),
+        ] {
+            let root = tempdir().unwrap();
+            let output = batch_publication_child(root.path(), &ids, "batch", Some(point))
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "crash hook {} did not fire",
+                point
+            );
+            let store = DirectoryLayerStore::new(root.path());
+            let visible_before_recovery =
+                futures::future::try_join_all(ids.iter().map(|id| store.directory_exists(*id)))
+                    .await
+                    .unwrap();
+            let visible_count = visible_before_recovery
+                .iter()
+                .filter(|visible| **visible)
+                .count();
+            assert_eq!(visible_count, if committed { ids.len() } else { 0 });
+            let listed = store.directories().await.unwrap();
+            assert_eq!(
+                ids.iter().filter(|id| listed.contains(id)).count(),
+                if committed { ids.len() } else { 0 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_multi_layer_batches_have_one_cross_process_winner() {
+        let root = tempdir().unwrap();
+        let first_ids = [[231, 232, 233, 234, 235], [241, 242, 243, 244, 245]];
+        let second_ids = [[241, 242, 243, 244, 245], [251, 252, 253, 254, 255]];
+        let first = batch_publication_child(root.path(), &first_ids, "first", None)
+            .spawn()
+            .unwrap();
+        let second = batch_publication_child(root.path(), &second_ids, "second", None)
+            .spawn()
+            .unwrap();
+        let first = first.wait_with_output().unwrap();
+        let second = second.wait_with_output().unwrap();
+        assert!(first.status.success());
+        assert!(second.status.success());
+        let outputs = [first.stdout, second.stdout];
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|bytes| String::from_utf8_lossy(bytes).contains("PROCESS_RESULT=won"))
+                .count(),
+            1
+        );
+        let store = DirectoryLayerStore::new(root.path());
+        let listed = store.directories().await.unwrap();
+        assert!(listed.contains(&first_ids[1]));
+        assert_eq!(
+            listed.contains(&first_ids[0]),
+            !listed.contains(&second_ids[1])
+        );
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn crash_during_quarantine_is_recovered_without_visible_residue() {
+        let root = tempdir().unwrap();
+        let ids = [[261, 262, 263, 264, 265], [271, 272, 273, 274, 275]];
+        let publication =
+            batch_publication_child(root.path(), &ids, "batch", Some("after_target_rename"))
+                .output()
+                .unwrap();
+        assert!(!publication.status.success());
+        let recovery = recovery_child(root.path(), Some("during_quarantine"))
+            .output()
+            .unwrap();
+        assert!(!recovery.status.success());
+
+        let store = DirectoryLayerStore::new(root.path());
+        assert!(store.directories().await.unwrap().is_empty());
+        for prefix in std::fs::read_dir(root.path()).unwrap() {
+            let prefix = prefix.unwrap();
+            if !prefix.file_type().unwrap().is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(prefix.path()).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(!name.contains(".recovery-") && !name.contains(".import-"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_commit_fsync_failure_is_explicitly_indeterminate() {
         let root = tempdir().unwrap();
         let id = [111, 112, 113, 114, 115];
         let output = publication_child(root.path(), id, "payload", None)
@@ -1042,7 +1215,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout).contains("PROCESS_RESULT=won"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("PROCESS_RESULT=indeterminate"));
         let store = DirectoryLayerStore::new(root.path());
         assert!(store.directory_exists(id).await.unwrap());
     }

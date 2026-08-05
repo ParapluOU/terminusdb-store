@@ -92,12 +92,18 @@ root. Same-ID collisions fail rather than overwrite.
 Pack limits cover caller-provided layer iterators, compressed output while it
 is produced, individual and aggregate decoded entries, copied target ancestry,
 one bounded proof reconstruction, and backend publication conversion. The
-directory and directory-archive backends use durable transaction and visibility
-markers, cross-process locks, atomic no-replace publication, and recovery. A
-batch is logically invisible until one durable global commit marker exists;
-recovery quarantines uncommitted targets before deleting them. Subprocess crash
-tests exercise pre- and post-commit boundaries, and two-process races admit
-exactly one same-ID publisher.
+gzip exporter streams to a bounded temporary file rather than retaining a
+growing compressed `Vec` beside mapped native input; gzip/tar import parsing
+runs in a charged blocking worker. The directory and directory-archive backends
+use durable transaction and visibility markers, cross-process locks, atomic
+no-replace publication, and recovery. A batch is logically invisible until the
+global commit-marker rename. `Ok` requires the following commit-directory
+fsync; failure returns an explicit indeterminate outcome because the marker is
+already visible and the operation is not retry-safe. Recovery quarantines
+uncommitted targets before deleting them and removes interrupted quarantine and
+staging artifacts. Multi-layer subprocess crash tests exercise partial target
+publication, marker durability, commit, and crash-during-recovery boundaries;
+overlapping two-process batches admit exactly one complete publisher.
 
 `export_layers_legacy` omits both the pack manifest and proof sidecars. This is
 the explicit compatibility route for old consumers. Regular `import_layers`
@@ -105,6 +111,10 @@ accepts legacy/no-proof packs but rejects proof state without external roots.
 `PackImportLimits` makes compressed, entry, aggregate, layer, ancestry, and
 aggregate peak-memory budgets caller-configurable. The current implementation
 has deterministic budget tests but not an OS-level peak-RSS acceptance result.
+
+The proof cache has hard resident-entry and in-flight decode caps. Its byte cap
+uses a conservative logical weight covering capacities, container bodies, Arc
+control blocks, and fixed allocator allowances; it is not an OS RSS guarantee.
 
 ## Performance status
 

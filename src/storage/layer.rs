@@ -41,6 +41,60 @@ use async_trait::async_trait;
 
 pub const MAX_LAYER_CHAIN_DEPTH: usize = 1024;
 
+/// Publication crossed its logical visibility point, but the final directory
+/// durability barrier failed. The caller must treat the transaction as
+/// indeterminate, inspect/recover the store, and must not blindly retry it.
+#[derive(Debug)]
+pub struct ImportCommitDurabilityIndeterminate {
+    backend: &'static str,
+    source: io::Error,
+}
+
+impl ImportCommitDurabilityIndeterminate {
+    pub(crate) fn new(backend: &'static str, source: io::Error) -> Self {
+        Self { backend, source }
+    }
+
+    pub fn backend(&self) -> &'static str {
+        self.backend
+    }
+}
+
+impl std::fmt::Display for ImportCommitDurabilityIndeterminate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} import is logically visible but final commit durability is indeterminate: {}",
+            self.backend, self.source
+        )
+    }
+}
+
+impl std::error::Error for ImportCommitDurabilityIndeterminate {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Detect the explicit no-retry result returned after a pack transaction has
+/// become visible but its final commit-directory fsync fails.
+pub fn is_indeterminate_import_commit(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ImportCommitDurabilityIndeterminate>())
+        .is_some()
+}
+
+pub(crate) fn indeterminate_import_commit_error(
+    backend: &'static str,
+    source: io::Error,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        ImportCommitDurabilityIndeterminate::new(backend, source),
+    )
+}
+
 macro_rules! walk_backwards_from_disk {
     ($store:ident, $name:ident, $current:ident, $body:block) => {
         let mut $current = $name;
@@ -265,14 +319,20 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
             .proof_layer(name)
             .await?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "proof state not found"))?;
+        // Decoding has already independently checked that every stored table
+        // reconstructs the roots committed by this state. Retain only that
+        // commitment while rebuilding so admission never holds two maximum-
+        // sized decoded ProofLayers at once.
+        let stored_state = stored.state.clone();
+        drop(stored);
         let rebuilt = self.rebuild_proof_layer(name).await?;
-        if rebuilt != *stored {
+        if rebuilt.state != stored_state {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "proof state differs from native layer delta",
             ));
         }
-        Ok(stored.state.clone())
+        Ok(stored_state)
     }
 
     async fn validate_proof_chain_against_store(
@@ -708,7 +768,10 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
     }
 
     /// Zero-copy publication path used by bounded pack admission. Backends
-    /// consume ref-counted immutable entry bytes after validation.
+    /// consume ref-counted immutable entry bytes after validation. A result
+    /// recognized by [`is_indeterminate_import_commit`] means logical
+    /// visibility was reached but the final durability barrier failed; callers
+    /// must recover/inspect and must not blindly retry the batch.
     async fn publish_imported_layers_shared(
         &self,
         layers: Vec<([u32; 5], HashMap<String, bytes::Bytes>)>,

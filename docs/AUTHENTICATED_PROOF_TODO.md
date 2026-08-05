@@ -42,9 +42,10 @@ src/proof.rs                             (new)
 formatter: this checkout's historical formatting would rewrite that unrelated
 file. Format only files intentionally changed in this work.
 
-On 2026-08-05, `cargo test` passed all 318 tests plus doc tests,
-`cargo test storage::pack::tests` passed 12 tests, `cargo check --lib` passed,
-and `git diff --check` was clean. These tests include exact subprocess crash
+On 2026-08-05, the post-audit `cargo test` passed all 330 tests plus doc tests,
+and the focused pack gate passed 15 tests. `cargo check --lib --example
+proof_store_bench` passed, and `git diff --check` was clean. These tests include
+exact subprocess crash
 points, two-process same-ID publication races, malformed pack containment,
 proof/cache/resource-limit mutations, and differential normal/proof reads.
 The independent Store audit is still required before protocol integration.
@@ -205,10 +206,13 @@ git diff --check
   is unacceptable.
 - [x] Add subprocess crash/fault injection at the durable staging, visibility
   marker, target publication, and global commit boundaries.
-  Recovery tests assert that concurrent/reopened readers observe no requested
-  layer before commit and the complete batch after commit. A post-commit
-  directory-fsync injection has success semantics so callers cannot retry an
-  already-visible transaction.
+  Real multi-layer writer processes and independent readers assert no requested
+  layer before commit and the complete batch after commit. Recovery is also
+  killed after quarantine rename and cleans residual hidden staging on restart.
+  A post-commit directory-fsync failure returns the typed
+  `ImportCommitDurabilityIndeterminate` outcome: the batch is logically visible,
+  durability is unconfirmed, and callers must inspect/recover rather than
+  blindly retry. `Ok` is returned only after the final fsync succeeds.
 - [x] Test same-ID and overlapping multi-layer imports across two store handles
   and, for filesystem backends, two processes. Exactly one transaction wins.
 - [x] Test reopen recovery before and after the commit point for both directory
@@ -229,6 +233,12 @@ git diff --check
   staging. Bound compressed input copies, decoded tar maps, native staging,
   proof decode/reconstruction, and publication buffers as one peak-memory
   model.
+- [x] Stream gzip export into a bounded temporary file so compressed output
+  never grows in a heap `Vec` beside a mapped native entry. Charge compressed
+  output plus the mapped entry against `max_peak_bytes`, and read the final
+  bounded result only after mappings and encoder buffers are gone. Run gzip/tar
+  import decoding in a blocking worker, charging its owned compressed copy
+  before allocation.
 - [x] Eliminate avoidable clones: consume imported maps into publication, drop
   staging before publish, and use shared immutable bytes or streaming where the
   backend contract permits it.
@@ -241,7 +251,9 @@ git diff --check
 
 - [x] Complete the proof cache's configurable entry and byte capacities.
   Preserve single-flight loading for resident keys and never hold a synchronous
-  mutex across `.await`.
+  mutex across `.await`. Entry and in-flight limits are hard caps; the byte
+  limit is a conservative logical accounting weight (capacity, containers,
+  Arc/fixed allocator overhead), not an OS RSS cap.
 - [x] Decide and test behavior when one decoded proof exceeds the byte limit
   (serve it to the caller but do not retain it).
 - [x] Fix and test archive LRU named-entry replacement: removing a non-LRU entry
@@ -255,7 +267,7 @@ git diff --check
 
 ## 7. Store verification gate
 
-- [x] Run focused proof tests (`proof_`: 25 passed; `proof::tests`: 14 passed):
+- [x] Run focused proof tests (`proof_`: 27 passed; `proof::tests`: 14 passed):
 
   ```sh
   cargo test proof_
@@ -264,7 +276,7 @@ git diff --check
 
 - [x] Run pack/publication/cache/failure-injection tests for memory, directory,
   archive, and cached archive backends.
-- [x] Run the complete Store suite (318 passed plus doc tests):
+- [x] Run the final post-audit complete Store suite (330 passed plus doc tests):
 
   ```sh
   cargo test

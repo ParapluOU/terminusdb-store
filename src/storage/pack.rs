@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt::Display;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -30,6 +30,7 @@ const PACK_MANIFEST: &[u8] = b"terminus-store-pack\nversion=2\nproof-state=pf4\n
 // Entry backing bytes are charged separately at their exact declared size.
 const PACK_LAYER_HEAP_OVERHEAD: usize = 512;
 const PACK_ENTRY_HEAP_OVERHEAD: usize = 512;
+const PACK_STREAM_HEAP_OVERHEAD: usize = 256 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackImportLimits {
     pub max_compressed_bytes: usize,
@@ -198,35 +199,64 @@ fn collect_layer_ids(
     Ok(result)
 }
 
-struct LimitedVecWriter {
-    bytes: Vec<u8>,
+struct LimitedTempWriter {
+    file: std::fs::File,
     max_bytes: usize,
+    max_peak_bytes: usize,
+    base_heap_bytes: usize,
     written: Arc<std::sync::atomic::AtomicUsize>,
+    mapped_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl LimitedVecWriter {
-    fn new(max_bytes: usize) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+impl LimitedTempWriter {
+    fn new(
+        max_bytes: usize,
+        max_peak_bytes: usize,
+        base_heap_bytes: usize,
+    ) -> io::Result<(
+        Self,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    )> {
+        if base_heap_bytes > max_peak_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "export pack peak-memory budget exceeded",
+            ));
+        }
         let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        (
+        let mapped_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Ok((
             Self {
-                bytes: Vec::new(),
+                file: tempfile::tempfile()?,
                 max_bytes,
+                max_peak_bytes,
+                base_heap_bytes,
                 written: written.clone(),
+                mapped_bytes: mapped_bytes.clone(),
             },
             written,
-        )
+            mapped_bytes,
+        ))
     }
 
-    fn into_inner(self) -> Vec<u8> {
-        self.bytes
+    fn into_bytes(mut self) -> io::Result<Vec<u8>> {
+        self.file.flush()?;
+        self.file.seek(io::SeekFrom::Start(0))?;
+        let length = self.written.load(std::sync::atomic::Ordering::Relaxed);
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(io::Error::other)?;
+        bytes.resize(length, 0);
+        self.file.read_exact(&mut bytes)?;
+        Ok(bytes)
     }
 }
 
-impl Write for LimitedVecWriter {
+impl Write for LimitedTempWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let next = self
-            .bytes
-            .len()
+            .written
+            .load(std::sync::atomic::Ordering::Relaxed)
             .checked_add(bytes.len())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pack size overflow"))?;
         if next > self.max_bytes {
@@ -235,17 +265,26 @@ impl Write for LimitedVecWriter {
                 "compressed layer pack exceeds negotiated limit",
             ));
         }
-        self.bytes
-            .try_reserve(bytes.len())
-            .map_err(io::Error::other)?;
-        self.bytes.extend_from_slice(bytes);
+        let mapped = self.mapped_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if self
+            .base_heap_bytes
+            .checked_add(mapped)
+            .and_then(|value| value.checked_add(next))
+            .map_or(true, |peak| peak > self.max_peak_bytes)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "export pack peak-memory budget exceeded",
+            ));
+        }
+        let count = self.file.write(bytes)?;
         self.written
-            .store(next, std::sync::atomic::Ordering::Relaxed);
-        Ok(bytes.len())
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        Ok(count)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.file.flush()
     }
 }
 
@@ -302,6 +341,13 @@ impl PeakBudget {
         self.transient = bytes;
         Ok(())
     }
+
+    fn release(&mut self, bytes: usize) -> io::Result<()> {
+        self.retained = self.retained.checked_sub(bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "pack peak accounting underflow")
+        })?;
+        Ok(())
+    }
 }
 
 async fn export_pack<S: PersistentLayerStore>(
@@ -315,9 +361,20 @@ async fn export_pack<S: PersistentLayerStore>(
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
         .as_secs();
     let layer_ids = collect_layer_ids(layer_ids, limits.max_layers)?;
-
-    let (writer, compressed_bytes) = LimitedVecWriter::new(limits.max_compressed_bytes);
-    let mut budget = PackBudget::new(limits, compressed_bytes);
+    let base_heap_bytes = PACK_STREAM_HEAP_OVERHEAD
+        .checked_add(
+            layer_ids
+                .capacity()
+                .checked_mul(std::mem::size_of::<[u32; 5]>())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "layer heap overflow"))?,
+        )
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pack heap overflow"))?;
+    let (writer, compressed_bytes, mapped_bytes) = LimitedTempWriter::new(
+        limits.max_compressed_bytes,
+        limits.max_peak_bytes,
+        base_heap_bytes,
+    )?;
+    let mut budget = PackBudget::new(limits, compressed_bytes, mapped_bytes, base_heap_bytes);
     let mut enc = GzEncoder::new(writer, Compression::default());
     {
         let mut tar = tar::Builder::new(&mut enc);
@@ -339,7 +396,7 @@ async fn export_pack<S: PersistentLayerStore>(
         }
         tar.finish()?;
     }
-    Ok(enc.finish()?.into_inner())
+    enc.finish()?.into_bytes()
 }
 
 struct PackBudget {
@@ -347,18 +404,24 @@ struct PackBudget {
     bytes: usize,
     limits: PackImportLimits,
     compressed_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    mapped_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    base_heap_bytes: usize,
 }
 
 impl PackBudget {
     fn new(
         limits: PackImportLimits,
         compressed_bytes: Arc<std::sync::atomic::AtomicUsize>,
+        mapped_bytes: Arc<std::sync::atomic::AtomicUsize>,
+        base_heap_bytes: usize,
     ) -> Self {
         Self {
             entries: 0,
             bytes: 0,
             limits,
             compressed_bytes,
+            mapped_bytes,
+            base_heap_bytes,
         }
     }
 
@@ -390,8 +453,10 @@ impl PackBudget {
         let compressed = self
             .compressed_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
-        if compressed
+        if self
+            .base_heap_bytes
             .checked_add(bytes)
+            .and_then(|value| value.checked_add(compressed))
             .map_or(true, |peak| peak > self.limits.max_peak_bytes)
         {
             return Err(io::Error::new(
@@ -399,7 +464,14 @@ impl PackBudget {
                 "export pack peak-memory budget exceeded",
             ));
         }
+        self.mapped_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    fn after_map(&self) {
+        self.mapped_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -901,10 +973,24 @@ async fn import_pack<S: PersistentLayerStore>(
         }
     }
 
-    // Decode directly from the caller's bounded slice. Copying it into a
-    // `'static` blocking task would double the largest attacker-controlled
-    // allocation before any uncompressed-entry limit could take effect.
-    let (v2, imported) = decode_pack(pack, &requested, limits, &mut peak)?;
+    // Decompression and tar parsing are blocking/CPU-heavy. The owned worker
+    // copy and its requested-id set are charged before allocation, then
+    // released from the retained model when the blocking worker returns.
+    let worker_overhead = requested
+        .len()
+        .checked_mul(PACK_LAYER_HEAP_OVERHEAD)
+        .and_then(|value| value.checked_add(pack.len()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pack worker heap overflow"))?;
+    peak.retain(worker_overhead)?;
+    let owned_pack = pack.to_vec();
+    let requested_for_decode = requested.clone();
+    let (v2, imported, mut peak) = tokio::task::spawn_blocking(move || {
+        let decoded = decode_pack(&owned_pack, &requested_for_decode, limits, &mut peak)?;
+        peak.release(worker_overhead)?;
+        Ok::<_, io::Error>((decoded.0, decoded.1, peak))
+    })
+    .await
+    .map_err(|error| io::Error::new(io::ErrorKind::Other, error))??;
     if imported.len() != requested.len() || layer_ids.iter().any(|id| !imported.contains_key(id)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1052,8 +1138,15 @@ async fn tar_append_file<S: PersistentLayerStore, W: io::Write>(
         let size = file.size().await?;
         budget.add_entry(size)?;
         budget.before_map(size)?;
-        let contents = file.map().await?;
+        let contents = match file.map().await {
+            Ok(contents) => contents,
+            Err(error) => {
+                budget.after_map();
+                return Err(error);
+            }
+        };
         if contents.len() != size {
+            budget.after_map();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "layer file changed while it was exported",
@@ -1072,7 +1165,9 @@ async fn tar_append_file<S: PersistentLayerStore, W: io::Write>(
         );
         header.set_mtime(mtime);
         header.set_cksum();
-        tar.append_data(&mut header, path, cursor)?;
+        let result = tar.append_data(&mut header, path, cursor);
+        budget.after_map();
+        result?;
 
         Ok(())
     } else {
@@ -1097,8 +1192,15 @@ async fn tar_append_file_if_exists<S: PersistentLayerStore, W: io::Write>(
         let size = file.size().await?;
         budget.add_entry(size)?;
         budget.before_map(size)?;
-        let contents = file.map().await?;
+        let contents = match file.map().await {
+            Ok(contents) => contents,
+            Err(error) => {
+                budget.after_map();
+                return Err(error);
+            }
+        };
         if contents.len() != size {
+            budget.after_map();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "layer file changed while it was exported",
@@ -1117,7 +1219,9 @@ async fn tar_append_file_if_exists<S: PersistentLayerStore, W: io::Write>(
         );
         header.set_mtime(mtime);
         header.set_cksum();
-        tar.append_data(&mut header, path, cursor)?;
+        let result = tar.append_data(&mut header, path, cursor);
+        budget.after_map();
+        result?;
     }
 
     Ok(())
@@ -1592,6 +1696,70 @@ mod tests {
         };
         assert!(checked_pack_entry_size(u64::MAX, &mut total, limits).is_err());
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn streaming_export_writer_enforces_output_plus_mapped_peak() {
+        let (mut writer, _written, mapped) = LimitedTempWriter::new(1024, 300, 256).unwrap();
+        mapped.store(40, std::sync::atomic::Ordering::Relaxed);
+        writer.write_all(&[0; 4]).unwrap();
+        let error = writer.write_all(&[0; 1]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("peak-memory"));
+    }
+
+    #[tokio::test]
+    async fn negotiated_export_peak_rejects_before_mapping_large_entry() {
+        let source = open_memory_store();
+        let builder = source.create_base_layer().await.unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value(
+                "a",
+                "p",
+                &"x".repeat(32 * 1024),
+            ))
+            .unwrap();
+        let layer = builder.commit().await.unwrap();
+        let limits = PackImportLimits {
+            max_peak_bytes: PACK_STREAM_HEAP_OVERHEAD + 4096,
+            ..PackImportLimits::default()
+        };
+        let result = source
+            .export_layers_with_limits(Box::new(vec![layer.name()].into_iter()), limits)
+            .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proof_import_peak_needs_one_decoded_layer_not_two() {
+        let source = open_memory_store();
+        let builder = source.create_base_layer().await.unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node("a", "p", "b"))
+            .unwrap();
+        let (layer, state) = builder.commit_with_proof().await.unwrap();
+        let id = layer.name();
+        let pack = source
+            .export_layers(Box::new(vec![id].into_iter()))
+            .await
+            .unwrap();
+        let limits = PackImportLimits {
+            // Deliberately below two maximum decoded ProofLayers. Admission
+            // drops the root-validated stored object before native rebuild.
+            max_peak_bytes: crate::proof::MAX_DECODED_PROOF_BYTES + 64 * 1024 * 1024,
+            ..PackImportLimits::default()
+        };
+        let target = open_memory_store();
+        target
+            .import_layers_with_limits(
+                &pack,
+                Box::new(vec![id].into_iter()),
+                HashMap::from([(id, state.state_root)]),
+                limits,
+            )
+            .await
+            .unwrap();
+        assert!(target.get_layer_from_id(id).await.unwrap().is_some());
     }
 
     #[tokio::test]

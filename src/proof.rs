@@ -1204,47 +1204,70 @@ impl PartialEq for ProofLayer {
 impl Eq for ProofLayer {}
 
 impl ProofLayer {
-    /// Approximate retained heap bytes for the decoded v4 proof cache. Shared
-    /// canonical delta tables are counted once; ordinal projections and Merkle
-    /// levels remain index-specific.
+    /// Conservative logical retained-byte estimate for the decoded v4 proof
+    /// cache. It charges vector capacities, dynamic field capacities, Arc
+    /// control blocks, container bodies, and a fixed allocator allowance per
+    /// allocation. It is deliberately an accounting weight, not an OS RSS or
+    /// allocator-usable-size measurement.
     pub fn estimated_cache_bytes(&self) -> usize {
+        const ALLOCATION_OVERHEAD: usize = 32;
+        const ARC_CONTROL_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
+        let allocation = |capacity: usize| {
+            if capacity == 0 {
+                0
+            } else {
+                capacity.saturating_add(ALLOCATION_OVERHEAD)
+            }
+        };
         let record_bytes = |records: &Arc<Vec<ProofRecord>>| {
             records.iter().fold(
-                records
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<ProofRecord>()),
+                std::mem::size_of::<Vec<ProofRecord>>()
+                    .saturating_add(ARC_CONTROL_OVERHEAD)
+                    .saturating_add(allocation(
+                        records
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ProofRecord>()),
+                    )),
                 |total, record| {
                     let object = match &record.triple.object {
                         CanonicalObject::Node(value) => value.capacity(),
                         CanonicalObject::Value { lexical, .. } => lexical.capacity(),
                     };
                     total
-                        .saturating_add(record.triple.subject.capacity())
-                        .saturating_add(record.triple.predicate.capacity())
-                        .saturating_add(object)
+                        .saturating_add(allocation(record.triple.subject.capacity()))
+                        .saturating_add(allocation(record.triple.predicate.capacity()))
+                        .saturating_add(allocation(object))
                 },
             )
         };
         let index_bytes = |index: &AuthenticatedIndex| {
-            index
-                .order
-                .capacity()
-                .saturating_mul(std::mem::size_of::<usize>())
+            std::mem::size_of::<Vec<usize>>()
+                .saturating_add(ARC_CONTROL_OVERHEAD)
+                .saturating_add(allocation(
+                    index
+                        .order
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                ))
+                .saturating_add(std::mem::size_of::<Vec<Vec<ProofHash>>>())
+                .saturating_add(ARC_CONTROL_OVERHEAD)
                 .saturating_add(
                     index
                         .levels
                         .iter()
-                        .map(|level| level.capacity().saturating_mul(32))
+                        .map(|level| allocation(level.capacity().saturating_mul(32)))
                         .sum::<usize>(),
                 )
-                .saturating_add(
+                .saturating_add(allocation(
                     index
                         .levels
                         .capacity()
                         .saturating_mul(std::mem::size_of::<Vec<ProofHash>>()),
-                )
+                ))
         };
-        let mut total = record_bytes(&self.addition_indexes[0].records)
+        let mut total = std::mem::size_of::<ProofLayer>()
+            .saturating_add(ARC_CONTROL_OVERHEAD)
+            .saturating_add(record_bytes(&self.addition_indexes[0].records))
             .saturating_add(record_bytes(&self.removal_indexes[0].records));
         for index in self
             .addition_indexes
