@@ -955,6 +955,8 @@ fn validate_construction_heap_budget(
 
 pub use commitment::{CommitmentState, LayerCommitment, QueryProof};
 
+pub mod argument;
+
 /// Per-layer sidecar payload for the Proof-of-WOQL commitment scheme.
 ///
 /// This module REPLACES the abandoned SHA-256 Merkle sidecar (`ProofLayer` /
@@ -982,7 +984,7 @@ pub mod commitment {
     };
     use dory_pcs::primitives::arithmetic::{Field as DoryField, Group, PairingCurve};
     use dory_pcs::primitives::poly::Polynomial;
-    use dory_pcs::setup::ProverSetup;
+    use dory_pcs::setup::{ProverSetup, VerifierSetup};
     use dory_pcs::Transparent;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -1045,6 +1047,30 @@ pub mod commitment {
         SETUP.get_or_init(|| deterministic_prover_setup(SETUP_MAX_LOG_N))
     }
 
+    /// The single source of truth for the row/column matrix layout of a padded
+    /// column of `2^num_vars` scalars: `sigma = ceil(num_vars/2)` columns-bits,
+    /// `nu = num_vars - sigma` row-bits (so `nu <= sigma`). The flat coefficient
+    /// index is `row * 2^sigma + col`, folded LSB-first, so an evaluation point's
+    /// first `sigma` variables are the column bits and the last `nu` are the row
+    /// bits. The query argument (proof::argument) reuses this so its sumcheck
+    /// point convention matches the committed columns exactly.
+    pub(crate) fn matrix_dims(num_vars: usize) -> (usize, usize) {
+        let sigma = num_vars.div_ceil(2);
+        let nu = num_vars - sigma;
+        (nu, sigma)
+    }
+
+    /// The global deterministic prover setup, for the query argument's openings.
+    pub(crate) fn prover_setup() -> &'static ProverSetup<BN254> {
+        dory_prover_setup()
+    }
+
+    /// The verifier setup derived once from the global prover setup.
+    pub(crate) fn verifier_setup() -> &'static VerifierSetup<BN254> {
+        static VERIFIER_SETUP: OnceLock<VerifierSetup<BN254>> = OnceLock::new();
+        VERIFIER_SETUP.get_or_init(|| dory_prover_setup().to_verifier_setup())
+    }
+
     /// Commit to one dictionary-id column via Dory, returning its succinct GT
     /// (tier-2) commitment. Empty columns get a canonical deterministic empty
     /// commitment (the GT identity).
@@ -1068,8 +1094,7 @@ pub mod commitment {
                 "proof column exceeds the global Dory setup capacity",
             ));
         }
-        let sigma = m.div_ceil(2);
-        let nu = m - sigma;
+        let (nu, sigma) = matrix_dims(m);
         let mut coefficients: Vec<ArkFr> = Vec::with_capacity(padded_len);
         for id in ids {
             coefficients.push(<ArkFr as DoryField>::from_u64(*id));
