@@ -40,6 +40,17 @@ tdb-succinct = "0.1.2"
 sha2 = "0.10"
 libc = "0.2"
 
+# Proof-of-WOQL crypto stack (Phase 1a: validate the dependency stack builds and
+# Dory works end-to-end). `arkworks` feature = pure-CPU arkworks BN254 backend
+# only; NO disk-persistence/GPU/blitzar. dory-pcs 0.4.0 pins the arkworks 0.5.x
+# stack, so the direct ark-* deps below track 0.5 to stay on one source identity.
+dory-pcs = { version = "0.4.0", default-features = false, features = ["arkworks"] }
+ark-bn254 = "0.5"
+ark-ec = "0.5"
+ark-ff = "0.5"
+ark-poly = "0.5"
+ark-serialize = "0.5"
+
 [features]
 noreadlock = []
 eprint_log = []

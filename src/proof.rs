@@ -1742,3 +1742,87 @@ pub mod commitment {
         }
     }
 }
+
+/// Phase 1a smoke test: prove the permissive `dory-pcs` BN254 crypto stack links
+/// and that Dory commit/open/verify works end-to-end (and rejects a tampered
+/// evaluation). This exercises the REAL crate API only; it does not touch
+/// `LayerCommitment`/`CommitmentState` logic, which still carry a placeholder
+/// root. Phase 1b will wire the real column commitment through this API.
+// TODO(proof-of-woql): replace this smoke test with the real per-column Dory
+// commitment inside `proof::commitment` once the wiring lands.
+#[cfg(test)]
+mod dory_smoke {
+    use dory_pcs::backends::arkworks::{
+        ArkFr, ArkworksPolynomial, Blake2bTranscript, G1Routines, G2Routines, BN254,
+    };
+    use dory_pcs::primitives::arithmetic::Field;
+    use dory_pcs::primitives::poly::Polynomial;
+    use dory_pcs::{prove, setup, verify, Transparent};
+
+    #[test]
+    fn dory_commit_open_verify_roundtrip_and_tamper_fails() {
+        // Transparent public-parameter setup, in-memory (the `disk-persistence`
+        // feature is intentionally off, so no URS file is written).
+        let (prover_setup, verifier_setup) = setup::<BN254>(6);
+
+        // Small square layout: nu=2, sigma=2 => 16 dictionary-encoded scalars.
+        let nu = 2usize;
+        let sigma = 2usize;
+        let num_vars = nu + sigma;
+        let poly_size = 1usize << num_vars;
+
+        let coefficients: Vec<ArkFr> = (0..poly_size).map(|_| ArkFr::random()).collect();
+        let poly = ArkworksPolynomial::new(coefficients);
+
+        // Commit to the column vector: tier-2 (GT) is the succinct commitment,
+        // tier-1 are the per-row G1 commitments, commit_blind is 0 in Transparent.
+        let (tier_2, tier_1, commit_blind) = poly
+            .commit::<BN254, Transparent, G1Routines>(nu, sigma, &prover_setup)
+            .expect("dory commit");
+
+        // Open at a random challenge point and produce the evaluation proof.
+        let point: Vec<ArkFr> = (0..num_vars).map(|_| ArkFr::random()).collect();
+        let evaluation = poly.evaluate(&point);
+
+        let mut prover_transcript = Blake2bTranscript::new(b"parture-dory-smoke");
+        let (proof, _blind) = prove::<_, BN254, G1Routines, G2Routines, _, _, Transparent>(
+            &poly,
+            &point,
+            tier_1,
+            commit_blind,
+            nu,
+            sigma,
+            &prover_setup,
+            &mut prover_transcript,
+        )
+        .expect("dory prove");
+
+        // Honest opening verifies (tier_2/GT is Copy; verifier_setup is by-value).
+        let mut verifier_transcript = Blake2bTranscript::new(b"parture-dory-smoke");
+        verify::<_, BN254, G1Routines, G2Routines, _>(
+            tier_2,
+            evaluation,
+            &point,
+            &proof,
+            verifier_setup.clone(),
+            &mut verifier_transcript,
+        )
+        .expect("honest dory opening must verify");
+
+        // Tampering with the claimed evaluation must be rejected.
+        let tampered = evaluation.add(&ArkFr::one());
+        let mut tamper_transcript = Blake2bTranscript::new(b"parture-dory-smoke");
+        assert!(
+            verify::<_, BN254, G1Routines, G2Routines, _>(
+                tier_2,
+                tampered,
+                &point,
+                &proof,
+                verifier_setup,
+                &mut tamper_transcript,
+            )
+            .is_err(),
+            "a tampered evaluation must fail Dory verification"
+        );
+    }
+}
