@@ -64,7 +64,7 @@ fn f1() -> ArkFr {
 /// The two claim shapes the query argument reduces to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClaimShape {
-    /// Prove `Sum_{x in {0,1}^k} G(x) = 0` for `G = prod(factors)`.
+    /// Prove `Sum_{x in {0,1}^k} G(x) = 0` for the claim's expression `G`.
     ZeroSum,
     /// Prove `G(x) = 0` for every `x` on the hypercube, via the standard
     /// zero-check reduction: after the columns are committed, draw a Fiat-Shamir
@@ -72,20 +72,84 @@ pub enum ClaimShape {
     Identity,
 }
 
-/// One claim: a shape plus the indices (into the shared column list) whose
-/// product forms `G`.
+/// A single multilinear operand in a claim expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operand {
+    /// The MLE of committed column `j` (index into the shared column list).
+    Column(usize),
+    /// The MLE of the PUBLIC `chi_n` indicator of `[0, n)` (verifier-derivable;
+    /// never committed). `n` is carried by [`SumcheckShape::chi_n`].
+    ChiN,
+}
+
+/// One term of a claim expression: a public constant `coeff` times a product of
+/// multilinear operands. An empty `operands` list is a pure constant term.
+#[derive(Clone, Debug)]
+pub struct Term {
+    pub coeff: ArkFr,
+    pub operands: Vec<Operand>,
+}
+
+/// A claim expression `G(x) = sum_t coeff_t * prod(operands_t)(x)`. This small
+/// form is enough for products of committed columns (the 2a claims) as well as
+/// the filter claims, which mix committed columns, public constants, and the
+/// public `chi_n` MLE with subtraction.
+#[derive(Clone, Debug)]
+pub struct Expr {
+    pub terms: Vec<Term>,
+}
+
+impl Expr {
+    /// A product of committed columns with coefficient 1 (the 2a claim form).
+    pub fn product(factors: &[usize]) -> Self {
+        Expr {
+            terms: vec![Term {
+                coeff: f1(),
+                operands: factors.iter().map(|&j| Operand::Column(j)).collect(),
+            }],
+        }
+    }
+
+    fn max_arity(&self) -> usize {
+        self.terms
+            .iter()
+            .map(|term| term.operands.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn uses_chi(&self) -> bool {
+        self.terms
+            .iter()
+            .any(|term| term.operands.iter().any(|op| *op == Operand::ChiN))
+    }
+}
+
+/// One claim: a shape plus the expression `G` it constrains.
 #[derive(Clone, Debug)]
 pub struct SumcheckClaim {
     pub shape: ClaimShape,
-    pub factors: Vec<usize>,
+    pub expr: Expr,
+}
+
+impl SumcheckClaim {
+    /// Convenience: a claim whose `G` is a product of committed columns.
+    pub fn product(shape: ClaimShape, factors: &[usize]) -> Self {
+        SumcheckClaim {
+            shape,
+            expr: Expr::product(factors),
+        }
+    }
 }
 
 /// The public description of a batched sumcheck instance (shared by prover and
-/// verifier; contains no witness data).
+/// verifier; contains no witness data). `chi_n` supplies the public real-row
+/// count `n` for any [`Operand::ChiN`] used by the claims.
 #[derive(Clone, Debug)]
 pub struct SumcheckShape {
     pub num_vars: usize,
     pub num_columns: usize,
+    pub chi_n: Option<usize>,
     pub claims: Vec<SumcheckClaim>,
 }
 
@@ -106,11 +170,26 @@ impl SumcheckShape {
             return Err(invalid("sumcheck requires at least one claim"));
         }
         for claim in &self.claims {
-            if claim.factors.is_empty() {
-                return Err(invalid("sumcheck claim needs at least one factor"));
+            if claim.expr.terms.is_empty() {
+                return Err(invalid("sumcheck claim needs at least one term"));
             }
-            if claim.factors.iter().any(|&c| c >= self.num_columns) {
-                return Err(invalid("sumcheck claim references an unknown column"));
+            for term in &claim.expr.terms {
+                for operand in &term.operands {
+                    match operand {
+                        Operand::Column(c) if *c >= self.num_columns => {
+                            return Err(invalid("sumcheck claim references an unknown column"));
+                        }
+                        Operand::ChiN if self.chi_n.is_none() => {
+                            return Err(invalid("claim uses chi_n but no real-row count is set"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(n) = self.chi_n {
+            if n > (1usize << self.num_vars) {
+                return Err(invalid("chi_n real-row count exceeds the hypercube size"));
             }
         }
         Ok(())
@@ -122,12 +201,16 @@ impl SumcheckShape {
             .any(|claim| claim.shape == ClaimShape::Identity)
     }
 
-    /// Per-round univariate degree: the largest product arity across claims,
+    fn uses_chi(&self) -> bool {
+        self.claims.iter().any(|claim| claim.expr.uses_chi())
+    }
+
+    /// Per-round univariate degree: the largest term arity across claims,
     /// counting the extra `eq` factor that identity (zero-check) claims carry.
     fn round_degree(&self) -> usize {
         self.claims
             .iter()
-            .map(|claim| claim.factors.len() + usize::from(claim.shape == ClaimShape::Identity))
+            .map(|claim| claim.expr.max_arity() + usize::from(claim.shape == ClaimShape::Identity))
             .max()
             .unwrap_or(1)
             .max(1)
@@ -170,6 +253,47 @@ fn eq_eval(a: &[ArkFr], b: &[ArkFr]) -> ArkFr {
     a.iter().zip(b.iter()).fold(f1(), |acc, (x, y)| {
         acc * (*x * *y + (f1() - *x) * (f1() - *y))
     })
+}
+
+/// The prover's `chi_n` table: `[1; n] ++ [0; 2^k - n]` (the indicator of the
+/// real rows `[0, n)`), whose multilinear extension the verifier reproduces
+/// closed-form via [`chi_n_eval`].
+fn chi_n_table(k: usize, n: usize) -> Vec<ArkFr> {
+    let size = 1usize << k;
+    let mut table = vec![f0(); size];
+    for slot in table.iter_mut().take(n.min(size)) {
+        *slot = f1();
+    }
+    table
+}
+
+/// Closed-form multilinear extension of the PUBLIC `chi_n` indicator of `[0, n)`
+/// at `point` (LSB-first). Handles `n` that is NOT a power of two, and the
+/// extremes `n = 0` (constant 0) and `n = 2^k` (constant 1). Standard less-than
+/// indicator MLE: walk the bits of `n` from MSB to LSB; each set bit `j`
+/// contributes the dyadic block of indices whose bit `j` is 0 (with the higher
+/// bits fixed to those of `n`), which are all `< n`.
+pub fn chi_n_eval(point: &[ArkFr], n: usize) -> ArkFr {
+    let k = point.len();
+    let size = 1usize << k;
+    if n == 0 {
+        return f0();
+    }
+    if n >= size {
+        return f1();
+    }
+    let mut result = f0();
+    let mut prefix = f1();
+    for j in (0..k).rev() {
+        let rj = point[j];
+        if (n >> j) & 1 == 1 {
+            result = result + prefix * (f1() - rj);
+            prefix = prefix * rj;
+        } else {
+            prefix = prefix * (f1() - rj);
+        }
+    }
+    result
 }
 
 /// Fold a table in place at its current lowest variable: `new[i] =
@@ -227,6 +351,7 @@ fn append_shape(transcript: &mut Transcript254, shape: &SumcheckShape) {
     transcript.append_bytes(LABEL_DOMAIN, b"parture/proof-of-woql/sumcheck/v0");
     transcript.append_bytes(LABEL_SHAPE, &(shape.num_vars as u64).to_le_bytes());
     transcript.append_bytes(LABEL_SHAPE, &(shape.num_columns as u64).to_le_bytes());
+    transcript.append_bytes(LABEL_SHAPE, &(shape.chi_n.unwrap_or(usize::MAX) as u64).to_le_bytes());
     transcript.append_bytes(LABEL_SHAPE, &(shape.claims.len() as u64).to_le_bytes());
     for claim in &shape.claims {
         let tag: u8 = match claim.shape {
@@ -234,9 +359,19 @@ fn append_shape(transcript: &mut Transcript254, shape: &SumcheckShape) {
             ClaimShape::Identity => 1,
         };
         transcript.append_bytes(LABEL_SHAPE, &[tag]);
-        transcript.append_bytes(LABEL_SHAPE, &(claim.factors.len() as u64).to_le_bytes());
-        for &factor in &claim.factors {
-            transcript.append_bytes(LABEL_SHAPE, &(factor as u64).to_le_bytes());
+        transcript.append_bytes(LABEL_SHAPE, &(claim.expr.terms.len() as u64).to_le_bytes());
+        for term in &claim.expr.terms {
+            transcript.append_field(LABEL_SHAPE, &term.coeff);
+            transcript.append_bytes(LABEL_SHAPE, &(term.operands.len() as u64).to_le_bytes());
+            for operand in &term.operands {
+                match operand {
+                    Operand::Column(c) => {
+                        transcript.append_bytes(LABEL_SHAPE, &[0u8]);
+                        transcript.append_bytes(LABEL_SHAPE, &(*c as u64).to_le_bytes());
+                    }
+                    Operand::ChiN => transcript.append_bytes(LABEL_SHAPE, &[1u8]),
+                }
+            }
         }
     }
 }
@@ -291,6 +426,11 @@ pub fn prove_sumcheck(
     } else {
         Vec::new()
     };
+    let mut chi = if shape.uses_chi() {
+        chi_n_table(k, shape.chi_n.expect("chi_n present when used"))
+    } else {
+        Vec::new()
+    };
 
     let mut round_polys = Vec::with_capacity(k);
     let mut r = Vec::with_capacity(k);
@@ -300,18 +440,29 @@ pub fn prove_sumcheck(
         for (x, slot) in poly.iter_mut().enumerate() {
             let x_field = ArkFr::from_u64(x as u64);
             let one_minus = f1() - x_field;
+            // Fold-to-X value of a table at hypercube pair `i`.
+            let at = |table: &[ArkFr], i: usize| table[2 * i] * one_minus + table[2 * i + 1] * x_field;
             let mut acc = f0();
             for i in 0..half {
                 for (j, claim) in shape.claims.iter().enumerate() {
-                    let mut term = rhos[j];
-                    if claim.shape == ClaimShape::Identity {
-                        term = term * (eq[2 * i] * one_minus + eq[2 * i + 1] * x_field);
+                    let eq_factor = if claim.shape == ClaimShape::Identity {
+                        at(&eq, i)
+                    } else {
+                        f1()
+                    };
+                    let mut expr_val = f0();
+                    for term in &claim.expr.terms {
+                        let mut prod = term.coeff;
+                        for operand in &term.operands {
+                            prod = prod
+                                * match operand {
+                                    Operand::Column(c) => at(&tables[*c], i),
+                                    Operand::ChiN => at(&chi, i),
+                                };
+                        }
+                        expr_val = expr_val + prod;
                     }
-                    for &c in &claim.factors {
-                        term = term
-                            * (tables[c][2 * i] * one_minus + tables[c][2 * i + 1] * x_field);
-                    }
-                    acc = acc + term;
+                    acc = acc + rhos[j] * eq_factor * expr_val;
                 }
             }
             *slot = acc;
@@ -326,6 +477,9 @@ pub fn prove_sumcheck(
         }
         if shape.has_identity() {
             fold_table(&mut eq, challenge);
+        }
+        if shape.uses_chi() {
+            fold_table(&mut chi, challenge);
         }
         round_polys.push(poly);
         r.push(challenge);
@@ -382,17 +536,29 @@ pub fn verify_sumcheck(
     }
 
     // Final check: the sumcheck's reduced value must equal the batched claim
-    // rebuilt from the claimed column evaluations at r.
+    // rebuilt from the claimed column evaluations at r, the public chi_n(r), and
+    // the public constants baked into the claim expressions.
+    let chi_at_r = shape.chi_n.map(|n| chi_n_eval(&r, n));
     let mut expected = f0();
     for (j, claim) in shape.claims.iter().enumerate() {
-        let mut term = rhos[j];
-        if claim.shape == ClaimShape::Identity {
-            term = term * eq_eval(&r_zc, &r);
+        let eq_factor = if claim.shape == ClaimShape::Identity {
+            eq_eval(&r_zc, &r)
+        } else {
+            f1()
+        };
+        let mut expr_val = f0();
+        for term in &claim.expr.terms {
+            let mut prod = term.coeff;
+            for operand in &term.operands {
+                prod = prod
+                    * match operand {
+                        Operand::Column(c) => proof.claimed_evals[*c],
+                        Operand::ChiN => chi_at_r.expect("chi_n present when used"),
+                    };
+            }
+            expr_val = expr_val + prod;
         }
-        for &c in &claim.factors {
-            term = term * proof.claimed_evals[c];
-        }
-        expected = expected + term;
+        expected = expected + rhos[j] * eq_factor * expr_val;
     }
     if expected != current {
         return Err(invalid("sumcheck final evaluation check failed"));
@@ -407,8 +573,6 @@ pub fn verify_sumcheck(
 
 /// Commit to a raw column (length `2^k`) with the global deterministic setup,
 /// returning its succinct GT (tier-2) commitment. Uses the shared matrix layout.
-// Exercised by the glue tests here; later phases open real LayerCommitment columns.
-#[allow(dead_code)]
 pub(crate) fn commit_column(column: &[ArkFr]) -> io::Result<ArkGT> {
     let (nu, sigma) = column_dims(column.len())?;
     let poly = ArkworksPolynomial::new(column.to_vec());
@@ -532,6 +696,24 @@ mod tests {
     }
 
     #[test]
+    fn chi_n_closed_form_matches_table_mle_including_non_power_of_two() {
+        // The verifier's closed-form chi_n(r) must equal the MLE of the prover's
+        // [1;n]++[0;N-n] table for EVERY n in 0..=N, including non-powers-of-two.
+        for k in 1..=6 {
+            let n_max = 1usize << k;
+            let point: Vec<ArkFr> = (0..k).map(|j| fr(7 * j as u64 + 3)).collect();
+            for n in 0..=n_max {
+                let table = chi_n_table(k, n);
+                assert_eq!(
+                    chi_n_eval(&point, n),
+                    mle_full_eval(&table, &point),
+                    "chi_n mismatch at k={k}, n={n}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn zero_sum_and_identity_roundtrip_for_k_4_to_10() {
         for k in 4..=10 {
             // ZeroSum over a single column that sums to zero, plus a product
@@ -553,19 +735,11 @@ mod tests {
             let shape = SumcheckShape {
                 num_vars: k,
                 num_columns: columns.len(),
+                chi_n: None,
                 claims: vec![
-                    SumcheckClaim {
-                        shape: ClaimShape::ZeroSum,
-                        factors: vec![0],
-                    },
-                    SumcheckClaim {
-                        shape: ClaimShape::ZeroSum,
-                        factors: vec![3, 1], // sum_x d(x)*b(x) == 0
-                    },
-                    SumcheckClaim {
-                        shape: ClaimShape::Identity,
-                        factors: vec![4], // zero column is zero everywhere
-                    },
+                    SumcheckClaim::product(ClaimShape::ZeroSum, &[0]),
+                    SumcheckClaim::product(ClaimShape::ZeroSum, &[3, 1]), // sum_x d*b == 0
+                    SumcheckClaim::product(ClaimShape::Identity, &[4]), // zero column
                 ],
             };
 
@@ -591,10 +765,8 @@ mod tests {
         let shape = SumcheckShape {
             num_vars: k,
             num_columns: 1,
-            claims: vec![SumcheckClaim {
-                shape: ClaimShape::ZeroSum,
-                factors: vec![0],
-            }],
+            chi_n: None,
+            claims: vec![SumcheckClaim::product(ClaimShape::ZeroSum, &[0])],
         };
         let mut pt = transcript();
         let (mut proof, _, _) = prove_sumcheck(&shape, &[a], &mut pt).unwrap();
@@ -610,10 +782,8 @@ mod tests {
         let shape = SumcheckShape {
             num_vars: k,
             num_columns: 1,
-            claims: vec![SumcheckClaim {
-                shape: ClaimShape::ZeroSum,
-                factors: vec![0],
-            }],
+            chi_n: None,
+            claims: vec![SumcheckClaim::product(ClaimShape::ZeroSum, &[0])],
         };
         let mut pt = transcript();
         let (mut proof, _, _) = prove_sumcheck(&shape, &[a], &mut pt).unwrap();
@@ -631,10 +801,8 @@ mod tests {
         let shape = SumcheckShape {
             num_vars: k,
             num_columns: 1,
-            claims: vec![SumcheckClaim {
-                shape: ClaimShape::Identity,
-                factors: vec![0],
-            }],
+            chi_n: None,
+            claims: vec![SumcheckClaim::product(ClaimShape::Identity, &[0])],
         };
         let mut pt = transcript();
         let (proof, _, _) = prove_sumcheck(&shape, &[nonzero], &mut pt).unwrap();
@@ -669,10 +837,8 @@ mod tests {
         let shape = SumcheckShape {
             num_vars: k,
             num_columns: 1,
-            claims: vec![SumcheckClaim {
-                shape: ClaimShape::ZeroSum,
-                factors: vec![0],
-            }],
+            chi_n: None,
+            claims: vec![SumcheckClaim::product(ClaimShape::ZeroSum, &[0])],
         };
 
         // Prover: bind the commitment, run sumcheck, open at r.
