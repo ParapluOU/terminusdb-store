@@ -958,6 +958,7 @@ pub use commitment::{CommitmentState, LayerCommitment, QueryProof};
 pub mod argument;
 pub mod filter;
 pub mod logup;
+pub mod query;
 
 /// Per-layer sidecar payload for the Proof-of-WOQL commitment scheme.
 ///
@@ -1507,6 +1508,15 @@ pub mod commitment {
             };
             layer.validate()?;
             Ok(layer)
+        }
+
+        /// Recompute the `commitment_root` binding purely from the state counts,
+        /// parent root, and the six column commitments (independent of the raw
+        /// tables). A query verifier trusts a layer's `commitment_root`, and calls
+        /// this to confirm the `column_commitments` it is about to open are exactly
+        /// the ones that root authenticates.
+        pub fn recomputed_commitment_root(&self) -> io::Result<ProofHash> {
+            self.compute_commitment_root()
         }
 
         /// The commitment root binds the parent root, the six counts, and the

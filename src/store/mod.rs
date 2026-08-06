@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, ValueTriple};
-use crate::proof::{CommitmentState, ProofHash, QueryProof, TriplePattern};
+use crate::proof::{CommitmentState, LayerCommitment, ProofHash, QueryProof, TriplePattern};
 use crate::storage::archive::{ArchiveLayerStore, DirectoryArchiveBackend, LruArchiveBackend};
 use crate::storage::directory::{DirectoryLabelStore, DirectoryLayerStore};
 use crate::storage::memory::{MemoryLabelStore, MemoryLayerStore};
@@ -334,6 +334,13 @@ impl StoreLayer {
             .proof_layer(self.layer.name())
             .await?
             .map(|proof| proof.state.clone()))
+    }
+
+    /// Load the full authenticated commitment (column commitments + state) for
+    /// this exact logical layer, e.g. to prove/verify a query argument against
+    /// the layer's committed columns.
+    pub async fn proof_commitment(&self) -> io::Result<Option<Arc<LayerCommitment>>> {
+        self.store.layer_store.proof_layer(self.layer.name()).await
     }
 
     /// Explicitly migrate this legacy layer and every legacy ancestor once.

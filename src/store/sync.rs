@@ -12,7 +12,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, ValueTriple};
-use crate::proof::{CommitmentState, ProofHash, QueryProof, TriplePattern};
+use std::sync::Arc;
+
+use crate::proof::{CommitmentState, LayerCommitment, ProofHash, QueryProof, TriplePattern};
 use crate::storage::PackImportLimits;
 use crate::store::{
     open_directory_store, open_memory_store, NamedGraph, Store, StoreLayer, StoreLayerBuilder,
@@ -149,6 +151,10 @@ impl SyncStoreLayer {
 
     pub fn proof_state(&self) -> io::Result<Option<CommitmentState>> {
         task_sync(self.inner.proof_state())
+    }
+
+    pub fn proof_commitment(&self) -> io::Result<Option<Arc<LayerCommitment>>> {
+        task_sync(self.inner.proof_commitment())
     }
 
     pub fn migrate_proof_chain(&self) -> io::Result<CommitmentState> {
