@@ -87,8 +87,17 @@ pub struct SortedProof {
 }
 
 /// The padded power-of-two domain for a column with `n` real rows (`>= 2`).
+#[allow(dead_code)]
 pub(crate) fn sort_domain(n: usize) -> io::Result<usize> {
-    n.checked_next_power_of_two()
+    column_domain(n, n)
+}
+
+/// The padded power-of-two domain (`>= 2`) large enough for a column of `len`
+/// entries with `n` real rows. When the caller already padded to a power-of-two
+/// `len` (e.g. a shared cross-gadget domain), that `len` is used as-is.
+fn column_domain(len: usize, n: usize) -> io::Result<usize> {
+    len.max(n)
+        .checked_next_power_of_two()
         .ok_or_else(|| invalid("sort domain size overflow"))
         .map(|d| d.max(2))
 }
@@ -231,7 +240,7 @@ pub(crate) fn prove_strictly_sorted_with_witness(
     bit_columns: &[Vec<ArkFr>],
     transcript: &mut Transcript254,
 ) -> io::Result<SortedProof> {
-    let n_domain = sort_domain(n)?;
+    let n_domain = column_domain(u.len(), n)?;
     if u.len() > n_domain || n > n_domain {
         return Err(invalid("sorted column longer than its domain"));
     }
@@ -326,7 +335,7 @@ pub fn prove_strictly_sorted(
     com_u: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<SortedProof> {
-    let n_domain = sort_domain(n)?;
+    let n_domain = column_domain(u.len(), n)?;
     let (u_shift, mult_c, bit_columns) = honest_witness(u, n, n_domain);
     prove_strictly_sorted_with_witness(u, n, com_u, &u_shift, &mult_c, &bit_columns, transcript)
 }

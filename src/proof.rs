@@ -963,6 +963,7 @@ pub mod gather;
 pub mod join;
 pub mod logup;
 pub mod membership;
+pub mod pairs;
 pub mod query;
 pub mod sort;
 
