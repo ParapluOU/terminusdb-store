@@ -957,6 +957,7 @@ pub use commitment::{CommitmentState, LayerCommitment, QueryProof};
 
 pub mod argument;
 pub mod filter;
+pub mod logup;
 
 /// Per-layer sidecar payload for the Proof-of-WOQL commitment scheme.
 ///

@@ -77,9 +77,10 @@ pub enum ClaimShape {
 pub enum Operand {
     /// The MLE of committed column `j` (index into the shared column list).
     Column(usize),
-    /// The MLE of the PUBLIC `chi_n` indicator of `[0, n)` (verifier-derivable;
-    /// never committed). `n` is carried by [`SumcheckShape::chi_n`].
-    ChiN,
+    /// The MLE of the PUBLIC prefix indicator of `[0, chi_bounds[b])`
+    /// (verifier-derivable; never committed). The bound is carried by
+    /// [`SumcheckShape::chi_bounds`]`[b]`.
+    Chi(usize),
 }
 
 /// One term of a claim expression: a public constant `coeff` times a product of
@@ -117,12 +118,6 @@ impl Expr {
             .max()
             .unwrap_or(0)
     }
-
-    fn uses_chi(&self) -> bool {
-        self.terms
-            .iter()
-            .any(|term| term.operands.iter().any(|op| *op == Operand::ChiN))
-    }
 }
 
 /// One claim: a shape plus the expression `G` it constrains.
@@ -143,13 +138,14 @@ impl SumcheckClaim {
 }
 
 /// The public description of a batched sumcheck instance (shared by prover and
-/// verifier; contains no witness data). `chi_n` supplies the public real-row
-/// count `n` for any [`Operand::ChiN`] used by the claims.
+/// verifier; contains no witness data). `chi_bounds` supplies the public prefix
+/// bounds for any [`Operand::Chi`] used by the claims (e.g. `[n, m]` for the
+/// filter's real-row count and the compaction's output length).
 #[derive(Clone, Debug)]
 pub struct SumcheckShape {
     pub num_vars: usize,
     pub num_columns: usize,
-    pub chi_n: Option<usize>,
+    pub chi_bounds: Vec<usize>,
     pub claims: Vec<SumcheckClaim>,
 }
 
@@ -179,18 +175,20 @@ impl SumcheckShape {
                         Operand::Column(c) if *c >= self.num_columns => {
                             return Err(invalid("sumcheck claim references an unknown column"));
                         }
-                        Operand::ChiN if self.chi_n.is_none() => {
-                            return Err(invalid("claim uses chi_n but no real-row count is set"));
+                        Operand::Chi(b) if *b >= self.chi_bounds.len() => {
+                            return Err(invalid("claim uses an undefined chi bound"));
                         }
                         _ => {}
                     }
                 }
             }
         }
-        if let Some(n) = self.chi_n {
-            if n > (1usize << self.num_vars) {
-                return Err(invalid("chi_n real-row count exceeds the hypercube size"));
-            }
+        if self
+            .chi_bounds
+            .iter()
+            .any(|&bound| bound > (1usize << self.num_vars))
+        {
+            return Err(invalid("chi bound exceeds the hypercube size"));
         }
         Ok(())
     }
@@ -199,10 +197,6 @@ impl SumcheckShape {
         self.claims
             .iter()
             .any(|claim| claim.shape == ClaimShape::Identity)
-    }
-
-    fn uses_chi(&self) -> bool {
-        self.claims.iter().any(|claim| claim.expr.uses_chi())
     }
 
     /// Per-round univariate degree: the largest term arity across claims,
@@ -351,7 +345,10 @@ fn append_shape(transcript: &mut Transcript254, shape: &SumcheckShape) {
     transcript.append_bytes(LABEL_DOMAIN, b"parture/proof-of-woql/sumcheck/v0");
     transcript.append_bytes(LABEL_SHAPE, &(shape.num_vars as u64).to_le_bytes());
     transcript.append_bytes(LABEL_SHAPE, &(shape.num_columns as u64).to_le_bytes());
-    transcript.append_bytes(LABEL_SHAPE, &(shape.chi_n.unwrap_or(usize::MAX) as u64).to_le_bytes());
+    transcript.append_bytes(LABEL_SHAPE, &(shape.chi_bounds.len() as u64).to_le_bytes());
+    for bound in &shape.chi_bounds {
+        transcript.append_bytes(LABEL_SHAPE, &(*bound as u64).to_le_bytes());
+    }
     transcript.append_bytes(LABEL_SHAPE, &(shape.claims.len() as u64).to_le_bytes());
     for claim in &shape.claims {
         let tag: u8 = match claim.shape {
@@ -369,7 +366,10 @@ fn append_shape(transcript: &mut Transcript254, shape: &SumcheckShape) {
                         transcript.append_bytes(LABEL_SHAPE, &[0u8]);
                         transcript.append_bytes(LABEL_SHAPE, &(*c as u64).to_le_bytes());
                     }
-                    Operand::ChiN => transcript.append_bytes(LABEL_SHAPE, &[1u8]),
+                    Operand::Chi(b) => {
+                        transcript.append_bytes(LABEL_SHAPE, &[1u8]);
+                        transcript.append_bytes(LABEL_SHAPE, &(*b as u64).to_le_bytes());
+                    }
                 }
             }
         }
@@ -426,11 +426,11 @@ pub fn prove_sumcheck(
     } else {
         Vec::new()
     };
-    let mut chi = if shape.uses_chi() {
-        chi_n_table(k, shape.chi_n.expect("chi_n present when used"))
-    } else {
-        Vec::new()
-    };
+    let mut chi_tables: Vec<Vec<ArkFr>> = shape
+        .chi_bounds
+        .iter()
+        .map(|&bound| chi_n_table(k, bound))
+        .collect();
 
     let mut round_polys = Vec::with_capacity(k);
     let mut r = Vec::with_capacity(k);
@@ -457,7 +457,7 @@ pub fn prove_sumcheck(
                             prod = prod
                                 * match operand {
                                     Operand::Column(c) => at(&tables[*c], i),
-                                    Operand::ChiN => at(&chi, i),
+                                    Operand::Chi(b) => at(&chi_tables[*b], i),
                                 };
                         }
                         expr_val = expr_val + prod;
@@ -478,8 +478,8 @@ pub fn prove_sumcheck(
         if shape.has_identity() {
             fold_table(&mut eq, challenge);
         }
-        if shape.uses_chi() {
-            fold_table(&mut chi, challenge);
+        for chi in chi_tables.iter_mut() {
+            fold_table(chi, challenge);
         }
         round_polys.push(poly);
         r.push(challenge);
@@ -536,9 +536,13 @@ pub fn verify_sumcheck(
     }
 
     // Final check: the sumcheck's reduced value must equal the batched claim
-    // rebuilt from the claimed column evaluations at r, the public chi_n(r), and
-    // the public constants baked into the claim expressions.
-    let chi_at_r = shape.chi_n.map(|n| chi_n_eval(&r, n));
+    // rebuilt from the claimed column evaluations at r, the public chi(r) values,
+    // and the public constants baked into the claim expressions.
+    let chi_at_r: Vec<ArkFr> = shape
+        .chi_bounds
+        .iter()
+        .map(|&bound| chi_n_eval(&r, bound))
+        .collect();
     let mut expected = f0();
     for (j, claim) in shape.claims.iter().enumerate() {
         let eq_factor = if claim.shape == ClaimShape::Identity {
@@ -553,7 +557,7 @@ pub fn verify_sumcheck(
                 prod = prod
                     * match operand {
                         Operand::Column(c) => proof.claimed_evals[*c],
-                        Operand::ChiN => chi_at_r.expect("chi_n present when used"),
+                        Operand::Chi(b) => chi_at_r[*b],
                     };
             }
             expr_val = expr_val + prod;
@@ -735,7 +739,7 @@ mod tests {
             let shape = SumcheckShape {
                 num_vars: k,
                 num_columns: columns.len(),
-                chi_n: None,
+                chi_bounds: Vec::new(),
                 claims: vec![
                     SumcheckClaim::product(ClaimShape::ZeroSum, &[0]),
                     SumcheckClaim::product(ClaimShape::ZeroSum, &[3, 1]), // sum_x d*b == 0
@@ -765,7 +769,7 @@ mod tests {
         let shape = SumcheckShape {
             num_vars: k,
             num_columns: 1,
-            chi_n: None,
+            chi_bounds: Vec::new(),
             claims: vec![SumcheckClaim::product(ClaimShape::ZeroSum, &[0])],
         };
         let mut pt = transcript();
@@ -782,7 +786,7 @@ mod tests {
         let shape = SumcheckShape {
             num_vars: k,
             num_columns: 1,
-            chi_n: None,
+            chi_bounds: Vec::new(),
             claims: vec![SumcheckClaim::product(ClaimShape::ZeroSum, &[0])],
         };
         let mut pt = transcript();
@@ -801,7 +805,7 @@ mod tests {
         let shape = SumcheckShape {
             num_vars: k,
             num_columns: 1,
-            chi_n: None,
+            chi_bounds: Vec::new(),
             claims: vec![SumcheckClaim::product(ClaimShape::Identity, &[0])],
         };
         let mut pt = transcript();
@@ -837,7 +841,7 @@ mod tests {
         let shape = SumcheckShape {
             num_vars: k,
             num_columns: 1,
-            chi_n: None,
+            chi_bounds: Vec::new(),
             claims: vec![SumcheckClaim::product(ClaimShape::ZeroSum, &[0])],
         };
 
