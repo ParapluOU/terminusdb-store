@@ -958,6 +958,7 @@ pub use commitment::{CommitmentState, LayerCommitment, QueryProof};
 pub mod argument;
 pub mod dict;
 pub mod filter;
+pub mod join;
 pub mod logup;
 pub mod query;
 
