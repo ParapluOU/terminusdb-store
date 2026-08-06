@@ -26,8 +26,15 @@ use dory_pcs::primitives::transcript::Transcript;
 use super::argument::Transcript254;
 use super::commitment::LayerCommitment;
 use super::dict::{hash_term, prove_dict_membership, verify_dict_membership, DictProof};
-use super::filter::{prove_filter, verify_filter, FullFilterProof};
+use super::filter::{
+    compact_selected, honest_witness, prove_filter, verify_filter, FullFilterProof,
+};
 use super::invalid;
+use super::join::{
+    compute_self_join, prove_self_join_complete, self_join_commitments, self_join_domain,
+    verify_self_join_complete, SelfJoinCommitments, SelfJoinCompleteProof,
+};
+use super::relocate::{prove_column_relocation, verify_column_relocation, RelocationProof};
 
 const QUERY_DOMAIN: &[u8] = b"parture/proof-of-woql/q1-query-by-iri/v0";
 
@@ -226,6 +233,247 @@ pub fn verify_layer_filter(
     )
 }
 
+// ===========================================================================
+// Q2: 2-atom graph-pattern query t(?x, <P>, ?y), t(?y, <P>, ?z) end-to-end.
+// ===========================================================================
+
+const GRAPH2_DOMAIN: &[u8] = b"parture/proof-of-woql/q2-graph-pattern2-by-iri/v0";
+
+fn pad(v: &[ArkFr], n: usize) -> Vec<ArkFr> {
+    let mut out = v.to_vec();
+    out.resize(n, f0());
+    out
+}
+
+/// A complete 2-atom graph-pattern proof, composed under one shared transcript and
+/// anchored to `commitment_root`:
+///   * `membership` — Q3 dictionary binding of the predicate IRI to its id.
+///   * `filter` (+ `com_sout`/`com_oout`) — Q1 complete filter of the layer by that
+///     id into `F = (Sf, Of)` = the predicate-P `(subject, object)` pairs, committed
+///     at the TABLE domain and root-anchored via the filter argument.
+///   * `relocate_s`/`relocate_o` — cross-domain equality tying the filter output
+///     (table domain) to the self-join input `Sf`/`Of` (join domain), positionally.
+///   * `join` (+ `join_commitments`) — the complete self-join of `F` on `Of == Sf`
+///     into `(X, Y, Z)`.
+/// `n_f`/`n_u` are the (sub-proof-pinned) filter-result count and distinct-key count,
+/// carried so the verifier can re-derive the join domain.
+#[derive(Clone, Debug)]
+pub struct GraphPattern2Proof {
+    pub membership: DictProof,
+    pub filter: FullFilterProof,
+    pub com_sout: ArkGT,
+    pub com_oout: ArkGT,
+    pub relocate_s: RelocationProof,
+    pub relocate_o: RelocationProof,
+    pub join: SelfJoinCompleteProof,
+    pub join_commitments: SelfJoinCommitments,
+    pub n_f: usize,
+    pub n_u: usize,
+}
+
+/// Prove the COMPLETE result of the 2-atom graph pattern
+/// `t(?x, <predicate_term>, ?y), t(?y, <predicate_term>, ?z)` against a materialized
+/// base layer: every `(x, y, z)` such that `(x, y)` and `(y, z)` are both triples
+/// with predicate `<predicate_term>`. Composes, under one shared transcript anchored
+/// to `commitment_root`: Q3 dict binding (IRI -> id) + Q1 complete filter (id -> F) +
+/// cross-domain relocation (F -> join input) + the complete self-join (F -> result).
+/// Returns the combined proof, the result commitments `(Com X, Com Y, Com Z)`, the
+/// result length `m_J`, and the REVEALED resolved id (authenticated by membership).
+pub fn prove_layer_graph_pattern2(
+    layer: &LayerCommitment,
+    predicate_term: &[u8],
+) -> io::Result<(GraphPattern2Proof, ArkGT, ArkGT, ArkGT, usize, u64)> {
+    let (s, p, o, n) = base_layer_columns(layer)?;
+    let predicate_id = resolve_predicate_id(layer, predicate_term)?;
+
+    let (dict_hash, dict_id) = layer.predicate_dictionary_columns()?;
+    let com_dict_hash = layer.predicate_dict_commitments.0;
+    let com_dict_id = layer.predicate_dict_commitments.1;
+
+    let mut transcript = Transcript254::new(GRAPH2_DOMAIN);
+    bind_statement(&mut transcript, layer, predicate_term, predicate_id);
+
+    // (1) Q3 membership: (hash_term(IRI), id) is a genuine dictionary row.
+    let q_hash = hash_term(predicate_term);
+    let id = ArkFr::from_u64(predicate_id);
+    let membership = prove_dict_membership(
+        &dict_hash,
+        &dict_id,
+        &com_dict_hash,
+        &com_dict_id,
+        q_hash,
+        id,
+        &mut transcript,
+    )?;
+
+    // (2) Q1 complete filter: F = (Sf, Of) = the predicate-P (subject, object) pairs.
+    let com_s = layer.column_commitments[0];
+    let com_p = layer.column_commitments[1];
+    let com_o = layer.column_commitments[2];
+    let pred = ArkFr::from_u64(predicate_id);
+    let (filter, com_sout, com_oout, m) =
+        prove_filter(&s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript)?;
+    // Recompute the dense filter output (same witness prove_filter used) to obtain the
+    // F columns; `s_out`/`o_out` are length `2^a` (table domain), dense in `[0, m)`.
+    let (sel, _w) = honest_witness(&p, pred, n);
+    let (s_out, o_out, _m) = compact_selected(&s, &o, &sel);
+    let sf = &s_out[..m];
+    let of = &o_out[..m];
+
+    // (3) Complete self-join of F on Of == Sf, committed at the join domain.
+    let (x, y, z, rho_l, rho_r, u, w_l, w_r, m_j) = compute_self_join(sf, of);
+    let n_u = u.len();
+    let n_join = self_join_domain(m, m_j, n_u)?;
+    let jcom =
+        self_join_commitments(sf, of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r)?;
+
+    // (4) Relocate F from the table domain to the join domain (positional equality).
+    let target_sf = pad(sf, n_join);
+    let target_of = pad(of, n_join);
+    let relocate_s =
+        prove_column_relocation(&s_out, &com_sout, &target_sf, &jcom.sf, &mut transcript)?;
+    let relocate_o =
+        prove_column_relocation(&o_out, &com_oout, &target_of, &jcom.of, &mut transcript)?;
+
+    // (5) The complete self-join argument over the relocated F.
+    let join = prove_self_join_complete(
+        sf, of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, m_j, &jcom, &mut transcript,
+    )?;
+
+    let (com_x, com_y, com_z) = (jcom.x, jcom.y, jcom.z);
+    let proof = GraphPattern2Proof {
+        membership,
+        filter,
+        com_sout,
+        com_oout,
+        relocate_s,
+        relocate_o,
+        join,
+        join_commitments: jcom,
+        n_f: m,
+        n_u,
+    };
+    Ok((proof, com_x, com_y, com_z, m_j, predicate_id))
+}
+
+/// Verify a 2-atom graph-pattern proof. Anchors to `commitment_root`; re-derives the
+/// join domain from the proof's pinned `n_F`/`n_U` and the public `m_J`; checks the
+/// caller's result commitments are the proof's join output; then re-runs, under the
+/// shared transcript in prover order: dict membership (IRI -> revealed id), the
+/// complete filter (id -> F), the two cross-domain relocations (F -> join input), and
+/// the complete self-join (F -> result). Concludes `(Com X, Com Y, Com Z)` is EXACTLY
+/// the complete result of `t(?x, <IRI>, ?y), t(?y, <IRI>, ?z)`, without rerunning it.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_layer_graph_pattern2(
+    layer: &LayerCommitment,
+    predicate_term: &[u8],
+    predicate_id: u64,
+    com_x: &ArkGT,
+    com_y: &ArkGT,
+    com_z: &ArkGT,
+    m_j: usize,
+    proof: &GraphPattern2Proof,
+) -> io::Result<()> {
+    if layer.recomputed_commitment_root()? != layer.state.commitment_root {
+        return Err(invalid(
+            "layer commitment_root does not bind its committed columns/dictionary",
+        ));
+    }
+    if layer.state.removal_count != 0 {
+        return Err(invalid(
+            "layer graph-pattern query requires a materialized base layer (no removals)",
+        ));
+    }
+    let n = layer.state.addition_count as usize;
+    let padded = padded_len(n)?;
+    let a = padded.trailing_zeros() as usize;
+    if proof.filter.sumcheck.round_polys.len() != a {
+        return Err(invalid(
+            "proof dimension does not match the layer's committed columns",
+        ));
+    }
+
+    // The caller's result commitments must be the proof's committed join output.
+    if proof.join_commitments.x != *com_x
+        || proof.join_commitments.y != *com_y
+        || proof.join_commitments.z != *com_z
+    {
+        return Err(invalid(
+            "result commitments do not match the proof's join output",
+        ));
+    }
+
+    // Re-derive the join domain from the pinned filter-result / distinct-key counts.
+    let n_f = proof.n_f;
+    let n_u = proof.n_u;
+    if n_f > padded {
+        return Err(invalid("filter result length exceeds the table domain"));
+    }
+    let n_join = self_join_domain(n_f, m_j, n_u)?;
+    let b = n_join.trailing_zeros() as usize;
+
+    let mut transcript = Transcript254::new(GRAPH2_DOMAIN);
+    bind_statement(&mut transcript, layer, predicate_term, predicate_id);
+
+    // (1) Membership: the revealed id is authentic for this IRI.
+    let q_hash = hash_term(predicate_term);
+    let id = ArkFr::from_u64(predicate_id);
+    verify_dict_membership(
+        &layer.predicate_dict_commitments.0,
+        &layer.predicate_dict_commitments.1,
+        q_hash,
+        id,
+        &proof.membership,
+        &mut transcript,
+    )?;
+
+    // (2) Filter: F = (S_out, O_out) is the complete predicate-P result (length n_F).
+    let com_s = layer.column_commitments[0];
+    let com_p = layer.column_commitments[1];
+    let com_o = layer.column_commitments[2];
+    let pred = ArkFr::from_u64(predicate_id);
+    verify_filter(
+        &com_s,
+        &com_p,
+        &com_o,
+        pred,
+        n,
+        &proof.com_sout,
+        &proof.com_oout,
+        n_f,
+        &proof.filter,
+        &mut transcript,
+    )?;
+
+    // (3) Relocate: the filter output equals the join input Sf/Of, positionally.
+    verify_column_relocation(
+        &proof.com_sout,
+        a,
+        &proof.join_commitments.sf,
+        b,
+        &proof.relocate_s,
+        &mut transcript,
+    )?;
+    verify_column_relocation(
+        &proof.com_oout,
+        a,
+        &proof.join_commitments.of,
+        b,
+        &proof.relocate_o,
+        &mut transcript,
+    )?;
+
+    // (4) Complete self-join of F -> (X, Y, Z).
+    verify_self_join_complete(
+        &proof.join_commitments,
+        n_f,
+        n_u,
+        m_j,
+        &proof.join,
+        &mut transcript,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +608,113 @@ mod tests {
         let (head, _) = child.commit_with_proof().unwrap();
         let lc = head.proof_commitment().unwrap().unwrap();
         assert!(prove_layer_filter(&lc, P1).is_err());
+    }
+
+    // ---- Q2: 2-atom graph-pattern (self-join) end-to-end ----
+
+    const KNOWS: &[u8] = b"http://ex/knows";
+
+    // Independently recompute the complete 2-hop result for a predicate id, from the
+    // layer's additions in stored order (matching the filter output's F ordering).
+    fn expected_join(
+        lc: &LayerCommitment,
+        pred_id: u64,
+    ) -> (Vec<ArkFr>, Vec<ArkFr>, Vec<ArkFr>, usize, usize) {
+        let mut sf = Vec::new();
+        let mut of = Vec::new();
+        for record in &lc.additions {
+            if record.predicate_id == pred_id {
+                sf.push(ArkFr::from_u64(record.subject_id));
+                of.push(ArkFr::from_u64(record.object_id));
+            }
+        }
+        let (x, y, z, _rl, _rr, u, _wl, _wr, m_j) = compute_self_join(&sf, &of);
+        let n_join = self_join_domain(sf.len(), m_j, u.len()).unwrap();
+        (x, y, z, n_join, m_j)
+    }
+
+    #[test]
+    fn graph_pattern2_two_hop_knows_paths_end_to_end() {
+        // knows: a->b, b->c, c->d, a->e (e a sink). 2-hop paths (x->y->z): (a,b,c) and
+        // (b,c,d). One unrelated "likes" edge exercises the filter's predicate isolation.
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("c", "knows", "d"),
+            ("a", "knows", "e"),
+            ("a", "likes", "zz"),
+        ]);
+        let (proof, com_x, com_y, com_z, m_j, id) =
+            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        // Verifier sees ONLY the IRI + revealed id + result commitments.
+        verify_layer_graph_pattern2(&lc, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
+
+        // Result is EXACTLY the two 2-hop paths (count + contents).
+        assert_eq!(m_j, 2);
+        let (x, y, z, n_join, exp_m) = expected_join(&lc, id);
+        assert_eq!(exp_m, m_j);
+        assert_eq!(commit_column(&pad(&x, n_join)).unwrap(), com_x);
+        assert_eq!(commit_column(&pad(&y, n_join)).unwrap(), com_y);
+        assert_eq!(commit_column(&pad(&z, n_join)).unwrap(), com_z);
+    }
+
+    #[test]
+    fn graph_pattern2_mismatched_result_or_count_is_rejected() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c"), ("c", "knows", "d")]);
+        let (proof, com_x, com_y, com_z, m_j, id) =
+            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        // Wrong result commitment (pass Com Z for Com X) -> mismatch with proof output.
+        assert!(
+            verify_layer_graph_pattern2(&lc, KNOWS, id, &com_z, &com_y, &com_z, m_j, &proof)
+                .is_err()
+        );
+        // Wrong claimed count.
+        assert!(
+            verify_layer_graph_pattern2(&lc, KNOWS, id, &com_x, &com_y, &com_z, m_j + 1, &proof)
+                .is_err()
+        );
+        // Honest verifies.
+        verify_layer_graph_pattern2(&lc, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
+    }
+
+    #[test]
+    fn graph_pattern2_fabricated_join_output_is_rejected() {
+        // Fabricate a bogus X-commitment and pass it consistently (defeats the equality
+        // gate); the self-join column opening still binds X to the sumcheck -> REJECT.
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c"), ("c", "knows", "d")]);
+        let (proof, _com_x, com_y, com_z, m_j, id) =
+            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        let (_, _, _, n_join, _) = expected_join(&lc, id);
+        let fake_x = commit_column(&pad(&[ArkFr::from_u64(424242)], n_join)).unwrap();
+        let mut bad = proof.clone();
+        bad.join_commitments.x = fake_x;
+        assert!(
+            verify_layer_graph_pattern2(&lc, KNOWS, id, &fake_x, &com_y, &com_z, m_j, &bad)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn graph_pattern2_no_two_hop_paths_empty_verifies() {
+        // Disjoint edges a->b and c->d: no y with x->y and y->z, so the result is empty.
+        let lc = build_layer(&[("a", "knows", "b"), ("c", "knows", "d")]);
+        let (proof, com_x, com_y, com_z, m_j, id) =
+            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        assert_eq!(m_j, 0);
+        verify_layer_graph_pattern2(&lc, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
+    }
+
+    #[test]
+    fn graph_pattern2_tampered_layer_root_is_rejected() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c"), ("c", "knows", "d")]);
+        let (proof, com_x, com_y, com_z, m_j, id) =
+            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        // Corrupt the anchor: a layer whose stored root does not bind its columns.
+        let mut tampered = (*lc).clone();
+        tampered.state.commitment_root[0] ^= 0xff;
+        assert!(
+            verify_layer_graph_pattern2(&tampered, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof)
+                .is_err()
+        );
     }
 }
