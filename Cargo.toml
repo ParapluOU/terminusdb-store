@@ -54,6 +54,8 @@ ark-serialize = "0.5"
 # Dory setup deterministically (same seed => identical public parameters on
 # every node). ChaCha20Rng's stream is documented stable across releases.
 rand_chacha = "0.3"
+# Blake2b hash-to-field for dictionary-binding (same fn on prover and verifier).
+blake2 = "0.10"
 
 [features]
 noreadlock = []

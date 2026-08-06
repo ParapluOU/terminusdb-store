@@ -98,6 +98,7 @@ fn filter_shape(k: usize, real_rows: usize, pred: ArkFr) -> SumcheckShape {
                 },
             ],
         },
+        target: f0(),
     };
 
     // B: (chi_n - sel) - (P - pred)*w = chi_n - sel - P*w + pred*w
@@ -123,6 +124,7 @@ fn filter_shape(k: usize, real_rows: usize, pred: ArkFr) -> SumcheckShape {
                 },
             ],
         },
+        target: f0(),
     };
 
     SumcheckShape {
@@ -311,6 +313,7 @@ fn full_filter_shape(
                 },
             ],
         },
+        target: f0(),
     };
     // B: (chi_n - sel) - (P - pred)*w = 0
     let claim_b = SumcheckClaim {
@@ -335,6 +338,7 @@ fn full_filter_shape(
                 },
             ],
         },
+        target: f0(),
     };
     // C: cstar*(alpha - (beta*S + O)) - 1 = 0
     let claim_c = reciprocal_claim(COL_CSTAR, &[COL_O, COL_S], alpha, beta);

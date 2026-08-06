@@ -120,19 +120,26 @@ impl Expr {
     }
 }
 
-/// One claim: a shape plus the expression `G` it constrains.
+/// One claim: a shape, the expression `G` it constrains, and the PUBLIC target
+/// sum it asserts. `target` is the value `Sum_x G(x)` (for `ZeroSum`) that the
+/// verifier already knows; it is `0` for every `Identity` claim and for a plain
+/// zero-sum, but may be a nonzero public scalar (e.g. `1/(alpha - q_fold)` for a
+/// LogUp membership claim). See [`SumcheckClaim::product`] / the logup builders,
+/// which default it to `0`.
 #[derive(Clone, Debug)]
 pub struct SumcheckClaim {
     pub shape: ClaimShape,
     pub expr: Expr,
+    pub target: ArkFr,
 }
 
 impl SumcheckClaim {
-    /// Convenience: a claim whose `G` is a product of committed columns.
+    /// Convenience: a zero-target claim whose `G` is a product of committed columns.
     pub fn product(shape: ClaimShape, factors: &[usize]) -> Self {
         SumcheckClaim {
             shape,
             expr: Expr::product(factors),
+            target: f0(),
         }
     }
 }
@@ -356,6 +363,7 @@ fn append_shape(transcript: &mut Transcript254, shape: &SumcheckShape) {
             ClaimShape::Identity => 1,
         };
         transcript.append_bytes(LABEL_SHAPE, &[tag]);
+        transcript.append_field(LABEL_SHAPE, &claim.target);
         transcript.append_bytes(LABEL_SHAPE, &(claim.expr.terms.len() as u64).to_le_bytes());
         for term in &claim.expr.terms {
             transcript.append_field(LABEL_SHAPE, &term.coeff);
@@ -517,8 +525,14 @@ pub fn verify_sumcheck(
 
     let (r_zc, rhos) = draw_preamble(transcript, shape);
 
-    // The batched claim starts at 0 (both shapes target a zero sum).
-    let mut current = f0();
+    // The batched claim starts at the rho-combination of the per-claim PUBLIC
+    // target sums (0 for identity/plain-zero-sum claims, a known nonzero scalar
+    // for a public-target claim such as LogUp membership).
+    let mut current = shape
+        .claims
+        .iter()
+        .zip(rhos.iter())
+        .fold(f0(), |acc, (claim, rho)| acc + *rho * claim.target);
     let mut r = Vec::with_capacity(k);
     for round_poly in &proof.round_polys {
         if round_poly.len() != degree + 1 {

@@ -956,6 +956,7 @@ fn validate_construction_heap_budget(
 pub use commitment::{CommitmentState, LayerCommitment, QueryProof};
 
 pub mod argument;
+pub mod dict;
 pub mod filter;
 pub mod logup;
 pub mod query;

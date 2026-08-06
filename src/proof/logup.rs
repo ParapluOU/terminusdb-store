@@ -109,6 +109,7 @@ pub(crate) fn reciprocal_claim(
     SumcheckClaim {
         shape: ClaimShape::Identity,
         expr: Expr { terms },
+        target: f0(),
     }
 }
 
@@ -138,5 +139,6 @@ pub(crate) fn multiset_link_claim(
                 },
             ],
         },
+        target: f0(),
     }
 }
