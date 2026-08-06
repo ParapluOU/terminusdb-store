@@ -1,6 +1,10 @@
 [package]
 name = "terminus-store"
-version = "0.22.0"
+# 0.21.8 (not 0.22.0) so a TerminusDB [patch.crates-io] accepts this fork as a
+# semver-compatible replacement of the 0.21.x consumers (store-prolog, grpc
+# label store). The breaking changes vs 0.21.7 are confined to proof-specific
+# APIs those consumers do not call; the base Store API is unchanged.
+version = "0.21.8"
 authors = ["Matthijs van Otterdijk <matthijs@datachemist.com>", "Philippe Höij <philippe.hoij@dfrnt.com>"]
 edition = "2018"
 license = "Apache-2.0"
