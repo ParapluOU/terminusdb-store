@@ -960,6 +960,7 @@ pub mod dict;
 pub mod filter;
 pub mod join;
 pub mod logup;
+pub mod membership;
 pub mod query;
 pub mod sort;
 
