@@ -44,6 +44,8 @@ use super::invalid;
 use super::membership::{
     prove_membership_with_mult_in_domain, verify_membership_with_mult, MembershipProof,
 };
+#[cfg(test)]
+use super::membership::prove_membership_with_mult_with_witness;
 use super::pairs::{prove_distinct_valid_pairs_in_domain, verify_distinct_valid_pairs, PairsProof};
 use super::sort::{prove_strictly_sorted, verify_strictly_sorted, SortedProof};
 
@@ -211,7 +213,63 @@ pub fn prove_self_join_complete(
     // (2c-2c) Sum_i w_L[i]*w_R[i] = m_J: valid-pair count EQUALS the output count.
     let wl_padded = padded(w_l, domain);
     let wr_padded = padded(w_r, domain);
-    let count = prove_count_identity(&wl_padded, &wr_padded, m_j, &com.w_l, &com.w_r, transcript)?;
+    // FIX 3: the TRUE n_U (not the padded domain) is the count's chi real length, so a
+    // weight stashed in the padding tail [n_U, domain) cannot inflate the count.
+    let count =
+        prove_count_identity(&wl_padded, &wr_padded, n_u, m_j, &com.w_l, &com.w_r, transcript)?;
+
+    Ok(SelfJoinCompleteProof {
+        pairs,
+        sorted_u,
+        membership_l,
+        membership_r,
+        count,
+    })
+}
+
+/// Prove a self-join from EXPLICIT witnesses, with the distinct-key count `n_U`
+/// decoupled from the committed `U` column length. The honest path derives `n_U =
+/// |U|`; the omission security test uses this to commit a `U`/`w` with a duplicate
+/// key STASHED in the padding tail `[n_U, domain)` while claiming a smaller `n_U`.
+/// `u_full`/`w_l_full`/`w_r_full` are length `domain`; `sf`/`of` and the output
+/// columns are the real (honest) slices.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_self_join_complete_with_witness(
+    sf: &[ArkFr],
+    of: &[ArkFr],
+    x: &[ArkFr],
+    y: &[ArkFr],
+    z: &[ArkFr],
+    rho_l: &[ArkFr],
+    rho_r: &[ArkFr],
+    u_full: &[ArkFr],
+    w_l_full: &[ArkFr],
+    w_r_full: &[ArkFr],
+    n_f: usize,
+    n_u: usize,
+    m_j: usize,
+    com: &SelfJoinCommitments,
+    transcript: &mut Transcript254,
+) -> io::Result<SelfJoinCompleteProof> {
+    let domain = u_full.len();
+    bind_instance(transcript, com, n_f, n_u, m_j);
+
+    let pairs = prove_distinct_valid_pairs_in_domain(
+        sf, of, x, y, z, rho_l, rho_r, &com.sf, &com.of, &com.x, &com.y, &com.z, &com.rho_l,
+        &com.rho_r, domain, transcript,
+    )?;
+    let sorted_u = prove_strictly_sorted(u_full, n_u, &com.u, transcript)?;
+    let of_p = padded(of, domain);
+    let sf_p = padded(sf, domain);
+    let membership_l = prove_membership_with_mult_with_witness(
+        u_full, &of_p, w_l_full, n_u, n_f, &com.u, &com.of, &com.w_l, transcript,
+    )?;
+    let membership_r = prove_membership_with_mult_with_witness(
+        u_full, &sf_p, w_r_full, n_u, n_f, &com.u, &com.sf, &com.w_r, transcript,
+    )?;
+    let count =
+        prove_count_identity(w_l_full, w_r_full, n_u, m_j, &com.w_l, &com.w_r, transcript)?;
 
     Ok(SelfJoinCompleteProof {
         pairs,
@@ -232,8 +290,6 @@ pub fn verify_self_join_complete(
     proof: &SelfJoinCompleteProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    let domain = self_join_domain(n_f, m_j, n_u)?;
-
     bind_instance(transcript, com, n_f, n_u, m_j);
 
     verify_distinct_valid_pairs(
@@ -243,8 +299,8 @@ pub fn verify_self_join_complete(
     verify_strictly_sorted(&com.u, n_u, &proof.sorted_u, transcript)?;
     verify_membership_with_mult(&com.u, &com.of, &com.w_l, n_u, n_f, &proof.membership_l, transcript)?;
     verify_membership_with_mult(&com.u, &com.sf, &com.w_r, n_u, n_f, &proof.membership_r, transcript)?;
-    // count was proved over w_L/w_R padded to `domain`, so its real length is `domain`.
-    verify_count_identity(&com.w_l, &com.w_r, domain, m_j, &proof.count, transcript)?;
+    // FIX 3: count's chi real length is the TRUE n_U (matches the prover).
+    verify_count_identity(&com.w_l, &com.w_r, n_u, m_j, &proof.count, transcript)?;
     Ok(())
 }
 
@@ -476,6 +532,53 @@ mod tests {
         let (x, y, z, rho_l, rho_r, u, w_l, w_r, m_j) = compute_self_join(&sf, &of);
         assert_eq!(m_j, 0);
         assert!(attempt(&sf, &of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, m_j).is_ok());
+    }
+
+    #[test]
+    fn omission_via_duplicate_key_stashed_in_u_padding_is_rejected() {
+        // THE REVIEWERS' EXACT OMISSION COUNTEREXAMPLE (audit FIX 2 + FIX 3).
+        // F = {(1,5),(2,5),(5,10),(5,20)} has the complete self-join m_J = 4. The
+        // attacker commits U = [1,2,5,10,20, 5,0,0] (claimed n_U = 5) with a DUPLICATE
+        // key 5 STASHED at padding index 5, and splits its weight: w_L =
+        // [0,0,1,1,1, 1,0,0], w_R = [1,1,1,0,0, 1,0,0]. Then Sum w_L*w_R = 2 over the
+        // full domain, so the attacker outputs only 2 genuine pairs and claims m_J = 2.
+        // BEFORE the fix (U side + count chi unmasked) this VERIFIES an INCOMPLETE
+        // result; masking the U side (FIX 2) makes membership reject the split, and the
+        // true-n_U count mask (FIX 3) rejects the undercount -> REJECT.
+        let sf = frs(&[1, 2, 5, 5]);
+        let of = frs(&[5, 5, 10, 20]);
+        let (n_f, n_u, m_j, domain) = (4usize, 5usize, 2usize, 8usize);
+        // Two GENUINE distinct pairs (so the pairs proof passes): (0,2) and (1,3).
+        let x = frs(&[1, 2]);
+        let y = frs(&[5, 5]);
+        let z = frs(&[10, 20]);
+        let rho_l = frs(&[0, 1]);
+        let rho_r = frs(&[2, 3]);
+        // Malicious witness columns at the domain (stash at index 5).
+        let u_full = frs(&[1, 2, 5, 10, 20, 5, 0, 0]);
+        let w_l_full = frs(&[0, 0, 1, 1, 1, 1, 0, 0]);
+        let w_r_full = frs(&[1, 1, 1, 0, 0, 1, 0, 0]);
+        let pad8 = |v: &[ArkFr]| padded(v, domain);
+        let com = SelfJoinCommitments {
+            sf: commit_column(&pad8(&sf)).unwrap(),
+            of: commit_column(&pad8(&of)).unwrap(),
+            x: commit_column(&pad8(&x)).unwrap(),
+            y: commit_column(&pad8(&y)).unwrap(),
+            z: commit_column(&pad8(&z)).unwrap(),
+            rho_l: commit_column(&pad8(&rho_l)).unwrap(),
+            rho_r: commit_column(&pad8(&rho_r)).unwrap(),
+            u: commit_column(&u_full).unwrap(),
+            w_l: commit_column(&w_l_full).unwrap(),
+            w_r: commit_column(&w_r_full).unwrap(),
+        };
+        let mut pt = transcript();
+        let proof = prove_self_join_complete_with_witness(
+            &sf, &of, &x, &y, &z, &rho_l, &rho_r, &u_full, &w_l_full, &w_r_full, n_f, n_u, m_j,
+            &com, &mut pt,
+        )
+        .unwrap();
+        let mut vt = transcript();
+        assert!(verify_self_join_complete(&com, n_f, n_u, m_j, &proof, &mut vt).is_err());
     }
 
     #[test]

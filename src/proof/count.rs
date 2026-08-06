@@ -94,21 +94,27 @@ fn count_shape(k: usize, n_u: usize, m_j: usize) -> SumcheckShape {
     }
 }
 
-/// Prove `Sum_i w_L[i]*w_R[i] = m_J`. `com_wl`/`com_wr` must commit `w_L`/`w_R`
-/// padded to `count_domain(n_U)`.
+/// Prove `Sum_i w_L[i]*w_R[i] = m_J`, summing over the real `[0, n_U)` rows only.
+/// `com_wl`/`com_wr` must commit `w_L`/`w_R` padded to `count_domain(w_L.len())`.
+/// `n_U` is the TRUE distinct-key count (the chi mask real length); passing the
+/// padded domain here would make the mask a no-op and let padding-tail weights
+/// inflate the count (audit FIX 3).
 pub fn prove_count_identity(
     w_l: &[ArkFr],
     w_r: &[ArkFr],
+    n_u: usize,
     m_j: usize,
     com_wl: &ArkGT,
     com_wr: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<CountProof> {
-    let n_u = w_l.len();
-    if w_r.len() != n_u {
+    if w_r.len() != w_l.len() {
         return Err(invalid("w_L and w_R must have equal length"));
     }
-    let n = count_domain(n_u)?;
+    let n = count_domain(w_l.len())?;
+    if n_u > n {
+        return Err(invalid("distinct-key count exceeds the domain"));
+    }
     let k = n.trailing_zeros() as usize;
     let wl_p = padded(w_l, n);
     let wr_p = padded(w_r, n);
@@ -171,13 +177,33 @@ mod tests {
     }
 
     fn run(w_l: &[ArkFr], w_r: &[ArkFr], m_j: usize) -> io::Result<()> {
+        run_with_n_u(w_l, w_r, w_l.len(), m_j)
+    }
+
+    // Prove/verify with an EXPLICIT claimed n_U (the chi real length).
+    fn run_with_n_u(w_l: &[ArkFr], w_r: &[ArkFr], n_u: usize, m_j: usize) -> io::Result<()> {
         let n = count_domain(w_l.len()).unwrap();
         let com_wl = commit_padded(w_l, n);
         let com_wr = commit_padded(w_r, n);
         let mut pt = transcript();
-        let proof = prove_count_identity(w_l, w_r, m_j, &com_wl, &com_wr, &mut pt)?;
+        let proof = prove_count_identity(w_l, w_r, n_u, m_j, &com_wl, &com_wr, &mut pt)?;
         let mut vt = transcript();
-        verify_count_identity(&com_wl, &com_wr, w_l.len(), m_j, &proof, &mut vt)
+        verify_count_identity(&com_wl, &com_wr, n_u, m_j, &proof, &mut vt)
+    }
+
+    #[test]
+    fn padding_tail_weight_is_masked_by_true_n_u() {
+        // FIX 3 demonstration. w over domain 8; real n_U = 3. A stashed pair at padding
+        // index 5 (w_L=w_R=1) inflates the sum when the chi mask is a no-op (the bug
+        // was join.rs passing the DOMAIN as n_U): true sum over [0,3) = 3*1+2*2+1*3 =
+        // 10, and the stash adds 1.
+        let w_l = frs(&[3, 2, 1, 0, 0, 1, 0, 0]);
+        let w_r = frs(&[1, 2, 3, 0, 0, 1, 0, 0]);
+        // BUG (n_U = domain = 8, chi no-op): the inflated count 11 verifies.
+        assert!(run_with_n_u(&w_l, &w_r, 8, 11).is_ok());
+        // FIX (true n_U = 3): the padding-tail weight is masked out.
+        assert!(run_with_n_u(&w_l, &w_r, 3, 11).is_err());
+        assert!(run_with_n_u(&w_l, &w_r, 3, 10).is_ok());
     }
 
     #[test]

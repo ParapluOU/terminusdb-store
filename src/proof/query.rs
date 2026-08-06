@@ -25,6 +25,7 @@ use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::Transcript254;
 use super::commitment::LayerCommitment;
+use super::ProofHash;
 use super::dict::{hash_term, prove_dict_membership, verify_dict_membership, DictProof};
 use super::filter::{
     compact_selected, honest_witness, prove_filter, verify_filter, FullFilterProof,
@@ -173,6 +174,7 @@ pub fn prove_layer_filter(
 /// never trusts the id out of band and never rescans the table.
 pub fn verify_layer_filter(
     layer: &LayerCommitment,
+    expected_root: ProofHash,
     predicate_term: &[u8],
     predicate_id: u64,
     com_sout: &ArkGT,
@@ -180,6 +182,14 @@ pub fn verify_layer_filter(
     m: usize,
     proof: &CombinedFilterProof,
 ) -> io::Result<()> {
+    // FIX 4: pin to an EXTERNALLY-trusted root FIRST (mirroring import_pack's
+    // external-root check), so the proof is bound to a root the verifier already
+    // trusts rather than whatever LayerCommitment the prover supplied.
+    if layer.state.commitment_root != expected_root {
+        return Err(invalid(
+            "layer commitment_root does not match the externally-trusted expected root",
+        ));
+    }
     if layer.recomputed_commitment_root()? != layer.state.commitment_root {
         return Err(invalid(
             "layer commitment_root does not bind its committed columns/dictionary",
@@ -366,6 +376,7 @@ pub fn prove_layer_graph_pattern2(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_layer_graph_pattern2(
     layer: &LayerCommitment,
+    expected_root: ProofHash,
     predicate_term: &[u8],
     predicate_id: u64,
     com_x: &ArkGT,
@@ -374,6 +385,12 @@ pub fn verify_layer_graph_pattern2(
     m_j: usize,
     proof: &GraphPattern2Proof,
 ) -> io::Result<()> {
+    // FIX 4: pin to an EXTERNALLY-trusted root FIRST.
+    if layer.state.commitment_root != expected_root {
+        return Err(invalid(
+            "layer commitment_root does not match the externally-trusted expected root",
+        ));
+    }
     if layer.recomputed_commitment_root()? != layer.state.commitment_root {
         return Err(invalid(
             "layer commitment_root does not bind its committed columns/dictionary",
@@ -543,7 +560,7 @@ mod tests {
         let (proof, com_sout, com_oout, m, resolved_id) = prove_layer_filter(&lc, P1).unwrap();
         // The verifier is given ONLY the IRI bytes + the revealed id (authenticated
         // by membership) -- never an out-of-band id.
-        verify_layer_filter(&lc, P1, resolved_id, &com_sout, &com_oout, m, &proof).unwrap();
+        verify_layer_filter(&lc, lc.state.commitment_root, P1,resolved_id, &com_sout, &com_oout, m, &proof).unwrap();
 
         // Result is EXACTLY the p1 rows (count + contents).
         assert_eq!(m, 4);
@@ -559,7 +576,10 @@ mod tests {
         let (proof, com_sout, com_oout, m, resolved_id) = prove_layer_filter(&lc, P1).unwrap();
         // Claim a different id for the same IRI -> membership fails.
         let wrong = resolved_id.wrapping_add(1);
-        assert!(verify_layer_filter(&lc, P1, wrong, &com_sout, &com_oout, m, &proof).is_err());
+        assert!(
+            verify_layer_filter(&lc, lc.state.commitment_root, P1, wrong, &com_sout, &com_oout, m, &proof)
+                .is_err()
+        );
     }
 
     #[test]
@@ -569,7 +589,10 @@ mod tests {
         // p2's genuine id, but paired with p1's IRI: (hash_term(p1), id_p2) is not a
         // dictionary row -> membership fails.
         let p2_id = resolve_predicate_id(&lc, P2).unwrap();
-        assert!(verify_layer_filter(&lc, P1, p2_id, &com_sout, &com_oout, m, &proof).is_err());
+        assert!(
+            verify_layer_filter(&lc, lc.state.commitment_root, P1, p2_id, &com_sout, &com_oout, m, &proof)
+                .is_err()
+        );
     }
 
     #[test]
@@ -585,10 +608,10 @@ mod tests {
         let (proof, com_sout, com_oout, m, resolved_id) = prove_layer_filter(&lc, P1).unwrap();
         // Wrong S_out commitment (use the O_out one) -> filter opening fails.
         assert!(
-            verify_layer_filter(&lc, P1, resolved_id, &com_oout, &com_oout, m, &proof).is_err()
+            verify_layer_filter(&lc, lc.state.commitment_root, P1,resolved_id, &com_oout, &com_oout, m, &proof).is_err()
         );
         // Honest still verifies.
-        verify_layer_filter(&lc, P1, resolved_id, &com_sout, &com_oout, m, &proof).unwrap();
+        verify_layer_filter(&lc, lc.state.commitment_root, P1,resolved_id, &com_sout, &com_oout, m, &proof).unwrap();
     }
 
     #[test]
@@ -647,7 +670,7 @@ mod tests {
         let (proof, com_x, com_y, com_z, m_j, id) =
             prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         // Verifier sees ONLY the IRI + revealed id + result commitments.
-        verify_layer_graph_pattern2(&lc, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
+        verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
 
         // Result is EXACTLY the two 2-hop paths (count + contents).
         assert_eq!(m_j, 2);
@@ -665,16 +688,16 @@ mod tests {
             prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         // Wrong result commitment (pass Com Z for Com X) -> mismatch with proof output.
         assert!(
-            verify_layer_graph_pattern2(&lc, KNOWS, id, &com_z, &com_y, &com_z, m_j, &proof)
+            verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &com_z, &com_y, &com_z, m_j, &proof)
                 .is_err()
         );
         // Wrong claimed count.
         assert!(
-            verify_layer_graph_pattern2(&lc, KNOWS, id, &com_x, &com_y, &com_z, m_j + 1, &proof)
+            verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &com_x, &com_y, &com_z, m_j + 1, &proof)
                 .is_err()
         );
         // Honest verifies.
-        verify_layer_graph_pattern2(&lc, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
+        verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
     }
 
     #[test]
@@ -689,7 +712,7 @@ mod tests {
         let mut bad = proof.clone();
         bad.join_commitments.x = fake_x;
         assert!(
-            verify_layer_graph_pattern2(&lc, KNOWS, id, &fake_x, &com_y, &com_z, m_j, &bad)
+            verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &fake_x, &com_y, &com_z, m_j, &bad)
                 .is_err()
         );
     }
@@ -701,20 +724,51 @@ mod tests {
         let (proof, com_x, com_y, com_z, m_j, id) =
             prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         assert_eq!(m_j, 0);
-        verify_layer_graph_pattern2(&lc, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
+        verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
     }
 
     #[test]
     fn graph_pattern2_tampered_layer_root_is_rejected() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c"), ("c", "knows", "d")]);
+        let good_root = lc.state.commitment_root;
         let (proof, com_x, com_y, com_z, m_j, id) =
             prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         // Corrupt the anchor: a layer whose stored root does not bind its columns.
         let mut tampered = (*lc).clone();
         tampered.state.commitment_root[0] ^= 0xff;
-        assert!(
-            verify_layer_graph_pattern2(&tampered, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof)
-                .is_err()
-        );
+        // Even pinned to the (correct) external root, the tampered layer's stored root
+        // no longer matches it -> the FIX 4 anchor rejects.
+        assert!(verify_layer_graph_pattern2(
+            &tampered, good_root, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn graph_pattern2_wrong_expected_root_is_rejected() {
+        // FIX 4 (external-root anchor): an honest proof against an honest layer must
+        // still REJECT when the verifier pins a DIFFERENT externally-trusted root.
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c"), ("c", "knows", "d")]);
+        let (proof, com_x, com_y, com_z, m_j, id) =
+            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        let mut wrong_root = lc.state.commitment_root;
+        wrong_root[0] ^= 0xff;
+        assert!(verify_layer_graph_pattern2(
+            &lc, wrong_root, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof
+        )
+        .is_err());
+        // The correct external root still verifies.
+        verify_layer_graph_pattern2(
+            &lc,
+            lc.state.commitment_root,
+            KNOWS,
+            id,
+            &com_x,
+            &com_y,
+            &com_z,
+            m_j,
+            &proof,
+        )
+        .unwrap();
     }
 }

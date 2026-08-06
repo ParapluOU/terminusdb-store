@@ -125,17 +125,36 @@ pub(crate) fn multiset_link_claim(
     out_mult: Operand,
     out_rec: usize,
 ) -> SumcheckClaim {
+    masked_multiset_link_claim(&[in_mult], in_rec, &[out_mult], out_rec)
+}
+
+/// Like [`multiset_link_claim`] but each side's multiplicity is the PRODUCT of
+/// several operands, e.g. a `chi` real-length mask AND a committed multiplicity
+/// column: `Σ_x [ Π(in_mask)·rec_in - Π(out_mask)·rec_out ] = 0`. Masking the
+/// SOURCE/UNIVERSE side by its `chi_{real_len}` keeps padding rows
+/// `[real_len, domain)` from acting as free poles a prover could exploit to inject
+/// fabricated members or split a duplicate stashed in the padding tail.
+pub(crate) fn masked_multiset_link_claim(
+    in_mask: &[Operand],
+    in_rec: usize,
+    out_mask: &[Operand],
+    out_rec: usize,
+) -> SumcheckClaim {
+    let mut in_operands = in_mask.to_vec();
+    in_operands.push(Operand::Column(in_rec));
+    let mut out_operands = out_mask.to_vec();
+    out_operands.push(Operand::Column(out_rec));
     SumcheckClaim {
         shape: ClaimShape::ZeroSum,
         expr: Expr {
             terms: vec![
                 Term {
                     coeff: f1(),
-                    operands: vec![in_mult, Operand::Column(in_rec)],
+                    operands: in_operands,
                 },
                 Term {
                     coeff: f0() - f1(),
-                    operands: vec![out_mult, Operand::Column(out_rec)],
+                    operands: out_operands,
                 },
             ],
         },

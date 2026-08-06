@@ -32,7 +32,7 @@ use super::argument::{
     ColumnOpening, Operand, SumcheckProof, SumcheckShape, Transcript254,
 };
 use super::invalid;
-use super::logup::{multiset_link_claim, reciprocal_claim, reciprocal_witness};
+use super::logup::{masked_multiset_link_claim, reciprocal_claim, reciprocal_witness};
 
 const COL_U: usize = 0;
 const COL_OF: usize = 1;
@@ -40,8 +40,10 @@ const COL_W: usize = 2;
 const COL_REC_U: usize = 3;
 const COL_REC_OF: usize = 4;
 const NUM_COLUMNS: usize = 5;
-// chi_bounds index for chi_{n_F} (the image side real length).
+// chi_bounds indices: chi_{n_F} (image side real length) and chi_{n_U} (universe side
+// real length; masks a duplicate key stashed in U's padding tail out of the link).
 const CHI_NF: usize = 0;
+const CHI_NU: usize = 1;
 
 const LABEL_BETA: &[u8] = b"pow/membership/fingerprint-beta";
 const LABEL_ALPHA: &[u8] = b"pow/membership/reciprocal-alpha";
@@ -91,19 +93,21 @@ pub(crate) fn count_multiplicities(u: &[ArkFr], of: &[ArkFr]) -> Vec<ArkFr> {
         .collect()
 }
 
-fn membership_shape(k: usize, n_of: usize, alpha: ArkFr, beta: ArkFr) -> SumcheckShape {
+fn membership_shape(k: usize, n_u: usize, n_of: usize, alpha: ArkFr, beta: ArkFr) -> SumcheckShape {
     let rec_u = reciprocal_claim(COL_REC_U, &[COL_U], alpha, beta);
     let rec_of = reciprocal_claim(COL_REC_OF, &[COL_OF], alpha, beta);
-    let link = multiset_link_claim(
-        Operand::Column(COL_W),
+    // Mask the UNIVERSE (U) side by chi_{n_U}: a duplicate key stashed in U's padding
+    // tail [n_U, domain) is not a valid pole, so its weight cannot cover an Of value.
+    let link = masked_multiset_link_claim(
+        &[Operand::Chi(CHI_NU), Operand::Column(COL_W)],
         COL_REC_U,
-        Operand::Chi(CHI_NF),
+        &[Operand::Chi(CHI_NF)],
         COL_REC_OF,
     );
     SumcheckShape {
         num_vars: k,
         num_columns: NUM_COLUMNS,
-        chi_bounds: vec![n_of],
+        chi_bounds: vec![n_of, n_u],
         claims: vec![rec_u, rec_of, link],
     }
 }
@@ -151,11 +155,42 @@ pub(crate) fn prove_membership_with_mult_in_domain(
             "membership domain must be a power of two >= the natural domain",
         ));
     }
-    let n = domain;
+    let u_p = padded(u, domain);
+    let of_p = padded(of, domain);
+    let w_p = padded(w, domain);
+    prove_membership_with_mult_with_witness(
+        &u_p, &of_p, &w_p, n_u, n_of, com_u, com_of, com_w, transcript,
+    )
+}
+
+/// Prove membership-with-multiplicity from FULLY EXPLICIT witness columns (each
+/// already padded to a common power-of-two domain `n = u_p.len()`) and explicit real
+/// lengths `n_U`/`n_F`. The honest entry points derive these; the security tests use
+/// this to stash a duplicate key in U's padding tail `[n_U, domain)` with a claimed
+/// `n_U` smaller than the committed column length.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_membership_with_mult_with_witness(
+    u_p: &[ArkFr],
+    of_p: &[ArkFr],
+    w_p: &[ArkFr],
+    n_u: usize,
+    n_of: usize,
+    com_u: &ArkGT,
+    com_of: &ArkGT,
+    com_w: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<MembershipProof> {
+    let n = u_p.len();
+    if !n.is_power_of_two() || n < 2 {
+        return Err(invalid("membership domain must be a power of two >= 2"));
+    }
+    if of_p.len() != n || w_p.len() != n {
+        return Err(invalid("membership witness column length mismatch"));
+    }
+    if n_u > n || n_of > n {
+        return Err(invalid("membership real length exceeds the domain"));
+    }
     let k = n.trailing_zeros() as usize;
-    let u_p = padded(u, n);
-    let of_p = padded(of, n);
-    let w_p = padded(w, n);
 
     // Round 1: bind the value + multiplicity commitments, draw the challenges.
     transcript.append_group(b"pow/membership/com-u", com_u);
@@ -165,15 +200,21 @@ pub(crate) fn prove_membership_with_mult_in_domain(
     let alpha = transcript.challenge_scalar(LABEL_ALPHA);
 
     // Round 2: reciprocal witnesses over the values.
-    let rec_u = reciprocal_witness(alpha, &u_p);
-    let rec_of = reciprocal_witness(alpha, &of_p);
+    let rec_u = reciprocal_witness(alpha, u_p);
+    let rec_of = reciprocal_witness(alpha, of_p);
     let rec_u_commitment = commit_column(&rec_u)?;
     let rec_of_commitment = commit_column(&rec_of)?;
     transcript.append_group(b"pow/membership/com-rec-u", &rec_u_commitment);
     transcript.append_group(b"pow/membership/com-rec-of", &rec_of_commitment);
 
-    let shape = membership_shape(k, n_of, alpha, beta);
-    let columns = vec![u_p, of_p, w_p, rec_u, rec_of];
+    let shape = membership_shape(k, n_u, n_of, alpha, beta);
+    let columns = vec![
+        u_p.to_vec(),
+        of_p.to_vec(),
+        w_p.to_vec(),
+        rec_u,
+        rec_of,
+    ];
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
     let opening = prove_column_openings(&columns, &r, transcript)?;
 
@@ -211,7 +252,7 @@ pub fn verify_membership_with_mult(
     transcript.append_group(b"pow/membership/com-rec-u", &proof.rec_u_commitment);
     transcript.append_group(b"pow/membership/com-rec-of", &proof.rec_of_commitment);
 
-    let shape = membership_shape(k, n_of, alpha, beta);
+    let shape = membership_shape(k, n_u, n_of, alpha, beta);
     let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
     verify_column_openings(
         &[
@@ -315,5 +356,33 @@ mod tests {
         // Of empty (n_F = 0): every multiplicity is 0.
         let u = frs(&[1, 2]);
         assert!(run(&u, &[], &frs(&[0, 0])).is_ok());
+    }
+
+    #[test]
+    fn duplicate_key_stashed_in_u_padding_tail_is_rejected() {
+        // COMPLETENESS regression (FIX 2). Real U = [5] (claimed n_U = 1), but a
+        // duplicate 5 is STASHED at padding index 1 (>= n_U) of the committed column.
+        // Of = [5,5]. A split weight w = [1,1] lets the padding pole cover the second
+        // 5, so the residue balances. With the U side unmasked this VERIFIES (an
+        // undercount vector for the count identity); masking the U side by chi_{n_U}
+        // excludes the padding pole -> the real U[0]=5 has w=1 but Of has two 5's ->
+        // REJECT.
+        let u_p = frs(&[5, 5, 0, 0]);
+        let of_p = frs(&[5, 5, 0, 0]);
+        let w_p = frs(&[1, 1, 0, 0]);
+        let (n_u, n_of) = (1usize, 2usize);
+        let com_u = commit_column(&u_p).unwrap();
+        let com_of = commit_column(&of_p).unwrap();
+        let com_w = commit_column(&w_p).unwrap();
+        let mut pt = transcript();
+        let proof = prove_membership_with_mult_with_witness(
+            &u_p, &of_p, &w_p, n_u, n_of, &com_u, &com_of, &com_w, &mut pt,
+        )
+        .unwrap();
+        let mut vt = transcript();
+        assert!(
+            verify_membership_with_mult(&com_u, &com_of, &com_w, n_u, n_of, &proof, &mut vt)
+                .is_err()
+        );
     }
 }

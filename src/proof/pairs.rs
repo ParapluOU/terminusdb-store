@@ -47,7 +47,7 @@ use super::argument::{
     Transcript254,
 };
 use super::invalid;
-use super::logup::{multiset_link_claim, reciprocal_witness, rlc_fold};
+use super::logup::{masked_multiset_link_claim, reciprocal_witness, rlc_fold};
 use super::sort::{prove_strictly_sorted, verify_strictly_sorted, SortedProof};
 
 const COL_SF: usize = 0;
@@ -64,8 +64,10 @@ const COL_REC_CAND_L: usize = 10;
 const COL_REC_SRC_R: usize = 11;
 const COL_REC_CAND_R: usize = 12;
 const NUM_COLUMNS: usize = 13;
-// chi_bounds index for chi_{m_J} (the output side real length).
+// chi_bounds indices: chi_{m_J} (candidate/output real length) and chi_{n_F} (source
+// real length; masks padding F-rows out of the SOURCE side of each link).
 const CHI_MJ: usize = 0;
+const CHI_NF: usize = 1;
 
 const LABEL_BETA_L: &[u8] = b"pow/pairs/left-beta";
 const LABEL_ALPHA_L: &[u8] = b"pow/pairs/left-alpha";
@@ -146,6 +148,7 @@ fn reciprocal_fold_claim(rec_col: usize, fold: &[(ArkFr, Operand)], alpha: ArkFr
 fn membership_shape(
     k: usize,
     m_j: usize,
+    n_f: usize,
     alpha_l: ArkFr,
     beta_l: ArkFr,
     alpha_r: ArkFr,
@@ -172,10 +175,10 @@ fn membership_shape(
         ],
         alpha_l,
     );
-    let link_l = multiset_link_claim(
-        Operand::Chi(CHI_MJ),
+    let link_l = masked_multiset_link_claim(
+        &[Operand::Chi(CHI_MJ)],
         COL_REC_CAND_L,
-        Operand::Column(COL_MULT_L_IN),
+        &[Operand::Chi(CHI_NF), Operand::Column(COL_MULT_L_IN)],
         COL_REC_SRC_L,
     );
     // RIGHT: source (Sf, Of, idx); candidate (Y, Z, rho_r).
@@ -197,16 +200,16 @@ fn membership_shape(
         ],
         alpha_r,
     );
-    let link_r = multiset_link_claim(
-        Operand::Chi(CHI_MJ),
+    let link_r = masked_multiset_link_claim(
+        &[Operand::Chi(CHI_MJ)],
         COL_REC_CAND_R,
-        Operand::Column(COL_MULT_R_IN),
+        &[Operand::Chi(CHI_NF), Operand::Column(COL_MULT_R_IN)],
         COL_REC_SRC_R,
     );
     SumcheckShape {
         num_vars: k,
         num_columns: NUM_COLUMNS,
-        chi_bounds: vec![m_j],
+        chi_bounds: vec![m_j, n_f],
         claims: vec![src_l, cand_l, link_l, src_r, cand_r, link_r],
     }
 }
@@ -289,7 +292,6 @@ pub(crate) fn prove_distinct_valid_pairs_in_domain(
         ));
     }
     let n = domain;
-    let k = n.trailing_zeros() as usize;
 
     let sf_p = padded(sf, n);
     let of_p = padded(of, n);
@@ -298,12 +300,63 @@ pub(crate) fn prove_distinct_valid_pairs_in_domain(
     let z_p = padded(z, n);
     let rho_l_p = padded(rho_l, n);
     let rho_r_p = padded(rho_r, n);
-    let idx_p: Vec<ArkFr> = (0..n).map(|i| ArkFr::from_u64(i as u64)).collect();
 
     let mult_l_in = source_multiplicities(&rho_l_p, n_f, m_j, n);
     let mult_r_in = source_multiplicities(&rho_r_p, n_f, m_j, n);
-    let mult_l_in_commitment = commit_column(&mult_l_in)?;
-    let mult_r_in_commitment = commit_column(&mult_r_in)?;
+
+    prove_distinct_valid_pairs_with_witness(
+        &sf_p, &of_p, &x_p, &y_p, &z_p, &rho_l_p, &rho_r_p, n_f, m_j, &mult_l_in, &mult_r_in,
+        com_sf, com_of, com_x, com_y, com_z, com_rho_l, com_rho_r, transcript,
+    )
+}
+
+/// Prove distinct-valid-pairs from FULLY EXPLICIT witness columns (each already
+/// padded to a common power-of-two domain `n = sf_p.len()`), an explicit real
+/// F-length `n_f` and output length `m_j`, and explicit source multiplicities. The
+/// honest entry point derives all of these; the security tests use this to inject a
+/// malicious `Sf`/`Of` padding tail, out-of-range `rho`, and a full-domain
+/// multiplicity that lights up padding source rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_distinct_valid_pairs_with_witness(
+    sf_p: &[ArkFr],
+    of_p: &[ArkFr],
+    x_p: &[ArkFr],
+    y_p: &[ArkFr],
+    z_p: &[ArkFr],
+    rho_l_p: &[ArkFr],
+    rho_r_p: &[ArkFr],
+    n_f: usize,
+    m_j: usize,
+    mult_l_in: &[ArkFr],
+    mult_r_in: &[ArkFr],
+    com_sf: &ArkGT,
+    com_of: &ArkGT,
+    com_x: &ArkGT,
+    com_y: &ArkGT,
+    com_z: &ArkGT,
+    com_rho_l: &ArkGT,
+    com_rho_r: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<PairsProof> {
+    let n = sf_p.len();
+    if !n.is_power_of_two() || n < 2 {
+        return Err(invalid("pairs domain must be a power of two >= 2"));
+    }
+    for column in [
+        of_p, x_p, y_p, z_p, rho_l_p, rho_r_p, mult_l_in, mult_r_in,
+    ] {
+        if column.len() != n {
+            return Err(invalid("pairs witness column length mismatch"));
+        }
+    }
+    if n_f > n || m_j > n {
+        return Err(invalid("pairs real length exceeds the domain"));
+    }
+    let k = n.trailing_zeros() as usize;
+    let idx_p: Vec<ArkFr> = (0..n).map(|i| ArkFr::from_u64(i as u64)).collect();
+
+    let mult_l_in_commitment = commit_column(mult_l_in)?;
+    let mult_r_in_commitment = commit_column(mult_r_in)?;
 
     // Round 1: bind the given columns + multiplicities, draw fresh challenges.
     transcript.append_group(b"pow/pairs/com-sf", com_sf);
@@ -321,10 +374,10 @@ pub(crate) fn prove_distinct_valid_pairs_in_domain(
     let alpha_r = transcript.challenge_scalar(LABEL_ALPHA_R);
 
     // Round 2: reciprocal witnesses over the 3-column fingerprints.
-    let rec_src_l = reciprocal_witness(alpha_l, &rlc_fold(beta_l, &[&sf_p, &of_p, &idx_p]));
-    let rec_cand_l = reciprocal_witness(alpha_l, &rlc_fold(beta_l, &[&x_p, &y_p, &rho_l_p]));
-    let rec_src_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &[&sf_p, &of_p, &idx_p]));
-    let rec_cand_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &[&y_p, &z_p, &rho_r_p]));
+    let rec_src_l = reciprocal_witness(alpha_l, &rlc_fold(beta_l, &[sf_p, of_p, &idx_p]));
+    let rec_cand_l = reciprocal_witness(alpha_l, &rlc_fold(beta_l, &[x_p, y_p, rho_l_p]));
+    let rec_src_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &[sf_p, of_p, &idx_p]));
+    let rec_cand_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &[y_p, z_p, rho_r_p]));
     let rec_src_l_commitment = commit_column(&rec_src_l)?;
     let rec_cand_l_commitment = commit_column(&rec_cand_l)?;
     let rec_src_r_commitment = commit_column(&rec_src_r)?;
@@ -334,17 +387,17 @@ pub(crate) fn prove_distinct_valid_pairs_in_domain(
     transcript.append_group(b"pow/pairs/com-rec-src-r", &rec_src_r_commitment);
     transcript.append_group(b"pow/pairs/com-rec-cand-r", &rec_cand_r_commitment);
 
-    let shape = membership_shape(k, m_j, alpha_l, beta_l, alpha_r, beta_r);
+    let shape = membership_shape(k, m_j, n_f, alpha_l, beta_l, alpha_r, beta_r);
     let columns = vec![
-        sf_p,
-        of_p,
-        x_p,
-        y_p,
-        z_p,
-        rho_l_p.clone(),
-        rho_r_p.clone(),
-        mult_l_in,
-        mult_r_in,
+        sf_p.to_vec(),
+        of_p.to_vec(),
+        x_p.to_vec(),
+        y_p.to_vec(),
+        z_p.to_vec(),
+        rho_l_p.to_vec(),
+        rho_r_p.to_vec(),
+        mult_l_in.to_vec(),
+        mult_r_in.to_vec(),
         rec_src_l,
         rec_cand_l,
         rec_src_r,
@@ -415,7 +468,7 @@ pub fn verify_distinct_valid_pairs(
     transcript.append_group(b"pow/pairs/com-rec-src-r", &proof.rec_src_r_commitment);
     transcript.append_group(b"pow/pairs/com-rec-cand-r", &proof.rec_cand_r_commitment);
 
-    let shape = membership_shape(k, m_j, alpha_l, beta_l, alpha_r, beta_r);
+    let shape = membership_shape(k, m_j, n_f, alpha_l, beta_l, alpha_r, beta_r);
     let (r, evals) = verify_sumcheck(&shape, &proof.membership_sumcheck, transcript)?;
     verify_column_openings(
         &[
@@ -566,5 +619,103 @@ mod tests {
     fn empty_output_verifies() {
         let (sf, of) = relation();
         assert!(run(&sf, &of, &[], &[], &[], &[], &[]).is_ok());
+    }
+
+    // ---- SOUNDNESS regression tests (source-side masking, FIX 1) ----
+
+    // Malicious multiplicity: count rho hits over the FULL domain [0, n) (including
+    // padding source rows), not just the honest [0, n_f).
+    fn full_multiplicities(rho_full: &[ArkFr], m_j: usize, n: usize) -> Vec<ArkFr> {
+        (0..n)
+            .map(|a| {
+                let a_fr = fr(a as u64);
+                fr(rho_full[..m_j].iter().filter(|v| **v == a_fr).count() as u64)
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_witness(
+        sf_p: &[ArkFr],
+        of_p: &[ArkFr],
+        x_p: &[ArkFr],
+        y_p: &[ArkFr],
+        z_p: &[ArkFr],
+        rho_l_p: &[ArkFr],
+        rho_r_p: &[ArkFr],
+        n_f: usize,
+        m_j: usize,
+    ) -> io::Result<()> {
+        let n = sf_p.len();
+        let mult_l = full_multiplicities(rho_l_p, m_j, n);
+        let mult_r = full_multiplicities(rho_r_p, m_j, n);
+        let com_sf = commit_column(sf_p).unwrap();
+        let com_of = commit_column(of_p).unwrap();
+        let com_x = commit_column(x_p).unwrap();
+        let com_y = commit_column(y_p).unwrap();
+        let com_z = commit_column(z_p).unwrap();
+        let com_rho_l = commit_column(rho_l_p).unwrap();
+        let com_rho_r = commit_column(rho_r_p).unwrap();
+        let mut pt = transcript();
+        let proof = prove_distinct_valid_pairs_with_witness(
+            sf_p, of_p, x_p, y_p, z_p, rho_l_p, rho_r_p, n_f, m_j, &mult_l, &mult_r, &com_sf,
+            &com_of, &com_x, &com_y, &com_z, &com_rho_l, &com_rho_r, &mut pt,
+        )?;
+        let mut vt = transcript();
+        verify_distinct_valid_pairs(
+            &com_sf, &com_of, &com_x, &com_y, &com_z, &com_rho_l, &com_rho_r, n_f, m_j, &proof,
+            &mut vt,
+        )
+    }
+
+    #[test]
+    fn substitution_pointing_at_a_padding_f_row_is_rejected() {
+        // n_f=3, domain=4. Sf/Of committed with a FAKE F-row at padding index 3 =
+        // (9,9). A fabricated output row (9,9,9) points rho_l=rho_r=3, and a malicious
+        // full-domain multiplicity lights up source row 3. With the source side
+        // unmasked this substitution VERIFIES; masking it by chi_{n_F} makes the
+        // fabricated candidate pole unmatched -> REJECT (and forces rho < n_F).
+        let sf_p = frs(&[1, 2, 5, 9]);
+        let of_p = frs(&[5, 5, 10, 9]);
+        let x_p = frs(&[1, 2, 9, 0]);
+        let y_p = frs(&[5, 5, 9, 0]);
+        let z_p = frs(&[10, 10, 9, 0]);
+        let rho_l_p = frs(&[0, 1, 3, 0]);
+        let rho_r_p = frs(&[2, 2, 3, 0]);
+        assert!(
+            run_with_witness(&sf_p, &of_p, &x_p, &y_p, &z_p, &rho_l_p, &rho_r_p, 3, 3).is_err()
+        );
+    }
+
+    #[test]
+    fn fabricated_zero_row_out_of_range_is_rejected() {
+        // A fabricated (0,0,0) row pointing rho at a ZERO padding row (index 3 >= n_F).
+        // With the source unmasked the all-zero padding pole matches; masking rejects.
+        let sf_p = frs(&[1, 2, 5, 0]);
+        let of_p = frs(&[5, 5, 10, 0]);
+        let x_p = frs(&[1, 2, 0, 0]);
+        let y_p = frs(&[5, 5, 0, 0]);
+        let z_p = frs(&[10, 10, 0, 0]);
+        let rho_l_p = frs(&[0, 1, 3, 0]);
+        let rho_r_p = frs(&[2, 2, 3, 0]);
+        assert!(
+            run_with_witness(&sf_p, &of_p, &x_p, &y_p, &z_p, &rho_l_p, &rho_r_p, 3, 3).is_err()
+        );
+    }
+
+    #[test]
+    fn honest_witness_path_still_verifies() {
+        // The honest output through the explicit-witness entry (mult only on [0,n_F))
+        // must still verify after masking.
+        let sf_p = frs(&[1, 2, 5, 5]);
+        let of_p = frs(&[5, 5, 10, 20]);
+        let x_p = frs(&[1, 1, 2, 2]);
+        let y_p = frs(&[5, 5, 5, 5]);
+        let z_p = frs(&[10, 20, 10, 20]);
+        let rho_l_p = frs(&[0, 0, 1, 1]);
+        let rho_r_p = frs(&[2, 3, 2, 3]);
+        assert!(
+            run_with_witness(&sf_p, &of_p, &x_p, &y_p, &z_p, &rho_l_p, &rho_r_p, 4, 4).is_ok()
+        );
     }
 }
