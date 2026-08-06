@@ -1135,6 +1135,46 @@ pub mod commitment {
         ])
     }
 
+    /// Commit a predicate-dictionary column (hashes or ids) padded to a power of
+    /// two via the SAME shared query-side helper the Q3 gadget uses, so the
+    /// committed columns align with what a membership proof opens. An empty
+    /// dictionary gets the canonical GT-identity commitment.
+    fn commit_predicate_dict_column(values: &[ArkFr]) -> io::Result<ArkGT> {
+        if values.is_empty() {
+            return Ok(<ArkGT as Group>::identity());
+        }
+        let padded_len = values
+            .len()
+            .checked_next_power_of_two()
+            .ok_or_else(|| invalid("predicate dictionary length overflow"))?;
+        if padded_len.trailing_zeros() as usize > SETUP_MAX_LOG_N {
+            return Err(invalid(
+                "predicate dictionary exceeds the global Dory setup capacity",
+            ));
+        }
+        let mut column = values.to_vec();
+        column.resize(padded_len, <ArkFr as DoryField>::zero());
+        super::argument::commit_column(&column)
+    }
+
+    /// Build the two predicate-dictionary commitments from the predicate catalog
+    /// (`term -> id`, canonical order): hash each term to a field element and
+    /// encode each id, then commit both columns.
+    fn commit_predicate_dictionary(predicate_catalog: &[ProofRecord]) -> io::Result<(ArkGT, ArkGT)> {
+        let hashes: Vec<ArkFr> = predicate_catalog
+            .iter()
+            .map(|record| super::dict::hash_term(&record.triple.predicate))
+            .collect();
+        let ids: Vec<ArkFr> = predicate_catalog
+            .iter()
+            .map(|record| <ArkFr as DoryField>::from_u64(record.predicate_id))
+            .collect();
+        Ok((
+            commit_predicate_dict_column(&hashes)?,
+            commit_predicate_dict_column(&ids)?,
+        ))
+    }
+
     fn serialize_commitment(commitment: &ArkGT) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         commitment
@@ -1203,6 +1243,14 @@ pub mod commitment {
         /// order: additions (S,P,O) then removals (S,P,O). `commitment_root`
         /// binds these. Phase 1b commits each column standalone at offset 0.
         pub column_commitments: [ArkGT; COLUMN_COUNT],
+        /// Dory commitments of the layer's PREDICATE dictionary as two columns
+        /// `(Com(pred_dict_hash), Com(pred_dict_id))`, where `pred_dict_hash[k] =
+        /// hash_term(predicate_bytes_k)` and `pred_dict_id[k] = predicate_id_k`
+        /// over `predicate_catalog`'s canonical order (padded to a power of two).
+        /// `commitment_root` binds these, so a Q3 dictionary-membership proof of an
+        /// IRI->id binding is authenticated by the root. Node/value dictionary is
+        /// deferred.
+        pub predicate_dict_commitments: (ArkGT, ArkGT),
     }
 
     impl PartialEq for LayerCommitment {
@@ -1284,6 +1332,9 @@ pub mod commitment {
 
             // Real per-column Dory commitments over the sorted id columns.
             let column_commitments = commit_delta_columns(&additions, &removals)?;
+            // Predicate-dictionary commitments (IRI->id binding, authenticated by
+            // the root so Q3 membership proofs can trust it).
+            let predicate_dict_commitments = commit_predicate_dictionary(&predicate_catalog)?;
 
             let state = CommitmentState {
                 parent_state_root,
@@ -1302,6 +1353,7 @@ pub mod commitment {
                 predicate_catalog,
                 node_value_catalog,
                 column_commitments,
+                predicate_dict_commitments,
             };
             layer.state.commitment_root = layer.compute_commitment_root()?;
             layer.validate()?;
@@ -1454,6 +1506,11 @@ pub mod commitment {
                 let bytes = r.bytes()?;
                 *slot = deserialize_commitment(&bytes)?;
             }
+            let predicate_dict_commitments = {
+                let hash = deserialize_commitment(&r.bytes()?)?;
+                let id = deserialize_commitment(&r.bytes()?)?;
+                (hash, id)
+            };
             if !r.done() {
                 return Err(invalid("trailing commitment file bytes"));
             }
@@ -1506,27 +1563,38 @@ pub mod commitment {
                 predicate_catalog,
                 node_value_catalog,
                 column_commitments,
+                predicate_dict_commitments,
             };
             layer.validate()?;
             Ok(layer)
         }
 
         /// Recompute the `commitment_root` binding purely from the state counts,
-        /// parent root, and the six column commitments (independent of the raw
-        /// tables). A query verifier trusts a layer's `commitment_root`, and calls
-        /// this to confirm the `column_commitments` it is about to open are exactly
-        /// the ones that root authenticates.
+        /// parent root, the six column commitments, and the two predicate-dictionary
+        /// commitments (independent of the raw tables). A query verifier trusts a
+        /// layer's `commitment_root`, and calls this to confirm the commitments it
+        /// is about to open are exactly the ones that root authenticates.
         pub fn recomputed_commitment_root(&self) -> io::Result<ProofHash> {
             self.compute_commitment_root()
         }
 
-        /// The commitment root binds the parent root, the six counts, and the
-        /// canonical-serialized six per-column Dory commitments (NOT the raw
-        /// tables, which are separately bound by the file checksum and revalidated
-        /// on decode). The column commitments in turn bind the sorted id columns.
+        /// The two predicate-dictionary commitments, in fixed bound order (hash
+        /// column then id column).
+        fn dictionary_commitments(&self) -> [&ArkGT; 2] {
+            [
+                &self.predicate_dict_commitments.0,
+                &self.predicate_dict_commitments.1,
+            ]
+        }
+
+        /// The commitment root binds the parent root, the six counts, the six
+        /// per-column Dory commitments, and the two predicate-dictionary
+        /// commitments (NOT the raw tables, which are separately bound by the file
+        /// checksum and revalidated on decode). The column commitments in turn bind
+        /// the sorted id columns; the dictionary commitments bind the IRI->id map.
         fn compute_commitment_root(&self) -> io::Result<ProofHash> {
             let mut hasher = Sha256::new();
-            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v0");
+            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v1");
             match self.state.parent_state_root {
                 Some(root) => {
                     hasher.update([1u8]);
@@ -1540,7 +1608,11 @@ pub mod commitment {
             hasher.update(self.state.parent_predicate_count.to_be_bytes());
             hasher.update(self.state.node_value_count.to_be_bytes());
             hasher.update(self.state.predicate_count.to_be_bytes());
-            for commitment in &self.column_commitments {
+            for commitment in self
+                .column_commitments
+                .iter()
+                .chain(self.dictionary_commitments())
+            {
                 let bytes = serialize_commitment(commitment)?;
                 hasher.update((bytes.len() as u64).to_be_bytes());
                 hasher.update(&bytes);
@@ -1570,7 +1642,11 @@ pub mod commitment {
             ] {
                 put_records(&mut out, table);
             }
-            for commitment in &self.column_commitments {
+            for commitment in self
+                .column_commitments
+                .iter()
+                .chain(self.dictionary_commitments())
+            {
                 let bytes = serialize_commitment(commitment)?;
                 put_bytes(&mut out, &bytes);
             }
@@ -1605,7 +1681,11 @@ pub mod commitment {
                     total = checked_proof_encoded_growth(total, record_len)?;
                 }
             }
-            for commitment in &self.column_commitments {
+            for commitment in self
+                .column_commitments
+                .iter()
+                .chain(self.dictionary_commitments())
+            {
                 let commitment_len = 8usize
                     .checked_add(commitment.compressed_size())
                     .ok_or_else(|| invalid("commitment encoded length overflow"))?;
@@ -1944,7 +2024,101 @@ pub mod commitment {
             assert_eq!(decoded.additions, commitment.additions);
             assert_eq!(decoded.node_value_catalog, commitment.node_value_catalog);
             assert_eq!(decoded.column_commitments, commitment.column_commitments);
+            assert_eq!(
+                decoded.predicate_dict_commitments,
+                commitment.predicate_dict_commitments
+            );
             assert_eq!(decoded.state.commitment_root, commitment.state.commitment_root);
+        }
+
+        // A base layer with three predicates p1<p2<p3 (dict of size 3, padded to 4)
+        // over distinct subjects/objects.
+        fn multi_predicate_layer() -> LayerCommitment {
+            LayerCommitment::from_native_delta(
+                None,
+                vec![
+                    record(1, 1, 2, "a", "p1", "b"),
+                    record(3, 2, 4, "c", "p2", "d"),
+                    record(5, 3, 6, "e", "p3", "f"),
+                ],
+                vec![],
+                0,
+                0,
+                6,
+                3,
+                vec![
+                    (CanonicalObject::Node(b"a".to_vec()), 1),
+                    (CanonicalObject::Node(b"b".to_vec()), 2),
+                    (CanonicalObject::Node(b"c".to_vec()), 3),
+                    (CanonicalObject::Node(b"d".to_vec()), 4),
+                    (CanonicalObject::Node(b"e".to_vec()), 5),
+                    (CanonicalObject::Node(b"f".to_vec()), 6),
+                ],
+                vec![(b"p1".to_vec(), 1), (b"p2".to_vec(), 2), (b"p3".to_vec(), 3)],
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn predicate_dictionary_commitments_align_with_shared_commit_column() {
+            use crate::proof::argument::commit_column;
+            use crate::proof::dict::hash_term;
+
+            let layer = multi_predicate_layer();
+            assert_eq!(layer.predicate_catalog.len(), 3);
+            // Rebuild the two padded dict columns exactly as the query side would,
+            // and confirm they match the stored commitments byte-for-byte.
+            let zero = <ArkFr as DoryField>::zero();
+            let mut hashes = vec![zero; 4];
+            let mut ids = vec![zero; 4];
+            for (k, record) in layer.predicate_catalog.iter().enumerate() {
+                hashes[k] = hash_term(&record.triple.predicate);
+                ids[k] = <ArkFr as DoryField>::from_u64(record.predicate_id);
+            }
+            assert_eq!(
+                commit_column(&hashes).unwrap(),
+                layer.predicate_dict_commitments.0
+            );
+            assert_eq!(commit_column(&ids).unwrap(), layer.predicate_dict_commitments.1);
+        }
+
+        #[test]
+        fn commitment_root_binds_the_predicate_dictionary() {
+            // Determinism: the same layer (incl. the dict commitments) yields the
+            // same root across two independent builds.
+            assert_eq!(
+                multi_predicate_layer().state.commitment_root,
+                multi_predicate_layer().state.commitment_root
+            );
+            // Changing a predicate TERM (same ids) changes the dict-hash commitment,
+            // hence the root.
+            let changed = LayerCommitment::from_native_delta(
+                None,
+                vec![
+                    record(1, 1, 2, "a", "pX", "b"),
+                    record(3, 2, 4, "c", "p2", "d"),
+                    record(5, 3, 6, "e", "p3", "f"),
+                ],
+                vec![],
+                0,
+                0,
+                6,
+                3,
+                vec![
+                    (CanonicalObject::Node(b"a".to_vec()), 1),
+                    (CanonicalObject::Node(b"b".to_vec()), 2),
+                    (CanonicalObject::Node(b"c".to_vec()), 3),
+                    (CanonicalObject::Node(b"d".to_vec()), 4),
+                    (CanonicalObject::Node(b"e".to_vec()), 5),
+                    (CanonicalObject::Node(b"f".to_vec()), 6),
+                ],
+                vec![(b"pX".to_vec(), 1), (b"p2".to_vec(), 2), (b"p3".to_vec(), 3)],
+            )
+            .unwrap();
+            assert_ne!(
+                multi_predicate_layer().state.commitment_root,
+                changed.state.commitment_root
+            );
         }
 
         #[test]
