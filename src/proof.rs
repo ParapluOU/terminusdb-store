@@ -959,6 +959,7 @@ pub mod argument;
 pub mod count;
 pub mod dict;
 pub mod filter;
+pub mod gather;
 pub mod join;
 pub mod logup;
 pub mod membership;
