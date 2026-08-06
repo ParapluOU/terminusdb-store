@@ -1135,43 +1135,51 @@ pub mod commitment {
         ])
     }
 
-    /// Commit a predicate-dictionary column (hashes or ids) padded to a power of
-    /// two via the SAME shared query-side helper the Q3 gadget uses, so the
-    /// committed columns align with what a membership proof opens. An empty
-    /// dictionary gets the canonical GT-identity commitment.
-    fn commit_predicate_dict_column(values: &[ArkFr]) -> io::Result<ArkGT> {
-        if values.is_empty() {
-            return Ok(<ArkGT as Group>::identity());
+    /// Build the two predicate-dictionary columns from the predicate catalog
+    /// (`term -> id`, canonical order): `hash[k] = hash_term(predicate_bytes_k)`,
+    /// `id[k] = predicate_id_k`, padded with zeros to a power of two of length
+    /// `>= 2` (the Q3 membership sumcheck needs at least one variable). An empty
+    /// dictionary yields empty columns. This is the single source of truth used
+    /// both to COMMIT the dictionary (here) and to OPEN it (via
+    /// `LayerCommitment::predicate_dictionary_columns`), so the two align.
+    fn predicate_dict_columns_from_catalog(
+        predicate_catalog: &[ProofRecord],
+    ) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>)> {
+        let d = predicate_catalog.len();
+        if d == 0 {
+            return Ok((Vec::new(), Vec::new()));
         }
-        let padded_len = values
-            .len()
+        let padded = d
             .checked_next_power_of_two()
-            .ok_or_else(|| invalid("predicate dictionary length overflow"))?;
-        if padded_len.trailing_zeros() as usize > SETUP_MAX_LOG_N {
+            .ok_or_else(|| invalid("predicate dictionary length overflow"))?
+            .max(2);
+        if padded.trailing_zeros() as usize > SETUP_MAX_LOG_N {
             return Err(invalid(
                 "predicate dictionary exceeds the global Dory setup capacity",
             ));
         }
-        let mut column = values.to_vec();
-        column.resize(padded_len, <ArkFr as DoryField>::zero());
-        super::argument::commit_column(&column)
+        let zero = <ArkFr as DoryField>::zero();
+        let mut hashes = vec![zero; padded];
+        let mut ids = vec![zero; padded];
+        for (k, record) in predicate_catalog.iter().enumerate() {
+            hashes[k] = super::dict::hash_term(&record.triple.predicate);
+            ids[k] = <ArkFr as DoryField>::from_u64(record.predicate_id);
+        }
+        Ok((hashes, ids))
     }
 
-    /// Build the two predicate-dictionary commitments from the predicate catalog
-    /// (`term -> id`, canonical order): hash each term to a field element and
-    /// encode each id, then commit both columns.
+    /// Commit the two predicate-dictionary columns via the SAME shared query-side
+    /// `commit_column` the Q3 gadget opens, so the committed columns align with
+    /// what a membership proof opens. An empty dictionary gets identity commitments.
     fn commit_predicate_dictionary(predicate_catalog: &[ProofRecord]) -> io::Result<(ArkGT, ArkGT)> {
-        let hashes: Vec<ArkFr> = predicate_catalog
-            .iter()
-            .map(|record| super::dict::hash_term(&record.triple.predicate))
-            .collect();
-        let ids: Vec<ArkFr> = predicate_catalog
-            .iter()
-            .map(|record| <ArkFr as DoryField>::from_u64(record.predicate_id))
-            .collect();
+        let (hashes, ids) = predicate_dict_columns_from_catalog(predicate_catalog)?;
+        if hashes.is_empty() {
+            let identity = <ArkGT as Group>::identity();
+            return Ok((identity, identity));
+        }
         Ok((
-            commit_predicate_dict_column(&hashes)?,
-            commit_predicate_dict_column(&ids)?,
+            super::argument::commit_column(&hashes)?,
+            super::argument::commit_column(&ids)?,
         ))
     }
 
@@ -1576,6 +1584,13 @@ pub mod commitment {
         /// is about to open are exactly the ones that root authenticates.
         pub fn recomputed_commitment_root(&self) -> io::Result<ProofHash> {
             self.compute_commitment_root()
+        }
+
+        /// Rebuild the padded predicate-dictionary columns `(hash, id)` that
+        /// `predicate_dict_commitments` commits, so a Q3 membership proof can open
+        /// them. Same padding/order as the committed columns.
+        pub fn predicate_dictionary_columns(&self) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>)> {
+            predicate_dict_columns_from_catalog(&self.predicate_catalog)
         }
 
         /// The two predicate-dictionary commitments, in fixed bound order (hash

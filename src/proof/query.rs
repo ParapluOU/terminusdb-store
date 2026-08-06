@@ -1,33 +1,48 @@
-//! Vertical slice: prove/verify a Q1 single-pattern filter `t(?s, P, ?o)` against
-//! a REAL committed store layer's columns, anchored to the layer's `commitment_root`.
+//! End-to-end single-pattern query BY PREDICATE IRI against a REAL committed
+//! store layer, anchored to the layer's `commitment_root`.
 //!
-//! For a materialized base layer (no removals), 1b's [`LayerCommitment`] holds the
-//! full table's `S/P/O` id columns in `additions` and their Dory commitments in
-//! `column_commitments[0..3]` (built by `commit_id_column`). Because the query
-//! argument (2a/2b) commits/opens columns with the SAME `matrix_dims`, global
-//! deterministic setup, `ArkFr::from_u64` encoding, and `next_power_of_two`
-//! padding that `commit_id_column` uses, a column committed by 1b opens correctly
-//! under the filter argument — so we can prove/verify a query directly against the
-//! layer's committed state without rerunning it. (A test here asserts the two
-//! commitments are byte-identical.)
+//! A query names a predicate IRI (term bytes), not a raw dictionary id. The proof
+//! combines two arguments under ONE shared transcript:
+//!   1. Q3 dictionary membership ([`super::dict`]): the revealed `predicate_id` is
+//!      the genuine dictionary id for `hash_term(predicate_term)`, authenticated by
+//!      the layer's committed predicate dictionary (`predicate_dict_commitments`).
+//!   2. Q1 filter compaction ([`super::filter`]): `(S_out, O_out)[0..m]` is exactly
+//!      the compaction of the rows whose predicate id equals that id.
 //!
-//! Predicate is a raw dictionary id (`ArkFr::from_u64`); IRI->id binding is Q3.
+//! Both the column commitments and the predicate-dictionary commitments are bound
+//! by `commitment_root` (1b + 3b-1). The verifier gets only the public IRI bytes
+//! plus a revealed id (checked via membership — never trusted out of band), and
+//! concludes `(S_out, O_out)` is exactly the complete result of `t(?s, <IRI>, ?o)`
+//! without rerunning the query. Node/value (subject/object) dictionary binding is
+//! deferred; absent-predicate (non-membership) proofs are a later feature — an IRI
+//! not in the layer fails closed.
 
 use std::io;
 
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::Field;
+use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::Transcript254;
 use super::commitment::LayerCommitment;
+use super::dict::{hash_term, prove_dict_membership, verify_dict_membership, DictProof};
 use super::filter::{prove_filter, verify_filter, FullFilterProof};
 use super::invalid;
 
-const QUERY_DOMAIN: &[u8] = b"parture/proof-of-woql/q1-layer-filter/v0";
+const QUERY_DOMAIN: &[u8] = b"parture/proof-of-woql/q1-query-by-iri/v0";
 
 #[inline]
 fn f0() -> ArkFr {
     ArkFr::zero()
+}
+
+/// A complete query-by-IRI proof: the predicate-dictionary membership proof
+/// (IRI -> id) and the filter/compaction proof (id -> result), both produced
+/// under one shared transcript.
+#[derive(Clone, Debug)]
+pub struct CombinedFilterProof {
+    pub membership: DictProof,
+    pub filter: FullFilterProof,
 }
 
 /// The padded hypercube size for a materialized base layer's columns, matching
@@ -69,42 +84,98 @@ fn base_layer_columns(
     Ok((s, p, o, n))
 }
 
-/// Prove `t(?s, predicate_id, ?o)` against a materialized base layer: the dense
-/// output `(S_out, O_out)[0..m]` is EXACTLY the compaction of the layer rows whose
-/// predicate id equals `predicate_id`. Returns the proof, the output commitments,
-/// and the result length `m`.
+/// Resolve a predicate IRI (term bytes) to its dictionary id in this layer, or
+/// fail closed if the term is not present (non-membership proofs are deferred).
+fn resolve_predicate_id(layer: &LayerCommitment, predicate_term: &[u8]) -> io::Result<u64> {
+    layer
+        .predicate_catalog
+        .iter()
+        .find(|record| record.triple.predicate == predicate_term)
+        .map(|record| record.predicate_id)
+        .ok_or_else(|| invalid("predicate not in layer dictionary"))
+}
+
+/// Bind the public statement into the shared transcript before either sub-proof:
+/// the trust anchor (`commitment_root`, which binds the column + dictionary
+/// commitments), the public predicate IRI bytes, and the revealed id.
+fn bind_statement(
+    transcript: &mut Transcript254,
+    layer: &LayerCommitment,
+    predicate_term: &[u8],
+    predicate_id: u64,
+) {
+    transcript.append_bytes(b"pow/q1-iri/commitment-root", &layer.state.commitment_root);
+    transcript.append_bytes(b"pow/q1-iri/predicate-term", predicate_term);
+    transcript.append_bytes(b"pow/q1-iri/predicate-id", &predicate_id.to_le_bytes());
+}
+
+/// Prove `t(?s, <predicate_term>, ?o)` against a materialized base layer. Resolves
+/// the predicate IRI to its committed dictionary id, proves that binding (Q3
+/// membership), then proves the filtered result for that id (Q1). Returns the
+/// combined proof, the output commitments, the result length `m`, and the REVEALED
+/// resolved id (authenticated by the membership proof — not secret).
 pub fn prove_layer_filter(
     layer: &LayerCommitment,
-    predicate_id: u64,
-) -> io::Result<(FullFilterProof, ArkGT, ArkGT, usize)> {
+    predicate_term: &[u8],
+) -> io::Result<(CombinedFilterProof, ArkGT, ArkGT, usize, u64)> {
     let (s, p, o, n) = base_layer_columns(layer)?;
+    let predicate_id = resolve_predicate_id(layer, predicate_term)?;
+
+    let (dict_hash, dict_id) = layer.predicate_dictionary_columns()?;
+    let com_dict_hash = layer.predicate_dict_commitments.0;
+    let com_dict_id = layer.predicate_dict_commitments.1;
+
+    let mut transcript = Transcript254::new(QUERY_DOMAIN);
+    bind_statement(&mut transcript, layer, predicate_term, predicate_id);
+
+    // Q3 membership: (hash_term(IRI), id) is a genuine dictionary row.
+    let q_hash = hash_term(predicate_term);
+    let id = ArkFr::from_u64(predicate_id);
+    let membership = prove_dict_membership(
+        &dict_hash,
+        &dict_id,
+        &com_dict_hash,
+        &com_dict_id,
+        q_hash,
+        id,
+        &mut transcript,
+    )?;
+
+    // Q1 filter: the result for that id.
     let com_s = layer.column_commitments[0];
     let com_p = layer.column_commitments[1];
     let com_o = layer.column_commitments[2];
     let pred = ArkFr::from_u64(predicate_id);
-    let mut transcript = Transcript254::new(QUERY_DOMAIN);
-    prove_filter(&s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript)
+    let (filter, com_sout, com_oout, m) =
+        prove_filter(&s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript)?;
+
+    Ok((
+        CombinedFilterProof { membership, filter },
+        com_sout,
+        com_oout,
+        m,
+        predicate_id,
+    ))
 }
 
-/// Verify a Q1 layer-filter proof. The trust anchor is the layer's
-/// `commitment_root`: this recomputes the root binding from the layer's state
-/// counts and `column_commitments` and checks it matches, so the `Com(S/P/O)` it
-/// opens are exactly the ones the root authenticates. Then it runs the filter
-/// verification. The verifier never rescans the table.
+/// Verify a query-by-IRI proof. Anchors to `commitment_root` (which binds both the
+/// column and predicate-dictionary commitments), independently computes
+/// `q_hash = hash_term(predicate_term)`, checks the revealed `predicate_id` is the
+/// genuine dictionary id for that IRI (membership), then checks the filtered
+/// result for that id (filter) — all under the shared transcript. The verifier
+/// never trusts the id out of band and never rescans the table.
 pub fn verify_layer_filter(
     layer: &LayerCommitment,
+    predicate_term: &[u8],
     predicate_id: u64,
     com_sout: &ArkGT,
     com_oout: &ArkGT,
     m: usize,
-    proof: &FullFilterProof,
+    proof: &CombinedFilterProof,
 ) -> io::Result<()> {
-    // Anchor: the column commitments (and the counts) must be the ones bound in
-    // commitment_root. (In deployment the trusted root also comes from the
-    // authenticated layer chain; here we confirm the binding logic holds.)
     if layer.recomputed_commitment_root()? != layer.state.commitment_root {
         return Err(invalid(
-            "layer commitment_root does not bind its column commitments",
+            "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
     if layer.state.removal_count != 0 {
@@ -115,18 +186,43 @@ pub fn verify_layer_filter(
     let n = layer.state.addition_count as usize;
     let padded = padded_len(n)?;
     let expected_k = padded.trailing_zeros() as usize;
-    if proof.sumcheck.round_polys.len() != expected_k {
+    if proof.filter.sumcheck.round_polys.len() != expected_k {
         return Err(invalid(
             "proof dimension does not match the layer's committed columns",
         ));
     }
+
+    let mut transcript = Transcript254::new(QUERY_DOMAIN);
+    bind_statement(&mut transcript, layer, predicate_term, predicate_id);
+
+    // Membership: the revealed id is authentic for this IRI.
+    let q_hash = hash_term(predicate_term);
+    let id = ArkFr::from_u64(predicate_id);
+    verify_dict_membership(
+        &layer.predicate_dict_commitments.0,
+        &layer.predicate_dict_commitments.1,
+        q_hash,
+        id,
+        &proof.membership,
+        &mut transcript,
+    )?;
+
+    // Filter: the result for that id.
     let com_s = layer.column_commitments[0];
     let com_p = layer.column_commitments[1];
     let com_o = layer.column_commitments[2];
     let pred = ArkFr::from_u64(predicate_id);
-    let mut transcript = Transcript254::new(QUERY_DOMAIN);
     verify_filter(
-        &com_s, &com_p, &com_o, pred, n, com_sout, com_oout, m, proof, &mut transcript,
+        &com_s,
+        &com_p,
+        &com_o,
+        pred,
+        n,
+        com_sout,
+        com_oout,
+        m,
+        &proof.filter,
+        &mut transcript,
     )
 }
 
@@ -137,37 +233,27 @@ mod tests {
     use crate::proof::argument::commit_column;
     use crate::store::sync::open_sync_memory_store;
 
-    // Build a materialized base layer with a known set of triples and return its
-    // LayerCommitment plus the authenticated CommitmentState.
-    fn build_layer(
-        triples: &[(&str, &str, &str)],
-    ) -> (
-        std::sync::Arc<LayerCommitment>,
-        crate::proof::CommitmentState,
-    ) {
+    const P1: &[u8] = b"http://ex/p1";
+    const P2: &[u8] = b"http://ex/p2";
+
+    fn iri(suffix: &str) -> String {
+        format!("http://ex/{suffix}")
+    }
+
+    // Build a materialized base layer from (subject, predicate, object) IRI triples.
+    fn build_layer(triples: &[(&str, &str, &str)]) -> std::sync::Arc<LayerCommitment> {
         let store = open_sync_memory_store();
         let builder = store.create_base_layer().unwrap();
         for (s, p, o) in triples {
             builder
-                .add_value_triple(ValueTriple::new_node(*s, *p, *o))
+                .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
                 .unwrap();
         }
-        let (layer, state) = builder.commit_with_proof().unwrap();
-        let lc = layer.proof_commitment().unwrap().unwrap();
-        (lc, state)
+        let (layer, _state) = builder.commit_with_proof().unwrap();
+        layer.proof_commitment().unwrap().unwrap()
     }
 
-    fn predicate_id(layer: &LayerCommitment, predicate: &str) -> u64 {
-        layer
-            .additions
-            .iter()
-            .find(|r| r.triple.predicate == predicate.as_bytes())
-            .map(|r| r.predicate_id)
-            .unwrap_or(u64::MAX) // absent predicate -> an id that matches nothing
-    }
-
-    // Independently recompute the expected dense result (subject/object id pairs)
-    // for a predicate, in the same stored order the prover compacts.
+    // Independently recompute the expected dense result for a predicate id.
     fn expected_result(layer: &LayerCommitment, pred_id: u64) -> (Vec<ArkFr>, Vec<ArkFr>, usize) {
         let padded = padded_len(layer.additions.len()).unwrap();
         let mut s_out = vec![f0(); padded];
@@ -183,15 +269,20 @@ mod tests {
         (s_out, o_out, m)
     }
 
-    #[test]
-    fn query_commitment_convention_matches_layer_commitment_columns() {
-        // THE integration check: the query side's commitment of a column extracted
-        // from the layer equals the 1b column commitment stored in the layer.
-        let (lc, _) = build_layer(&[
+    fn sample_layer() -> std::sync::Arc<LayerCommitment> {
+        build_layer(&[
             ("a1", "p1", "b1"),
             ("a2", "p1", "b2"),
+            ("a3", "p1", "b3"),
+            ("a4", "p1", "b4"),
             ("c1", "p2", "d1"),
-        ]);
+            ("c2", "p2", "d2"),
+        ])
+    }
+
+    #[test]
+    fn query_commitment_convention_matches_layer_commitment_columns() {
+        let lc = build_layer(&[("a1", "p1", "b1"), ("a2", "p1", "b2"), ("c1", "p2", "d1")]);
         let (s, p, o, _n) = base_layer_columns(&lc).unwrap();
         assert_eq!(commit_column(&s).unwrap(), lc.column_commitments[0]);
         assert_eq!(commit_column(&p).unwrap(), lc.column_commitments[1]);
@@ -199,79 +290,75 @@ mod tests {
     }
 
     #[test]
-    fn prove_and_verify_q1_over_a_real_layer_with_exact_result() {
-        let triples = [
-            ("a1", "p1", "b1"),
-            ("a2", "p1", "b2"),
-            ("a3", "p1", "b3"),
-            ("a4", "p1", "b4"),
-            ("c1", "p2", "d1"),
-            ("c2", "p2", "d2"),
-        ];
-        let (lc, state) = build_layer(&triples);
-        // The layer commitment we prove against carries the store's authenticated
-        // commitment_root.
-        assert_eq!(lc.state.commitment_root, state.commitment_root);
+    fn prove_and_verify_by_iri_with_exact_result() {
+        let lc = sample_layer();
+        let (proof, com_sout, com_oout, m, resolved_id) = prove_layer_filter(&lc, P1).unwrap();
+        // The verifier is given ONLY the IRI bytes + the revealed id (authenticated
+        // by membership) -- never an out-of-band id.
+        verify_layer_filter(&lc, P1, resolved_id, &com_sout, &com_oout, m, &proof).unwrap();
 
-        let p1 = predicate_id(&lc, "p1");
-        let (proof, com_sout, com_oout, m) = prove_layer_filter(&lc, p1).unwrap();
-        verify_layer_filter(&lc, p1, &com_sout, &com_oout, m, &proof).unwrap();
-
-        // The proven result is EXACTLY the p1 rows (count + contents): the output
-        // commitments equal an independent commitment of the expected dense rows.
+        // Result is EXACTLY the p1 rows (count + contents).
         assert_eq!(m, 4);
-        let (exp_s, exp_o, exp_m) = expected_result(&lc, p1);
+        let (exp_s, exp_o, exp_m) = expected_result(&lc, resolved_id);
         assert_eq!(exp_m, m);
         assert_eq!(commit_column(&exp_s).unwrap(), com_sout);
         assert_eq!(commit_column(&exp_o).unwrap(), com_oout);
     }
 
     #[test]
-    fn tampered_result_commitment_is_rejected() {
-        let (lc, _) = build_layer(&[
-            ("a1", "p1", "b1"),
-            ("a2", "p1", "b2"),
-            ("c1", "p2", "d1"),
-        ]);
-        let p1 = predicate_id(&lc, "p1");
-        let (proof, com_sout, com_oout, m) = prove_layer_filter(&lc, p1).unwrap();
-        // Swap in a wrong S_out commitment (use the O_out one) -> rejected.
-        assert!(verify_layer_filter(&lc, p1, &com_oout, &com_oout, m, &proof).is_err());
-        // Honest still verifies.
-        verify_layer_filter(&lc, p1, &com_sout, &com_oout, m, &proof).unwrap();
+    fn wrong_revealed_id_for_the_iri_is_rejected() {
+        let lc = sample_layer();
+        let (proof, com_sout, com_oout, m, resolved_id) = prove_layer_filter(&lc, P1).unwrap();
+        // Claim a different id for the same IRI -> membership fails.
+        let wrong = resolved_id.wrapping_add(1);
+        assert!(verify_layer_filter(&lc, P1, wrong, &com_sout, &com_oout, m, &proof).is_err());
     }
 
     #[test]
-    fn absent_predicate_yields_empty_result_and_verifies() {
-        let (lc, _) = build_layer(&[
-            ("a1", "p1", "b1"),
-            ("a2", "p1", "b2"),
-            ("c1", "p2", "d1"),
-        ]);
-        // A predicate id that is not present in the layer.
-        let absent = predicate_id(&lc, "does-not-exist");
-        let (proof, com_sout, com_oout, m) = prove_layer_filter(&lc, absent).unwrap();
-        assert_eq!(m, 0);
-        verify_layer_filter(&lc, absent, &com_sout, &com_oout, m, &proof).unwrap();
+    fn substituted_id_from_a_different_predicate_is_rejected() {
+        let lc = sample_layer();
+        let (proof, com_sout, com_oout, m, _p1_id) = prove_layer_filter(&lc, P1).unwrap();
+        // p2's genuine id, but paired with p1's IRI: (hash_term(p1), id_p2) is not a
+        // dictionary row -> membership fails.
+        let p2_id = resolve_predicate_id(&lc, P2).unwrap();
+        assert!(verify_layer_filter(&lc, P1, p2_id, &com_sout, &com_oout, m, &proof).is_err());
+    }
+
+    #[test]
+    fn absent_predicate_iri_fails_closed() {
+        let lc = sample_layer();
+        let err = prove_layer_filter(&lc, b"http://ex/absent").unwrap_err();
+        assert!(err.to_string().contains("predicate not in layer dictionary"));
+    }
+
+    #[test]
+    fn tampered_result_is_rejected_under_the_combined_transcript() {
+        let lc = sample_layer();
+        let (proof, com_sout, com_oout, m, resolved_id) = prove_layer_filter(&lc, P1).unwrap();
+        // Wrong S_out commitment (use the O_out one) -> filter opening fails.
+        assert!(
+            verify_layer_filter(&lc, P1, resolved_id, &com_oout, &com_oout, m, &proof).is_err()
+        );
+        // Honest still verifies.
+        verify_layer_filter(&lc, P1, resolved_id, &com_sout, &com_oout, m, &proof).unwrap();
     }
 
     #[test]
     fn non_materialized_layer_fails_closed() {
-        // A base layer with removals is rejected (cross-layer live-set is later).
         let store = open_sync_memory_store();
         let builder = store.create_base_layer().unwrap();
         for (s, p, o) in [("a1", "p1", "b1"), ("a2", "p1", "b2")] {
             builder
-                .add_value_triple(ValueTriple::new_node(s, p, o))
+                .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
                 .unwrap();
         }
         let (base, _) = builder.commit_with_proof().unwrap();
         let child = base.open_write().unwrap();
         child
-            .remove_value_triple(ValueTriple::new_node("a1", "p1", "b1"))
+            .remove_value_triple(ValueTriple::new_node(&iri("a1"), &iri("p1"), &iri("b1")))
             .unwrap();
         let (head, _) = child.commit_with_proof().unwrap();
         let lc = head.proof_commitment().unwrap().unwrap();
-        assert!(prove_layer_filter(&lc, 1).is_err());
+        assert!(prove_layer_filter(&lc, P1).is_err());
     }
 }
