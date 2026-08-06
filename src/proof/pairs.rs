@@ -242,6 +242,38 @@ pub fn prove_distinct_valid_pairs(
     com_rho_r: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<PairsProof> {
+    let domain = pairs_domain(sf.len(), x.len())?;
+    prove_distinct_valid_pairs_in_domain(
+        sf, of, x, y, z, rho_l, rho_r, com_sf, com_of, com_x, com_y, com_z, com_rho_l, com_rho_r,
+        domain, transcript,
+    )
+}
+
+/// Like [`prove_distinct_valid_pairs`] but pads every column onto a caller-chosen
+/// power-of-two `domain` (`>= pairs_domain(n_F, m_J)`) instead of the natural one.
+/// The full self-join integration (Phase 2c-2e) uses this so `Sf`/`Of` share ONE
+/// commitment with the U-membership sub-proofs (a single committed relation across
+/// the whole self-join). Real lengths (`n_F`, `m_J`) still drive the chi mask and
+/// the source multiplicities, so padding rows stay inert.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_distinct_valid_pairs_in_domain(
+    sf: &[ArkFr],
+    of: &[ArkFr],
+    x: &[ArkFr],
+    y: &[ArkFr],
+    z: &[ArkFr],
+    rho_l: &[ArkFr],
+    rho_r: &[ArkFr],
+    com_sf: &ArkGT,
+    com_of: &ArkGT,
+    com_x: &ArkGT,
+    com_y: &ArkGT,
+    com_z: &ArkGT,
+    com_rho_l: &ArkGT,
+    com_rho_r: &ArkGT,
+    domain: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<PairsProof> {
     let n_f = sf.len();
     let m_j = x.len();
     if of.len() != n_f {
@@ -250,7 +282,13 @@ pub fn prove_distinct_valid_pairs(
     if y.len() != m_j || z.len() != m_j || rho_l.len() != m_j || rho_r.len() != m_j {
         return Err(invalid("output columns X/Y/Z/rho_l/rho_r length mismatch"));
     }
-    let n = pairs_domain(n_f, m_j)?;
+    let natural = pairs_domain(n_f, m_j)?;
+    if !domain.is_power_of_two() || domain < natural {
+        return Err(invalid(
+            "pairs domain must be a power of two >= the natural domain",
+        ));
+    }
+    let n = domain;
     let k = n.trailing_zeros() as usize;
 
     let sf_p = padded(sf, n);

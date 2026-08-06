@@ -79,7 +79,8 @@ fn padded(column: &[ArkFr], n: usize) -> Vec<ArkFr> {
 /// Honest multiplicities `w[i] = #{ a < n_F : Of_a = U[i] }`. For distinct `U`
 /// this is the unique correct `w`; for duplicated `U` the caller must instead
 /// choose a `w` whose per-value SUM matches (see the module doc / duplicate test).
-// Used by the tests here and by the 2c-2d gather step.
+// Used by the tests here; the honest-witness form the self-join integration relies
+// on (see `proof::join::compute_self_join`).
 #[allow(dead_code)]
 pub(crate) fn count_multiplicities(u: &[ArkFr], of: &[ArkFr]) -> Vec<ArkFr> {
     u.iter()
@@ -118,12 +119,39 @@ pub fn prove_membership_with_mult(
     com_w: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<MembershipProof> {
+    let domain = membership_domain(u.len(), of.len())?;
+    prove_membership_with_mult_in_domain(u, of, w, com_u, com_of, com_w, domain, transcript)
+}
+
+/// Like [`prove_membership_with_mult`] but pads onto a caller-chosen power-of-two
+/// `domain` (`>= membership_domain(n_U, n_F)`) instead of the natural one, so the
+/// full self-join integration (Phase 2c-2e) can share ONE `Com(U)` /
+/// `Com(Of)` / `Com(Sf)` / `Com(w)` with the other sub-proofs. Real lengths
+/// `n_U`/`n_F` still drive the chi mask, so the residue ranges only over the true
+/// `Of` rows (padding poles are excluded).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_membership_with_mult_in_domain(
+    u: &[ArkFr],
+    of: &[ArkFr],
+    w: &[ArkFr],
+    com_u: &ArkGT,
+    com_of: &ArkGT,
+    com_w: &ArkGT,
+    domain: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<MembershipProof> {
     let n_u = u.len();
     let n_of = of.len();
     if w.len() != n_u {
         return Err(invalid("multiplicity column length must match U"));
     }
-    let n = membership_domain(n_u, n_of)?;
+    let natural = membership_domain(n_u, n_of)?;
+    if !domain.is_power_of_two() || domain < natural {
+        return Err(invalid(
+            "membership domain must be a power of two >= the natural domain",
+        ));
+    }
+    let n = domain;
     let k = n.trailing_zeros() as usize;
     let u_p = padded(u, n);
     let of_p = padded(of, n);

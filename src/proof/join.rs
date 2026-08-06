@@ -1,83 +1,65 @@
-//! Q2 self-join SOUNDNESS gadget (Phase 2c-1), in isolation over a committed
-//! relation. Reuses the LogUp membership pattern (proof::logup + the Q3
-//! single-element pattern generalized to multiplicities).
+//! Full SOUND & COMPLETE self-join proof (Phase 2c-2e): composes the tested
+//! completeness gadgets under ONE shared transcript against ONE set of committed
+//! columns. Clean-room composition; no COSL code.
 //!
-//! Model: a 2-atom self-join `t(?x, P, ?y), t(?y, P, ?z)` reduces to filtering by
-//! `P` once into a candidate relation `F = (Sf, Of)` (Q1, done), then self-joining
-//! `F` on `Of == Sf` (the shared variable `y`) to output `(x, y, z)`. This gadget
-//! proves the SOUNDNESS of a claimed output: every output row is a genuine join of
-//! two `F` rows on `y`. Concretely, for every `k < m_J`:
-//!   * `(X_out_k, Y_out_k)` is a row of `F` (left atom), AND
-//!   * `(Y_out_k, Z_out_k)` is a row of `F` (right atom).
-//! The shared committed `Y_out` column links the two memberships, so each output
-//! row is a valid `(x, y, z)`. This forbids FABRICATED rows; it does NOT yet
-//! forbid OMITTED rows (completeness is Phase 2c-2 — see the known-gap test).
+//! A 2-atom self-join `t(?x, P, ?y), t(?y, P, ?z)` reduces (after the Q1 filter by
+//! `P`) to self-joining a relation `F = (Sf, Of)` on `Of == Sf` (the shared
+//! variable `y`), producing `(X, Y, Z)`. This module proves the claimed output is
+//! the COMPLETE join. It replaces the earlier soundness-only gadget (subsumed by
+//! `proof::pairs`) and the UNSOUND `proof::gather` (deleted): the gather only pinned
+//! MARGINAL usage counts, which do not determine the bipartite pairing.
 //!
-//! Both memberships are LogUp lookups against the SAME `F` fingerprint
-//! `f_fold_a = beta*Sf_a + Of_a`: the left folds output rows as
-//! `l_fold_k = beta*X_k + Y_k` and the right as `r_fold_k = beta*Y_k + Z_k`, and
-//! each is proved to lie in `{f_fold_a}` with prover-committed multiplicities.
-//! One committed `F`, two membership instances. Clean-room from the log-derivative
-//! identity; no COSL code.
+//! The completeness argument (now sound) chains five tested gadgets:
+//!   * (2c-2f) `prove_distinct_valid_pairs`: the output is a SET of `m_J` DISTINCT
+//!     genuine key-matching (left-F-row, right-F-row) pairs (index-pointer
+//!     membership + combined-index strict monotonicity).
+//!   * (2c-2a) `prove_strictly_sorted(U)`: the claimed key column `U` is strictly
+//!     increasing, hence DISTINCT.
+//!   * (2c-2b) `prove_membership_with_mult(Of, U, w_L)` and `(Sf, U, w_R)`: `Of` is
+//!     the image of `U` under `w_L` and `Sf` the image under `w_R`, so `U` contains
+//!     EVERY join key and `w_L`/`w_R` are the TRUE per-key group counts.
+//!   * (2c-2c) `prove_count_identity(w_L, w_R, m_J)`: `Sum_i w_L[i]*w_R[i] = m_J`,
+//!     i.e. the number of valid pairs EQUALS the output count.
+//!
+//! Together: the output is `m_J` DISTINCT valid pairs AND `m_J` equals the total
+//! number of valid pairs, so the output is ALL valid pairs (a size-`m_J` subset of a
+//! size-`m_J` universe is the whole universe) => SOUND + COMPLETE.
+//!
+//! Composition: all ten logical columns are committed ONCE at a single shared
+//! `self_join_domain`, and the SAME commitments are threaded into every sub-proof
+//! that references them (`Sf`/`Of` link pairs<->membership; `U`/`w_L`/`w_R` link
+//! distinctness<->membership<->count). The whole instance is bound up front so each
+//! sub-proof's Fiat-Shamir challenges depend on the entire committed instance.
 
 use std::io;
 
+use ark_ff::PrimeField;
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::{
-    commit_column, prove_column_openings, prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ColumnOpening, Operand, SumcheckProof, SumcheckShape, Transcript254,
-};
+use super::argument::{commit_column, Transcript254};
+use super::count::{prove_count_identity, verify_count_identity, CountProof};
 use super::invalid;
-use super::logup::{multiset_link_claim, reciprocal_claim, reciprocal_witness, rlc_fold};
-
-// Column ordering for the batched self-join sumcheck.
-const COL_SF: usize = 0;
-const COL_OF: usize = 1;
-const COL_X: usize = 2;
-const COL_Y: usize = 3;
-const COL_Z: usize = 4;
-const COL_MULT_L: usize = 5;
-const COL_MULT_R: usize = 6;
-const COL_DSTAR_F: usize = 7;
-const COL_CSTAR_L: usize = 8;
-const COL_CSTAR_R: usize = 9;
-const NUM_COLUMNS: usize = 10;
-// chi_bounds index for chi_{m_J} (the output length).
-const CHI_MJ: usize = 0;
-
-const LABEL_BETA: &[u8] = b"pow/join/fingerprint-beta";
-const LABEL_ALPHA: &[u8] = b"pow/join/reciprocal-alpha";
+use super::membership::{
+    prove_membership_with_mult_in_domain, verify_membership_with_mult, MembershipProof,
+};
+use super::pairs::{prove_distinct_valid_pairs_in_domain, verify_distinct_valid_pairs, PairsProof};
+use super::sort::{prove_strictly_sorted, verify_strictly_sorted, SortedProof};
 
 #[inline]
 fn f0() -> ArkFr {
     ArkFr::zero()
 }
 
-/// A self-join soundness proof: the batched sumcheck over the three reciprocal
-/// (Identity) claims and the two LogUp-link (ZeroSum) claims, one batched Dory
-/// opening over all ten columns, and the internal witness commitments the
-/// verifier binds (`Com(X/Y/Z)` are returned separately as the query output).
-#[derive(Clone, Debug)]
-pub struct JoinSoundnessProof {
-    pub sumcheck: SumcheckProof,
-    pub opening: ColumnOpening,
-    pub mult_l_commitment: ArkGT,
-    pub mult_r_commitment: ArkGT,
-    pub dstar_f_commitment: ArkGT,
-    pub cstar_l_commitment: ArkGT,
-    pub cstar_r_commitment: ArkGT,
-}
-
-/// The common power-of-two domain for a relation of `mu` rows and an output of
-/// `m_j` rows (both zero-padded onto it); `>= 2` so the sumcheck has a variable.
-pub(crate) fn join_padded_len(mu: usize, m_j: usize) -> io::Result<usize> {
-    mu.max(m_j)
+/// The single shared power-of-two domain (`>= 2`) onto which EVERY self-join column
+/// is padded, so each logical column has ONE commitment reusable across sub-proofs.
+pub(crate) fn self_join_domain(n_f: usize, m_j: usize, n_u: usize) -> io::Result<usize> {
+    n_f.max(m_j)
+        .max(n_u)
         .checked_next_power_of_two()
-        .ok_or_else(|| invalid("join domain size overflow"))
-        .map(|n| n.max(2))
+        .ok_or_else(|| invalid("self-join domain size overflow"))
+        .map(|d| d.max(2))
 }
 
 fn padded(column: &[ArkFr], n: usize) -> Vec<ArkFr> {
@@ -86,279 +68,247 @@ fn padded(column: &[ArkFr], n: usize) -> Vec<ArkFr> {
     out
 }
 
-/// The multiplicity column over `F`: `mult[a] = |{ k : (out_a[k], out_b[k]) ==
-/// (Sf_a, Of_a) }|` (raw row equality), as a length-`n` field vector (0 on padding
-/// `F` rows). Assumes `F` rows are distinct (true for a filtered relation: a fixed
-/// predicate makes `(subject, object)` unique).
-pub(crate) fn multiplicity_over_f(
-    sf: &[ArkFr],
-    of: &[ArkFr],
-    out_a: &[ArkFr],
-    out_b: &[ArkFr],
-    n: usize,
-) -> Vec<ArkFr> {
-    let mut mult = vec![f0(); n];
-    for a in 0..sf.len() {
-        let mut count = 0u64;
-        for k in 0..out_a.len() {
-            if out_a[k] == sf[a] && out_b[k] == of[a] {
-                count += 1;
-            }
-        }
-        mult[a] = ArkFr::from_u64(count);
-    }
-    mult
+/// The ten committed columns of a self-join instance, all committed at
+/// `self_join_domain`. The SAME `sf`/`of` feed the pairs proof and the U-membership
+/// proofs; the SAME `u`/`w_l`/`w_r` feed distinctness, membership, and count.
+#[derive(Clone, Debug)]
+pub struct SelfJoinCommitments {
+    pub sf: ArkGT,
+    pub of: ArkGT,
+    pub x: ArkGT,
+    pub y: ArkGT,
+    pub z: ArkGT,
+    pub rho_l: ArkGT,
+    pub rho_r: ArkGT,
+    pub u: ArkGT,
+    pub w_l: ArkGT,
+    pub w_r: ArkGT,
 }
 
-/// The five claims over columns
-/// `[Sf, Of, X, Y, Z, mult_L, mult_R, dstar_F, cstar_L, cstar_R]`:
-///   * Identity: `dstar_F*(alpha - (beta*Sf + Of)) - 1 = 0`
-///   * Identity: `cstar_L*(alpha - (beta*X  + Y )) - 1 = 0`
-///   * Identity: `cstar_R*(alpha - (beta*Y  + Z )) - 1 = 0`
-///   * ZeroSum (left):  `Sum chi_{m_J}*cstar_L - Sum mult_L*dstar_F = 0`
-///   * ZeroSum (right): `Sum chi_{m_J}*cstar_R - Sum mult_R*dstar_F = 0`
-fn join_shape(k: usize, m_j: usize, alpha: ArkFr, beta: ArkFr) -> SumcheckShape {
-    let dstar = reciprocal_claim(COL_DSTAR_F, &[COL_OF, COL_SF], alpha, beta);
-    let cstar_l = reciprocal_claim(COL_CSTAR_L, &[COL_Y, COL_X], alpha, beta);
-    let cstar_r = reciprocal_claim(COL_CSTAR_R, &[COL_Z, COL_Y], alpha, beta);
-    let link_l = multiset_link_claim(
-        Operand::Chi(CHI_MJ),
-        COL_CSTAR_L,
-        Operand::Column(COL_MULT_L),
-        COL_DSTAR_F,
-    );
-    let link_r = multiset_link_claim(
-        Operand::Chi(CHI_MJ),
-        COL_CSTAR_R,
-        Operand::Column(COL_MULT_R),
-        COL_DSTAR_F,
-    );
-    SumcheckShape {
-        num_vars: k,
-        num_columns: NUM_COLUMNS,
-        chi_bounds: vec![m_j],
-        claims: vec![dstar, cstar_l, cstar_r, link_l, link_r],
-    }
+/// A full sound+complete self-join proof: the five composed sub-proofs.
+#[derive(Clone, Debug)]
+pub struct SelfJoinCompleteProof {
+    pub pairs: PairsProof,
+    pub sorted_u: SortedProof,
+    pub membership_l: MembershipProof,
+    pub membership_r: MembershipProof,
+    pub count: CountProof,
 }
 
-/// Prove self-join soundness with EXPLICIT multiplicity witnesses (length `n`).
-/// The honest entry point [`prove_self_join_soundness`] derives them; tests use
-/// this to inject wrong multiplicities.
+/// Commit every self-join column at the shared domain. Real callers derive these
+/// commitments from the committed store layer; tests build them here.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_self_join_soundness_with_witness(
+pub fn self_join_commitments(
     sf: &[ArkFr],
     of: &[ArkFr],
-    com_sf: &ArkGT,
-    com_of: &ArkGT,
-    x_out: &[ArkFr],
-    y_out: &[ArkFr],
-    z_out: &[ArkFr],
-    mult_l: &[ArkFr],
-    mult_r: &[ArkFr],
-    transcript: &mut Transcript254,
-) -> io::Result<(JoinSoundnessProof, ArkGT, ArkGT, ArkGT, usize)> {
-    let mu = sf.len();
-    let m_j = x_out.len();
-    if of.len() != mu {
-        return Err(invalid("relation Sf/Of length mismatch"));
-    }
-    if y_out.len() != m_j || z_out.len() != m_j {
-        return Err(invalid("output X/Y/Z length mismatch"));
-    }
-    let n = join_padded_len(mu, m_j)?;
-    if mult_l.len() != n || mult_r.len() != n {
-        return Err(invalid("multiplicity column length mismatch"));
-    }
-    let k = n.trailing_zeros() as usize;
-
-    let sf_p = padded(sf, n);
-    let of_p = padded(of, n);
-    let x_p = padded(x_out, n);
-    let y_p = padded(y_out, n);
-    let z_p = padded(z_out, n);
-
-    // Round 1: commit the output + multiplicity columns (raw-data witnesses, so
-    // committed before the fingerprint challenge), bind all data commitments.
-    let com_x = commit_column(&x_p)?;
-    let com_y = commit_column(&y_p)?;
-    let com_z = commit_column(&z_p)?;
-    let mult_l_commitment = commit_column(mult_l)?;
-    let mult_r_commitment = commit_column(mult_r)?;
-    bind_data_commitments(
-        transcript,
-        com_sf,
-        com_of,
-        &com_x,
-        &com_y,
-        &com_z,
-        &mult_l_commitment,
-        &mult_r_commitment,
-    );
-    let beta = transcript.challenge_scalar(LABEL_BETA);
-    let alpha = transcript.challenge_scalar(LABEL_ALPHA);
-
-    // Round 2: reciprocal witnesses over the beta-fingerprinted rows.
-    let dstar_f = reciprocal_witness(alpha, &rlc_fold(beta, &[&of_p, &sf_p]));
-    let cstar_l = reciprocal_witness(alpha, &rlc_fold(beta, &[&y_p, &x_p]));
-    let cstar_r = reciprocal_witness(alpha, &rlc_fold(beta, &[&z_p, &y_p]));
-    let dstar_f_commitment = commit_column(&dstar_f)?;
-    let cstar_l_commitment = commit_column(&cstar_l)?;
-    let cstar_r_commitment = commit_column(&cstar_r)?;
-    bind_reciprocal_commitments(
-        transcript,
-        &dstar_f_commitment,
-        &cstar_l_commitment,
-        &cstar_r_commitment,
-    );
-
-    let shape = join_shape(k, m_j, alpha, beta);
-    let columns = vec![
-        sf_p,
-        of_p,
-        x_p,
-        y_p,
-        z_p,
-        mult_l.to_vec(),
-        mult_r.to_vec(),
-        dstar_f,
-        cstar_l,
-        cstar_r,
-    ];
-    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
-
-    Ok((
-        JoinSoundnessProof {
-            sumcheck,
-            opening,
-            mult_l_commitment,
-            mult_r_commitment,
-            dstar_f_commitment,
-            cstar_l_commitment,
-            cstar_r_commitment,
-        },
-        com_x,
-        com_y,
-        com_z,
-        m_j,
-    ))
+    x: &[ArkFr],
+    y: &[ArkFr],
+    z: &[ArkFr],
+    rho_l: &[ArkFr],
+    rho_r: &[ArkFr],
+    u: &[ArkFr],
+    w_l: &[ArkFr],
+    w_r: &[ArkFr],
+) -> io::Result<SelfJoinCommitments> {
+    let n = self_join_domain(sf.len(), x.len(), u.len())?;
+    Ok(SelfJoinCommitments {
+        sf: commit_column(&padded(sf, n))?,
+        of: commit_column(&padded(of, n))?,
+        x: commit_column(&padded(x, n))?,
+        y: commit_column(&padded(y, n))?,
+        z: commit_column(&padded(z, n))?,
+        rho_l: commit_column(&padded(rho_l, n))?,
+        rho_r: commit_column(&padded(rho_r, n))?,
+        u: commit_column(&padded(u, n))?,
+        w_l: commit_column(&padded(w_l, n))?,
+        w_r: commit_column(&padded(w_r, n))?,
+    })
 }
 
-/// Prove that a claimed self-join output `(X_out, Y_out, Z_out)` (length `m_J`) is
-/// SOUND against the committed relation `F = (Sf, Of)`: every output row's
-/// `(x, y)` and `(y, z)` is a genuine `F` row. `com_sf`/`com_of` must commit `Sf`/
-/// `Of` padded to `join_padded_len(mu, m_J)`. Returns the proof, `Com(X/Y/Z)`, and
-/// `m_J`.
-pub fn prove_self_join_soundness(
-    sf: &[ArkFr],
-    of: &[ArkFr],
-    com_sf: &ArkGT,
-    com_of: &ArkGT,
-    x_out: &[ArkFr],
-    y_out: &[ArkFr],
-    z_out: &[ArkFr],
-    transcript: &mut Transcript254,
-) -> io::Result<(JoinSoundnessProof, ArkGT, ArkGT, ArkGT, usize)> {
-    let n = join_padded_len(sf.len(), x_out.len())?;
-    let mult_l = multiplicity_over_f(sf, of, x_out, y_out, n);
-    let mult_r = multiplicity_over_f(sf, of, y_out, z_out, n);
-    prove_self_join_soundness_with_witness(
-        sf, of, com_sf, com_of, x_out, y_out, z_out, &mult_l, &mult_r, transcript,
-    )
-}
+const LABEL_DOMAIN: &[u8] = b"pow/join-complete/domain-v1";
+const LABEL_LEN: &[u8] = b"pow/join-complete/len";
 
-/// Verify a self-join soundness proof. The verifier concludes every output row is
-/// a genuine `(x, y, z)` join of two `F` rows (no fabricated rows). Omitted rows
-/// are NOT detected here (completeness is Phase 2c-2).
-#[allow(clippy::too_many_arguments)]
-pub fn verify_self_join_soundness(
-    com_sf: &ArkGT,
-    com_of: &ArkGT,
-    com_x: &ArkGT,
-    com_y: &ArkGT,
-    com_z: &ArkGT,
+/// Bind the entire committed instance (10 commitments + public lengths) up front so
+/// every sub-proof's challenges cross-depend on the whole instance. Mirrored exactly
+/// by prover and verifier.
+fn bind_instance(
+    transcript: &mut Transcript254,
+    com: &SelfJoinCommitments,
+    n_f: usize,
+    n_u: usize,
     m_j: usize,
-    proof: &JoinSoundnessProof,
+) {
+    transcript.append_bytes(LABEL_DOMAIN, b"parture/proof-of-woql/self-join-complete/v0");
+    transcript.append_bytes(LABEL_LEN, &(n_f as u64).to_le_bytes());
+    transcript.append_bytes(LABEL_LEN, &(n_u as u64).to_le_bytes());
+    transcript.append_bytes(LABEL_LEN, &(m_j as u64).to_le_bytes());
+    transcript.append_group(b"pow/join-complete/com-sf", &com.sf);
+    transcript.append_group(b"pow/join-complete/com-of", &com.of);
+    transcript.append_group(b"pow/join-complete/com-x", &com.x);
+    transcript.append_group(b"pow/join-complete/com-y", &com.y);
+    transcript.append_group(b"pow/join-complete/com-z", &com.z);
+    transcript.append_group(b"pow/join-complete/com-rho-l", &com.rho_l);
+    transcript.append_group(b"pow/join-complete/com-rho-r", &com.rho_r);
+    transcript.append_group(b"pow/join-complete/com-u", &com.u);
+    transcript.append_group(b"pow/join-complete/com-w-l", &com.w_l);
+    transcript.append_group(b"pow/join-complete/com-w-r", &com.w_r);
+}
+
+/// Prove the claimed self-join output `(X, Y, Z)` (with index pointers `rho_l`,
+/// `rho_r` and key witnesses `U`, `w_L`, `w_R`) is the SOUND & COMPLETE self-join of
+/// `F = (Sf, Of)` on `Of == Sf`. `com` must commit every column padded to
+/// `self_join_domain(n_F, m_J, n_U)` (see [`self_join_commitments`]).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_self_join_complete(
+    sf: &[ArkFr],
+    of: &[ArkFr],
+    x: &[ArkFr],
+    y: &[ArkFr],
+    z: &[ArkFr],
+    rho_l: &[ArkFr],
+    rho_r: &[ArkFr],
+    u: &[ArkFr],
+    w_l: &[ArkFr],
+    w_r: &[ArkFr],
+    m_j: usize,
+    com: &SelfJoinCommitments,
+    transcript: &mut Transcript254,
+) -> io::Result<SelfJoinCompleteProof> {
+    let n_f = sf.len();
+    let n_u = u.len();
+    if of.len() != n_f {
+        return Err(invalid("F columns Sf/Of length mismatch"));
+    }
+    if x.len() != m_j
+        || y.len() != m_j
+        || z.len() != m_j
+        || rho_l.len() != m_j
+        || rho_r.len() != m_j
+    {
+        return Err(invalid("output columns must all have length m_J"));
+    }
+    if w_l.len() != n_u || w_r.len() != n_u {
+        return Err(invalid("multiplicity columns must match U length"));
+    }
+    let domain = self_join_domain(n_f, m_j, n_u)?;
+
+    bind_instance(transcript, com, n_f, n_u, m_j);
+
+    // (2c-2f) output = m_J DISTINCT genuine key-matching (left, right) F-pairs.
+    let pairs = prove_distinct_valid_pairs_in_domain(
+        sf, of, x, y, z, rho_l, rho_r, &com.sf, &com.of, &com.x, &com.y, &com.z, &com.rho_l,
+        &com.rho_r, domain, transcript,
+    )?;
+    // (2c-2a) U strictly increasing over [0, n_U): the distinct join-key set.
+    let u_padded = padded(u, domain);
+    let sorted_u = prove_strictly_sorted(&u_padded, n_u, &com.u, transcript)?;
+    // (2c-2b) Of is the image of U under w_L, and Sf the image of U under w_R:
+    // U covers every join key and w_L/w_R are the TRUE per-key group counts.
+    let membership_l =
+        prove_membership_with_mult_in_domain(u, of, w_l, &com.u, &com.of, &com.w_l, domain, transcript)?;
+    let membership_r =
+        prove_membership_with_mult_in_domain(u, sf, w_r, &com.u, &com.sf, &com.w_r, domain, transcript)?;
+    // (2c-2c) Sum_i w_L[i]*w_R[i] = m_J: valid-pair count EQUALS the output count.
+    let wl_padded = padded(w_l, domain);
+    let wr_padded = padded(w_r, domain);
+    let count = prove_count_identity(&wl_padded, &wr_padded, m_j, &com.w_l, &com.w_r, transcript)?;
+
+    Ok(SelfJoinCompleteProof {
+        pairs,
+        sorted_u,
+        membership_l,
+        membership_r,
+        count,
+    })
+}
+
+/// Verify a full sound+complete self-join proof against the committed instance,
+/// re-running each sub-verification on the same shared transcript in prover order.
+pub fn verify_self_join_complete(
+    com: &SelfJoinCommitments,
+    n_f: usize,
+    n_u: usize,
+    m_j: usize,
+    proof: &SelfJoinCompleteProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    let k = proof.sumcheck.round_polys.len();
-    if k == 0 || k >= usize::BITS as usize {
-        return Err(invalid("join proof has an implausible variable count"));
-    }
-    if m_j > (1usize << k) {
-        return Err(invalid("output length exceeds the join domain"));
-    }
+    let domain = self_join_domain(n_f, m_j, n_u)?;
 
-    bind_data_commitments(
-        transcript,
-        com_sf,
-        com_of,
-        com_x,
-        com_y,
-        com_z,
-        &proof.mult_l_commitment,
-        &proof.mult_r_commitment,
-    );
-    let beta = transcript.challenge_scalar(LABEL_BETA);
-    let alpha = transcript.challenge_scalar(LABEL_ALPHA);
-    bind_reciprocal_commitments(
-        transcript,
-        &proof.dstar_f_commitment,
-        &proof.cstar_l_commitment,
-        &proof.cstar_r_commitment,
-    );
+    bind_instance(transcript, com, n_f, n_u, m_j);
 
-    let shape = join_shape(k, m_j, alpha, beta);
-    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
-    verify_column_openings(
-        &[
-            *com_sf,
-            *com_of,
-            *com_x,
-            *com_y,
-            *com_z,
-            proof.mult_l_commitment,
-            proof.mult_r_commitment,
-            proof.dstar_f_commitment,
-            proof.cstar_l_commitment,
-            proof.cstar_r_commitment,
-        ],
-        &r,
-        &evals,
-        &proof.opening,
+    verify_distinct_valid_pairs(
+        &com.sf, &com.of, &com.x, &com.y, &com.z, &com.rho_l, &com.rho_r, n_f, m_j, &proof.pairs,
         transcript,
-    )
+    )?;
+    verify_strictly_sorted(&com.u, n_u, &proof.sorted_u, transcript)?;
+    verify_membership_with_mult(&com.u, &com.of, &com.w_l, n_u, n_f, &proof.membership_l, transcript)?;
+    verify_membership_with_mult(&com.u, &com.sf, &com.w_r, n_u, n_f, &proof.membership_r, transcript)?;
+    // count was proved over w_L/w_R padded to `domain`, so its real length is `domain`.
+    verify_count_identity(&com.w_l, &com.w_r, domain, m_j, &proof.count, transcript)?;
+    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn bind_data_commitments(
-    transcript: &mut Transcript254,
-    com_sf: &ArkGT,
-    com_of: &ArkGT,
-    com_x: &ArkGT,
-    com_y: &ArkGT,
-    com_z: &ArkGT,
-    com_mult_l: &ArkGT,
-    com_mult_r: &ArkGT,
-) {
-    transcript.append_group(b"pow/join/com-sf", com_sf);
-    transcript.append_group(b"pow/join/com-of", com_of);
-    transcript.append_group(b"pow/join/com-x", com_x);
-    transcript.append_group(b"pow/join/com-y", com_y);
-    transcript.append_group(b"pow/join/com-z", com_z);
-    transcript.append_group(b"pow/join/com-mult-l", com_mult_l);
-    transcript.append_group(b"pow/join/com-mult-r", com_mult_r);
+/// Sorted distinct union of two value columns (the join-key universe `U`). Sorted by
+/// canonical field representation, which for `u64`-range dictionary ids is numeric
+/// order (the order the strict-sortedness gadget checks).
+fn sorted_distinct_union(a: &[ArkFr], b: &[ArkFr]) -> Vec<ArkFr> {
+    let mut all: Vec<ArkFr> = a.iter().chain(b.iter()).copied().collect();
+    all.sort_by(|p, q| p.0.into_bigint().cmp(&q.0.into_bigint()));
+    all.dedup();
+    all
 }
 
-fn bind_reciprocal_commitments(
-    transcript: &mut Transcript254,
-    com_dstar_f: &ArkGT,
-    com_cstar_l: &ArkGT,
-    com_cstar_r: &ArkGT,
+/// `mult[i] = #{ e in `col` : e == u[i] }` as field elements.
+fn multiplicity_in(u: &[ArkFr], col: &[ArkFr]) -> Vec<ArkFr> {
+    u.iter()
+        .map(|value| ArkFr::from_u64(col.iter().filter(|e| *e == value).count() as u64))
+        .collect()
+}
+
+/// Compute the complete self-join of `F = (Sf, Of)` on `Of == Sf`, plus every
+/// witness column the completeness proof needs. Returns
+/// `(X, Y, Z, rho_l, rho_r, U, w_L, w_R, m_J)`:
+///   * one output row `(X = Sf[l], Y = Of[l] = Sf[r], Z = Of[r])` with index
+///     pointers `rho_l = l`, `rho_r = r` for every `(l, r)` with `Of[l] == Sf[r]`,
+///     emitted in `(l, r)` lexicographic order == combined-index `C*l + r` ascending
+///     (`C = next_pow2(n_F) >= n_F > r`), so `rho`s are strictly increasing;
+///   * `U` = sorted distinct union of `values(Of)` and `values(Sf)` (the join keys);
+///   * `w_L[i] = #{ l : Of[l] == U[i] }`, `w_R[i] = #{ r : Sf[r] == U[i] }`;
+///   * `m_J = |output| = Sum_i w_L[i]*w_R[i]`.
+#[allow(clippy::type_complexity)]
+pub fn compute_self_join(
+    sf: &[ArkFr],
+    of: &[ArkFr],
+) -> (
+    Vec<ArkFr>,
+    Vec<ArkFr>,
+    Vec<ArkFr>,
+    Vec<ArkFr>,
+    Vec<ArkFr>,
+    Vec<ArkFr>,
+    Vec<ArkFr>,
+    Vec<ArkFr>,
+    usize,
 ) {
-    transcript.append_group(b"pow/join/com-dstar-f", com_dstar_f);
-    transcript.append_group(b"pow/join/com-cstar-l", com_cstar_l);
-    transcript.append_group(b"pow/join/com-cstar-r", com_cstar_r);
+    let n_f = sf.len();
+    let (mut x, mut y, mut z, mut rho_l, mut rho_r) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for l in 0..n_f {
+        for r in 0..n_f {
+            if of[l] == sf[r] {
+                x.push(sf[l]);
+                y.push(of[l]);
+                z.push(of[r]);
+                rho_l.push(ArkFr::from_u64(l as u64));
+                rho_r.push(ArkFr::from_u64(r as u64));
+            }
+        }
+    }
+    let m_j = x.len();
+    let u = sorted_distinct_union(of, sf);
+    let w_l = multiplicity_in(&u, of);
+    let w_r = multiplicity_in(&u, sf);
+    (x, y, z, rho_l, rho_r, u, w_l, w_r, m_j)
 }
 
 #[cfg(test)]
@@ -374,108 +324,173 @@ mod tests {
     }
 
     fn transcript() -> Transcript254 {
-        Transcript254::new(b"parture-join-test")
+        Transcript254::new(b"parture-self-join-complete-test")
     }
 
-    fn commit_padded(column: &[ArkFr], n: usize) -> ArkGT {
-        commit_column(&padded(column, n)).unwrap()
-    }
-
-    // F = {(1,2),(2,3),(3,1),(2,4)}; self-join on Of==Sf gives the valid output
-    // {(1,2,3),(1,2,4),(2,3,1),(3,1,2)}.
+    // F = {(1,5),(2,5),(5,10),(5,20)}; key 5 has left F-rows {0,1} and right {2,3}.
     fn relation() -> (Vec<ArkFr>, Vec<ArkFr>) {
-        (frs(&[1, 2, 3, 2]), frs(&[2, 3, 1, 4]))
+        (frs(&[1, 2, 5, 5]), frs(&[5, 5, 10, 20]))
     }
 
-    fn valid_output() -> (Vec<ArkFr>, Vec<ArkFr>, Vec<ArkFr>) {
-        (frs(&[1, 1, 2, 3]), frs(&[2, 2, 3, 1]), frs(&[3, 4, 1, 2]))
-    }
-
-    // Honest run: commit F at the right domain, prove, verify.
-    fn run(
+    #[allow(clippy::too_many_arguments)]
+    fn attempt(
         sf: &[ArkFr],
         of: &[ArkFr],
         x: &[ArkFr],
         y: &[ArkFr],
         z: &[ArkFr],
+        rho_l: &[ArkFr],
+        rho_r: &[ArkFr],
+        u: &[ArkFr],
+        w_l: &[ArkFr],
+        w_r: &[ArkFr],
+        m_j: usize,
     ) -> io::Result<()> {
-        let n = join_padded_len(sf.len(), x.len()).unwrap();
-        let com_sf = commit_padded(sf, n);
-        let com_of = commit_padded(of, n);
+        let com = self_join_commitments(sf, of, x, y, z, rho_l, rho_r, u, w_l, w_r)?;
         let mut pt = transcript();
-        let (proof, com_x, com_y, com_z, m) =
-            prove_self_join_soundness(sf, of, &com_sf, &com_of, x, y, z, &mut pt)?;
+        let proof = prove_self_join_complete(
+            sf, of, x, y, z, rho_l, rho_r, u, w_l, w_r, m_j, &com, &mut pt,
+        )?;
         let mut vt = transcript();
-        verify_self_join_soundness(&com_sf, &com_of, &com_x, &com_y, &com_z, m, &proof, &mut vt)
+        verify_self_join_complete(&com, sf.len(), u.len(), m_j, &proof, &mut vt)
+    }
+
+    // Prove/verify the honestly-computed complete self-join of F.
+    fn attempt_honest(sf: &[ArkFr], of: &[ArkFr]) -> io::Result<()> {
+        let (x, y, z, rho_l, rho_r, u, w_l, w_r, m_j) = compute_self_join(sf, of);
+        attempt(sf, of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, m_j)
     }
 
     #[test]
-    fn valid_join_output_verifies() {
+    fn compute_self_join_matches_hand_computed_output() {
         let (sf, of) = relation();
-        let (x, y, z) = valid_output();
-        assert!(run(&sf, &of, &x, &y, &z).is_ok());
+        let (x, y, z, rho_l, rho_r, u, w_l, w_r, m_j) = compute_self_join(&sf, &of);
+        // Exact contents of the complete join, ordered by (rho_l, rho_r).
+        assert_eq!(m_j, 4);
+        assert_eq!(x, frs(&[1, 1, 2, 2]));
+        assert_eq!(y, frs(&[5, 5, 5, 5]));
+        assert_eq!(z, frs(&[10, 20, 10, 20]));
+        assert_eq!(rho_l, frs(&[0, 0, 1, 1]));
+        assert_eq!(rho_r, frs(&[2, 3, 2, 3]));
+        // U = sorted distinct union of {5,10,20} and {1,2,5} = {1,2,5,10,20}.
+        assert_eq!(u, frs(&[1, 2, 5, 10, 20]));
+        assert_eq!(w_l, frs(&[0, 0, 2, 1, 1])); // key counts in Of
+        assert_eq!(w_r, frs(&[1, 1, 2, 0, 0])); // key counts in Sf
     }
 
     #[test]
-    fn fabricated_left_row_is_rejected() {
-        // Append (x=9, y=2, z=3): (9,2) is NOT an F row, though (2,3) is.
+    fn genuine_complete_self_join_verifies() {
         let (sf, of) = relation();
-        let x = frs(&[1, 1, 2, 3, 9]);
-        let y = frs(&[2, 2, 3, 1, 2]);
-        let z = frs(&[3, 4, 1, 2, 3]);
-        assert!(run(&sf, &of, &x, &y, &z).is_err());
+        assert!(attempt_honest(&sf, &of).is_ok());
     }
 
     #[test]
-    fn fabricated_right_row_is_rejected() {
-        // Append (x=1, y=2, z=9): (1,2) is an F row, but (2,9) is NOT.
+    fn rob_peter_omit_and_duplicate_is_rejected() {
+        // THE ROB-PETER ATTACK: keep the honest COUNT (m_J = 4) and the honest key
+        // witnesses (U, w_L, w_R) untouched -- so both memberships and the count
+        // identity still pass -- but omit the valid pair (1,3) and duplicate (0,2).
+        // Every output row is still a genuine key-match, so the memberships cannot
+        // see it. It is caught by the pairs' COMBINED-INDEX STRICT MONOTONICITY: the
+        // duplicated (rho_l, rho_r) = (0,2) makes i_eval = C*rho_l + rho_r repeat,
+        // so i_eval is not strictly increasing.
         let (sf, of) = relation();
-        let x = frs(&[1, 1, 2, 3, 1]);
-        let y = frs(&[2, 2, 3, 1, 2]);
-        let z = frs(&[3, 4, 1, 2, 9]);
-        assert!(run(&sf, &of, &x, &y, &z).is_err());
+        let (_, _, _, _, _, u, w_l, w_r, m_j) = compute_self_join(&sf, &of);
+        // {(0,2),(0,2),(0,3),(1,2)}: (1,3) omitted, (0,2) duplicated. Still 4 rows.
+        let x = frs(&[1, 1, 1, 2]);
+        let y = frs(&[5, 5, 5, 5]);
+        let z = frs(&[10, 10, 20, 10]);
+        let rho_l = frs(&[0, 0, 0, 1]);
+        let rho_r = frs(&[2, 2, 3, 2]);
+        assert!(attempt(&sf, &of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, m_j).is_err());
     }
 
     #[test]
-    fn wrong_multiplicities_are_rejected() {
+    fn omitting_a_pair_is_caught_by_count_identity() {
+        // Drop the valid pair (1,3): 3 DISTINCT valid pairs remain (i_eval strictly
+        // increasing, memberships pass), but the honest key witnesses give
+        // Sum w_L*w_R = 4 != 3 claimed rows, so the COUNT IDENTITY rejects.
         let (sf, of) = relation();
-        let (x, y, z) = valid_output();
-        let n = join_padded_len(sf.len(), x.len()).unwrap();
-        let com_sf = commit_padded(&sf, n);
-        let com_of = commit_padded(&of, n);
-
-        // Honest multiplicities, then corrupt one entry of mult_L.
-        let mut mult_l = multiplicity_over_f(&sf, &of, &x, &y, n);
-        let mult_r = multiplicity_over_f(&sf, &of, &y, &z, n);
-        mult_l[0] = mult_l[0] + fr(1);
-
-        let mut pt = transcript();
-        let (proof, com_x, com_y, com_z, m) = prove_self_join_soundness_with_witness(
-            &sf, &of, &com_sf, &com_of, &x, &y, &z, &mult_l, &mult_r, &mut pt,
-        )
-        .unwrap();
-        let mut vt = transcript();
-        assert!(verify_self_join_soundness(
-            &com_sf, &com_of, &com_x, &com_y, &com_z, m, &proof, &mut vt
-        )
-        .is_err());
+        let (_, _, _, _, _, u, w_l, w_r, _) = compute_self_join(&sf, &of);
+        let x = frs(&[1, 2, 2]);
+        let y = frs(&[5, 5, 5]);
+        let z = frs(&[10, 10, 20]);
+        let rho_l = frs(&[0, 1, 1]);
+        let rho_r = frs(&[2, 2, 3]);
+        assert!(attempt(&sf, &of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, 3).is_err());
     }
 
     #[test]
-    fn known_gap_omitting_a_valid_pair_still_verifies() {
-        // SOUNDNESS-ONLY: dropping a genuine join row (1,2,4) leaves a valid subset
-        // -- every remaining row is still a real join -- so it VERIFIES here.
-        // Phase 2c-2 (completeness) will make omission FAIL.
+    fn duplicating_a_pair_to_inflate_count_is_rejected() {
+        // Claim 5 rows by duplicating (0,2). Honest w gives Sum w_L*w_R = 4 != 5, so
+        // the count identity rejects; the duplicate also breaks combined-index
+        // monotonicity (checked first). Either way: REJECT.
         let (sf, of) = relation();
-        let x = frs(&[1, 2, 3]); // (1,2,4) omitted
-        let y = frs(&[2, 3, 1]);
-        let z = frs(&[3, 1, 2]);
-        assert!(run(&sf, &of, &x, &y, &z).is_ok());
+        let (_, _, _, _, _, u, w_l, w_r, _) = compute_self_join(&sf, &of);
+        let x = frs(&[1, 1, 1, 2, 2]);
+        let y = frs(&[5, 5, 5, 5, 5]);
+        let z = frs(&[10, 10, 20, 10, 20]);
+        let rho_l = frs(&[0, 0, 0, 1, 1]);
+        let rho_r = frs(&[2, 2, 3, 2, 3]);
+        assert!(attempt(&sf, &of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, 5).is_err());
     }
 
     #[test]
-    fn empty_output_verifies() {
+    fn within_group_swap_is_rejected() {
+        // {(0,2)x2,(1,3)x2}: same marginals/count as the honest join, every row a
+        // valid pair -> memberships + count pass, but i_eval = [2,2,7,7] repeats ->
+        // combined-index strict monotonicity rejects (the case the gather missed).
         let (sf, of) = relation();
-        assert!(run(&sf, &of, &[], &[], &[]).is_ok());
+        let (_, _, _, _, _, u, w_l, w_r, m_j) = compute_self_join(&sf, &of);
+        let x = frs(&[1, 1, 2, 2]);
+        let y = frs(&[5, 5, 5, 5]);
+        let z = frs(&[10, 10, 20, 20]);
+        let rho_l = frs(&[0, 0, 1, 1]);
+        let rho_r = frs(&[2, 2, 3, 3]);
+        assert!(attempt(&sf, &of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, m_j).is_err());
+    }
+
+    #[test]
+    fn fabricated_output_row_is_rejected() {
+        // X[0] = 99 != Sf[rho_l[0]=0] = 1: the left index-augmented membership fails.
+        let (sf, of) = relation();
+        let (mut x, y, z, rho_l, rho_r, u, w_l, w_r, m_j) = compute_self_join(&sf, &of);
+        x[0] = fr(99);
+        assert!(attempt(&sf, &of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, m_j).is_err());
+    }
+
+    #[test]
+    fn wrong_multiplicity_is_rejected() {
+        // Tamper w_L (claim key 5 appears 3x in Of, not 2x): the LEFT membership
+        // residue (Of image of U under w_L) no longer holds -> REJECT.
+        let (sf, of) = relation();
+        let (x, y, z, rho_l, rho_r, u, mut w_l, w_r, m_j) = compute_self_join(&sf, &of);
+        w_l[2] = w_l[2] + fr(1);
+        assert!(attempt(&sf, &of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, m_j).is_err());
+    }
+
+    #[test]
+    fn empty_join_verifies() {
+        // F with no self-matches: Of and Sf are disjoint value sets.
+        let sf = frs(&[1, 2]);
+        let of = frs(&[3, 4]);
+        let (x, y, z, rho_l, rho_r, u, w_l, w_r, m_j) = compute_self_join(&sf, &of);
+        assert_eq!(m_j, 0);
+        assert!(attempt(&sf, &of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, m_j).is_ok());
+    }
+
+    #[test]
+    fn realistic_multi_key_self_join_verifies() {
+        // Several keys with different left/right multiplicities.
+        // F = {(1,2),(7,2),(2,9),(2,4),(4,5),(9,1)}:
+        //   key 2: left rows with Of=2 -> {0,1} (Sf 1,7); right rows Sf=2 -> {2,3}.
+        //   key 4: left Of=4 -> {3}; right Sf=4 -> {4}.
+        //   key 9: left Of=9 -> {2}; right Sf=9 -> {5}.
+        //   key 1: left Of=1 -> {5}; right Sf=1 -> {0}.
+        let sf = frs(&[1, 7, 2, 2, 4, 9]);
+        let of = frs(&[2, 2, 9, 4, 5, 1]);
+        let (x, y, z, rho_l, rho_r, u, w_l, w_r, m_j) = compute_self_join(&sf, &of);
+        // key 2 contributes 2*2 = 4; keys 1,4,9 contribute 1 each => m_J = 7.
+        assert_eq!(m_j, 7);
+        assert!(attempt(&sf, &of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, m_j).is_ok());
     }
 }
