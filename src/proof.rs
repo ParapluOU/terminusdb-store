@@ -961,6 +961,7 @@ pub mod filter;
 pub mod join;
 pub mod logup;
 pub mod query;
+pub mod sort;
 
 /// Per-layer sidecar payload for the Proof-of-WOQL commitment scheme.
 ///

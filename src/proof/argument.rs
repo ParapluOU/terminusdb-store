@@ -81,6 +81,10 @@ pub enum Operand {
     /// (verifier-derivable; never committed). The bound is carried by
     /// [`SumcheckShape::chi_bounds`]`[b]`.
     Chi(usize),
+    /// The MLE of the PUBLIC index function `f(i) = i` over `{0,1}^k`
+    /// (verifier-derivable; never committed). Its evaluation at `r` is the
+    /// closed form `idx(r) = Sum_j r_j * 2^j`.
+    Idx,
 }
 
 /// One term of a claim expression: a public constant `coeff` times a product of
@@ -206,6 +210,16 @@ impl SumcheckShape {
             .any(|claim| claim.shape == ClaimShape::Identity)
     }
 
+    fn uses_idx(&self) -> bool {
+        self.claims.iter().any(|claim| {
+            claim
+                .expr
+                .terms
+                .iter()
+                .any(|term| term.operands.iter().any(|op| *op == Operand::Idx))
+        })
+    }
+
     /// Per-round univariate degree: the largest term arity across claims,
     /// counting the extra `eq` factor that identity (zero-check) claims carry.
     fn round_degree(&self) -> usize {
@@ -297,6 +311,24 @@ pub fn chi_n_eval(point: &[ArkFr], n: usize) -> ArkFr {
     result
 }
 
+/// The prover's index table `[0, 1, 2, .., 2^k - 1]` (the values of `f(i) = i`),
+/// whose multilinear extension the verifier reproduces closed-form via
+/// [`idx_eval`].
+fn idx_table(k: usize) -> Vec<ArkFr> {
+    (0..(1usize << k)).map(|i| ArkFr::from_u64(i as u64)).collect()
+}
+
+/// Closed-form MLE of the PUBLIC index function `f(i) = i` at `point` (LSB-first):
+/// `idx(r) = Sum_j r_j * 2^j` (since `i = Sum_j bit_j(i) * 2^j` and each bit's MLE
+/// is `r_j`).
+pub fn idx_eval(point: &[ArkFr]) -> ArkFr {
+    let mut acc = f0();
+    for (j, rj) in point.iter().enumerate() {
+        acc = acc + *rj * ArkFr::from_u64(1u64 << j);
+    }
+    acc
+}
+
 /// Fold a table in place at its current lowest variable: `new[i] =
 /// t[2i]*(1-r) + t[2i+1]*r`, halving the length.
 fn fold_table(table: &mut Vec<ArkFr>, r: ArkFr) {
@@ -378,6 +410,7 @@ fn append_shape(transcript: &mut Transcript254, shape: &SumcheckShape) {
                         transcript.append_bytes(LABEL_SHAPE, &[1u8]);
                         transcript.append_bytes(LABEL_SHAPE, &(*b as u64).to_le_bytes());
                     }
+                    Operand::Idx => transcript.append_bytes(LABEL_SHAPE, &[2u8]),
                 }
             }
         }
@@ -439,6 +472,11 @@ pub fn prove_sumcheck(
         .iter()
         .map(|&bound| chi_n_table(k, bound))
         .collect();
+    let mut idx = if shape.uses_idx() {
+        idx_table(k)
+    } else {
+        Vec::new()
+    };
 
     let mut round_polys = Vec::with_capacity(k);
     let mut r = Vec::with_capacity(k);
@@ -466,6 +504,7 @@ pub fn prove_sumcheck(
                                 * match operand {
                                     Operand::Column(c) => at(&tables[*c], i),
                                     Operand::Chi(b) => at(&chi_tables[*b], i),
+                                    Operand::Idx => at(&idx, i),
                                 };
                         }
                         expr_val = expr_val + prod;
@@ -488,6 +527,9 @@ pub fn prove_sumcheck(
         }
         for chi in chi_tables.iter_mut() {
             fold_table(chi, challenge);
+        }
+        if shape.uses_idx() {
+            fold_table(&mut idx, challenge);
         }
         round_polys.push(poly);
         r.push(challenge);
@@ -557,6 +599,7 @@ pub fn verify_sumcheck(
         .iter()
         .map(|&bound| chi_n_eval(&r, bound))
         .collect();
+    let idx_at_r = idx_eval(&r);
     let mut expected = f0();
     for (j, claim) in shape.claims.iter().enumerate() {
         let eq_factor = if claim.shape == ClaimShape::Identity {
@@ -572,6 +615,7 @@ pub fn verify_sumcheck(
                     * match operand {
                         Operand::Column(c) => proof.claimed_evals[*c],
                         Operand::Chi(b) => chi_at_r[*b],
+                        Operand::Idx => idx_at_r,
                     };
             }
             expr_val = expr_val + prod;
@@ -711,6 +755,15 @@ mod tests {
 
     fn transcript() -> Transcript254 {
         Transcript254::new(b"parture-argument-test")
+    }
+
+    #[test]
+    fn idx_closed_form_matches_table_mle() {
+        // idx(r) = Sum_j r_j*2^j must equal the MLE of the table [0,1,..,2^k-1].
+        for k in 1..=6 {
+            let point: Vec<ArkFr> = (0..k).map(|j| fr(5 * j as u64 + 2)).collect();
+            assert_eq!(idx_eval(&point), mle_full_eval(&idx_table(k), &point));
+        }
     }
 
     #[test]
