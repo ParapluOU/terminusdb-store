@@ -42,23 +42,24 @@ use super::logup::{
     multiset_link_claim, pseudo_inverse, reciprocal_claim, reciprocal_witness, rlc_fold,
 };
 
-// Column ordering. The 2b-1 indicator gadget uses [P, sel, w]; the full Q1
-// compaction extends this with the data + output + reciprocal columns.
+// Column ordering. The 2b-1 indicator gadget uses [P, sel, w].
 const COL_P: usize = 0;
 const COL_SEL: usize = 1;
 const COL_W: usize = 2;
-const COL_S: usize = 3;
-const COL_O: usize = 4;
-const COL_SOUT: usize = 5;
-const COL_OOUT: usize = 6;
-const COL_CSTAR: usize = 7;
-const COL_DSTAR: usize = 8;
 // chi_bounds indices: chi_n (real-row count n) and chi_m (output length m).
 const CHI_N: usize = 0;
 const CHI_M: usize = 1;
 
-const LABEL_BETA: &[u8] = b"pow/q1/logup-beta";
-const LABEL_ALPHA: &[u8] = b"pow/q1/logup-alpha";
+// Generalized per-atom filter column layout (filter on ANY subset of {S,P,O}). The
+// base columns come first so a constant position folds directly into claims A/B; the
+// kept (variable) output columns follow, then the two reciprocal columns, then the
+// optional unit INPUT column used only for a ground atom (|C| = 3).
+const A_COL_S: usize = 0;
+const A_COL_P: usize = 1;
+const A_COL_O: usize = 2;
+const A_COL_SEL: usize = 3;
+const A_COL_W: usize = 4;
+const A_COL_KEPT_BASE: usize = 5;
 
 #[inline]
 fn f0() -> ArkFr {
@@ -285,196 +286,433 @@ pub struct FullFilterProof {
     pub dstar_commitment: ArkGT,
 }
 
-/// All nine claims of the full Q1 over columns
-/// `[P, sel, w, S, O, S_out, O_out, cstar, dstar]` with `chi_bounds = [n, m]`.
-fn full_filter_shape(
-    k: usize,
+/// The variable/constant positions of a triple atom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Position {
+    S,
+    P,
+    O,
+}
+
+impl Position {
+    fn base_col(self) -> usize {
+        match self {
+            Position::S => A_COL_S,
+            Position::P => A_COL_P,
+            Position::O => A_COL_O,
+        }
+    }
+    fn tag(self) -> u8 {
+        match self {
+            Position::S => 0,
+            Position::P => 1,
+            Position::O => 2,
+        }
+    }
+}
+
+/// A per-atom filter: the constant positions (with their constant ids) and the KEPT
+/// (variable) positions in atom order. `kept` must be exactly `{S,P,O}` minus the
+/// constant positions.
+#[derive(Clone, Debug)]
+pub struct AtomFilterSpec {
+    pub constants: Vec<(Position, ArkFr)>,
+    pub kept: Vec<Position>,
+}
+
+/// A kept (output) column source: a variable base position, or the public all-ones
+/// UNIT column used for a ground atom (|C| = 3) so C/D/E runs uniformly.
+#[derive(Clone, Copy, Debug)]
+enum KeptSource {
+    Base(Position),
+    Unit,
+}
+
+impl AtomFilterSpec {
+    /// The classic predicate-only filter: `P` constant, keep `S` and `O`.
+    pub fn predicate(pred: ArkFr) -> Self {
+        Self {
+            constants: vec![(Position::P, pred)],
+            kept: vec![Position::S, Position::O],
+        }
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.constants.len() + self.kept.len() != 3 {
+            return Err(invalid("atom filter spec must cover S, P, O exactly once"));
+        }
+        let mut is_constant = [false; 3];
+        for (pos, _) in &self.constants {
+            if is_constant[pos.tag() as usize] {
+                return Err(invalid("duplicate constant position in atom filter"));
+            }
+            is_constant[pos.tag() as usize] = true;
+        }
+        let expected: Vec<Position> = [Position::S, Position::P, Position::O]
+            .iter()
+            .copied()
+            .filter(|p| !is_constant[p.tag() as usize])
+            .collect();
+        if self.kept != expected {
+            return Err(invalid(
+                "atom filter kept positions must be the constants' complement in atom order",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Kept-column sources: the variable positions, or a single UNIT column for a
+    /// ground atom (no variable positions).
+    fn kept_sources(&self) -> Vec<KeptSource> {
+        if self.kept.is_empty() {
+            vec![KeptSource::Unit]
+        } else {
+            self.kept.iter().map(|p| KeptSource::Base(*p)).collect()
+        }
+    }
+}
+
+/// A per-atom filter proof. `Identity` is the |C| = 0 case (`t(?s,?p,?o)`): the result
+/// is every real row, so the kept columns ARE the base columns and no sumcheck is
+/// produced. `Compacted` carries the selection + compaction argument (|C| >= 1).
+#[derive(Clone, Debug)]
+pub enum AtomFilterProof {
+    Identity,
+    Compacted(FullFilterProof),
+}
+
+fn a_col_cstar(num_kept: usize) -> usize {
+    A_COL_KEPT_BASE + num_kept
+}
+fn a_col_dstar(num_kept: usize) -> usize {
+    A_COL_KEPT_BASE + num_kept + 1
+}
+fn a_col_unit_in(num_kept: usize) -> usize {
+    A_COL_KEPT_BASE + num_kept + 2
+}
+
+/// Selection claims A and B generalized over the constant positions, folded with a
+/// PUBLIC Fiat-Shamir coefficient `beta_c` baked into the term coefficients (no new
+/// committed column):
+///   lhs_i = Σ_r beta_c^r * (Col_{pos_r}[i] - c_r)
+///   A: sel * lhs = 0        B: (chi_n - sel) - lhs * w = 0
+/// For |C| = 1 this is exactly the classic Q1 (a single term, `beta_c^0 = 1`).
+fn selection_claims(spec: &AtomFilterSpec, beta_c: ArkFr) -> (SumcheckClaim, SumcheckClaim) {
+    let mut a_terms = Vec::with_capacity(2 * spec.constants.len());
+    let mut b_terms = vec![
+        Term {
+            coeff: f1(),
+            operands: vec![Operand::Chi(CHI_N)],
+        },
+        Term {
+            coeff: f0() - f1(),
+            operands: vec![Operand::Column(A_COL_SEL)],
+        },
+    ];
+    let mut power = f1();
+    for (pos, c) in &spec.constants {
+        let col = pos.base_col();
+        // A: beta_c^r * sel*Col - (beta_c^r * c) * sel
+        a_terms.push(Term {
+            coeff: power,
+            operands: vec![Operand::Column(A_COL_SEL), Operand::Column(col)],
+        });
+        a_terms.push(Term {
+            coeff: f0() - power * *c,
+            operands: vec![Operand::Column(A_COL_SEL)],
+        });
+        // B: -(beta_c^r) * Col*w + (beta_c^r * c) * w
+        b_terms.push(Term {
+            coeff: f0() - power,
+            operands: vec![Operand::Column(col), Operand::Column(A_COL_W)],
+        });
+        b_terms.push(Term {
+            coeff: power * *c,
+            operands: vec![Operand::Column(A_COL_W)],
+        });
+        power = power * beta_c;
+    }
+    (
+        SumcheckClaim {
+            shape: ClaimShape::Identity,
+            expr: Expr { terms: a_terms },
+            target: f0(),
+        },
+        SumcheckClaim {
+            shape: ClaimShape::Identity,
+            expr: Expr { terms: b_terms },
+            target: f0(),
+        },
+    )
+}
+
+/// The full atom-filter shape: selection (A, B) + compaction (C, D, E) over the kept
+/// columns. The compaction half is arity-generic (folds the kept INPUT columns for
+/// `cstar` and the kept OUTPUT columns for `dstar`).
+#[allow(clippy::too_many_arguments)]
+fn atom_shape(
+    spec: &AtomFilterSpec,
+    num_vars: usize,
     real_rows: usize,
     output_len: usize,
-    pred: ArkFr,
+    num_kept: usize,
+    has_unit: bool,
+    beta_c: ArkFr,
     alpha: ArkFr,
     beta: ArkFr,
 ) -> SumcheckShape {
-    let neg_one = f0() - f1();
-    let neg_pred = f0() - pred;
+    let (claim_a, claim_b) = selection_claims(spec, beta_c);
 
-    // A: sel*(P - pred) = 0
-    let claim_a = SumcheckClaim {
-        shape: ClaimShape::Identity,
-        expr: Expr {
-            terms: vec![
-                Term {
-                    coeff: f1(),
-                    operands: vec![Operand::Column(COL_SEL), Operand::Column(COL_P)],
-                },
-                Term {
-                    coeff: neg_pred,
-                    operands: vec![Operand::Column(COL_SEL)],
-                },
-            ],
-        },
-        target: f0(),
+    let kept_in: Vec<usize> = if has_unit {
+        vec![a_col_unit_in(num_kept)]
+    } else {
+        spec.kept.iter().map(|p| p.base_col()).collect()
     };
-    // B: (chi_n - sel) - (P - pred)*w = 0
-    let claim_b = SumcheckClaim {
-        shape: ClaimShape::Identity,
-        expr: Expr {
-            terms: vec![
-                Term {
-                    coeff: f1(),
-                    operands: vec![Operand::Chi(CHI_N)],
-                },
-                Term {
-                    coeff: neg_one,
-                    operands: vec![Operand::Column(COL_SEL)],
-                },
-                Term {
-                    coeff: neg_one,
-                    operands: vec![Operand::Column(COL_P), Operand::Column(COL_W)],
-                },
-                Term {
-                    coeff: pred,
-                    operands: vec![Operand::Column(COL_W)],
-                },
-            ],
-        },
-        target: f0(),
-    };
-    // C: cstar*(alpha - (beta*S + O)) - 1 = 0
-    let claim_c = reciprocal_claim(COL_CSTAR, &[COL_O, COL_S], alpha, beta);
-    // D: dstar*(alpha - (beta*S_out + O_out)) - 1 = 0
-    let claim_d = reciprocal_claim(COL_DSTAR, &[COL_OOUT, COL_SOUT], alpha, beta);
-    // E (ZeroSum, the LogUp link): Σ sel*cstar - Σ chi_m*dstar = 0
-    let claim_e = multiset_link_claim(
-        Operand::Column(COL_SEL),
-        COL_CSTAR,
-        Operand::Chi(CHI_M),
-        COL_DSTAR,
-    );
+    let kept_out: Vec<usize> = (0..num_kept).map(|d| A_COL_KEPT_BASE + d).collect();
+    let cstar = a_col_cstar(num_kept);
+    let dstar = a_col_dstar(num_kept);
 
+    // C: cstar reciprocal over the kept INPUT fold; D: dstar over the kept OUTPUT fold.
+    let claim_c = reciprocal_claim(cstar, &kept_in, alpha, beta);
+    let claim_d = reciprocal_claim(dstar, &kept_out, alpha, beta);
+    // E (LogUp link): Σ sel*cstar - Σ chi_m*dstar = 0.
+    let claim_e = multiset_link_claim(Operand::Column(A_COL_SEL), cstar, Operand::Chi(CHI_M), dstar);
+
+    let num_columns = a_col_unit_in(num_kept) + usize::from(has_unit);
     SumcheckShape {
-        num_vars: k,
-        num_columns: 9,
+        num_vars,
+        num_columns,
         chi_bounds: vec![real_rows, output_len],
         claims: vec![claim_a, claim_b, claim_c, claim_d, claim_e],
     }
 }
 
-/// Compact the selected rows into a dense output: for every `i` with `sel_i = 1`
-/// (in row order) append `(S_i, O_i)`; pad the tail with zeros. Returns the dense
-/// output columns and the match count `m`.
+const A_LABEL_DOMAIN: &[u8] = b"pow/atom-filter/domain-v1";
+const A_LABEL_SPEC: &[u8] = b"pow/atom-filter/spec";
+const A_LABEL_BETA_C: &[u8] = b"pow/atom-filter/const-beta";
+const A_LABEL_BETA: &[u8] = b"pow/atom-filter/logup-beta";
+const A_LABEL_ALPHA: &[u8] = b"pow/atom-filter/logup-alpha";
+
+fn base_column<'a>(pos: Position, s: &'a [ArkFr], p: &'a [ArkFr], o: &'a [ArkFr]) -> &'a [ArkFr] {
+    match pos {
+        Position::S => s,
+        Position::P => p,
+        Position::O => o,
+    }
+}
+
+fn base_commitment(pos: Position, com_s: &ArkGT, com_p: &ArkGT, com_o: &ArkGT) -> ArkGT {
+    match pos {
+        Position::S => *com_s,
+        Position::P => *com_p,
+        Position::O => *com_o,
+    }
+}
+
+/// Bind the PUBLIC atom spec (constant positions + values, kept positions) so the
+/// challenges depend on the whole statement.
+fn bind_spec(transcript: &mut Transcript254, spec: &AtomFilterSpec) {
+    transcript.append_bytes(A_LABEL_DOMAIN, b"parture/proof-of-woql/atom-filter/v0");
+    transcript.append_bytes(A_LABEL_SPEC, &(spec.constants.len() as u64).to_le_bytes());
+    for (pos, c) in &spec.constants {
+        transcript.append_bytes(A_LABEL_SPEC, &[pos.tag()]);
+        transcript.append_field(A_LABEL_SPEC, c);
+    }
+    for pos in &spec.kept {
+        transcript.append_bytes(A_LABEL_SPEC, &[pos.tag()]);
+    }
+}
+
+/// Honest selection: `sel_i = 1` iff `i < real_rows` AND every constant position matches.
+fn atom_sel(
+    spec: &AtomFilterSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    real_rows: usize,
+) -> Vec<ArkFr> {
+    (0..s.len())
+        .map(|i| {
+            let matches = i < real_rows
+                && spec
+                    .constants
+                    .iter()
+                    .all(|(pos, c)| base_column(*pos, s, p, o)[i] == *c);
+            if matches {
+                f1()
+            } else {
+                f0()
+            }
+        })
+        .collect()
+}
+
+/// Honest pseudo-inverse witness `w` for the constant RLC residual (needs `beta_c`):
+/// `w_i = 1/lhs_i` on in-range non-matching rows, `0` on padding and matching rows.
+fn atom_w(
+    spec: &AtomFilterSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    real_rows: usize,
+    beta_c: ArkFr,
+) -> Vec<ArkFr> {
+    let masked_lhs: Vec<ArkFr> = (0..s.len())
+        .map(|i| {
+            if i >= real_rows {
+                return f0();
+            }
+            let mut acc = f0();
+            let mut power = f1();
+            for (pos, c) in &spec.constants {
+                acc = acc + power * (base_column(*pos, s, p, o)[i] - *c);
+                power = power * beta_c;
+            }
+            acc
+        })
+        .collect();
+    pseudo_inverse(&masked_lhs)
+}
+
+/// The kept-source INPUT columns (full length), in kept order.
+fn kept_source_columns(
+    spec: &AtomFilterSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+) -> Vec<Vec<ArkFr>> {
+    spec.kept_sources()
+        .into_iter()
+        .map(|src| match src {
+            KeptSource::Base(pos) => base_column(pos, s, p, o).to_vec(),
+            KeptSource::Unit => vec![f1(); s.len()],
+        })
+        .collect()
+}
+
+/// Compact several columns in lockstep by `sel` (dense prefix + zero tail); returns
+/// one output column per input and the match count `m`.
+fn compact_columns(sources: &[Vec<ArkFr>], sel: &[ArkFr]) -> (Vec<Vec<ArkFr>>, usize) {
+    let size = sel.len();
+    let mut outs: Vec<Vec<ArkFr>> = sources.iter().map(|_| vec![f0(); size]).collect();
+    let mut m = 0usize;
+    for i in 0..size {
+        if sel[i] == f1() {
+            for (d, src) in sources.iter().enumerate() {
+                outs[d][m] = src[i];
+            }
+            m += 1;
+        }
+    }
+    (outs, m)
+}
+
+/// Compact the selected rows of `(S, O)` into a dense output. Retained for the query
+/// layer's honest recomputation of the predicate-only result.
 pub(crate) fn compact_selected(
     s: &[ArkFr],
     o: &[ArkFr],
     sel: &[ArkFr],
 ) -> (Vec<ArkFr>, Vec<ArkFr>, usize) {
-    let size = s.len();
-    let mut s_out = vec![f0(); size];
-    let mut o_out = vec![f0(); size];
-    let mut m = 0usize;
-    for i in 0..size {
-        if sel[i] == f1() {
-            s_out[m] = s[i];
-            o_out[m] = o[i];
-            m += 1;
-        }
-    }
+    let (mut outs, m) = compact_columns(&[s.to_vec(), o.to_vec()], sel);
+    let o_out = outs.pop().unwrap();
+    let s_out = outs.pop().unwrap();
     (s_out, o_out, m)
 }
 
-fn bind_data_commitments(
-    transcript: &mut Transcript254,
-    com_p: &ArkGT,
-    com_sel: &ArkGT,
-    com_w: &ArkGT,
-    com_s: &ArkGT,
-    com_o: &ArkGT,
-    com_sout: &ArkGT,
-    com_oout: &ArkGT,
-) {
-    transcript.append_group(b"pow/q1/com-p", com_p);
-    transcript.append_group(b"pow/q1/com-sel", com_sel);
-    transcript.append_group(b"pow/q1/com-w", com_w);
-    transcript.append_group(b"pow/q1/com-s", com_s);
-    transcript.append_group(b"pow/q1/com-o", com_o);
-    transcript.append_group(b"pow/q1/com-sout", com_sout);
-    transcript.append_group(b"pow/q1/com-oout", com_oout);
+fn slices(cols: &[Vec<ArkFr>]) -> Vec<&[ArkFr]> {
+    cols.iter().map(|c| c.as_slice()).collect()
 }
 
-fn bind_reciprocal_commitments(transcript: &mut Transcript254, com_cstar: &ArkGT, com_dstar: &ArkGT) {
-    transcript.append_group(b"pow/q1/com-cstar", com_cstar);
-    transcript.append_group(b"pow/q1/com-dstar", com_dstar);
-}
-
-/// Prove the full Q1 for EXPLICIT witnesses (used by the honest entry point and,
-/// in tests, to inject malicious output/witnesses). Commits `sel, w, S_out, O_out`
-/// and the reciprocal witnesses; returns the proof and the output commitments.
+/// Prove the selection + compaction argument for an EXPLICIT `sel`/`kept_out` witness
+/// (the honest entry derives them; tests inject malicious ones). `sources` are the
+/// kept-source INPUT columns; `w`/`cstar`/`dstar` are always derived honestly (`w`
+/// from the Fiat-Shamir `beta_c`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_filter_with_witness_full(
+fn prove_compacted_with_witness(
+    spec: &AtomFilterSpec,
     s: &[ArkFr],
     p: &[ArkFr],
     o: &[ArkFr],
-    pred: ArkFr,
     real_rows: usize,
     sel: &[ArkFr],
-    w: &[ArkFr],
-    s_out: &[ArkFr],
-    o_out: &[ArkFr],
+    sources: &[Vec<ArkFr>],
+    kept_out: &[Vec<ArkFr>],
     output_len: usize,
     com_s: &ArkGT,
     com_p: &ArkGT,
     com_o: &ArkGT,
     transcript: &mut Transcript254,
-) -> io::Result<(FullFilterProof, ArkGT, ArkGT)> {
-    let size = p.len();
-    if !size.is_power_of_two() {
-        return Err(invalid("predicate column length must be a power of two"));
+) -> io::Result<(FullFilterProof, Vec<ArkGT>, usize)> {
+    let size = s.len();
+    if !size.is_power_of_two() || size < 2 {
+        return Err(invalid("atom filter column length must be a power of two >= 2"));
     }
-    for column in [s, o, sel, w, s_out, o_out] {
+    for column in [p, o, sel] {
         if column.len() != size {
-            return Err(invalid("Q1 column length mismatch"));
+            return Err(invalid("atom filter column length mismatch"));
         }
     }
     if real_rows > size || output_len > size {
-        return Err(invalid("row count exceeds column length"));
+        return Err(invalid("atom filter row count exceeds column length"));
     }
-    let k = size.trailing_zeros() as usize;
+    let num_kept = sources.len();
+    if kept_out.len() != num_kept || sources.iter().chain(kept_out).any(|c| c.len() != size) {
+        return Err(invalid("atom filter kept column layout mismatch"));
+    }
+    let has_unit = spec.kept.is_empty();
+    let num_vars = size.trailing_zeros() as usize;
 
+    // Round 1: commit the DATA columns (sel + kept outputs + the unit input if a ground
+    // atom), bind the spec + all data commitments, then draw the challenges.
     let com_sel = commit_column(sel)?;
-    let com_w = commit_column(w)?;
-    let com_sout = commit_column(s_out)?;
-    let com_oout = commit_column(o_out)?;
+    let mut com_kept = Vec::with_capacity(num_kept);
+    for column in kept_out {
+        com_kept.push(commit_column(column)?);
+    }
+    let com_unit_in = if has_unit {
+        Some(commit_column(&sources[0])?)
+    } else {
+        None
+    };
 
-    // Round 1: bind the data commitments, then draw the fingerprint challenges.
-    bind_data_commitments(
-        transcript, com_p, &com_sel, &com_w, com_s, com_o, &com_sout, &com_oout,
-    );
-    let beta = transcript.challenge_scalar(LABEL_BETA);
-    let alpha = transcript.challenge_scalar(LABEL_ALPHA);
+    bind_spec(transcript, spec);
+    transcript.append_group(b"pow/atom/com-s", com_s);
+    transcript.append_group(b"pow/atom/com-p", com_p);
+    transcript.append_group(b"pow/atom/com-o", com_o);
+    transcript.append_group(b"pow/atom/com-sel", &com_sel);
+    for c in &com_kept {
+        transcript.append_group(b"pow/atom/com-kept", c);
+    }
+    if let Some(c) = &com_unit_in {
+        transcript.append_group(b"pow/atom/com-unit-in", c);
+    }
+    let beta_c = transcript.challenge_scalar(A_LABEL_BETA_C);
+    let beta = transcript.challenge_scalar(A_LABEL_BETA);
+    let alpha = transcript.challenge_scalar(A_LABEL_ALPHA);
 
-    // Reciprocal witnesses over the beta-fingerprinted rows (a_i = beta*S+O).
-    let input_fold = rlc_fold(beta, &[o, s]);
-    let cstar = reciprocal_witness(alpha, &input_fold);
-    let output_fold = rlc_fold(beta, &[o_out, s_out]);
-    let dstar = reciprocal_witness(alpha, &output_fold);
+    // Round 2: derived witnesses (w from beta_c; reciprocals from alpha/beta), bound
+    // AFTER the challenges are drawn.
+    let w = atom_w(spec, s, p, o, real_rows, beta_c);
+    let cstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(sources)));
+    let dstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(kept_out)));
+    let com_w = commit_column(&w)?;
     let com_cstar = commit_column(&cstar)?;
     let com_dstar = commit_column(&dstar)?;
+    transcript.append_group(b"pow/atom/com-w", &com_w);
+    transcript.append_group(b"pow/atom/com-cstar", &com_cstar);
+    transcript.append_group(b"pow/atom/com-dstar", &com_dstar);
 
-    // Round 2: bind the reciprocal commitments (drawn AFTER alpha/beta), then run
-    // the single batched sumcheck over all five claims and open all nine columns.
-    bind_reciprocal_commitments(transcript, &com_cstar, &com_dstar);
-    let shape = full_filter_shape(k, real_rows, output_len, pred, alpha, beta);
-    let columns = vec![
-        p.to_vec(),
-        sel.to_vec(),
-        w.to_vec(),
-        s.to_vec(),
-        o.to_vec(),
-        s_out.to_vec(),
-        o_out.to_vec(),
-        cstar,
-        dstar,
-    ];
+    let shape = atom_shape(
+        spec, num_vars, real_rows, output_len, num_kept, has_unit, beta_c, alpha, beta,
+    );
+    let mut columns = vec![s.to_vec(), p.to_vec(), o.to_vec(), sel.to_vec(), w];
+    columns.extend(kept_out.iter().cloned());
+    columns.push(cstar);
+    columns.push(dstar);
+    if has_unit {
+        columns.push(sources[0].clone());
+    }
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
     let opening = prove_column_openings(&columns, &r, transcript)?;
 
@@ -487,14 +725,181 @@ pub(crate) fn prove_filter_with_witness_full(
             cstar_commitment: com_cstar,
             dstar_commitment: com_dstar,
         },
-        com_sout,
-        com_oout,
+        com_kept,
+        output_len,
     ))
 }
 
-/// Prove the complete Q1 filter query: `(S_out, O_out)[0..m]` is EXACTLY the
-/// compaction of `{(S_i, O_i) : P_i == pred AND i < real_rows}`. Returns the
-/// proof, `Com(S_out)`, `Com(O_out)`, and the result length `m`.
+/// Honest selection + compaction for a spec with at least one constant.
+#[allow(clippy::too_many_arguments)]
+fn prove_compacted(
+    spec: &AtomFilterSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    real_rows: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(FullFilterProof, Vec<ArkGT>, usize)> {
+    let sources = kept_source_columns(spec, s, p, o);
+    let sel = atom_sel(spec, s, p, o, real_rows);
+    let (kept_out, m) = compact_columns(&sources, &sel);
+    prove_compacted_with_witness(
+        spec, s, p, o, real_rows, &sel, &sources, &kept_out, m, com_s, com_p, com_o, transcript,
+    )
+}
+
+/// Prove a generalized per-atom filter: filter the table by the constant positions and
+/// compact the KEPT (variable) positions into dense output columns (one per kept
+/// position). Returns the proof, one commitment per kept column, and the result count
+/// `m`. Cases: |C| = 0 -> the whole real prefix (kept columns ARE the base columns, no
+/// argument); |C| = 1/2 -> selection + compaction; |C| = 3 (ground atom) -> a UNIT kept
+/// column so C/D/E run uniformly and `m` is the present/absent count (0 or 1).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_atom_filter(
+    spec: &AtomFilterSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    real_rows: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(AtomFilterProof, Vec<ArkGT>, usize)> {
+    spec.validate()?;
+    if spec.constants.is_empty() {
+        let com_kept = spec
+            .kept
+            .iter()
+            .map(|pos| base_commitment(*pos, com_s, com_p, com_o))
+            .collect();
+        return Ok((AtomFilterProof::Identity, com_kept, real_rows));
+    }
+    let (inner, com_kept, m) =
+        prove_compacted(spec, s, p, o, real_rows, com_s, com_p, com_o, transcript)?;
+    Ok((AtomFilterProof::Compacted(inner), com_kept, m))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_compacted(
+    spec: &AtomFilterSpec,
+    real_rows: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    com_kept: &[ArkGT],
+    output_len: usize,
+    proof: &FullFilterProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    let num_vars = proof.sumcheck.round_polys.len();
+    if num_vars == 0 || num_vars >= usize::BITS as usize {
+        return Err(invalid("atom filter proof has an implausible variable count"));
+    }
+    let size = 1usize << num_vars;
+    if real_rows > size || output_len > size {
+        return Err(invalid("atom filter row count exceeds column length"));
+    }
+    let num_kept = spec.kept_sources().len();
+    if com_kept.len() != num_kept {
+        return Err(invalid("atom filter kept commitment count mismatch"));
+    }
+    let has_unit = spec.kept.is_empty();
+    // The unit INPUT column is public; the verifier recomputes its commitment.
+    let com_unit_in = if has_unit {
+        Some(commit_column(&vec![f1(); size])?)
+    } else {
+        None
+    };
+
+    bind_spec(transcript, spec);
+    transcript.append_group(b"pow/atom/com-s", com_s);
+    transcript.append_group(b"pow/atom/com-p", com_p);
+    transcript.append_group(b"pow/atom/com-o", com_o);
+    transcript.append_group(b"pow/atom/com-sel", &proof.sel_commitment);
+    for c in com_kept {
+        transcript.append_group(b"pow/atom/com-kept", c);
+    }
+    if let Some(c) = &com_unit_in {
+        transcript.append_group(b"pow/atom/com-unit-in", c);
+    }
+    let beta_c = transcript.challenge_scalar(A_LABEL_BETA_C);
+    let beta = transcript.challenge_scalar(A_LABEL_BETA);
+    let alpha = transcript.challenge_scalar(A_LABEL_ALPHA);
+    transcript.append_group(b"pow/atom/com-w", &proof.w_commitment);
+    transcript.append_group(b"pow/atom/com-cstar", &proof.cstar_commitment);
+    transcript.append_group(b"pow/atom/com-dstar", &proof.dstar_commitment);
+
+    let shape = atom_shape(
+        spec, num_vars, real_rows, output_len, num_kept, has_unit, beta_c, alpha, beta,
+    );
+    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+
+    let mut coms = vec![
+        *com_s,
+        *com_p,
+        *com_o,
+        proof.sel_commitment,
+        proof.w_commitment,
+    ];
+    coms.extend_from_slice(com_kept);
+    coms.push(proof.cstar_commitment);
+    coms.push(proof.dstar_commitment);
+    if let Some(c) = com_unit_in {
+        coms.push(c);
+    }
+    verify_column_openings(&coms, &r, &evals, &proof.opening, transcript)
+}
+
+/// Verify a generalized per-atom filter proof. The verifier concludes `com_kept[0..m]`
+/// is EXACTLY the complete filtered result for `spec` over the first `real_rows` rows.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_atom_filter(
+    spec: &AtomFilterSpec,
+    real_rows: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    com_kept: &[ArkGT],
+    output_len: usize,
+    proof: &AtomFilterProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    spec.validate()?;
+    match proof {
+        AtomFilterProof::Identity => {
+            if !spec.constants.is_empty() {
+                return Err(invalid("identity atom proof for a non-empty constant set"));
+            }
+            let expected: Vec<ArkGT> = spec
+                .kept
+                .iter()
+                .map(|pos| base_commitment(*pos, com_s, com_p, com_o))
+                .collect();
+            if com_kept != expected.as_slice() || output_len != real_rows {
+                return Err(invalid(
+                    "identity atom result does not equal the base columns",
+                ));
+            }
+            Ok(())
+        }
+        AtomFilterProof::Compacted(inner) => {
+            if spec.constants.is_empty() {
+                return Err(invalid("compacted atom proof for an empty constant set"));
+            }
+            verify_compacted(
+                spec, real_rows, com_s, com_p, com_o, com_kept, output_len, inner, transcript,
+            )
+        }
+    }
+}
+
+/// Prove the classic predicate-only Q1 (`P` constant, keep `S`, `O`) as the |C| = 1
+/// special case. Returns the proof, `Com(S_out)`, `Com(O_out)`, and `m`. Retained so
+/// the dictionary-bound query layer (`proof::query`) is unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_filter(
     s: &[ArkFr],
@@ -507,18 +912,13 @@ pub fn prove_filter(
     com_o: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<(FullFilterProof, ArkGT, ArkGT, usize)> {
-    let (sel, w) = honest_witness(p, pred, real_rows);
-    let (s_out, o_out, m) = compact_selected(s, o, &sel);
-    let (proof, com_sout, com_oout) = prove_filter_with_witness_full(
-        s, p, o, pred, real_rows, &sel, &w, &s_out, &o_out, m, com_s, com_p, com_o, transcript,
-    )?;
-    Ok((proof, com_sout, com_oout, m))
+    let spec = AtomFilterSpec::predicate(pred);
+    let (inner, com_kept, m) =
+        prove_compacted(&spec, s, p, o, real_rows, com_s, com_p, com_o, transcript)?;
+    Ok((inner, com_kept[0], com_kept[1], m))
 }
 
-/// Verify a complete Q1 filter query proof. The verifier concludes that
-/// `(S_out, O_out)[0..m]` is exactly the complete filtered result for
-/// `predicate = pred` over the first `real_rows` rows, WITHOUT rerunning the
-/// query. `m` is pinned by the LogUp count/residue check.
+/// Verify the classic predicate-only Q1 (|C| = 1, keep `S`, `O`).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_filter(
     com_s: &ArkGT,
@@ -532,48 +932,18 @@ pub fn verify_filter(
     proof: &FullFilterProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    let k = proof.sumcheck.round_polys.len();
-    if k == 0 || k >= usize::BITS as usize {
-        return Err(invalid("Q1 proof has an implausible variable count"));
-    }
-    if real_rows > (1usize << k) || output_len > (1usize << k) {
-        return Err(invalid("row count exceeds column length"));
-    }
-
-    bind_data_commitments(
-        transcript,
-        com_p,
-        &proof.sel_commitment,
-        &proof.w_commitment,
+    let spec = AtomFilterSpec::predicate(pred);
+    verify_compacted(
+        &spec,
+        real_rows,
         com_s,
+        com_p,
         com_o,
-        com_sout,
-        com_oout,
-    );
-    let beta = transcript.challenge_scalar(LABEL_BETA);
-    let alpha = transcript.challenge_scalar(LABEL_ALPHA);
-    bind_reciprocal_commitments(transcript, &proof.cstar_commitment, &proof.dstar_commitment);
-
-    let shape = full_filter_shape(k, real_rows, output_len, pred, alpha, beta);
-    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
-    verify_column_openings(
-        &[
-            *com_p,
-            proof.sel_commitment,
-            proof.w_commitment,
-            *com_s,
-            *com_o,
-            *com_sout,
-            *com_oout,
-            proof.cstar_commitment,
-            proof.dstar_commitment,
-        ],
-        &r,
-        &evals,
-        &proof.opening,
+        &[*com_sout, *com_oout],
+        output_len,
+        proof,
         transcript,
-    )?;
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -755,28 +1125,81 @@ mod tests {
         Ok(m)
     }
 
-    // Prove/verify with an EXPLICIT (possibly malicious) output.
-    #[allow(clippy::too_many_arguments)]
-    fn q1_run_with_output(
+    // ---- Generalized per-atom filter (any subset of {S,P,O} constant) ----
+
+    fn col16(real: &[u64]) -> Vec<ArkFr> {
+        (0..16usize)
+            .map(|i| fr(if i < real.len() { real[i] } else { 0 }))
+            .collect()
+    }
+
+    fn mkspec(constants: &[(Position, u64)], kept: &[Position]) -> AtomFilterSpec {
+        AtomFilterSpec {
+            constants: constants.iter().map(|(p, c)| (*p, fr(*c))).collect(),
+            kept: kept.to_vec(),
+        }
+    }
+
+    // 8 real rows (padded to 16). Rows: (S,P,O).
+    fn atom_table() -> (Vec<ArkFr>, Vec<ArkFr>, Vec<ArkFr>, usize) {
+        let s = col16(&[1, 2, 3, 1, 5, 6, 1, 5]);
+        let p = col16(&[10, 10, 20, 10, 30, 10, 20, 30]);
+        let o = col16(&[100, 200, 300, 400, 500, 600, 700, 800]);
+        (s, p, o, 8)
+    }
+
+    // Honest prove+verify of the atom filter. Returns (m, kept commitments).
+    fn atom_honest(
+        spec: &AtomFilterSpec,
         s: &[ArkFr],
         p: &[ArkFr],
         o: &[ArkFr],
-        pred: ArkFr,
         n: usize,
-        s_out: &[ArkFr],
-        o_out: &[ArkFr],
-        m: usize,
-    ) -> io::Result<()> {
-        let (sel, w) = honest_witness(p, pred, n);
+    ) -> io::Result<(usize, Vec<ArkGT>)> {
         let (com_s, com_p, com_o) = (commit(s), commit(p), commit(o));
         let mut pt = transcript();
-        let (proof, com_sout, com_oout) = prove_filter_with_witness_full(
-            s, p, o, pred, n, &sel, &w, s_out, o_out, m, &com_s, &com_p, &com_o, &mut pt,
+        let (proof, com_kept, m) =
+            prove_atom_filter(spec, s, p, o, n, &com_s, &com_p, &com_o, &mut pt)?;
+        let mut vt = transcript();
+        verify_atom_filter(spec, n, &com_s, &com_p, &com_o, &com_kept, m, &proof, &mut vt)?;
+        Ok((m, com_kept))
+    }
+
+    // Prove+verify a compacted atom filter with an EXPLICIT sel + kept_out (malicious
+    // injection). Requires |C| >= 1.
+    #[allow(clippy::too_many_arguments)]
+    fn atom_with_witness(
+        spec: &AtomFilterSpec,
+        s: &[ArkFr],
+        p: &[ArkFr],
+        o: &[ArkFr],
+        n: usize,
+        sel: &[ArkFr],
+        kept_out: &[Vec<ArkFr>],
+        m: usize,
+    ) -> io::Result<()> {
+        let (com_s, com_p, com_o) = (commit(s), commit(p), commit(o));
+        let sources = kept_source_columns(spec, s, p, o);
+        let mut pt = transcript();
+        let (proof, com_kept, _) = prove_compacted_with_witness(
+            spec, s, p, o, n, sel, &sources, kept_out, m, &com_s, &com_p, &com_o, &mut pt,
         )?;
         let mut vt = transcript();
-        verify_filter(
-            &com_s, &com_p, &com_o, pred, n, &com_sout, &com_oout, m, &proof, &mut vt,
-        )
+        verify_compacted(spec, n, &com_s, &com_p, &com_o, &com_kept, m, &proof, &mut vt)
+    }
+
+    // Honest sel + compaction for a spec (helper for the injection tests).
+    fn atom_honest_witness(
+        spec: &AtomFilterSpec,
+        s: &[ArkFr],
+        p: &[ArkFr],
+        o: &[ArkFr],
+        n: usize,
+    ) -> (Vec<ArkFr>, Vec<Vec<ArkFr>>, usize) {
+        let sel = atom_sel(spec, s, p, o, n);
+        let sources = kept_source_columns(spec, s, p, o);
+        let (kept_out, m) = compact_columns(&sources, &sel);
+        (sel, kept_out, m)
     }
 
     #[test]
@@ -792,59 +1215,123 @@ mod tests {
     }
 
     #[test]
-    fn q1_fabricated_output_row_is_rejected() {
-        let (s, p, o, n) = q1_tables();
-        let pred = fr(1);
-        let (sel, _) = honest_witness(&p, pred, n);
-        let (mut s_out, o_out, m) = compact_selected(&s, &o, &sel);
-        s_out[0] = fr(999); // (999, 100) is not a selected row
-        assert!(q1_run_with_output(&s, &p, &o, pred, n, &s_out, &o_out, m).is_err());
+    fn atom_filter_honest_all_arities() {
+        let (s, p, o, n) = atom_table();
+        // |C| = 0: t(?s,?p,?o) -> all real rows; kept columns ARE the base columns.
+        let (m0, kept0) = atom_honest(&mkspec(&[], &[Position::S, Position::P, Position::O]), &s, &p, &o, n).unwrap();
+        assert_eq!(m0, n);
+        assert_eq!(kept0, vec![commit(&s), commit(&p), commit(&o)]);
+        // |C| = 1, P constant (the classic Q1): P=10 -> rows 0,1,3,5.
+        let (m1, _) = atom_honest(&mkspec(&[(Position::P, 10)], &[Position::S, Position::O]), &s, &p, &o, n).unwrap();
+        assert_eq!(m1, 4);
+        // |C| = 1, S constant: S=1 -> rows 0,3,6.
+        let (m1b, _) = atom_honest(&mkspec(&[(Position::S, 1)], &[Position::P, Position::O]), &s, &p, &o, n).unwrap();
+        assert_eq!(m1b, 3);
+        // |C| = 2: S=1 AND P=10 -> rows 0,3; kept O = [100, 400].
+        let (m2, kept2) = atom_honest(&mkspec(&[(Position::S, 1), (Position::P, 10)], &[Position::O]), &s, &p, &o, n).unwrap();
+        assert_eq!(m2, 2);
+        assert_eq!(kept2, vec![commit(&col16(&[100, 400]))]);
+        // |C| = 3 (ground atom) present: (1,10,100) is row 0 -> m = 1.
+        let (m3, _) = atom_honest(&mkspec(&[(Position::S, 1), (Position::P, 10), (Position::O, 100)], &[]), &s, &p, &o, n).unwrap();
+        assert_eq!(m3, 1);
+        // |C| = 3 absent: (1,10,999) is not present -> m = 0.
+        let (m3a, _) = atom_honest(&mkspec(&[(Position::S, 1), (Position::P, 10), (Position::O, 999)], &[]), &s, &p, &o, n).unwrap();
+        assert_eq!(m3a, 0);
     }
 
     #[test]
-    fn q1_omitted_output_row_is_rejected() {
-        let (s, p, o, n) = q1_tables();
-        let pred = fr(1);
-        let (sel, _) = honest_witness(&p, pred, n);
-        let (mut s_out, mut o_out, _m) = compact_selected(&s, &o, &sel);
-        // Drop the 4th selected row and claim m = 3.
-        s_out[3] = fr(0);
-        o_out[3] = fr(0);
-        assert!(q1_run_with_output(&s, &p, &o, pred, n, &s_out, &o_out, 3).is_err());
+    fn atom_filter_omission_is_rejected() {
+        let (s, p, o, n) = atom_table();
+        for spec in [
+            mkspec(&[(Position::P, 10)], &[Position::S, Position::O]),
+            mkspec(&[(Position::S, 1), (Position::P, 10)], &[Position::O]),
+        ] {
+            let (mut sel, _, _) = atom_honest_witness(&spec, &s, &p, &o, n);
+            // Drop the first genuine match (flip a 1 -> 0).
+            let hit = (0..n).find(|&i| sel[i] == f1()).unwrap();
+            sel[hit] = f0();
+            let sources = kept_source_columns(&spec, &s, &p, &o);
+            let (kept_out, m) = compact_columns(&sources, &sel);
+            assert!(atom_with_witness(&spec, &s, &p, &o, n, &sel, &kept_out, m).is_err());
+        }
     }
 
     #[test]
-    fn q1_wrong_m_too_large_or_too_small_is_rejected() {
-        let (s, p, o, n) = q1_tables();
-        let pred = fr(1);
-        let (sel, _) = honest_witness(&p, pred, n);
-        let (s_out, o_out, m) = compact_selected(&s, &o, &sel); // m = 4
-        // Too large: claim a 5th (padding) output row.
-        assert!(q1_run_with_output(&s, &p, &o, pred, n, &s_out, &o_out, m + 1).is_err());
-        // Too small: claim only 3 of the 4 real rows.
-        assert!(q1_run_with_output(&s, &p, &o, pred, n, &s_out, &o_out, m - 1).is_err());
+    fn atom_filter_false_positive_is_rejected() {
+        let (s, p, o, n) = atom_table();
+        for spec in [
+            mkspec(&[(Position::P, 10)], &[Position::S, Position::O]),
+            mkspec(&[(Position::S, 1), (Position::P, 10)], &[Position::O]),
+        ] {
+            let (mut sel, _, _) = atom_honest_witness(&spec, &s, &p, &o, n);
+            // Select an in-range NON-matching row.
+            let miss = (0..n).find(|&i| sel[i] == f0()).unwrap();
+            sel[miss] = f1();
+            let sources = kept_source_columns(&spec, &s, &p, &o);
+            let (kept_out, m) = compact_columns(&sources, &sel);
+            assert!(atom_with_witness(&spec, &s, &p, &o, n, &sel, &kept_out, m).is_err());
+        }
     }
 
     #[test]
-    fn q1_reordered_output_verifies_but_duplicate_is_rejected() {
-        let (s, p, o, n) = q1_tables();
-        let pred = fr(1);
-        let (sel, _) = honest_witness(&p, pred, n);
-        let (s_out, o_out, m) = compact_selected(&s, &o, &sel);
+    fn atom_filter_padding_collision_is_masked_and_selected_padding_rejects() {
+        let (s, mut p, o, n) = atom_table();
+        p[10] = fr(10); // a PADDING row (>= n) collides with the queried predicate.
+        let spec = mkspec(&[(Position::P, 10)], &[Position::S, Position::O]);
+        let (mut sel, kept_out, m) = atom_honest_witness(&spec, &s, &p, &o, n);
+        assert_eq!(sel[10], f0()); // chi_n masks it out of the honest selection.
+        assert!(atom_with_witness(&spec, &s, &p, &o, n, &sel, &kept_out, m).is_ok());
+        // A prover that selects the colliding padding row is rejected.
+        sel[10] = f1();
+        let (kept2, m2) = compact_columns(&kept_source_columns(&spec, &s, &p, &o), &sel);
+        assert!(atom_with_witness(&spec, &s, &p, &o, n, &sel, &kept2, m2).is_err());
+    }
 
-        // Reordering the true rows is a valid multiset -> verifies.
-        let mut s_rev = s_out.clone();
-        let mut o_rev = o_out.clone();
-        s_rev[..m].reverse();
-        o_rev[..m].reverse();
-        assert!(q1_run_with_output(&s, &p, &o, pred, n, &s_rev, &o_rev, m).is_ok());
-
+    #[test]
+    fn atom_filter_reordered_output_verifies_but_duplicate_is_rejected() {
+        let (s, p, o, n) = atom_table();
+        let spec = mkspec(&[(Position::P, 10)], &[Position::S, Position::O]);
+        let (sel, kept_out, m) = atom_honest_witness(&spec, &s, &p, &o, n);
+        // Reordering the true output rows is a valid multiset -> verifies.
+        let mut reordered = kept_out.clone();
+        for col in reordered.iter_mut() {
+            col[..m].reverse();
+        }
+        assert!(atom_with_witness(&spec, &s, &p, &o, n, &sel, &reordered, m).is_ok());
         // Duplicating a row (wrong multiplicity) -> rejected.
-        let mut s_dup = s_out.clone();
-        let mut o_dup = o_out.clone();
-        s_dup[3] = s_out[0];
-        o_dup[3] = o_out[0];
-        assert!(q1_run_with_output(&s, &p, &o, pred, n, &s_dup, &o_dup, m).is_err());
+        let mut dup = kept_out.clone();
+        for col in dup.iter_mut() {
+            col[m - 1] = col[0];
+        }
+        assert!(atom_with_witness(&spec, &s, &p, &o, n, &sel, &dup, m).is_err());
+    }
+
+    #[test]
+    fn atom_filter_wrong_m_is_rejected() {
+        let (s, p, o, n) = atom_table();
+        let spec = mkspec(&[(Position::P, 10)], &[Position::S, Position::O]);
+        let (sel, kept_out, m) = atom_honest_witness(&spec, &s, &p, &o, n); // m = 4
+        assert!(atom_with_witness(&spec, &s, &p, &o, n, &sel, &kept_out, m + 1).is_err());
+        assert!(atom_with_witness(&spec, &s, &p, &o, n, &sel, &kept_out, m - 1).is_err());
+    }
+
+    #[test]
+    fn atom_filter_rlc_cancellation_is_rejected() {
+        // |C| = 2 (S=1, P=10). A malicious in-range row is built so that
+        // (S - 1) + beta_guess*(P - 10) = 0 for a GUESSED beta_guess = 2: pick P = 5,
+        // then S = 11 makes 10 + 2*(-5) = 0. Marking it selected passes only if the
+        // real Fiat-Shamir beta_c equals the guess; since beta_c is drawn AFTER S,P are
+        // committed, beta_c != 2 -> lhs != 0 -> claim A rejects.
+        let s = col16(&[1, 11, 3, 1]);
+        let p = col16(&[10, 5, 20, 10]);
+        let o = col16(&[100, 200, 300, 400]);
+        let n = 4;
+        let spec = mkspec(&[(Position::S, 1), (Position::P, 10)], &[Position::O]);
+        let mut sel = atom_sel(&spec, &s, &p, &o, n);
+        assert_eq!(sel[1], f0()); // row 1 is (S=11, P=5): not a genuine match.
+        sel[1] = f1();
+        let (kept_out, m) = compact_columns(&kept_source_columns(&spec, &s, &p, &o), &sel);
+        assert!(atom_with_witness(&spec, &s, &p, &o, n, &sel, &kept_out, m).is_err());
     }
 
     #[test]
