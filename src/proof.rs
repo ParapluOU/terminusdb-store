@@ -1002,7 +1002,7 @@ pub mod commitment {
     use rand_chacha::ChaCha20Rng;
 
     const COMMITMENT_MAGIC: &[u8; 8] = b"TSPCW0\0\0";
-    pub const COMMITMENT_FORMAT_VERSION: u32 = 2;
+    pub const COMMITMENT_FORMAT_VERSION: u32 = 3;
 
     /// Number of committed columns per layer: additions (S,P,O) then removals
     /// (S,P,O), in that fixed order.
@@ -1204,18 +1204,9 @@ pub mod commitment {
     fn node_value_dict_columns_from_catalog(
         node_value_catalog: &[ProofRecord],
     ) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>)> {
-        let d = node_value_catalog.len();
-        if d == 0 {
+        let padded = node_value_dict_padded_len(node_value_catalog.len())?;
+        if padded == 0 {
             return Ok((Vec::new(), Vec::new()));
-        }
-        let padded = d
-            .checked_next_power_of_two()
-            .ok_or_else(|| invalid("node/value dictionary length overflow"))?
-            .max(2);
-        if padded.trailing_zeros() as usize > SETUP_MAX_LOG_N {
-            return Err(invalid(
-                "node/value dictionary exceeds the global Dory setup capacity",
-            ));
         }
         let zero = <ArkFr as DoryField>::zero();
         let mut hashes = vec![zero; padded];
@@ -1241,6 +1232,144 @@ pub mod commitment {
         Ok((
             super::argument::commit_column(&hashes)?,
             super::argument::commit_column(&ids)?,
+        ))
+    }
+
+    /// Reserved datatype tag for a `Node` entry in the node/value datatype column.
+    /// `CanonicalDatatype` is `#[repr(u8)]` with 47 real variants (discriminants
+    /// `0..=46`, `AnySimpleType = 44`, `DateTimeInterval = 46`), so `255` is safely
+    /// distinct from every real discriminant. The later range gadget masks Node
+    /// rows out by a datatype-inequality check against this tag.
+    const NODE_DATATYPE_TAG: u64 = 255;
+
+    /// Padded length (a power of two `>= 2`, or `0` for an empty catalog) shared by
+    /// EVERY committed node/value dictionary column — `hash`, `id`, `value`,
+    /// `datatype`. Single source of truth so the four columns are the exact same
+    /// length and stay row-aligned (a range proof opens `value`/`datatype` at the
+    /// SAME index a membership proof opens `hash`/`id`).
+    fn node_value_dict_padded_len(catalog_len: usize) -> io::Result<usize> {
+        if catalog_len == 0 {
+            return Ok(0);
+        }
+        let padded = catalog_len
+            .checked_next_power_of_two()
+            .ok_or_else(|| invalid("node/value dictionary length overflow"))?
+            .max(2);
+        if padded.trailing_zeros() as usize > SETUP_MAX_LOG_N {
+            return Err(invalid(
+                "node/value dictionary exceeds the global Dory setup capacity",
+            ));
+        }
+        Ok(padded)
+    }
+
+    /// Fixed byte width of a SUPPORTED fixed-width order-preserving numeric
+    /// datatype's `to_lexical` encoding, or `None` for any other datatype
+    /// (variable-width like `String`/`Decimal`/`BigInt`, or non-range types).
+    ///
+    /// CONFIRMED against tdb-succinct `src/tfc/datatypes.rs` (git rev ec15199,
+    /// the pinned dep): every listed type's `ToLexical::to_lexical` writes exactly
+    /// `width` bytes, and the raw bytes are ALREADY the order-preserving encoding,
+    /// so a big-endian unsigned read of the fixed-width bytes is monotone in value:
+    ///   * `Boolean` -> 1 byte `vec![0]`/`vec![1]`         (false=0 < true=1).
+    ///   * `UInt8/16/32/64` -> 1/2/4/8 bytes, `write_uN::<BigEndian>` (raw BE).
+    ///   * `Int8/16/32/64`  -> 1/2/4/8 bytes, offset-binary: `to_lexical` writes
+    ///     `(1<<(8*width-1)) ^ (self as uN)` big-endian, so `min` maps to all-zero
+    ///     and BE-reading the bytes recovers a monotone unsigned code.
+    ///   * `Float32/64` -> 4/8 bytes, IEEE total-order: `to_lexical` writes
+    ///     `bits ^ 0x8000..` for non-negative and `bits ^ 0xffff..` for negative,
+    ///     big-endian — the standard monotone transform over finite floats.
+    fn order_preserving_numeric_width(datatype: CanonicalDatatype) -> Option<usize> {
+        use CanonicalDatatype::*;
+        Some(match datatype {
+            Boolean => 1,
+            UInt8 | Int8 => 1,
+            UInt16 | Int16 => 2,
+            UInt32 | Int32 | Float32 => 4,
+            UInt64 | Int64 | Float64 => 8,
+            _ => return None,
+        })
+    }
+
+    /// The order-preserving unsigned-integer encoding of a catalog entry's object
+    /// value as an `ArkFr`, or the `0` sentinel for entries that are never
+    /// range-queried (`Node`s, and `String`/variable-width or otherwise
+    /// unsupported datatypes). For a supported fixed-width numeric type the store's
+    /// `to_lexical` bytes ARE the OP encoding (see `order_preserving_numeric_width`),
+    /// so we big-endian read the fixed-width bytes into `[0, 2^{8*width})`. Widths
+    /// are `<= 8`, so the value always fits a `u64`. A supported type whose lexical
+    /// width does NOT match the expected fixed width is treated as corruption and
+    /// fails closed (this cannot happen for store-produced values).
+    fn node_value_op_value(object: &CanonicalObject) -> io::Result<ArkFr> {
+        let (datatype, lexical) = match object {
+            CanonicalObject::Value { datatype, lexical } => (*datatype, lexical),
+            CanonicalObject::Node(_) => return Ok(<ArkFr as DoryField>::zero()),
+        };
+        let width = match order_preserving_numeric_width(datatype) {
+            Some(width) => width,
+            None => return Ok(<ArkFr as DoryField>::zero()),
+        };
+        if lexical.len() != width {
+            return Err(invalid(
+                "order-preserving numeric literal has unexpected lexical width",
+            ));
+        }
+        let mut buf = [0u8; 8];
+        buf[8 - width..].copy_from_slice(lexical);
+        Ok(<ArkFr as DoryField>::from_u64(u64::from_be_bytes(buf)))
+    }
+
+    /// Build the node/value-dictionary VALUE column (one entry per catalog row, in
+    /// the SAME canonical order/padding as `node_value_dict_columns_from_catalog`):
+    /// `value[k] = node_value_op_value(object_k)` — the order-preserving numeric
+    /// encoding for supported fixed-width numeric literals, `0` otherwise. Padding
+    /// rows carry `0` (as `hash`/`id` do; they have `id = 0` so any real-row check
+    /// excludes them). Single source of truth for both COMMIT and OPEN.
+    fn node_value_dict_value_column(node_value_catalog: &[ProofRecord]) -> io::Result<Vec<ArkFr>> {
+        let padded = node_value_dict_padded_len(node_value_catalog.len())?;
+        let mut values = vec![<ArkFr as DoryField>::zero(); padded];
+        for (k, record) in node_value_catalog.iter().enumerate() {
+            values[k] = node_value_op_value(&record.triple.object)?;
+        }
+        Ok(values)
+    }
+
+    /// Build the node/value-dictionary DATATYPE column (one entry per catalog row,
+    /// same order/padding): `datatype[k]` is the `CanonicalDatatype` discriminant
+    /// for a `Value` object, or the reserved `NODE_DATATYPE_TAG` for a `Node`. Lets
+    /// the later range gadget mask rows to the queried datatype by equality. Padding
+    /// rows carry `0` (mirrors `hash`/`id`); tag `0` is `String`, which is not a
+    /// range-supported type, and padding rows have `id = 0`, so padding never
+    /// false-matches a numeric range query. Single source of truth for COMMIT/OPEN.
+    fn node_value_dict_datatype_column(node_value_catalog: &[ProofRecord]) -> io::Result<Vec<ArkFr>> {
+        let padded = node_value_dict_padded_len(node_value_catalog.len())?;
+        let mut datatypes = vec![<ArkFr as DoryField>::zero(); padded];
+        for (k, record) in node_value_catalog.iter().enumerate() {
+            let tag = match &record.triple.object {
+                CanonicalObject::Value { datatype, .. } => *datatype as u8 as u64,
+                CanonicalObject::Node(_) => NODE_DATATYPE_TAG,
+            };
+            datatypes[k] = <ArkFr as DoryField>::from_u64(tag);
+        }
+        Ok(datatypes)
+    }
+
+    /// Commit the node/value VALUE and DATATYPE columns via the SAME shared
+    /// query-side `commit_column` the range/membership gadgets open, so the
+    /// committed columns align with what a proof opens. An empty dictionary gets
+    /// identity commitments (mirrors `commit_node_value_dictionary`).
+    fn commit_node_value_dict_range(
+        node_value_catalog: &[ProofRecord],
+    ) -> io::Result<(ArkGT, ArkGT)> {
+        let values = node_value_dict_value_column(node_value_catalog)?;
+        let datatypes = node_value_dict_datatype_column(node_value_catalog)?;
+        if values.is_empty() {
+            let identity = <ArkGT as Group>::identity();
+            return Ok((identity, identity));
+        }
+        Ok((
+            super::argument::commit_column(&values)?,
+            super::argument::commit_column(&datatypes)?,
         ))
     }
 
@@ -1326,6 +1455,25 @@ pub mod commitment {
         /// `commitment_root` binds these, so a Q3 dictionary-membership proof of a
         /// subject/object CONSTANT->id binding is authenticated by the root.
         pub node_value_dict_commitments: (ArkGT, ArkGT),
+        /// Dory commitments of TWO extra node/value-dictionary columns that back
+        /// the (later) numeric RANGE gadget, over `node_value_catalog`'s canonical
+        /// order (same padding/length as `node_value_dict_commitments`):
+        ///   `.0` = `Com(nv_dict_value)`: `nv_dict_value[k]` is the ORDER-PRESERVING
+        ///          unsigned-integer encoding of object_k's value when object_k is a
+        ///          supported fixed-width numeric literal, else the `0` sentinel
+        ///          (`Node`s, `String`/variable-width or non-OP datatypes). See
+        ///          `node_value_dict_value_column`.
+        ///   `.1` = `Com(nv_dict_datatype)`: `nv_dict_datatype[k]` is object_k's
+        ///          `CanonicalDatatype` discriminant (a `Value`) or the reserved
+        ///          `NODE_DATATYPE_TAG` (a `Node`); lets the later gadget mask rows
+        ///          to the queried datatype by equality. See
+        ///          `node_value_dict_datatype_column`.
+        /// `commitment_root` binds these two, so the value column a range proof
+        /// compares against — and the datatype it is masked by — are authenticated
+        /// by the root. The `object_id` column is NOT value-ordered on rollup
+        /// layers, so the range gadget ranges over this committed OP encoding and
+        /// ties each triple's object to its dict row by a per-row membership lookup.
+        pub node_value_dict_range_commitments: (ArkGT, ArkGT),
     }
 
     impl PartialEq for LayerCommitment {
@@ -1413,6 +1561,10 @@ pub mod commitment {
             // Node/value-dictionary commitments (subject/object CONSTANT->id
             // binding, authenticated by the root the same way).
             let node_value_dict_commitments = commit_node_value_dictionary(&node_value_catalog)?;
+            // Node/value order-preserving VALUE + DATATYPE columns backing the
+            // (later) numeric range gadget, authenticated by the root the same way.
+            let node_value_dict_range_commitments =
+                commit_node_value_dict_range(&node_value_catalog)?;
 
             let state = CommitmentState {
                 parent_state_root,
@@ -1433,6 +1585,7 @@ pub mod commitment {
                 column_commitments,
                 predicate_dict_commitments,
                 node_value_dict_commitments,
+                node_value_dict_range_commitments,
             };
             layer.state.commitment_root = layer.compute_commitment_root()?;
             layer.validate()?;
@@ -1595,6 +1748,13 @@ pub mod commitment {
                 let id = deserialize_commitment(&r.bytes()?)?;
                 (hash, id)
             };
+            // Same fixed order as `dictionary_commitments`/`encode_body`: the
+            // node/value VALUE then DATATYPE commitment follow the hash/id pair.
+            let node_value_dict_range_commitments = {
+                let value = deserialize_commitment(&r.bytes()?)?;
+                let datatype = deserialize_commitment(&r.bytes()?)?;
+                (value, datatype)
+            };
             if !r.done() {
                 return Err(invalid("trailing commitment file bytes"));
             }
@@ -1649,13 +1809,14 @@ pub mod commitment {
                 column_commitments,
                 predicate_dict_commitments,
                 node_value_dict_commitments,
+                node_value_dict_range_commitments,
             };
             layer.validate()?;
             Ok(layer)
         }
 
         /// Recompute the `commitment_root` binding purely from the state counts,
-        /// parent root, the six column commitments, and the four dictionary
+        /// parent root, the six column commitments, and the six dictionary
         /// commitments (independent of the raw tables). A query verifier trusts a
         /// layer's `commitment_root`, and calls this to confirm the commitments it
         /// is about to open are exactly the ones that root authenticates.
@@ -1678,27 +1839,47 @@ pub mod commitment {
             node_value_dict_columns_from_catalog(&self.node_value_catalog)
         }
 
-        /// The four dictionary commitments, in fixed bound order: predicate hash,
-        /// predicate id, then node/value hash, node/value id. `commitment_root`
-        /// binds them in this order.
-        fn dictionary_commitments(&self) -> [&ArkGT; 4] {
+        /// Rebuild the padded node/value-dictionary VALUE column that
+        /// `node_value_dict_range_commitments.0` commits, so a range proof can open
+        /// it. Same padding/order/length as `node_value_dictionary_columns`.
+        pub fn node_value_dictionary_value_column(&self) -> io::Result<Vec<ArkFr>> {
+            node_value_dict_value_column(&self.node_value_catalog)
+        }
+
+        /// Rebuild the padded node/value-dictionary DATATYPE column that
+        /// `node_value_dict_range_commitments.1` commits, so the range gadget can
+        /// open it and mask rows to the queried datatype. Same padding/order/length
+        /// as `node_value_dictionary_columns`.
+        pub fn node_value_dictionary_datatype_column(&self) -> io::Result<Vec<ArkFr>> {
+            node_value_dict_datatype_column(&self.node_value_catalog)
+        }
+
+        /// The six dictionary commitments, in fixed bound order: predicate hash,
+        /// predicate id, node/value hash, node/value id, then the node/value
+        /// order-preserving VALUE and DATATYPE columns. `commitment_root` binds
+        /// them in this order.
+        fn dictionary_commitments(&self) -> [&ArkGT; 6] {
             [
                 &self.predicate_dict_commitments.0,
                 &self.predicate_dict_commitments.1,
                 &self.node_value_dict_commitments.0,
                 &self.node_value_dict_commitments.1,
+                &self.node_value_dict_range_commitments.0,
+                &self.node_value_dict_range_commitments.1,
             ]
         }
 
         /// The commitment root binds the parent root, the six counts, the six
-        /// per-column Dory commitments, and the FOUR dictionary commitments (the
-        /// predicate hash/id pair then the node/value hash/id pair) — NOT the raw
-        /// tables, which are separately bound by the file checksum and revalidated
-        /// on decode. The column commitments in turn bind the sorted id columns;
-        /// the dictionary commitments bind the IRI->id and constant->id maps.
+        /// per-column Dory commitments, and the SIX dictionary commitments (the
+        /// predicate hash/id pair, the node/value hash/id pair, then the node/value
+        /// order-preserving VALUE + DATATYPE pair) — NOT the raw tables, which are
+        /// separately bound by the file checksum and revalidated on decode. The
+        /// column commitments in turn bind the sorted id columns; the dictionary
+        /// commitments bind the IRI->id and constant->id maps and the value/datatype
+        /// encodings.
         fn compute_commitment_root(&self) -> io::Result<ProofHash> {
             let mut hasher = Sha256::new();
-            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v2");
+            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v3");
             match self.state.parent_state_root {
                 Some(root) => {
                     hasher.update([1u8]);
@@ -2136,6 +2317,10 @@ pub mod commitment {
                 decoded.node_value_dict_commitments,
                 commitment.node_value_dict_commitments
             );
+            assert_eq!(
+                decoded.node_value_dict_range_commitments,
+                commitment.node_value_dict_range_commitments
+            );
             assert_eq!(decoded.state.commitment_root, commitment.state.commitment_root);
         }
 
@@ -2271,8 +2456,8 @@ pub mod commitment {
         }
 
         #[test]
-        fn commitment_format_version_is_two() {
-            assert_eq!(COMMITMENT_FORMAT_VERSION, 2);
+        fn commitment_format_version_is_three() {
+            assert_eq!(COMMITMENT_FORMAT_VERSION, 3);
         }
 
         #[test]
@@ -2339,6 +2524,10 @@ pub mod commitment {
                 commitment.node_value_dict_commitments
             );
             assert_eq!(
+                decoded.node_value_dict_range_commitments,
+                commitment.node_value_dict_range_commitments
+            );
+            assert_eq!(
                 decoded.predicate_dict_commitments,
                 commitment.predicate_dict_commitments
             );
@@ -2352,6 +2541,192 @@ pub mod commitment {
                 decoded.recomputed_commitment_root().unwrap(),
                 decoded.state.commitment_root
             );
+        }
+
+        #[test]
+        fn node_value_range_columns_align_with_shared_commit_column() {
+            use crate::proof::argument::commit_column;
+
+            let layer = node_and_value_layer();
+            // Rebuild the two range columns exactly as the query side would (via the
+            // public accessors) and confirm they match the stored commitments
+            // byte-for-byte, and share the length of the hash/id columns.
+            let (hashes, _ids) = layer.node_value_dictionary_columns().unwrap();
+            let values = layer.node_value_dictionary_value_column().unwrap();
+            let datatypes = layer.node_value_dictionary_datatype_column().unwrap();
+            assert_eq!(values.len(), hashes.len());
+            assert_eq!(datatypes.len(), hashes.len());
+            assert_eq!(
+                commit_column(&values).unwrap(),
+                layer.node_value_dict_range_commitments.0
+            );
+            assert_eq!(
+                commit_column(&datatypes).unwrap(),
+                layer.node_value_dict_range_commitments.1
+            );
+        }
+
+        #[test]
+        fn commitment_root_binds_the_node_value_value_and_datatype_columns() {
+            use crate::proof::argument::commit_column;
+
+            let layer = node_and_value_layer();
+            assert_eq!(
+                layer.recomputed_commitment_root().unwrap(),
+                layer.state.commitment_root
+            );
+            let other = commit_column(&[
+                <ArkFr as DoryField>::from_u64(11),
+                <ArkFr as DoryField>::from_u64(13),
+            ])
+            .unwrap();
+            // Tampering the VALUE commitment diverges the recomputed root...
+            assert_ne!(other, layer.node_value_dict_range_commitments.0);
+            let mut tampered_value = layer.clone();
+            tampered_value.node_value_dict_range_commitments.0 = other;
+            assert_ne!(
+                tampered_value.recomputed_commitment_root().unwrap(),
+                tampered_value.state.commitment_root
+            );
+            // ...and so does tampering the DATATYPE commitment.
+            assert_ne!(other, layer.node_value_dict_range_commitments.1);
+            let mut tampered_datatype = layer.clone();
+            tampered_datatype.node_value_dict_range_commitments.1 = other;
+            assert_ne!(
+                tampered_datatype.recomputed_commitment_root().unwrap(),
+                tampered_datatype.state.commitment_root
+            );
+        }
+
+        // 255 must not collide with any real CanonicalDatatype discriminant.
+        #[test]
+        fn reserved_node_datatype_tag_is_not_a_real_discriminant() {
+            use std::convert::TryFrom;
+            assert_eq!(NODE_DATATYPE_TAG, 255);
+            for tag in 0u8..=254 {
+                // Every value below the reserved tag that IS a real discriminant is
+                // strictly less than 255; TryFrom fails for the gaps. Either way,
+                // no real discriminant equals 255.
+                if let Ok(dt) = CanonicalDatatype::try_from(tag) {
+                    assert_ne!(dt as u64, NODE_DATATYPE_TAG);
+                }
+            }
+        }
+
+        // Build a real base layer through the store carrying numeric value objects
+        // and assert the committed VALUE column holds the expected big-endian
+        // integers, order-preserving (monotone) within a datatype, with Node/String
+        // entries getting the 0 sentinel and the reserved / String datatype tags.
+        #[test]
+        fn node_value_value_column_encodes_order_preserving_integers() {
+            use crate::layer::ValueTriple;
+            use crate::store::sync::open_sync_memory_store;
+            use std::convert::TryInto;
+            use tdb_succinct::TdbDataType;
+
+            let iri = |s: &str| format!("http://ex/{s}");
+            let p = iri("p");
+
+            let store = open_sync_memory_store();
+            let builder = store.create_base_layer().unwrap();
+            // Three UInt32 values (inserted OUT of numeric order) + a Boolean + a
+            // Node object + a String value.
+            builder
+                .add_value_triple(ValueTriple::new_value(&iri("s1"), &p, u32::make_entry(&300u32)))
+                .unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_value(&iri("s2"), &p, u32::make_entry(&5u32)))
+                .unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_value(&iri("s3"), &p, u32::make_entry(&7u32)))
+                .unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_value(&iri("s4"), &p, bool::make_entry(&true)))
+                .unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_node(&iri("s5"), &p, &iri("target")))
+                .unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_string_value(&iri("s6"), &p, "hello"))
+                .unwrap();
+            let (layer, _state) = builder.commit_with_proof().unwrap();
+            let layer = layer.proof_commitment().unwrap().unwrap();
+
+            let values = layer.node_value_dictionary_value_column().unwrap();
+            let datatypes = layer.node_value_dictionary_datatype_column().unwrap();
+            assert_eq!(values.len(), datatypes.len());
+            assert!(values.len() >= layer.node_value_catalog.len());
+
+            let mut uint32_by_index: Vec<(usize, u64)> = Vec::new();
+            let mut saw_bool = false;
+            let mut saw_string = false;
+            let mut saw_node = false;
+            for (k, record) in layer.node_value_catalog.iter().enumerate() {
+                match &record.triple.object {
+                    CanonicalObject::Value {
+                        datatype: CanonicalDatatype::UInt32,
+                        lexical,
+                    } => {
+                        assert_eq!(lexical.len(), 4);
+                        let expected = u32::from_be_bytes(lexical.as_slice().try_into().unwrap());
+                        assert_eq!(values[k], <ArkFr as DoryField>::from_u64(expected as u64));
+                        assert_eq!(
+                            datatypes[k],
+                            <ArkFr as DoryField>::from_u64(CanonicalDatatype::UInt32 as u64)
+                        );
+                        uint32_by_index.push((k, expected as u64));
+                    }
+                    CanonicalObject::Value {
+                        datatype: CanonicalDatatype::Boolean,
+                        lexical,
+                    } => {
+                        saw_bool = true;
+                        // Boolean true -> lexical [1] -> value 1.
+                        assert_eq!(lexical.as_slice(), &[1u8]);
+                        assert_eq!(values[k], <ArkFr as DoryField>::from_u64(1));
+                        assert_eq!(
+                            datatypes[k],
+                            <ArkFr as DoryField>::from_u64(CanonicalDatatype::Boolean as u64)
+                        );
+                    }
+                    CanonicalObject::Value {
+                        datatype: CanonicalDatatype::String,
+                        ..
+                    } => {
+                        saw_string = true;
+                        // Variable-width, non-OP: 0 sentinel, String datatype tag (0).
+                        assert_eq!(values[k], <ArkFr as DoryField>::zero());
+                        assert_eq!(
+                            datatypes[k],
+                            <ArkFr as DoryField>::from_u64(CanonicalDatatype::String as u64)
+                        );
+                    }
+                    CanonicalObject::Node(_) => {
+                        saw_node = true;
+                        // Nodes (subjects and the node object): 0 sentinel, reserved tag.
+                        assert_eq!(values[k], <ArkFr as DoryField>::zero());
+                        assert_eq!(datatypes[k], <ArkFr as DoryField>::from_u64(NODE_DATATYPE_TAG));
+                    }
+                    other => panic!("unexpected catalog object {:?}", other),
+                }
+            }
+            assert_eq!(uint32_by_index.len(), 3, "three distinct UInt32 values");
+            assert!(saw_bool && saw_string && saw_node);
+            // Order-preservation: the committed values 5,7,300 appear in ASCENDING
+            // catalog order (the dictionary is sorted by the OP lexical bytes within
+            // a datatype, so the committed column is monotone in the numeric value).
+            let sorted: Vec<u64> = {
+                let mut by_index = uint32_by_index.clone();
+                by_index.sort_by_key(|(k, _)| *k);
+                by_index.into_iter().map(|(_, v)| v).collect()
+            };
+            assert_eq!(sorted, vec![5u64, 7, 300]);
+
+            // Padding rows (beyond the catalog) carry the 0 sentinel in both columns.
+            for k in layer.node_value_catalog.len()..values.len() {
+                assert_eq!(values[k], <ArkFr as DoryField>::zero());
+                assert_eq!(datatypes[k], <ArkFr as DoryField>::zero());
+            }
         }
 
         #[test]
