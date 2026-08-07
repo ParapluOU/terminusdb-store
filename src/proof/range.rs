@@ -79,7 +79,9 @@ use super::argument::{
     ClaimShape, ColumnOpening, Expr, Operand, SumcheckClaim, SumcheckProof, SumcheckShape, Term,
     Transcript254,
 };
+use super::filter::{self, FilterProof};
 use super::invalid;
+use super::logup::{masked_multiset_link_claim, reciprocal_claim, reciprocal_witness, rlc_fold};
 use super::sort::{booleanity_claim, low_bits};
 
 // Column layout: V, then the B+1 bit columns b_0..b_B, then sel.
@@ -465,6 +467,615 @@ pub fn verify_range_select(
     verify_column_openings(&commitments, &r, &evals, &proof.opening, transcript)
 }
 
+// ===========================================================================
+// CP-B2: authenticated node/value dict lookup (obj_id -> value, datatype).
+// ===========================================================================
+//
+// Given a committed OBJECT-ID column `obj_id` (`N = 2^k` rows, `real_n` real) and
+// the committed node/value dictionary as three ROW-ALIGNED columns
+// `dict_id` / `dict_value` / `dict_datatype` (`n_dict` real rows, padded to the
+// SAME `2^k` domain), this proves the prover-committed witness columns `v_val`,
+// `v_dt` are the GENUINE dict entries for each row's object id:
+//   `(obj_id[i], v_val[i], v_dt[i]) == (dict_id[j], dict_value[j], dict_datatype[j])`
+// for the dict row `j` whose id is `obj_id[i]`, for every real row `i < real_n`.
+//
+// # The lookup (batched multi-column LogUp, mirrors [`super::membership`])
+// Draw a fold challenge `β` (after committing the witness columns) and fingerprint
+// each side's `(id, value, datatype)` triple into ONE scalar per row:
+//   * query fold  `q[i]  = obj_id[i]  + β·v_val[i]  + β²·v_dt[i]`
+//   * dict  fold  `d[j]  = dict_id[j] + β·dict_value[j] + β²·dict_datatype[j]`
+// Commit reciprocal witnesses `rec_q[i] = 1/(α − q[i])`, `rec_d[j] = 1/(α − d[j])`
+// (α drawn after `β`), pinned by two Identity [`reciprocal_claim`]s, plus a
+// committed MULTIPLICITY column `w[j]` = #{ real query rows whose id is dict row
+// `j` }. The single ZeroSum [`masked_multiset_link_claim`] links them:
+//   `Σ_i χ_n[i]·rec_q[i]  −  Σ_j χ_{n_dict}[j]·w[j]·rec_d[j] = 0`.
+// BOTH sides are masked (the audited discipline): `χ_n` drops padding query rows,
+// `χ_{n_dict}` drops padding dict rows so they cannot act as free poles.
+//
+// # WHY this forces v_val/v_dt correct (the security tie)
+// At random α the link holds as a rational identity in α iff the query-fold
+// multiset (one pole per real query row) equals the dict-fold multiset (dict row
+// `j` weighted by `w[j]`, real rows only). So every real query pole `q[i]` must be
+// cancelled by some dict pole `d[j]`. With `β` drawn AFTER commit, the fold
+// `(id,val,dt) ↦ id + β·val + β²·dt` is injective w.h.p., so `q[i] == d[j]` forces
+// `obj_id[i] = dict_id[j]`, `v_val[i] = dict_value[j]`, `v_dt[i] = dict_datatype[j]`.
+// Because `dict_id` is UNIQUE per row (the dict is an id↔object bijection),
+// `obj_id[i] = dict_id[j]` pins `j` to THE unique dict row for that id — so
+// `v_val[i]`/`v_dt[i]` are forced to be that row's TRUE value/datatype. A prover
+// that commits a WRONG `v_val[i]` (≠ dict_value of `obj_id[i]`) produces a query
+// pole that matches NO dict pole (the only row with id `obj_id[i]` has the true,
+// different value), leaving an uncancelled pole → the identity fails → REJECT.
+// The reciprocals are themselves pinned (Identity claims, committed + opened), so a
+// prover cannot fudge them to fake a balance.
+
+// Column layout for the lookup sumcheck (one `2^k` domain shared by both sides).
+const L_COL_OBJ_ID: usize = 0;
+const L_COL_V_VAL: usize = 1;
+const L_COL_V_DT: usize = 2;
+const L_COL_REC_Q: usize = 3;
+const L_COL_DICT_ID: usize = 4;
+const L_COL_DICT_VALUE: usize = 5;
+const L_COL_DICT_DATATYPE: usize = 6;
+const L_COL_W: usize = 7;
+const L_COL_REC_D: usize = 8;
+const L_NUM_COLUMNS: usize = 9;
+// chi_bounds indices: χ_n (real query rows) and χ_{n_dict} (real dict rows).
+const L_CHI_N: usize = 0;
+const L_CHI_NDICT: usize = 1;
+
+const LOOKUP_DOMAIN: &[u8] = b"pow/obj-lookup/domain-v1";
+const LOOKUP_STMT: &[u8] = b"pow/obj-lookup/statement";
+const LOOKUP_BETA: &[u8] = b"pow/obj-lookup/fingerprint-beta";
+const LOOKUP_ALPHA: &[u8] = b"pow/obj-lookup/reciprocal-alpha";
+
+/// A batched authenticated dict-lookup proof: the sumcheck over the two reciprocal
+/// (Identity) claims + the masked LogUp link (ZeroSum), one batched Dory opening of
+/// all nine columns, and the witness commitments the verifier binds. `com_v_val` /
+/// `com_v_dt` are the AUTHENTICATED value/datatype columns the composing gadget
+/// (range on `v_val`, datatype-mask on `v_dt`) reuses as their committed inputs.
+#[derive(Clone, Debug)]
+pub struct DictLookupProof {
+    pub sumcheck: SumcheckProof,
+    pub opening: ColumnOpening,
+    pub com_v_val: ArkGT,
+    pub com_v_dt: ArkGT,
+    pub com_w: ArkGT,
+    pub com_rec_q: ArkGT,
+    pub com_rec_d: ArkGT,
+}
+
+fn lookup_shape(k: usize, real_n: usize, n_dict: usize, alpha: ArkFr, beta: ArkFr) -> SumcheckShape {
+    // Fold order [id, value, datatype] -> id + β·value + β²·datatype on both sides.
+    let rec_q = reciprocal_claim(
+        L_COL_REC_Q,
+        &[L_COL_OBJ_ID, L_COL_V_VAL, L_COL_V_DT],
+        alpha,
+        beta,
+    );
+    let rec_d = reciprocal_claim(
+        L_COL_REC_D,
+        &[L_COL_DICT_ID, L_COL_DICT_VALUE, L_COL_DICT_DATATYPE],
+        alpha,
+        beta,
+    );
+    // Σ χ_n·rec_q − Σ χ_{n_dict}·w·rec_d = 0. Both sides masked.
+    let link = masked_multiset_link_claim(
+        &[Operand::Chi(L_CHI_N)],
+        L_COL_REC_Q,
+        &[Operand::Chi(L_CHI_NDICT), Operand::Column(L_COL_W)],
+        L_COL_REC_D,
+    );
+    SumcheckShape {
+        num_vars: k,
+        num_columns: L_NUM_COLUMNS,
+        chi_bounds: vec![real_n, n_dict],
+        claims: vec![rec_q, rec_d, link],
+    }
+}
+
+/// Bind the PUBLIC lookup statement (real query length, real dict length) so the
+/// Fiat-Shamir challenges depend on both masks.
+fn bind_lookup_statement(transcript: &mut Transcript254, real_n: usize, n_dict: usize) {
+    transcript.append_bytes(LOOKUP_DOMAIN, b"parture/proof-of-woql/object-range-lookup/v0");
+    transcript.append_bytes(LOOKUP_STMT, &(real_n as u64).to_le_bytes());
+    transcript.append_bytes(LOOKUP_STMT, &(n_dict as u64).to_le_bytes());
+}
+
+/// The honest lookup witness: for each row, `v_val[i]`/`v_dt[i]` are the dict entry
+/// of the real dict row whose id equals `obj_id[i]` (else the `0` sentinel — only
+/// possible on padding rows, which are masked out), and `w[j]` counts the real
+/// query rows (`i < real_n`) whose id is dict row `j`. A linear scan (dictionaries
+/// are small at the relation level; CP-C can index it).
+pub(crate) fn honest_dict_lookup(
+    obj_id: &[ArkFr],
+    dict_id: &[ArkFr],
+    dict_value: &[ArkFr],
+    dict_datatype: &[ArkFr],
+    real_n: usize,
+    n_dict: usize,
+) -> (Vec<ArkFr>, Vec<ArkFr>, Vec<ArkFr>) {
+    let size = obj_id.len();
+    let real_dict = n_dict.min(dict_id.len());
+    let mut v_val = vec![f0(); size];
+    let mut v_dt = vec![f0(); size];
+    for i in 0..size {
+        for j in 0..real_dict {
+            if dict_id[j] == obj_id[i] {
+                v_val[i] = dict_value[j];
+                v_dt[i] = dict_datatype[j];
+                break;
+            }
+        }
+    }
+    let mut w = vec![f0(); size];
+    for j in 0..real_dict {
+        let mut count = 0u64;
+        for id in obj_id.iter().take(real_n.min(size)) {
+            if *id == dict_id[j] {
+                count += 1;
+            }
+        }
+        w[j] = ArkFr::from_u64(count);
+    }
+    (v_val, v_dt, w)
+}
+
+/// Prove an authenticated lookup for EXPLICIT witness columns `(v_val, v_dt, w)`.
+/// The honest entry [`prove_dict_value_lookup`] derives them; the security tests use
+/// this to inject a WRONG `v_val`/`v_dt`/`w`. All nine columns must share the same
+/// power-of-two domain `2^k` as `obj_id` (the dict columns are pre-padded to it, and
+/// their three commitments commit those padded columns).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_dict_value_lookup_with_witness(
+    obj_id: &[ArkFr],
+    com_obj_id: &ArkGT,
+    v_val: &[ArkFr],
+    v_dt: &[ArkFr],
+    w: &[ArkFr],
+    dict_id: &[ArkFr],
+    dict_value: &[ArkFr],
+    dict_datatype: &[ArkFr],
+    com_dict_id: &ArkGT,
+    com_dict_value: &ArkGT,
+    com_dict_datatype: &ArkGT,
+    real_n: usize,
+    n_dict: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<DictLookupProof> {
+    let size = obj_id.len();
+    if !size.is_power_of_two() || size < 2 {
+        return Err(invalid("lookup object-id column length must be a power of two >= 2"));
+    }
+    for column in [v_val, v_dt, w, dict_id, dict_value, dict_datatype] {
+        if column.len() != size {
+            return Err(invalid("lookup column length mismatch (all columns share one domain)"));
+        }
+    }
+    if real_n > size || n_dict > size {
+        return Err(invalid("lookup real length exceeds the column domain"));
+    }
+    let k = size.trailing_zeros() as usize;
+
+    // Round 1: commit the witness DATA columns, bind the statement and every data
+    // commitment, THEN draw the fold/reciprocal challenges.
+    let com_v_val = commit_column(v_val)?;
+    let com_v_dt = commit_column(v_dt)?;
+    let com_w = commit_column(w)?;
+    bind_lookup_statement(transcript, real_n, n_dict);
+    transcript.append_group(b"pow/obj-lookup/com-obj-id", com_obj_id);
+    transcript.append_group(b"pow/obj-lookup/com-dict-id", com_dict_id);
+    transcript.append_group(b"pow/obj-lookup/com-dict-value", com_dict_value);
+    transcript.append_group(b"pow/obj-lookup/com-dict-datatype", com_dict_datatype);
+    transcript.append_group(b"pow/obj-lookup/com-v-val", &com_v_val);
+    transcript.append_group(b"pow/obj-lookup/com-v-dt", &com_v_dt);
+    transcript.append_group(b"pow/obj-lookup/com-w", &com_w);
+    let beta = transcript.challenge_scalar(LOOKUP_BETA);
+    let alpha = transcript.challenge_scalar(LOOKUP_ALPHA);
+
+    // Round 2: reciprocal witnesses over the β-fingerprinted folds, bound after α/β.
+    let fold_q = rlc_fold(beta, &[obj_id, v_val, v_dt]);
+    let fold_d = rlc_fold(beta, &[dict_id, dict_value, dict_datatype]);
+    let rec_q = reciprocal_witness(alpha, &fold_q);
+    let rec_d = reciprocal_witness(alpha, &fold_d);
+    let com_rec_q = commit_column(&rec_q)?;
+    let com_rec_d = commit_column(&rec_d)?;
+    transcript.append_group(b"pow/obj-lookup/com-rec-q", &com_rec_q);
+    transcript.append_group(b"pow/obj-lookup/com-rec-d", &com_rec_d);
+
+    let shape = lookup_shape(k, real_n, n_dict, alpha, beta);
+    let columns = vec![
+        obj_id.to_vec(),
+        v_val.to_vec(),
+        v_dt.to_vec(),
+        rec_q,
+        dict_id.to_vec(),
+        dict_value.to_vec(),
+        dict_datatype.to_vec(),
+        w.to_vec(),
+        rec_d,
+    ];
+    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
+    let opening = prove_column_openings(&columns, &r, transcript)?;
+
+    Ok(DictLookupProof {
+        sumcheck,
+        opening,
+        com_v_val,
+        com_v_dt,
+        com_w,
+        com_rec_q,
+        com_rec_d,
+    })
+}
+
+/// Prove that the (internally committed) `v_val`/`v_dt` columns are the genuine dict
+/// entries for each `obj_id[i]` (real rows). The dict columns must be pre-padded to
+/// `obj_id`'s domain and committed there.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_dict_value_lookup(
+    obj_id: &[ArkFr],
+    com_obj_id: &ArkGT,
+    dict_id: &[ArkFr],
+    dict_value: &[ArkFr],
+    dict_datatype: &[ArkFr],
+    com_dict_id: &ArkGT,
+    com_dict_value: &ArkGT,
+    com_dict_datatype: &ArkGT,
+    real_n: usize,
+    n_dict: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<DictLookupProof> {
+    let (v_val, v_dt, w) =
+        honest_dict_lookup(obj_id, dict_id, dict_value, dict_datatype, real_n, n_dict);
+    prove_dict_value_lookup_with_witness(
+        obj_id,
+        com_obj_id,
+        &v_val,
+        &v_dt,
+        &w,
+        dict_id,
+        dict_value,
+        dict_datatype,
+        com_dict_id,
+        com_dict_value,
+        com_dict_datatype,
+        real_n,
+        n_dict,
+        transcript,
+    )
+}
+
+/// Verify a batched authenticated dict-lookup proof. Concludes that the proof's
+/// `com_v_val`/`com_v_dt` commit the TRUE dict `value`/`datatype` of each real
+/// `obj_id` row (see the module security tie). The `com_v_val`/`com_v_dt` bound and
+/// opened here are the SAME commitments the composing range/datatype gadgets consume,
+/// so those gadgets range over authenticated values.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_dict_value_lookup(
+    com_obj_id: &ArkGT,
+    com_dict_id: &ArkGT,
+    com_dict_value: &ArkGT,
+    com_dict_datatype: &ArkGT,
+    real_n: usize,
+    n_dict: usize,
+    proof: &DictLookupProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    let k = proof.sumcheck.round_polys.len();
+    if k == 0 || k >= usize::BITS as usize {
+        return Err(invalid("lookup proof has an implausible variable count"));
+    }
+    if real_n > (1usize << k) || n_dict > (1usize << k) {
+        return Err(invalid("lookup real length exceeds the column domain"));
+    }
+
+    bind_lookup_statement(transcript, real_n, n_dict);
+    transcript.append_group(b"pow/obj-lookup/com-obj-id", com_obj_id);
+    transcript.append_group(b"pow/obj-lookup/com-dict-id", com_dict_id);
+    transcript.append_group(b"pow/obj-lookup/com-dict-value", com_dict_value);
+    transcript.append_group(b"pow/obj-lookup/com-dict-datatype", com_dict_datatype);
+    transcript.append_group(b"pow/obj-lookup/com-v-val", &proof.com_v_val);
+    transcript.append_group(b"pow/obj-lookup/com-v-dt", &proof.com_v_dt);
+    transcript.append_group(b"pow/obj-lookup/com-w", &proof.com_w);
+    let beta = transcript.challenge_scalar(LOOKUP_BETA);
+    let alpha = transcript.challenge_scalar(LOOKUP_ALPHA);
+    transcript.append_group(b"pow/obj-lookup/com-rec-q", &proof.com_rec_q);
+    transcript.append_group(b"pow/obj-lookup/com-rec-d", &proof.com_rec_d);
+
+    let shape = lookup_shape(k, real_n, n_dict, alpha, beta);
+    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    let commitments = [
+        *com_obj_id,
+        proof.com_v_val,
+        proof.com_v_dt,
+        proof.com_rec_q,
+        *com_dict_id,
+        *com_dict_value,
+        *com_dict_datatype,
+        proof.com_w,
+        proof.com_rec_d,
+    ];
+    verify_column_openings(&commitments, &r, &evals, &proof.opening, transcript)
+}
+
+// ===========================================================================
+// CP-B2: authenticated object-range selection (lookup + datatype mask + range).
+// ===========================================================================
+//
+// Composition: `sel[i] = χ_n[i] · [datatype(obj_id[i]) == T] · [value(obj_id[i]) op c]`,
+// where `value`/`datatype` are the DICT-AUTHENTICATED entries for `obj_id[i]`:
+//   1. lookup       — `DictLookupProof` binds `com_v_val`/`com_v_dt` to the TRUE dict
+//                     value/datatype of each real `obj_id` row.
+//   2. datatype mask — `filter::prove_filter_indicator` on the committed `v_dt` with
+//                     public constant `T` -> boolean `dt_match = [v_dt == T]` (χ_n-masked).
+//   3. range        — `prove_range_select` on the committed `v_val` -> boolean
+//                     `range_sel = [v_val op c]` (χ_n-masked; `b_bits = 64` since dict
+//                     OP values are < 2^64, an honest root-anchored bound — see below).
+//   4. combine      — Identity `sel − dt_match·range_sel = 0`, commit `sel`.
+// All four run on ONE shared transcript, so every challenge downstream depends on the
+// prior sub-proofs. The datatype mask is MANDATORY for cross-datatype soundness:
+// without it a `v_val` of a DIFFERENT datatype than `T` would still be compared to `c`
+// (a meaningless OP over a foreign encoding) and could be wrongly selected.
+//
+// SOUNDNESS PRECONDITION (range): real `v_val < 2^B` with `B = 64`. Structural: the
+// dict value column holds order-preserving encodings of ≤ 8-byte numerics (`< 2^64`)
+// and `0` sentinels — all `< 2^64`. This relies on the honest, root-anchored dict
+// (the lookup authenticates `v_val` AGAINST that dict), so no committed `v_val` on a
+// real row can be a huge near-modulus field element.
+
+/// The bit-width the object-range gadget always uses: dict order-preserving VALUE
+/// encodings are ≤ 8-byte numerics (`< 2^64`), so 64 bits suffice and the range
+/// gadget's `V ∈ [0, 2^B)` precondition holds for every authenticated real value.
+pub const OBJECT_RANGE_B_BITS: usize = 64;
+
+const COMBINE_DOMAIN: &[u8] = b"pow/obj-combine/domain-v1";
+const CB_COL_DT_MATCH: usize = 0;
+const CB_COL_RANGE_SEL: usize = 1;
+const CB_COL_SEL: usize = 2;
+
+/// The `sel − dt_match·range_sel = 0` combine proof (Identity sumcheck, arity 2 ->
+/// degree 3) plus its batched opening of `[dt_match, range_sel, sel]`.
+#[derive(Clone, Debug)]
+pub struct ObjectRangeCombineProof {
+    pub sumcheck: SumcheckProof,
+    pub opening: ColumnOpening,
+}
+
+/// The full authenticated object-range selection proof: the lookup sub-proof (which
+/// carries `com_v_val`/`com_v_dt`), the datatype-mask indicator, the range sub-proof,
+/// and the combine sub-proof. `Com(sel)` is returned separately (the authoritative
+/// output-column commitment, passed back into the verifier).
+#[derive(Clone, Debug)]
+pub struct ObjectRangeProof {
+    pub lookup: DictLookupProof,
+    pub datatype: FilterProof,
+    pub com_dt_match: ArkGT,
+    pub com_dt_w: ArkGT,
+    pub range: RangeSelectProof,
+    pub com_range_sel: ArkGT,
+    pub combine: ObjectRangeCombineProof,
+}
+
+fn combine_shape(k: usize) -> SumcheckShape {
+    // sel − dt_match·range_sel = 0 (both inputs already boolean and χ_n-masked).
+    let claim = SumcheckClaim {
+        shape: ClaimShape::Identity,
+        expr: Expr {
+            terms: vec![
+                Term {
+                    coeff: f1(),
+                    operands: vec![Operand::Column(CB_COL_SEL)],
+                },
+                Term {
+                    coeff: f0() - f1(),
+                    operands: vec![
+                        Operand::Column(CB_COL_DT_MATCH),
+                        Operand::Column(CB_COL_RANGE_SEL),
+                    ],
+                },
+            ],
+        },
+        target: f0(),
+    };
+    SumcheckShape {
+        num_vars: k,
+        num_columns: 3,
+        chi_bounds: Vec::new(),
+        claims: vec![claim],
+    }
+}
+
+/// Commit `sel = dt_match ⊙ range_sel` and prove the combine Identity over
+/// `[dt_match, range_sel, sel]`. Returns the proof and `Com(sel)`.
+fn prove_object_range_combine(
+    dt_match: &[ArkFr],
+    range_sel: &[ArkFr],
+    com_dt_match: &ArkGT,
+    com_range_sel: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(ObjectRangeCombineProof, ArkGT)> {
+    let size = dt_match.len();
+    if range_sel.len() != size {
+        return Err(invalid("combine column length mismatch"));
+    }
+    let sel: Vec<ArkFr> = dt_match
+        .iter()
+        .zip(range_sel.iter())
+        .map(|(a, b)| *a * *b)
+        .collect();
+    let com_sel = commit_column(&sel)?;
+    let k = size.trailing_zeros() as usize;
+
+    transcript.append_bytes(COMBINE_DOMAIN, b"parture/proof-of-woql/object-range-combine/v0");
+    transcript.append_group(b"pow/obj-combine/com-dt", com_dt_match);
+    transcript.append_group(b"pow/obj-combine/com-range", com_range_sel);
+    transcript.append_group(b"pow/obj-combine/com-sel", &com_sel);
+
+    let shape = combine_shape(k);
+    let columns = vec![dt_match.to_vec(), range_sel.to_vec(), sel];
+    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
+    let opening = prove_column_openings(&columns, &r, transcript)?;
+    Ok((ObjectRangeCombineProof { sumcheck, opening }, com_sel))
+}
+
+fn verify_object_range_combine(
+    com_dt_match: &ArkGT,
+    com_range_sel: &ArkGT,
+    com_sel: &ArkGT,
+    proof: &ObjectRangeCombineProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    let k = proof.sumcheck.round_polys.len();
+    if k == 0 || k >= usize::BITS as usize {
+        return Err(invalid("combine proof has an implausible variable count"));
+    }
+    transcript.append_bytes(COMBINE_DOMAIN, b"parture/proof-of-woql/object-range-combine/v0");
+    transcript.append_group(b"pow/obj-combine/com-dt", com_dt_match);
+    transcript.append_group(b"pow/obj-combine/com-range", com_range_sel);
+    transcript.append_group(b"pow/obj-combine/com-sel", com_sel);
+
+    let shape = combine_shape(k);
+    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    verify_column_openings(
+        &[*com_dt_match, *com_range_sel, *com_sel],
+        &r,
+        &evals,
+        &proof.opening,
+        transcript,
+    )
+}
+
+/// Prove an authenticated OBJECT-RANGE SELECTION: `Com(sel)` where
+/// `sel[i] = χ_n[i] · [datatype(obj_id[i]) == T] · [value(obj_id[i]) op c]`, with
+/// `value`/`datatype` the dict-authenticated entries of `obj_id[i]`. The dict
+/// columns must be pre-padded to `obj_id`'s domain and committed there. Uses
+/// `b_bits = 64` internally (dict OP values are `< 2^64`). Returns the proof and
+/// `Com(sel)`.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_object_range_select(
+    obj_id: &[ArkFr],
+    com_obj_id: &ArkGT,
+    dict_id: &[ArkFr],
+    dict_value: &[ArkFr],
+    dict_datatype: &[ArkFr],
+    com_dict_id: &ArkGT,
+    com_dict_value: &ArkGT,
+    com_dict_datatype: &ArkGT,
+    n_dict: usize,
+    datatype_t: ArkFr,
+    op: RangeOp,
+    c: ArkFr,
+    b_bits: usize,
+    real_n: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<(ObjectRangeProof, ArkGT)> {
+    // 1) Derive + prove the authenticated (v_val, v_dt) for every obj_id row.
+    let (v_val, v_dt, w) =
+        honest_dict_lookup(obj_id, dict_id, dict_value, dict_datatype, real_n, n_dict);
+    let lookup = prove_dict_value_lookup_with_witness(
+        obj_id,
+        com_obj_id,
+        &v_val,
+        &v_dt,
+        &w,
+        dict_id,
+        dict_value,
+        dict_datatype,
+        com_dict_id,
+        com_dict_value,
+        com_dict_datatype,
+        real_n,
+        n_dict,
+        transcript,
+    )?;
+
+    // 2) Datatype mask over the AUTHENTICATED v_dt column (reuse the filter indicator).
+    let (datatype, com_dt_match, com_dt_w, _dt_eval) =
+        filter::prove_filter_indicator(&v_dt, datatype_t, real_n, &lookup.com_v_dt, transcript)?;
+
+    // 3) Range over the AUTHENTICATED v_val column (reuse CP-B1).
+    let (range, com_range_sel) =
+        prove_range_select(&v_val, &lookup.com_v_val, op, c, b_bits, real_n, transcript)?;
+
+    // 4) Combine sel = dt_match · range_sel. Recompute the two boolean columns via the
+    // very same honest witnesses the sub-gadgets committed, so they match the openings.
+    let (dt_match, _dt_w_col) = filter::honest_witness(&v_dt, datatype_t, real_n);
+    let (_bits, range_sel) = honest_witness(&v_val, real_n, op, c, b_bits);
+    let (combine, com_sel) =
+        prove_object_range_combine(&dt_match, &range_sel, &com_dt_match, &com_range_sel, transcript)?;
+
+    Ok((
+        ObjectRangeProof {
+            lookup,
+            datatype,
+            com_dt_match,
+            com_dt_w,
+            range,
+            com_range_sel,
+            combine,
+        },
+        com_sel,
+    ))
+}
+
+/// Verify an authenticated object-range selection proof against the caller's
+/// authoritative `com_sel`. Re-runs, on one shared transcript in prover order: the
+/// authenticated lookup, the datatype mask (constant `T`), the range (`op`, `c`), and
+/// the combine. Concludes `com_sel` commits EXACTLY the object-range selection.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_object_range_select(
+    com_obj_id: &ArkGT,
+    com_dict_id: &ArkGT,
+    com_dict_value: &ArkGT,
+    com_dict_datatype: &ArkGT,
+    n_dict: usize,
+    datatype_t: ArkFr,
+    op: RangeOp,
+    c: ArkFr,
+    b_bits: usize,
+    real_n: usize,
+    com_sel: &ArkGT,
+    proof: &ObjectRangeProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    verify_dict_value_lookup(
+        com_obj_id,
+        com_dict_id,
+        com_dict_value,
+        com_dict_datatype,
+        real_n,
+        n_dict,
+        &proof.lookup,
+        transcript,
+    )?;
+    filter::verify_filter_indicator(
+        &proof.lookup.com_v_dt,
+        datatype_t,
+        real_n,
+        &proof.com_dt_match,
+        &proof.com_dt_w,
+        &proof.datatype,
+        transcript,
+    )?;
+    verify_range_select(
+        &proof.lookup.com_v_val,
+        op,
+        c,
+        b_bits,
+        real_n,
+        &proof.com_range_sel,
+        &proof.range,
+        transcript,
+    )?;
+    verify_object_range_combine(
+        &proof.com_dt_match,
+        &proof.com_range_sel,
+        com_sel,
+        &proof.combine,
+        transcript,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,5 +1409,482 @@ mod tests {
         let com_sel_all = run(&v, RangeOp::Lt, 1000, b_bits, real_n).unwrap();
         let expected = expected_sel(&real, size, real_n, RangeOp::Lt, 1000);
         assert_eq!(com_sel_all, commit(&expected));
+    }
+}
+
+// ===========================================================================
+// CP-B2 tests: authenticated lookup + authenticated object-range selection.
+// ===========================================================================
+#[cfg(test)]
+mod object_range_tests {
+    use super::*;
+    use crate::layer::ValueTriple;
+    use crate::proof::{CanonicalDatatype, CanonicalObject};
+    use crate::store::sync::open_sync_memory_store;
+    use std::convert::TryInto;
+    use tdb_succinct::TdbDataType;
+
+    const UINT32_TAG: u64 = CanonicalDatatype::UInt32 as u64;
+    const BOOLEAN_TAG: u64 = CanonicalDatatype::Boolean as u64;
+    const NODE_TAG: u64 = 255;
+
+    fn transcript() -> Transcript254 {
+        Transcript254::new(b"parture-object-range-test")
+    }
+
+    fn commit(column: &[ArkFr]) -> ArkGT {
+        commit_column(column).unwrap()
+    }
+
+    fn cmp_op(op: RangeOp, a: u64, b: u64) -> bool {
+        match op {
+            RangeOp::Lt => a < b,
+            RangeOp::Le => a <= b,
+            RangeOp::Gt => a > b,
+            RangeOp::Ge => a >= b,
+        }
+    }
+
+    /// A committed node/value dictionary drawn from a REAL base layer carrying a set
+    /// of UInt32 values plus a Boolean, a Node object, and a String value (mixed
+    /// datatypes), so the range gadget's OP encodings are the genuine store ones.
+    struct DictFixture {
+        dict_id: Vec<ArkFr>,
+        dict_value: Vec<ArkFr>,
+        dict_datatype: Vec<ArkFr>,
+        com_id: ArkGT,
+        com_value: ArkGT,
+        com_datatype: ArkGT,
+        n_dict: usize,
+        domain: usize,
+        /// (object_id, u32 value) for each UInt32 catalog entry.
+        uint32: Vec<(u64, u64)>,
+        /// A Boolean object's id (its value is 1 — we insert `true`).
+        bool_id: u64,
+        /// A Node object's id (its OP value is the 0 sentinel).
+        node_id: u64,
+    }
+
+    fn build_dict_fixture() -> DictFixture {
+        let iri = |s: &str| format!("http://ex/{s}");
+        let p = iri("p");
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        // Five UInt32 values (inserted OUT of numeric order), a Boolean, a Node
+        // object, and a String value.
+        for (s, v) in [("s1", 300u32), ("s2", 5), ("s3", 7), ("s4", 40), ("s5", 100)] {
+            builder
+                .add_value_triple(ValueTriple::new_value(&iri(s), &p, u32::make_entry(&v)))
+                .unwrap();
+        }
+        builder
+            .add_value_triple(ValueTriple::new_value(&iri("s6"), &p, bool::make_entry(&true)))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node(&iri("s7"), &p, &iri("target")))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value(&iri("s8"), &p, "hello"))
+            .unwrap();
+        let (layer, _state) = builder.commit_with_proof().unwrap();
+        let layer = layer.proof_commitment().unwrap().unwrap();
+
+        let dict_id = layer.node_value_dictionary_columns().unwrap().1;
+        let dict_value = layer.node_value_dictionary_value_column().unwrap();
+        let dict_datatype = layer.node_value_dictionary_datatype_column().unwrap();
+        let n_dict = layer.node_value_catalog.len();
+        let domain = dict_id.len();
+
+        let mut uint32 = Vec::new();
+        let mut bool_id = None;
+        let mut node_id = None;
+        for record in &layer.node_value_catalog {
+            match &record.triple.object {
+                CanonicalObject::Value {
+                    datatype: CanonicalDatatype::UInt32,
+                    lexical,
+                } => {
+                    let value = u32::from_be_bytes(lexical.as_slice().try_into().unwrap());
+                    uint32.push((record.object_id, value as u64));
+                }
+                CanonicalObject::Value {
+                    datatype: CanonicalDatatype::Boolean,
+                    ..
+                } => bool_id = Some(record.object_id),
+                CanonicalObject::Node(_) => {
+                    // Pick any node (subject or the node object); its OP value is 0.
+                    node_id.get_or_insert(record.object_id);
+                }
+                _ => {}
+            }
+        }
+        // Sanity: the genuine encoding matches what we asserted (order-preserving u32).
+        assert_eq!(uint32.len(), 5, "five UInt32 dictionary entries");
+
+        DictFixture {
+            com_id: layer.node_value_dict_commitments.1,
+            com_value: layer.node_value_dict_range_commitments.0,
+            com_datatype: layer.node_value_dict_range_commitments.1,
+            dict_id,
+            dict_value,
+            dict_datatype,
+            n_dict,
+            domain,
+            uint32,
+            bool_id: bool_id.unwrap(),
+            node_id: node_id.unwrap(),
+        }
+    }
+
+    /// A query object-id column of length `domain` from `(id, value, dt)` rows, plus
+    /// the reference expected boolean selection for `(datatype_t, op, c)` over the
+    /// first `real_n` rows.
+    fn query_columns(
+        fx: &DictFixture,
+        rows: &[(u64, u64, u64)],
+    ) -> (Vec<ArkFr>, usize) {
+        let real_n = rows.len();
+        assert!(real_n <= fx.domain);
+        let obj_id: Vec<ArkFr> = (0..fx.domain)
+            .map(|i| ArkFr::from_u64(if i < real_n { rows[i].0 } else { 0 }))
+            .collect();
+        (obj_id, real_n)
+    }
+
+    fn expected_sel(
+        fx: &DictFixture,
+        rows: &[(u64, u64, u64)],
+        real_n: usize,
+        datatype_t: u64,
+        op: RangeOp,
+        c: u64,
+    ) -> Vec<ArkFr> {
+        (0..fx.domain)
+            .map(|i| {
+                if i < real_n {
+                    let (_, value, dt) = rows[i];
+                    if dt == datatype_t && cmp_op(op, value, c) {
+                        ArkFr::one()
+                    } else {
+                        ArkFr::zero()
+                    }
+                } else {
+                    ArkFr::zero()
+                }
+            })
+            .collect()
+    }
+
+    // A canonical mixed-datatype query: the 5 UInt32 rows, a Boolean row, a Node row.
+    fn mixed_rows(fx: &DictFixture) -> Vec<(u64, u64, u64)> {
+        let mut rows: Vec<(u64, u64, u64)> = fx
+            .uint32
+            .iter()
+            .map(|(id, v)| (*id, *v, UINT32_TAG))
+            .collect();
+        rows.push((fx.bool_id, 1, BOOLEAN_TAG)); // Boolean true -> value 1
+        rows.push((fx.node_id, 0, NODE_TAG)); // Node -> OP value 0 sentinel
+        rows
+    }
+
+    fn prove_verify(
+        fx: &DictFixture,
+        obj_id: &[ArkFr],
+        datatype_t: u64,
+        op: RangeOp,
+        c: u64,
+        real_n: usize,
+    ) -> io::Result<ArkGT> {
+        let com_obj_id = commit(obj_id);
+        let t = ArkFr::from_u64(datatype_t);
+        let c_fr = ArkFr::from_u64(c);
+        let mut pt = transcript();
+        let (proof, com_sel) = prove_object_range_select(
+            obj_id,
+            &com_obj_id,
+            &fx.dict_id,
+            &fx.dict_value,
+            &fx.dict_datatype,
+            &fx.com_id,
+            &fx.com_value,
+            &fx.com_datatype,
+            fx.n_dict,
+            t,
+            op,
+            c_fr,
+            OBJECT_RANGE_B_BITS,
+            real_n,
+            &mut pt,
+        )?;
+        let mut vt = transcript();
+        verify_object_range_select(
+            &com_obj_id,
+            &fx.com_id,
+            &fx.com_value,
+            &fx.com_datatype,
+            fx.n_dict,
+            t,
+            op,
+            c_fr,
+            OBJECT_RANGE_B_BITS,
+            real_n,
+            &com_sel,
+            &proof,
+            &mut vt,
+        )?;
+        Ok(com_sel)
+    }
+
+    // ---- Standalone authenticated lookup (checkpoint 1) ----
+
+    #[test]
+    fn lookup_authenticates_genuine_values() {
+        let fx = build_dict_fixture();
+        let rows = mixed_rows(&fx);
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let com_obj_id = commit(&obj_id);
+        let mut pt = transcript();
+        let proof = prove_dict_value_lookup(
+            &obj_id,
+            &com_obj_id,
+            &fx.dict_id,
+            &fx.dict_value,
+            &fx.dict_datatype,
+            &fx.com_id,
+            &fx.com_value,
+            &fx.com_datatype,
+            real_n,
+            fx.n_dict,
+            &mut pt,
+        )
+        .unwrap();
+        let mut vt = transcript();
+        verify_dict_value_lookup(
+            &com_obj_id,
+            &fx.com_id,
+            &fx.com_value,
+            &fx.com_datatype,
+            real_n,
+            fx.n_dict,
+            &proof,
+            &mut vt,
+        )
+        .unwrap();
+
+        // The authenticated v_val/v_dt commitments equal an independent commit of the
+        // TRUE dict entries for each obj_id row (the lookup's whole point).
+        let (v_val, v_dt, _w) =
+            honest_dict_lookup(&obj_id, &fx.dict_id, &fx.dict_value, &fx.dict_datatype, real_n, fx.n_dict);
+        assert_eq!(proof.com_v_val, commit(&v_val));
+        assert_eq!(proof.com_v_dt, commit(&v_dt));
+    }
+
+    #[test]
+    fn lookup_rejects_wrong_v_val() {
+        // A prover that authenticates a WRONG value for a real obj_id (points the row
+        // at a DIFFERENT dict value than obj_id's true entry) is rejected: its query
+        // pole matches no dict pole.
+        let fx = build_dict_fixture();
+        let rows = mixed_rows(&fx);
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let com_obj_id = commit(&obj_id);
+        let (mut v_val, v_dt, w) =
+            honest_dict_lookup(&obj_id, &fx.dict_id, &fx.dict_value, &fx.dict_datatype, real_n, fx.n_dict);
+        // Row 0's true value is uint32[0]; overwrite with a DIFFERENT genuine value.
+        let wrong = ArkFr::from_u64(fx.uint32[1].1);
+        assert_ne!(v_val[0], wrong);
+        v_val[0] = wrong;
+        let mut pt = transcript();
+        let proof = prove_dict_value_lookup_with_witness(
+            &obj_id, &com_obj_id, &v_val, &v_dt, &w, &fx.dict_id, &fx.dict_value,
+            &fx.dict_datatype, &fx.com_id, &fx.com_value, &fx.com_datatype, real_n, fx.n_dict,
+            &mut pt,
+        )
+        .unwrap();
+        let mut vt = transcript();
+        assert!(verify_dict_value_lookup(
+            &com_obj_id, &fx.com_id, &fx.com_value, &fx.com_datatype, real_n, fx.n_dict, &proof,
+            &mut vt,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lookup_rejects_wrong_v_dt() {
+        // Same, but forging the DATATYPE of a real obj_id -> unmatched pole -> reject.
+        let fx = build_dict_fixture();
+        let rows = mixed_rows(&fx);
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let com_obj_id = commit(&obj_id);
+        let (v_val, mut v_dt, w) =
+            honest_dict_lookup(&obj_id, &fx.dict_id, &fx.dict_value, &fx.dict_datatype, real_n, fx.n_dict);
+        // Claim a UInt32 row is actually Boolean (a cross-datatype forgery attempt).
+        assert_eq!(v_dt[0], ArkFr::from_u64(UINT32_TAG));
+        v_dt[0] = ArkFr::from_u64(BOOLEAN_TAG);
+        let mut pt = transcript();
+        let proof = prove_dict_value_lookup_with_witness(
+            &obj_id, &com_obj_id, &v_val, &v_dt, &w, &fx.dict_id, &fx.dict_value,
+            &fx.dict_datatype, &fx.com_id, &fx.com_value, &fx.com_datatype, real_n, fx.n_dict,
+            &mut pt,
+        )
+        .unwrap();
+        let mut vt = transcript();
+        assert!(verify_dict_value_lookup(
+            &com_obj_id, &fx.com_id, &fx.com_value, &fx.com_datatype, real_n, fx.n_dict, &proof,
+            &mut vt,
+        )
+        .is_err());
+    }
+
+    // ---- Full authenticated object-range selection (checkpoint 2) ----
+
+    #[test]
+    fn all_ops_select_only_matching_datatype_and_value() {
+        let fx = build_dict_fixture();
+        let rows = mixed_rows(&fx);
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let c = 40u64; // straddles the UInt32 values 5,7,40,100,300 (boundary at 40).
+        for op in [RangeOp::Lt, RangeOp::Le, RangeOp::Gt, RangeOp::Ge] {
+            let com_sel = prove_verify(&fx, &obj_id, UINT32_TAG, op, c, real_n).unwrap();
+            let expected = expected_sel(&fx, &rows, real_n, UINT32_TAG, op, c);
+            assert_eq!(com_sel, commit(&expected), "op {:?}", op);
+        }
+    }
+
+    #[test]
+    fn datatype_mask_excludes_other_datatypes() {
+        // c = 0, op = Ge: EVERY row's value satisfies `>= 0` (uint32s, Boolean=1,
+        // Node=0). Only the UInt32 rows must be selected; the Boolean and Node rows
+        // are dropped purely by the datatype mask.
+        let fx = build_dict_fixture();
+        let rows = mixed_rows(&fx);
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let com_sel = prove_verify(&fx, &obj_id, UINT32_TAG, RangeOp::Ge, 0, real_n).unwrap();
+        let expected = expected_sel(&fx, &rows, real_n, UINT32_TAG, RangeOp::Ge, 0);
+        // Exactly the five UInt32 rows are selected (all >= 0); Boolean+Node are 0.
+        let ones = expected.iter().filter(|s| **s == ArkFr::one()).count();
+        assert_eq!(ones, 5);
+        for (i, row) in rows.iter().enumerate() {
+            if row.2 != UINT32_TAG {
+                assert_eq!(expected[i], ArkFr::zero());
+            }
+        }
+        assert_eq!(com_sel, commit(&expected));
+
+        // And a Boolean-datatype query with the SAME c/op selects ONLY the Boolean row.
+        let com_sel_bool = prove_verify(&fx, &obj_id, BOOLEAN_TAG, RangeOp::Ge, 0, real_n).unwrap();
+        let expected_bool = expected_sel(&fx, &rows, real_n, BOOLEAN_TAG, RangeOp::Ge, 0);
+        assert_eq!(expected_bool.iter().filter(|s| **s == ArkFr::one()).count(), 1);
+        assert_eq!(com_sel_bool, commit(&expected_bool));
+    }
+
+    #[test]
+    fn padding_rows_get_sel_zero() {
+        // Real rows are the 5 UInt32; the tail is padding. Even though padding obj_id
+        // = 0 authenticates value/datatype 0, the χ_n mask forces sel = 0 there.
+        let fx = build_dict_fixture();
+        let rows: Vec<(u64, u64, u64)> =
+            fx.uint32.iter().map(|(id, v)| (*id, *v, UINT32_TAG)).collect();
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let com_sel = prove_verify(&fx, &obj_id, UINT32_TAG, RangeOp::Ge, 0, real_n).unwrap();
+        let expected = expected_sel(&fx, &rows, real_n, UINT32_TAG, RangeOp::Ge, 0);
+        for i in real_n..fx.domain {
+            assert_eq!(expected[i], ArkFr::zero());
+        }
+        assert_eq!(com_sel, commit(&expected));
+    }
+
+    #[test]
+    fn wrong_datatype_t_at_verify_is_rejected() {
+        let fx = build_dict_fixture();
+        let rows = mixed_rows(&fx);
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let com_obj_id = commit(&obj_id);
+        let mut pt = transcript();
+        let (proof, com_sel) = prove_object_range_select(
+            &obj_id, &com_obj_id, &fx.dict_id, &fx.dict_value, &fx.dict_datatype,
+            &fx.com_id, &fx.com_value, &fx.com_datatype, fx.n_dict,
+            ArkFr::from_u64(UINT32_TAG), RangeOp::Ge, ArkFr::from_u64(40), OBJECT_RANGE_B_BITS,
+            real_n, &mut pt,
+        )
+        .unwrap();
+        let mut vt = transcript();
+        assert!(verify_object_range_select(
+            &com_obj_id, &fx.com_id, &fx.com_value, &fx.com_datatype, fx.n_dict,
+            ArkFr::from_u64(BOOLEAN_TAG), // wrong T
+            RangeOp::Ge, ArkFr::from_u64(40), OBJECT_RANGE_B_BITS, real_n, &com_sel, &proof, &mut vt,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn wrong_c_at_verify_is_rejected() {
+        let fx = build_dict_fixture();
+        let rows = mixed_rows(&fx);
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let com_obj_id = commit(&obj_id);
+        let mut pt = transcript();
+        let (proof, com_sel) = prove_object_range_select(
+            &obj_id, &com_obj_id, &fx.dict_id, &fx.dict_value, &fx.dict_datatype,
+            &fx.com_id, &fx.com_value, &fx.com_datatype, fx.n_dict,
+            ArkFr::from_u64(UINT32_TAG), RangeOp::Ge, ArkFr::from_u64(40), OBJECT_RANGE_B_BITS,
+            real_n, &mut pt,
+        )
+        .unwrap();
+        let mut vt = transcript();
+        assert!(verify_object_range_select(
+            &com_obj_id, &fx.com_id, &fx.com_value, &fx.com_datatype, fx.n_dict,
+            ArkFr::from_u64(UINT32_TAG), RangeOp::Ge,
+            ArkFr::from_u64(41), // wrong c
+            OBJECT_RANGE_B_BITS, real_n, &com_sel, &proof, &mut vt,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn tampered_com_sel_at_verify_is_rejected() {
+        let fx = build_dict_fixture();
+        let rows = mixed_rows(&fx);
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let com_obj_id = commit(&obj_id);
+        let mut pt = transcript();
+        let (proof, _com_sel) = prove_object_range_select(
+            &obj_id, &com_obj_id, &fx.dict_id, &fx.dict_value, &fx.dict_datatype,
+            &fx.com_id, &fx.com_value, &fx.com_datatype, fx.n_dict,
+            ArkFr::from_u64(UINT32_TAG), RangeOp::Ge, ArkFr::from_u64(40), OBJECT_RANGE_B_BITS,
+            real_n, &mut pt,
+        )
+        .unwrap();
+        let bogus = commit(&vec![ArkFr::zero(); fx.domain]); // not the proven sel
+        let mut vt = transcript();
+        assert!(verify_object_range_select(
+            &com_obj_id, &fx.com_id, &fx.com_value, &fx.com_datatype, fx.n_dict,
+            ArkFr::from_u64(UINT32_TAG), RangeOp::Ge, ArkFr::from_u64(40), OBJECT_RANGE_B_BITS,
+            real_n, &bogus, &proof, &mut vt,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn repeated_obj_ids_are_authenticated_with_multiplicity() {
+        // The same obj_id appears in several query rows (multiplicity > 1 on its dict
+        // row); the lookup's w column must count them and the selection is per-row.
+        let fx = build_dict_fixture();
+        let (id0, v0) = fx.uint32[0];
+        let (id1, v1) = fx.uint32[1];
+        let rows = vec![
+            (id0, v0, UINT32_TAG),
+            (id0, v0, UINT32_TAG),
+            (id1, v1, UINT32_TAG),
+            (id0, v0, UINT32_TAG),
+            (fx.bool_id, 1, BOOLEAN_TAG),
+        ];
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let c = v0.max(v1);
+        for op in [RangeOp::Lt, RangeOp::Le, RangeOp::Ge] {
+            let com_sel = prove_verify(&fx, &obj_id, UINT32_TAG, op, c, real_n).unwrap();
+            let expected = expected_sel(&fx, &rows, real_n, UINT32_TAG, op, c);
+            assert_eq!(com_sel, commit(&expected), "op {:?}", op);
+        }
     }
 }
