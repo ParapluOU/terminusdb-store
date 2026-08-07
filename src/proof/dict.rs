@@ -42,6 +42,7 @@ use super::argument::{
 };
 use super::invalid;
 use super::logup::{reciprocal_claim, reciprocal_witness, rlc_fold};
+use super::CanonicalObject;
 
 // Column ordering for the dictionary membership sumcheck.
 const COL_HASH: usize = 0;
@@ -71,6 +72,41 @@ pub fn hash_term(term: &[u8]) -> ArkFr {
     use blake2::{Blake2b512, Digest};
     let mut hasher = Blake2b512::new();
     hasher.update(term);
+    let digest = hasher.finalize();
+    ArkFr(Fr::from_le_bytes_mod_order(digest.as_slice()))
+}
+
+/// Deterministic hash-to-field for a canonical OBJECT (which shares its id space
+/// with subjects: a subject constant is a `Node(iri)` too). Same Blake2b-512 ->
+/// `Fr::from_le_bytes_mod_order` primitive as `hash_term`, but over DOMAIN-TAGGED
+/// bytes so it is collision-separated from `hash_term` (predicate hashing) and so
+/// a `Node` can never collide with a `Value`:
+///   * `Node(iri)`            -> `Blake2b512(0x00 ++ iri)`
+///   * `Value{datatype, lex}` -> `Blake2b512(0x01 ++ (datatype as u8)
+///                                 ++ (lex.len() as u64, big-endian) ++ lex)`
+/// The fixed one-byte tag separates the two variants; the fixed one-byte datatype
+/// discriminant (`CanonicalDatatype` is `#[repr(u8)]`) followed by an 8-byte
+/// length prefix makes `(datatype, lexical)` unambiguously parseable, so no two
+/// distinct values share a preimage. CRITICAL invariant: the SAME node IRI hashes
+/// identically whether it appears as a subject constant or an object constant
+/// (both are `Node(iri)`), because they resolve through the one shared id. The
+/// verifier applies this SAME function to the PUBLIC query constant, so it must be
+/// deterministic and total.
+pub fn hash_object(obj: &CanonicalObject) -> ArkFr {
+    use blake2::{Blake2b512, Digest};
+    let mut hasher = Blake2b512::new();
+    match obj {
+        CanonicalObject::Node(iri) => {
+            hasher.update([0x00u8]);
+            hasher.update(iri);
+        }
+        CanonicalObject::Value { datatype, lexical } => {
+            hasher.update([0x01u8]);
+            hasher.update([*datatype as u8]);
+            hasher.update((lexical.len() as u64).to_be_bytes());
+            hasher.update(lexical);
+        }
+    }
     let digest = hasher.finalize();
     ArkFr(Fr::from_le_bytes_mod_order(digest.as_slice()))
 }
@@ -311,6 +347,59 @@ mod tests {
         assert_eq!(hash_term(b"predicate:knows"), hash_term(b"predicate:knows"));
         assert_ne!(hash_term(b"predicate:knows"), hash_term(b"predicate:likes"));
         assert_ne!(hash_term(b""), hash_term(b"x"));
+    }
+
+    #[test]
+    fn hash_object_is_deterministic_and_separates() {
+        use crate::proof::CanonicalDatatype;
+
+        let node = |iri: &[u8]| CanonicalObject::Node(iri.to_vec());
+        let value = |dt: CanonicalDatatype, lex: &[u8]| CanonicalObject::Value {
+            datatype: dt,
+            lexical: lex.to_vec(),
+        };
+
+        // Determinism: the same object hashes identically every time.
+        assert_eq!(hash_object(&node(b"iri:Person")), hash_object(&node(b"iri:Person")));
+        assert_eq!(
+            hash_object(&value(CanonicalDatatype::String, b"hi")),
+            hash_object(&value(CanonicalDatatype::String, b"hi"))
+        );
+
+        // The SAME node IRI as a subject constant and as an object constant hashes
+        // identically (both are `Node(iri)`) — the shared-id invariant.
+        assert_eq!(hash_object(&node(b"iri:x")), hash_object(&node(b"iri:x")));
+
+        // Distinct nodes differ.
+        assert_ne!(hash_object(&node(b"iri:x")), hash_object(&node(b"iri:y")));
+
+        // Node vs Value are domain-separated even when the raw bytes coincide.
+        assert_ne!(
+            hash_object(&node(b"hi")),
+            hash_object(&value(CanonicalDatatype::String, b"hi"))
+        );
+
+        // Same lexical, different datatype -> distinct.
+        assert_ne!(
+            hash_object(&value(CanonicalDatatype::String, b"hi")),
+            hash_object(&value(CanonicalDatatype::AnyUri, b"hi"))
+        );
+
+        // Different lexical, same datatype -> distinct.
+        assert_ne!(
+            hash_object(&value(CanonicalDatatype::String, b"hi")),
+            hash_object(&value(CanonicalDatatype::String, b"ho"))
+        );
+
+        // Length-prefix guards against a datatype/lexical boundary ambiguity: a
+        // one-byte-longer lexical can never masquerade as a different value.
+        assert_ne!(
+            hash_object(&value(CanonicalDatatype::String, b"ab")),
+            hash_object(&value(CanonicalDatatype::String, b"a"))
+        );
+
+        // Separated from the predicate hasher (`hash_term`) as well.
+        assert_ne!(hash_object(&node(b"iri:x")), hash_term(b"iri:x"));
     }
 
     #[test]

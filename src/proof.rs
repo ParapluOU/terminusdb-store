@@ -1002,7 +1002,7 @@ pub mod commitment {
     use rand_chacha::ChaCha20Rng;
 
     const COMMITMENT_MAGIC: &[u8; 8] = b"TSPCW0\0\0";
-    pub const COMMITMENT_FORMAT_VERSION: u32 = 1;
+    pub const COMMITMENT_FORMAT_VERSION: u32 = 2;
 
     /// Number of committed columns per layer: additions (S,P,O) then removals
     /// (S,P,O), in that fixed order.
@@ -1191,6 +1191,59 @@ pub mod commitment {
         ))
     }
 
+    /// Build the two node/value-dictionary columns from the node/value catalog
+    /// (`object -> id`, canonical order): `hash[k] = hash_object(object_k)`,
+    /// `id[k] = object_id_k`, padded with zeros to a power of two of length `>= 2`
+    /// (the Q3 membership sumcheck needs at least one variable). Mirrors
+    /// `predicate_dict_columns_from_catalog` exactly but hashes the OBJECT (a
+    /// `Node` IRI or a typed `Value` literal) via the domain-tagged `hash_object`.
+    /// Subjects share this id space (they are the `Node(_)` subset), so a subject
+    /// constant resolves through the very same `(hash_object(Node(iri)), id)` row.
+    /// Single source of truth for both COMMIT (here) and OPEN (via
+    /// `LayerCommitment::node_value_dictionary_columns`), so the two align.
+    fn node_value_dict_columns_from_catalog(
+        node_value_catalog: &[ProofRecord],
+    ) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>)> {
+        let d = node_value_catalog.len();
+        if d == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let padded = d
+            .checked_next_power_of_two()
+            .ok_or_else(|| invalid("node/value dictionary length overflow"))?
+            .max(2);
+        if padded.trailing_zeros() as usize > SETUP_MAX_LOG_N {
+            return Err(invalid(
+                "node/value dictionary exceeds the global Dory setup capacity",
+            ));
+        }
+        let zero = <ArkFr as DoryField>::zero();
+        let mut hashes = vec![zero; padded];
+        let mut ids = vec![zero; padded];
+        for (k, record) in node_value_catalog.iter().enumerate() {
+            hashes[k] = super::dict::hash_object(&record.triple.object);
+            ids[k] = <ArkFr as DoryField>::from_u64(record.object_id);
+        }
+        Ok((hashes, ids))
+    }
+
+    /// Commit the two node/value-dictionary columns via the SAME shared query-side
+    /// `commit_column` the Q3 gadget opens, so the committed columns align with
+    /// what a membership proof opens. An empty dictionary gets identity commitments.
+    fn commit_node_value_dictionary(
+        node_value_catalog: &[ProofRecord],
+    ) -> io::Result<(ArkGT, ArkGT)> {
+        let (hashes, ids) = node_value_dict_columns_from_catalog(node_value_catalog)?;
+        if hashes.is_empty() {
+            let identity = <ArkGT as Group>::identity();
+            return Ok((identity, identity));
+        }
+        Ok((
+            super::argument::commit_column(&hashes)?,
+            super::argument::commit_column(&ids)?,
+        ))
+    }
+
     fn serialize_commitment(commitment: &ArkGT) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         commitment
@@ -1264,9 +1317,15 @@ pub mod commitment {
         /// hash_term(predicate_bytes_k)` and `pred_dict_id[k] = predicate_id_k`
         /// over `predicate_catalog`'s canonical order (padded to a power of two).
         /// `commitment_root` binds these, so a Q3 dictionary-membership proof of an
-        /// IRI->id binding is authenticated by the root. Node/value dictionary is
-        /// deferred.
+        /// IRI->id binding is authenticated by the root.
         pub predicate_dict_commitments: (ArkGT, ArkGT),
+        /// Dory commitments of the layer's NODE/VALUE dictionary as two columns
+        /// `(Com(nv_dict_hash), Com(nv_dict_id))`, where `nv_dict_hash[k] =
+        /// hash_object(object_k)` and `nv_dict_id[k] = object_id_k` over
+        /// `node_value_catalog`'s canonical order (padded to a power of two).
+        /// `commitment_root` binds these, so a Q3 dictionary-membership proof of a
+        /// subject/object CONSTANT->id binding is authenticated by the root.
+        pub node_value_dict_commitments: (ArkGT, ArkGT),
     }
 
     impl PartialEq for LayerCommitment {
@@ -1351,6 +1410,9 @@ pub mod commitment {
             // Predicate-dictionary commitments (IRI->id binding, authenticated by
             // the root so Q3 membership proofs can trust it).
             let predicate_dict_commitments = commit_predicate_dictionary(&predicate_catalog)?;
+            // Node/value-dictionary commitments (subject/object CONSTANT->id
+            // binding, authenticated by the root the same way).
+            let node_value_dict_commitments = commit_node_value_dictionary(&node_value_catalog)?;
 
             let state = CommitmentState {
                 parent_state_root,
@@ -1370,6 +1432,7 @@ pub mod commitment {
                 node_value_catalog,
                 column_commitments,
                 predicate_dict_commitments,
+                node_value_dict_commitments,
             };
             layer.state.commitment_root = layer.compute_commitment_root()?;
             layer.validate()?;
@@ -1527,6 +1590,11 @@ pub mod commitment {
                 let id = deserialize_commitment(&r.bytes()?)?;
                 (hash, id)
             };
+            let node_value_dict_commitments = {
+                let hash = deserialize_commitment(&r.bytes()?)?;
+                let id = deserialize_commitment(&r.bytes()?)?;
+                (hash, id)
+            };
             if !r.done() {
                 return Err(invalid("trailing commitment file bytes"));
             }
@@ -1580,13 +1648,14 @@ pub mod commitment {
                 node_value_catalog,
                 column_commitments,
                 predicate_dict_commitments,
+                node_value_dict_commitments,
             };
             layer.validate()?;
             Ok(layer)
         }
 
         /// Recompute the `commitment_root` binding purely from the state counts,
-        /// parent root, the six column commitments, and the two predicate-dictionary
+        /// parent root, the six column commitments, and the four dictionary
         /// commitments (independent of the raw tables). A query verifier trusts a
         /// layer's `commitment_root`, and calls this to confirm the commitments it
         /// is about to open are exactly the ones that root authenticates.
@@ -1601,23 +1670,35 @@ pub mod commitment {
             predicate_dict_columns_from_catalog(&self.predicate_catalog)
         }
 
-        /// The two predicate-dictionary commitments, in fixed bound order (hash
-        /// column then id column).
-        fn dictionary_commitments(&self) -> [&ArkGT; 2] {
+        /// Rebuild the padded node/value-dictionary columns `(hash, id)` that
+        /// `node_value_dict_commitments` commits, so a Q3 membership proof can open
+        /// them for a subject/object constant. Same padding/order as the committed
+        /// columns.
+        pub fn node_value_dictionary_columns(&self) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>)> {
+            node_value_dict_columns_from_catalog(&self.node_value_catalog)
+        }
+
+        /// The four dictionary commitments, in fixed bound order: predicate hash,
+        /// predicate id, then node/value hash, node/value id. `commitment_root`
+        /// binds them in this order.
+        fn dictionary_commitments(&self) -> [&ArkGT; 4] {
             [
                 &self.predicate_dict_commitments.0,
                 &self.predicate_dict_commitments.1,
+                &self.node_value_dict_commitments.0,
+                &self.node_value_dict_commitments.1,
             ]
         }
 
         /// The commitment root binds the parent root, the six counts, the six
-        /// per-column Dory commitments, and the two predicate-dictionary
-        /// commitments (NOT the raw tables, which are separately bound by the file
-        /// checksum and revalidated on decode). The column commitments in turn bind
-        /// the sorted id columns; the dictionary commitments bind the IRI->id map.
+        /// per-column Dory commitments, and the FOUR dictionary commitments (the
+        /// predicate hash/id pair then the node/value hash/id pair) — NOT the raw
+        /// tables, which are separately bound by the file checksum and revalidated
+        /// on decode. The column commitments in turn bind the sorted id columns;
+        /// the dictionary commitments bind the IRI->id and constant->id maps.
         fn compute_commitment_root(&self) -> io::Result<ProofHash> {
             let mut hasher = Sha256::new();
-            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v1");
+            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v2");
             match self.state.parent_state_root {
                 Some(root) => {
                     hasher.update([1u8]);
@@ -2051,6 +2132,10 @@ pub mod commitment {
                 decoded.predicate_dict_commitments,
                 commitment.predicate_dict_commitments
             );
+            assert_eq!(
+                decoded.node_value_dict_commitments,
+                commitment.node_value_dict_commitments
+            );
             assert_eq!(decoded.state.commitment_root, commitment.state.commitment_root);
         }
 
@@ -2142,6 +2227,189 @@ pub mod commitment {
                 multi_predicate_layer().state.commitment_root,
                 changed.state.commitment_root
             );
+        }
+
+        // A base layer with a NODE object (b, id 2) and a typed VALUE literal
+        // object ("lit"^^string, id 3), both under subject a (id 1) / predicate p
+        // (id 1). Exercises both `CanonicalObject` variants in the node/value dict.
+        fn node_and_value_layer() -> LayerCommitment {
+            let value_triple = ProofRecord {
+                subject_id: 1,
+                predicate_id: 1,
+                object_id: 3,
+                triple: CanonicalTriple {
+                    subject: b"a".to_vec(),
+                    predicate: b"p".to_vec(),
+                    object: CanonicalObject::Value {
+                        datatype: CanonicalDatatype::String,
+                        lexical: b"lit".to_vec(),
+                    },
+                },
+            };
+            LayerCommitment::from_native_delta(
+                None,
+                vec![record(1, 1, 2, "a", "p", "b"), value_triple],
+                vec![],
+                0,
+                0,
+                3,
+                1,
+                vec![
+                    (CanonicalObject::Node(b"a".to_vec()), 1),
+                    (CanonicalObject::Node(b"b".to_vec()), 2),
+                    (
+                        CanonicalObject::Value {
+                            datatype: CanonicalDatatype::String,
+                            lexical: b"lit".to_vec(),
+                        },
+                        3,
+                    ),
+                ],
+                vec![(b"p".to_vec(), 1)],
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn commitment_format_version_is_two() {
+            assert_eq!(COMMITMENT_FORMAT_VERSION, 2);
+        }
+
+        #[test]
+        fn node_value_dictionary_commitments_align_with_shared_commit_column() {
+            use crate::proof::argument::commit_column;
+            use crate::proof::dict::hash_object;
+
+            let layer = node_and_value_layer();
+            assert_eq!(layer.node_value_catalog.len(), 3);
+            // Rebuild the two padded dict columns exactly as the query side would
+            // (via the public accessor), and confirm they match the stored
+            // commitments byte-for-byte.
+            let (hashes, ids) = layer.node_value_dictionary_columns().unwrap();
+            assert_eq!(hashes.len(), 4); // 3 entries padded to a power of two
+            for (k, record) in layer.node_value_catalog.iter().enumerate() {
+                assert_eq!(hashes[k], hash_object(&record.triple.object));
+                assert_eq!(ids[k], <ArkFr as DoryField>::from_u64(record.object_id));
+            }
+            assert_eq!(
+                commit_column(&hashes).unwrap(),
+                layer.node_value_dict_commitments.0
+            );
+            assert_eq!(
+                commit_column(&ids).unwrap(),
+                layer.node_value_dict_commitments.1
+            );
+        }
+
+        #[test]
+        fn commitment_root_binds_the_node_value_dictionary() {
+            use crate::proof::argument::commit_column;
+
+            let layer = sample();
+            // Baseline: the recomputed root equals the stored root.
+            assert_eq!(
+                layer.recomputed_commitment_root().unwrap(),
+                layer.state.commitment_root
+            );
+            // Tamper ONE node/value dict commitment component with a distinct but
+            // otherwise valid GT: the recomputed root must diverge from the stored
+            // root (the node/value dict is now bound into the trust anchor).
+            let other = commit_column(&[
+                <ArkFr as DoryField>::from_u64(7),
+                <ArkFr as DoryField>::from_u64(9),
+            ])
+            .unwrap();
+            assert_ne!(other, layer.node_value_dict_commitments.0);
+            let mut tampered = layer.clone();
+            tampered.node_value_dict_commitments.0 = other;
+            assert_ne!(
+                tampered.recomputed_commitment_root().unwrap(),
+                tampered.state.commitment_root
+            );
+        }
+
+        #[test]
+        fn encode_decode_preserves_node_value_dictionary_and_root() {
+            let commitment = node_and_value_layer();
+            let bytes = commitment.encode().unwrap();
+            assert_eq!(bytes.len(), commitment.encoded_len().unwrap());
+            let decoded = LayerCommitment::decode(&bytes).unwrap();
+            assert_eq!(
+                decoded.node_value_dict_commitments,
+                commitment.node_value_dict_commitments
+            );
+            assert_eq!(
+                decoded.predicate_dict_commitments,
+                commitment.predicate_dict_commitments
+            );
+            // The recomputed root is stable across encode->decode and equals the
+            // stored root on both sides (the new field survives the round trip).
+            assert_eq!(
+                decoded.recomputed_commitment_root().unwrap(),
+                commitment.state.commitment_root
+            );
+            assert_eq!(
+                decoded.recomputed_commitment_root().unwrap(),
+                decoded.state.commitment_root
+            );
+        }
+
+        #[test]
+        fn node_value_dictionary_opens_for_node_and_value_entries() {
+            use crate::proof::argument::{commit_column, Transcript254};
+            use crate::proof::dict::{hash_object, prove_dict_membership, verify_dict_membership};
+
+            let layer = node_and_value_layer();
+            let (dict_hash, dict_id) = layer.node_value_dictionary_columns().unwrap();
+            // The committed columns are exactly the ones a membership proof opens.
+            assert_eq!(
+                commit_column(&dict_hash).unwrap(),
+                layer.node_value_dict_commitments.0
+            );
+            assert_eq!(
+                commit_column(&dict_id).unwrap(),
+                layer.node_value_dict_commitments.1
+            );
+            let com_h = layer.node_value_dict_commitments.0;
+            let com_i = layer.node_value_dict_commitments.1;
+
+            // A prove+verify round for one `(hash_object(term), id)` pair.
+            let open = |q_hash: ArkFr, id: ArkFr| -> io::Result<()> {
+                let mut pt = Transcript254::new(b"nv-dict-open");
+                let proof =
+                    prove_dict_membership(&dict_hash, &dict_id, &com_h, &com_i, q_hash, id, &mut pt)?;
+                let mut vt = Transcript254::new(b"nv-dict-open");
+                verify_dict_membership(&com_h, &com_i, q_hash, id, &proof, &mut vt)
+            };
+
+            // Resolve ids from the catalog for BOTH a Node object and a Value object.
+            let node_obj = CanonicalObject::Node(b"b".to_vec());
+            let value_obj = CanonicalObject::Value {
+                datatype: CanonicalDatatype::String,
+                lexical: b"lit".to_vec(),
+            };
+            let id_of = |obj: &CanonicalObject| -> u64 {
+                layer
+                    .node_value_catalog
+                    .iter()
+                    .find(|r| &r.triple.object == obj)
+                    .expect("object present in catalog")
+                    .object_id
+            };
+
+            for obj in [&node_obj, &value_obj] {
+                let id = id_of(obj);
+                let q_hash = hash_object(obj);
+                let id_fr = <ArkFr as DoryField>::from_u64(id);
+                // Honest opening verifies.
+                assert!(open(q_hash, id_fr).is_ok());
+                // A WRONG id for a real term is rejected (the pair is bound).
+                assert!(open(q_hash, <ArkFr as DoryField>::from_u64(id + 100)).is_err());
+            }
+
+            // An ABSENT term is rejected.
+            let absent = hash_object(&CanonicalObject::Node(b"not-in-dictionary".to_vec()));
+            assert!(open(absent, <ArkFr as DoryField>::from_u64(2)).is_err());
         }
 
         #[test]
