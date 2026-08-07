@@ -132,7 +132,11 @@ impl Layout {
 }
 
 /// The shared power-of-two domain (`>= 2`) onto which every join column is padded.
-pub(crate) fn binary_join_domain(
+///
+/// Exposed `pub` alongside [`compute_binary_join`] so external consumers (the
+/// `woql-proof` compiler's end-to-end tests) can reproduce the exact per-column
+/// padding a BGP proof uses when recomputing an independent natural join.
+pub fn binary_join_domain(
     n_r: usize,
     n_s: usize,
     m_j: usize,

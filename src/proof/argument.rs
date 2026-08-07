@@ -635,7 +635,11 @@ pub fn verify_sumcheck(
 
 /// Commit to a raw column (length `2^k`) with the global deterministic setup,
 /// returning its succinct GT (tier-2) commitment. Uses the shared matrix layout.
-pub(crate) fn commit_column(column: &[ArkFr]) -> io::Result<ArkGT> {
+///
+/// Exposed `pub` so external consumers (e.g. the `woql-proof` plan compiler's
+/// end-to-end tests) can INDEPENDENTLY recompute expected result-column
+/// commitments and compare them to a BGP proof's output. Pure and deterministic.
+pub fn commit_column(column: &[ArkFr]) -> io::Result<ArkGT> {
     let (nu, sigma) = column_dims(column.len())?;
     let poly = ArkworksPolynomial::new(column.to_vec());
     let (tier_2, _rows, _blind) = poly
