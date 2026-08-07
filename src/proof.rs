@@ -960,6 +960,7 @@ pub mod count;
 pub mod dict;
 pub mod filter;
 pub mod join;
+pub mod join2;
 pub mod logup;
 pub mod membership;
 pub mod pairs;
