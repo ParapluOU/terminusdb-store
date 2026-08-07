@@ -24,6 +24,9 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::Transcript254;
+use super::bgp::{
+    prove_bgp_chain, verify_bgp_chain, BgpChainProof, JoinStep, RelationCommit, RelationWitness,
+};
 use super::commitment::LayerCommitment;
 use super::ProofHash;
 use super::dict::{hash_term, prove_dict_membership, verify_dict_membership, DictProof};
@@ -491,6 +494,240 @@ pub fn verify_layer_graph_pattern2(
     )
 }
 
+// ===========================================================================
+// Q_k: general k-atom conjunctive BGP over ONE committed layer, left-deep.
+// ===========================================================================
+
+const LAYER_BGP_DOMAIN: &[u8] = b"parture/proof-of-woql/qk-layer-bgp-by-iri/v0";
+
+/// One atom of a layer BGP. v1 SCOPE: the PREDICATE is a constant IRI (authenticated by
+/// the layer's predicate dictionary), and the subject/object are VARIABLES (the kept
+/// output columns). Subject/object CONSTANTS need the node/value dictionary commitment
+/// (Phase 7.5, not yet committed) and are intentionally not supported here.
+#[derive(Clone, Debug)]
+pub struct LayerBgpAtom {
+    pub predicate_term: Vec<u8>,
+}
+
+/// A layer BGP plan: `k` atoms and the `k - 1` left-deep join steps. `joins[j]` names
+/// the single shared variable's column on the evolving accumulator (`acc_key`) and on
+/// atom `j + 1`'s relation (`rel_key`). Each atom relation has two columns `[S, O]`, so
+/// the accumulator schema evolves as `[r_other_out.., key, s_other_out..]` per step.
+#[derive(Clone, Debug)]
+pub struct LayerBgpPlan {
+    pub atoms: Vec<LayerBgpAtom>,
+    pub joins: Vec<JoinStep>,
+}
+
+/// The per-atom half of a layer BGP proof: the dictionary binding of the predicate IRI
+/// to its id, the complete predicate filter into `(S_out, O_out)` at the table domain,
+/// and the filter output length.
+#[derive(Clone, Debug)]
+pub struct LayerBgpAtomProof {
+    pub membership: DictProof,
+    pub filter: FullFilterProof,
+    pub com_sout: ArkGT,
+    pub com_oout: ArkGT,
+    pub m: usize,
+}
+
+/// A complete k-atom layer BGP proof: one per-atom (membership + filter) proof, plus the
+/// left-deep binary-join chain over the filtered relations, all under one transcript.
+#[derive(Clone, Debug)]
+pub struct LayerBgpProof {
+    pub atoms: Vec<LayerBgpAtomProof>,
+    pub chain: BgpChainProof,
+}
+
+/// Bind the public statement of a layer BGP: the trust anchor (`commitment_root`, which
+/// binds both the column and predicate-dictionary commitments), `k`, and every atom's
+/// predicate IRI + revealed id, then the join plan. Identical on both sides.
+fn bind_layer_bgp_statement(
+    transcript: &mut Transcript254,
+    layer: &LayerCommitment,
+    plan: &LayerBgpPlan,
+    ids: &[u64],
+) {
+    transcript.append_bytes(b"pow/bgp-layer/commitment-root", &layer.state.commitment_root);
+    transcript.append_bytes(b"pow/bgp-layer/k", &(plan.atoms.len() as u64).to_le_bytes());
+    for (atom, id) in plan.atoms.iter().zip(ids.iter()) {
+        transcript.append_bytes(b"pow/bgp-layer/pred-term", &atom.predicate_term);
+        transcript.append_bytes(b"pow/bgp-layer/pred-id", &id.to_le_bytes());
+    }
+    for step in &plan.joins {
+        transcript.append_bytes(b"pow/bgp-layer/acc-key", &(step.acc_key as u64).to_le_bytes());
+        transcript.append_bytes(b"pow/bgp-layer/rel-key", &(step.rel_key as u64).to_le_bytes());
+    }
+}
+
+fn validate_bgp_plan(plan: &LayerBgpPlan) -> io::Result<usize> {
+    let k = plan.atoms.len();
+    if k < 2 {
+        return Err(invalid("layer BGP needs at least two atoms"));
+    }
+    if plan.joins.len() != k - 1 {
+        return Err(invalid("layer BGP plan must have exactly k-1 join steps"));
+    }
+    Ok(k)
+}
+
+/// Prove the COMPLETE result of a k-atom conjunctive BGP against a materialized base
+/// layer. Each atom is filtered by its (dictionary-authenticated) predicate IRI into the
+/// `(subject, object)` pairs `(S_out, O_out)`; the resulting `k` relations are joined by
+/// the left-deep binary-join chain ([`super::bgp`]) on the plan's shared variables — all
+/// under ONE shared transcript anchored to `commitment_root`. Returns the combined proof,
+/// the final result column commitments (schema `[r_other_out.., key, s_other_out..]`), the
+/// result length `m`, and the REVEALED resolved predicate ids (authenticated by membership).
+pub fn prove_layer_bgp(
+    layer: &LayerCommitment,
+    plan: &LayerBgpPlan,
+) -> io::Result<(LayerBgpProof, Vec<ArkGT>, usize, Vec<u64>)> {
+    let k = validate_bgp_plan(plan)?;
+    let (s, p, o, n) = base_layer_columns(layer)?;
+
+    // Resolve every predicate IRI up front (fail closed if any is absent).
+    let mut resolved_ids = Vec::with_capacity(k);
+    for atom in &plan.atoms {
+        resolved_ids.push(resolve_predicate_id(layer, &atom.predicate_term)?);
+    }
+
+    let (dict_hash, dict_id) = layer.predicate_dictionary_columns()?;
+    let com_dict_hash = layer.predicate_dict_commitments.0;
+    let com_dict_id = layer.predicate_dict_commitments.1;
+    let com_s = layer.column_commitments[0];
+    let com_p = layer.column_commitments[1];
+    let com_o = layer.column_commitments[2];
+    let a = padded_len(n)?.trailing_zeros() as usize;
+
+    let mut transcript = Transcript254::new(LAYER_BGP_DOMAIN);
+    bind_layer_bgp_statement(&mut transcript, layer, plan, &resolved_ids);
+
+    let mut atom_proofs = Vec::with_capacity(k);
+    let mut relations: Vec<RelationWitness> = Vec::with_capacity(k);
+    for (atom, &pred_id) in plan.atoms.iter().zip(resolved_ids.iter()) {
+        // (1) Q3 membership: (hash_term(IRI), id) is a genuine dictionary row.
+        let q_hash = hash_term(&atom.predicate_term);
+        let id = ArkFr::from_u64(pred_id);
+        let membership = prove_dict_membership(
+            &dict_hash, &dict_id, &com_dict_hash, &com_dict_id, q_hash, id, &mut transcript,
+        )?;
+        // (2) Q1 complete filter: (S_out, O_out) = the predicate's (subject, object) pairs
+        // at the TABLE domain, root-anchored via the filter argument.
+        let pred = ArkFr::from_u64(pred_id);
+        let (filter, com_sout, com_oout, m) =
+            prove_filter(&s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript)?;
+        // Recompute the dense filter output (same witness the filter used) as the chain
+        // relation's columns; `com_sout`/`com_oout` are their table-domain commitments.
+        let (sel, _w) = honest_witness(&p, pred, n);
+        let (s_out, o_out, _m) = compact_selected(&s, &o, &sel);
+        atom_proofs.push(LayerBgpAtomProof { membership, filter, com_sout, com_oout, m });
+        relations.push(RelationWitness {
+            columns: vec![s_out, o_out],
+            commitments: vec![com_sout, com_oout],
+            log_domain: a,
+            n: m,
+        });
+    }
+
+    // (3) The left-deep chain over the k filtered relations, same shared transcript.
+    let (chain, result_coms, result_m) = prove_bgp_chain(&relations, &plan.joins, &mut transcript)?;
+
+    Ok((
+        LayerBgpProof { atoms: atom_proofs, chain },
+        result_coms,
+        result_m,
+        resolved_ids,
+    ))
+}
+
+/// Verify a k-atom layer BGP proof. Anchors to `commitment_root` FIRST (exactly like
+/// [`verify_layer_graph_pattern2`]); then, under the shared transcript in prover order,
+/// re-checks every atom's dictionary binding + complete filter, and the left-deep join
+/// chain over the filtered relations (which enforces the two continuity conditions).
+/// Concludes `result_coms[0..m]` is EXACTLY the complete BGP result, without rerunning it.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_layer_bgp(
+    layer: &LayerCommitment,
+    expected_root: ProofHash,
+    plan: &LayerBgpPlan,
+    predicate_ids: &[u64],
+    result_coms: &[ArkGT],
+    m: usize,
+    proof: &LayerBgpProof,
+) -> io::Result<()> {
+    // Anchor to an EXTERNALLY-trusted root FIRST (FIX 4), before any sub-proof.
+    if layer.state.commitment_root != expected_root {
+        return Err(invalid(
+            "layer commitment_root does not match the externally-trusted expected root",
+        ));
+    }
+    if layer.recomputed_commitment_root()? != layer.state.commitment_root {
+        return Err(invalid(
+            "layer commitment_root does not bind its committed columns/dictionary",
+        ));
+    }
+    if layer.state.removal_count != 0 {
+        return Err(invalid(
+            "layer BGP query requires a materialized base layer (no removals)",
+        ));
+    }
+    let k = validate_bgp_plan(plan)?;
+    if proof.atoms.len() != k || predicate_ids.len() != k {
+        return Err(invalid("layer BGP proof/atom/id count mismatch"));
+    }
+    let n = layer.state.addition_count as usize;
+    let a = padded_len(n)?.trailing_zeros() as usize;
+
+    let mut transcript = Transcript254::new(LAYER_BGP_DOMAIN);
+    bind_layer_bgp_statement(&mut transcript, layer, plan, predicate_ids);
+
+    let com_s = layer.column_commitments[0];
+    let com_p = layer.column_commitments[1];
+    let com_o = layer.column_commitments[2];
+
+    let mut relations: Vec<RelationCommit> = Vec::with_capacity(k);
+    for (atom, ap) in plan.atoms.iter().zip(proof.atoms.iter()) {
+        let pred_id = predicate_ids[relations.len()];
+        // The filter dimension must match the layer's committed table columns.
+        if ap.filter.sumcheck.round_polys.len() != a {
+            return Err(invalid(
+                "atom filter dimension does not match the layer's committed columns",
+            ));
+        }
+        // (1) Membership: the revealed id is authentic for this IRI.
+        let q_hash = hash_term(&atom.predicate_term);
+        let id = ArkFr::from_u64(pred_id);
+        verify_dict_membership(
+            &layer.predicate_dict_commitments.0,
+            &layer.predicate_dict_commitments.1,
+            q_hash,
+            id,
+            &ap.membership,
+            &mut transcript,
+        )?;
+        // (2) Filter: (S_out, O_out) is the complete predicate result (length m).
+        let pred = ArkFr::from_u64(pred_id);
+        verify_filter(
+            &com_s, &com_p, &com_o, pred, n, &ap.com_sout, &ap.com_oout, ap.m, &ap.filter,
+            &mut transcript,
+        )?;
+        relations.push(RelationCommit {
+            commitments: vec![ap.com_sout, ap.com_oout],
+            log_domain: a,
+            n: ap.m,
+        });
+    }
+
+    // (3) The left-deep chain over the k filtered relations.
+    let (chain_coms, chain_m) = verify_bgp_chain(&relations, &plan.joins, &proof.chain, &mut transcript)?;
+    if chain_m != m || chain_coms.as_slice() != result_coms {
+        return Err(invalid(
+            "layer BGP result does not match the proof's chain output",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,5 +1007,168 @@ mod tests {
             &proof,
         )
         .unwrap();
+    }
+
+    // ---- Q_k: general k-atom layer BGP (left-deep chain) end-to-end ----
+
+    const LIKES: &[u8] = b"http://ex/likes";
+    const OWNS: &[u8] = b"http://ex/owns";
+
+    fn atom(term: &[u8]) -> LayerBgpAtom {
+        LayerBgpAtom { predicate_term: term.to_vec() }
+    }
+
+    // The two (subject, object) columns of one atom relation, filtered from the layer's
+    // additions in stored order (matching the filter output ordering).
+    fn atom_relation(lc: &LayerCommitment, pred_id: u64) -> Vec<Vec<ArkFr>> {
+        let mut s = Vec::new();
+        let mut o = Vec::new();
+        for rec in &lc.additions {
+            if rec.predicate_id == pred_id {
+                s.push(ArkFr::from_u64(rec.subject_id));
+                o.push(ArkFr::from_u64(rec.object_id));
+            }
+        }
+        vec![s, o]
+    }
+
+    // Independently recompute the complete BGP result columns (real length) and the final
+    // join domain, folding the audited compute_binary_join over the plan's join steps.
+    fn expected_layer_bgp(
+        lc: &LayerCommitment,
+        ids: &[u64],
+        joins: &[JoinStep],
+    ) -> (Vec<Vec<ArkFr>>, usize) {
+        use crate::proof::join2::{binary_join_domain, compute_binary_join};
+        let split = |cols: &[Vec<ArkFr>], key: usize| -> (Vec<ArkFr>, Vec<Vec<ArkFr>>) {
+            let k = cols[key].clone();
+            let other = cols
+                .iter()
+                .enumerate()
+                .filter(|(c, _)| *c != key)
+                .map(|(_, c)| c.clone())
+                .collect();
+            (k, other)
+        };
+        let mut acc = atom_relation(lc, ids[0]);
+        let mut acc_len = acc[0].len();
+        let mut domain = padded_len(lc.additions.len()).unwrap();
+        for (j, step) in joins.iter().enumerate() {
+            let rel = atom_relation(lc, ids[j + 1]);
+            let rel_len = rel[0].len();
+            let (r_key, r_other) = split(&acc, step.acc_key);
+            let (s_key, s_other) = split(&rel, step.rel_key);
+            let r_refs: Vec<&[ArkFr]> = r_other.iter().map(|c| c.as_slice()).collect();
+            let s_refs: Vec<&[ArkFr]> = s_other.iter().map(|c| c.as_slice()).collect();
+            let w = compute_binary_join(&r_key, &r_refs, &s_key, &s_refs);
+            domain = binary_join_domain(acc_len, rel_len, w.m_j, w.n_u).unwrap();
+            let mut new_acc = w.r_other_out.clone();
+            new_acc.push(w.key.clone());
+            new_acc.extend(w.s_other_out.clone());
+            acc = new_acc;
+            acc_len = w.m_j;
+        }
+        (acc, domain)
+    }
+
+    #[test]
+    fn layer_bgp_three_atom_path_end_to_end() {
+        // knows: a->b, c->b, e->f;  likes: b->g, f->h;  owns: g->k, h->m.
+        // BGP t(?x,knows,?y), t(?y,likes,?z), t(?z,owns,?w). Paths (x,y,z,w):
+        //   (a,b,g,k), (c,b,g,k), (e,f,h,m).
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("c", "knows", "b"),
+            ("e", "knows", "f"),
+            ("b", "likes", "g"),
+            ("f", "likes", "h"),
+            ("g", "owns", "k"),
+            ("h", "owns", "m"),
+        ]);
+        let plan = LayerBgpPlan {
+            atoms: vec![atom(KNOWS), atom(LIKES), atom(OWNS)],
+            joins: vec![
+                JoinStep { acc_key: 1, rel_key: 0 }, // y = O(knows) == S(likes)
+                JoinStep { acc_key: 2, rel_key: 0 }, // z = O(likes) == S(owns)
+            ],
+        };
+        let (proof, result_coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        // Verifier sees ONLY the IRIs + revealed ids + result commitments.
+        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &result_coms, m, &proof).unwrap();
+
+        // Result is EXACTLY the three 3-hop paths (count + committed columns).
+        assert_eq!(m, 3);
+        assert_eq!(proof.atoms.len(), 3);
+        let (exp_cols, domain) = expected_layer_bgp(&lc, &ids, &plan.joins);
+        assert_eq!(result_coms.len(), exp_cols.len());
+        assert_eq!(exp_cols.len(), 4); // [x, y, z, w]
+        for (c, col) in exp_cols.iter().enumerate() {
+            assert_eq!(commit_column(&pad(col, domain)).unwrap(), result_coms[c]);
+        }
+    }
+
+    #[test]
+    fn layer_bgp_k2_matches_self_join_capstone() {
+        // The k=2 layer BGP (two knows atoms joined on the shared y) reduces to the
+        // existing 2-atom self-join capstone: SAME result count AND committed columns.
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("c", "knows", "d"),
+            ("a", "knows", "e"),
+            ("a", "likes", "zz"),
+        ]);
+        let (gp, com_x, com_y, com_z, gp_m, gp_id) =
+            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        verify_layer_graph_pattern2(
+            &lc, lc.state.commitment_root, KNOWS, gp_id, &com_x, &com_y, &com_z, gp_m, &gp,
+        )
+        .unwrap();
+
+        let plan = LayerBgpPlan {
+            atoms: vec![atom(KNOWS), atom(KNOWS)],
+            joins: vec![JoinStep { acc_key: 1, rel_key: 0 }],
+        };
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+
+        assert_eq!(m, gp_m);
+        assert_eq!(coms, vec![com_x, com_y, com_z]);
+    }
+
+    #[test]
+    fn layer_bgp_wrong_expected_root_is_rejected() {
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "likes", "c"),
+            ("c", "owns", "d"),
+        ]);
+        let plan = LayerBgpPlan {
+            atoms: vec![atom(KNOWS), atom(LIKES), atom(OWNS)],
+            joins: vec![
+                JoinStep { acc_key: 1, rel_key: 0 },
+                JoinStep { acc_key: 2, rel_key: 0 },
+            ],
+        };
+        let (proof, result_coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        // A DIFFERENT externally-trusted root must reject even an honest proof.
+        let mut wrong_root = lc.state.commitment_root;
+        wrong_root[0] ^= 0xff;
+        assert!(
+            verify_layer_bgp(&lc, wrong_root, &plan, &ids, &result_coms, m, &proof).is_err()
+        );
+        // The correct external root still verifies.
+        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &result_coms, m, &proof)
+            .unwrap();
+    }
+
+    #[test]
+    fn layer_bgp_absent_predicate_fails_closed() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
+        let plan = LayerBgpPlan {
+            atoms: vec![atom(KNOWS), atom(b"http://ex/absent")],
+            joins: vec![JoinStep { acc_key: 1, rel_key: 0 }],
+        };
+        assert!(prove_layer_bgp(&lc, &plan).is_err());
     }
 }
