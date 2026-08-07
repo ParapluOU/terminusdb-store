@@ -1465,4 +1465,355 @@ mod tests {
         };
         assert!(prove_layer_bgp(&lc, &plan).is_err());
     }
+
+    // ---- Q_k with subject/object CONSTANTS (node/value dictionary) end-to-end ----
+
+    const NAME: &[u8] = b"http://ex/name";
+
+    // Build a materialized base layer from arbitrary ValueTriples (node OR value objects).
+    fn build_layer_triples(triples: Vec<ValueTriple>) -> std::sync::Arc<LayerCommitment> {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for t in triples {
+            builder.add_value_triple(t).unwrap();
+        }
+        let (layer, _state) = builder.commit_with_proof().unwrap();
+        layer.proof_commitment().unwrap().unwrap()
+    }
+
+    fn node_const(suffix: &str) -> AtomTerm {
+        AtomTerm::NodeConstant(iri(suffix).into_bytes())
+    }
+
+    // One atom's dense KEPT (variable) columns from the layer additions in stored order,
+    // applying the predicate + any subject/object constant ids. Mirrors EXACTLY what
+    // prove_atom_filter compacts (kept in S,O order); one column per variable.
+    fn kept_relation(
+        lc: &LayerCommitment,
+        atom: &LayerBgpAtom,
+        predicate_id: u64,
+        subject_id: Option<u64>,
+        object_id: Option<u64>,
+    ) -> Vec<Vec<ArkFr>> {
+        let keep_s = matches!(atom.subject, AtomTerm::Variable);
+        let keep_o = matches!(atom.object, AtomTerm::Variable);
+        let mut cols: Vec<Vec<ArkFr>> = Vec::new();
+        if keep_s {
+            cols.push(Vec::new());
+        }
+        if keep_o {
+            cols.push(Vec::new());
+        }
+        for rec in &lc.additions {
+            if rec.predicate_id == predicate_id
+                && subject_id.map_or(true, |s| rec.subject_id == s)
+                && object_id.map_or(true, |o| rec.object_id == o)
+            {
+                let mut idx = 0;
+                if keep_s {
+                    cols[idx].push(ArkFr::from_u64(rec.subject_id));
+                    idx += 1;
+                }
+                if keep_o {
+                    cols[idx].push(ArkFr::from_u64(rec.object_id));
+                }
+            }
+        }
+        cols
+    }
+
+    // Independently recompute the complete BGP result columns (real length) and final join
+    // domain over per-atom kept relations, folding the audited compute_binary_join over the
+    // plan's join steps (mirrors expected_layer_bgp but for variable-arity relations).
+    fn expected_const_bgp(
+        lc: &LayerCommitment,
+        atoms: &[LayerBgpAtom],
+        predicate_ids: &[u64],
+        subject_ids: &[Option<u64>],
+        object_ids: &[Option<u64>],
+        joins: &[JoinStep],
+    ) -> (Vec<Vec<ArkFr>>, usize) {
+        use crate::proof::join2::{binary_join_domain, compute_binary_join};
+        let split = |cols: &[Vec<ArkFr>], key: usize| -> (Vec<ArkFr>, Vec<Vec<ArkFr>>) {
+            let k = cols[key].clone();
+            let other = cols
+                .iter()
+                .enumerate()
+                .filter(|(c, _)| *c != key)
+                .map(|(_, c)| c.clone())
+                .collect();
+            (k, other)
+        };
+        let rel = |i: usize| {
+            kept_relation(lc, &atoms[i], predicate_ids[i], subject_ids[i], object_ids[i])
+        };
+        let mut acc = rel(0);
+        let mut acc_len = acc[0].len();
+        let mut domain = padded_len(lc.additions.len()).unwrap();
+        for (j, step) in joins.iter().enumerate() {
+            let r = rel(j + 1);
+            let rel_len = r[0].len();
+            let (r_key, r_other) = split(&acc, step.acc_key);
+            let (s_key, s_other) = split(&r, step.rel_key);
+            let r_refs: Vec<&[ArkFr]> = r_other.iter().map(|c| c.as_slice()).collect();
+            let s_refs: Vec<&[ArkFr]> = s_other.iter().map(|c| c.as_slice()).collect();
+            let w = compute_binary_join(&r_key, &r_refs, &s_key, &s_refs);
+            domain = binary_join_domain(acc_len, rel_len, w.m_j, w.n_u).unwrap();
+            let mut new_acc = w.r_other_out.clone();
+            new_acc.push(w.key.clone());
+            new_acc.extend(w.s_other_out.clone());
+            acc = new_acc;
+            acc_len = w.m_j;
+        }
+        (acc, domain)
+    }
+
+    // Prove+verify a 2-atom const-bearing plan, then assert the result equals the
+    // INDEPENDENTLY-recomputed filtered+joined result (count + committed columns).
+    fn check_const_bgp(lc: &LayerCommitment, plan: &LayerBgpPlan, expected_m: usize) {
+        let (proof, coms, m, ids) = prove_layer_bgp(lc, plan).unwrap();
+        verify_layer_bgp(lc, lc.state.commitment_root, plan, &ids, &coms, m, &proof).unwrap();
+        assert_eq!(m, expected_m);
+        let subject_ids: Vec<Option<u64>> = proof.atoms.iter().map(|a| a.subject_id).collect();
+        let object_ids: Vec<Option<u64>> = proof.atoms.iter().map(|a| a.object_id).collect();
+        let (exp_cols, domain) =
+            expected_const_bgp(lc, &plan.atoms, &ids, &subject_ids, &object_ids, &plan.joins);
+        assert_eq!(coms.len(), exp_cols.len());
+        for (c, col) in exp_cols.iter().enumerate() {
+            assert_eq!(commit_column(&pad(col, domain)).unwrap(), coms[c], "column {c}");
+        }
+    }
+
+    #[test]
+    fn layer_bgp_object_node_constant_end_to_end() {
+        // t(?x, likes, ?z), t(?x, knows, <b>): x likes z AND x knows <b>.
+        // likes: a->m,a->o,c->n,d->p ; knows: a->b,c->b,d->q. x knows b => {a,c}.
+        // Join on x (subject of both): (a,m),(a,o),(c,n). The const atom is the RIGHT
+        // relation (arity 1), exercising an empty s_other in the join.
+        let lc = build_layer(&[
+            ("a", "likes", "m"),
+            ("a", "likes", "o"),
+            ("c", "likes", "n"),
+            ("d", "likes", "p"),
+            ("a", "knows", "b"),
+            ("c", "knows", "b"),
+            ("d", "knows", "q"),
+        ]);
+        let plan = LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom::all_variables(LIKES.to_vec()),
+                LayerBgpAtom {
+                    subject: AtomTerm::Variable,
+                    predicate_term: KNOWS.to_vec(),
+                    object: node_const("b"),
+                },
+            ],
+            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }], // x = S(likes) == S(knows)
+        };
+        let (proof, _coms, _m, _ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        // The revealed object id equals <b>'s node/value dictionary id; the variable
+        // atom reveals no constant ids.
+        let b_id = resolve_node_value_id(&lc, &CanonicalObject::Node(iri("b").into_bytes())).unwrap();
+        assert_eq!(proof.atoms[1].object_id, Some(b_id));
+        assert_eq!(proof.atoms[1].subject_id, None);
+        assert_eq!(proof.atoms[0].subject_id, None);
+        assert_eq!(proof.atoms[0].object_id, None);
+        // Result [z, x] equals the independently-recomputed filtered+joined result.
+        check_const_bgp(&lc, &plan, 3);
+    }
+
+    #[test]
+    fn layer_bgp_object_value_constant_end_to_end() {
+        // t(?x, name, "hi"), t(?x, knows, ?z): x named "hi" AND x knows z. The value-literal
+        // atom is the LEFT relation (arity 1), exercising an empty r_other in the join.
+        let name_iri = iri("name");
+        let lc = build_layer_triples(vec![
+            ValueTriple::new_string_value(&iri("a"), &name_iri, "hi"),
+            ValueTriple::new_string_value(&iri("c"), &name_iri, "hi"),
+            ValueTriple::new_string_value(&iri("d"), &name_iri, "bye"),
+            ValueTriple::new_node(&iri("a"), &iri("knows"), &iri("m")),
+            ValueTriple::new_node(&iri("a"), &iri("knows"), &iri("o")),
+            ValueTriple::new_node(&iri("c"), &iri("knows"), &iri("n")),
+        ]);
+        // Recover the EXACT canonical "hi" value object from the catalog (its lexical bytes
+        // are the store's typed encoding, not literally b"hi"): find a's name-triple object.
+        let name_id = resolve_predicate_id(&lc, NAME).unwrap();
+        let a_id = resolve_node_value_id(&lc, &CanonicalObject::Node(iri("a").into_bytes())).unwrap();
+        let hi_id = lc
+            .additions
+            .iter()
+            .find(|r| r.subject_id == a_id && r.predicate_id == name_id)
+            .unwrap()
+            .object_id;
+        let (dt, lex) = match &lc
+            .node_value_catalog
+            .iter()
+            .find(|r| r.object_id == hi_id)
+            .unwrap()
+            .triple
+            .object
+        {
+            CanonicalObject::Value { datatype, lexical } => (*datatype, lexical.clone()),
+            _ => panic!("expected a value literal"),
+        };
+        let plan = LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom {
+                    subject: AtomTerm::Variable,
+                    predicate_term: NAME.to_vec(),
+                    object: AtomTerm::ValueConstant(dt, lex),
+                },
+                LayerBgpAtom::all_variables(KNOWS.to_vec()),
+            ],
+            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }], // x = S(name) == S(knows)
+        };
+        let (proof, _coms, _m, _ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        assert_eq!(proof.atoms[0].object_id, Some(hi_id));
+        assert_eq!(proof.atoms[0].subject_id, None);
+        // Result [x, z] = {(a,m),(a,o),(c,n)}.
+        check_const_bgp(&lc, &plan, 3);
+    }
+
+    #[test]
+    fn layer_bgp_subject_node_constant_end_to_end() {
+        // t(<a>, knows, ?y), t(?y, likes, ?z): a knows y AND y likes z. The subject-const
+        // atom is the LEFT relation (arity 1, keeps O = y).
+        // knows: a->b,a->c,d->e ; likes: b->m,b->o,c->n. a knows y => {b,c}.
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("a", "knows", "c"),
+            ("d", "knows", "e"),
+            ("b", "likes", "m"),
+            ("b", "likes", "o"),
+            ("c", "likes", "n"),
+        ]);
+        let plan = LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom {
+                    subject: node_const("a"),
+                    predicate_term: KNOWS.to_vec(),
+                    object: AtomTerm::Variable,
+                },
+                LayerBgpAtom::all_variables(LIKES.to_vec()),
+            ],
+            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }], // y = O(knows) == S(likes)
+        };
+        let (proof, _coms, _m, _ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        let a_id = resolve_node_value_id(&lc, &CanonicalObject::Node(iri("a").into_bytes())).unwrap();
+        assert_eq!(proof.atoms[0].subject_id, Some(a_id));
+        assert_eq!(proof.atoms[0].object_id, None);
+        // Result [y, z] = {(b,m),(b,o),(c,n)}.
+        check_const_bgp(&lc, &plan, 3);
+    }
+
+    #[test]
+    fn layer_bgp_mixed_constant_and_variable_atoms_and_rejections() {
+        // t(?x, knows, ?y), t(?y, likes, <g>): x knows y AND y likes <g>. Joins on the
+        // OBJECT variable y (acc_key = 1) of the all-variable atom against the object-const
+        // atom (arity 1). knows: a->b,c->b,a->e ; likes: b->g,e->h,f->g. y likes g => {b,f}.
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("c", "knows", "b"),
+            ("a", "knows", "e"),
+            ("b", "likes", "g"),
+            ("e", "likes", "h"),
+            ("f", "likes", "g"),
+        ]);
+        let plan = LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom::all_variables(KNOWS.to_vec()),
+                LayerBgpAtom {
+                    subject: AtomTerm::Variable,
+                    predicate_term: LIKES.to_vec(),
+                    object: node_const("g"),
+                },
+            ],
+            joins: vec![JoinStep { acc_key: 1, rel_key: 0 }], // y = O(knows) == S(likes)
+        };
+        // Honest: result [x, y] = {(a,b),(c,b)}.
+        check_const_bgp(&lc, &plan, 2);
+
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+
+        // Wrong revealed constant id: the verifier feeds the SAME id to both the membership
+        // and the filter, and binds it into the statement transcript -> a substituted id
+        // breaks the node/value membership (the pair is no longer a dictionary row).
+        let mut bad_id = proof.clone();
+        bad_id.atoms[1].object_id = Some(proof.atoms[1].object_id.unwrap().wrapping_add(1));
+        assert!(
+            verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &bad_id).is_err()
+        );
+
+        // Substituting a DIFFERENT genuine node id (here <b>'s id) for <g> is also rejected:
+        // membership binds the PAIR (hash_object(<g>), id), so <b>'s id fails for <g>.
+        let b_id = resolve_node_value_id(&lc, &CanonicalObject::Node(iri("b").into_bytes())).unwrap();
+        let mut sub_id = proof.clone();
+        sub_id.atoms[1].object_id = Some(b_id);
+        assert!(
+            verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &sub_id).is_err()
+        );
+
+        // Wrong externally-trusted root rejects even an honest proof.
+        let mut wrong_root = lc.state.commitment_root;
+        wrong_root[0] ^= 0xff;
+        assert!(
+            verify_layer_bgp(&lc, wrong_root, &plan, &ids, &coms, m, &proof).is_err()
+        );
+
+        // Honest still verifies.
+        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+    }
+
+    #[test]
+    fn layer_bgp_absent_constant_fails_closed() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
+        // The object constant <absent> is not in the layer's node/value dictionary.
+        let plan = LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom::all_variables(KNOWS.to_vec()),
+                LayerBgpAtom {
+                    subject: AtomTerm::Variable,
+                    predicate_term: LIKES.to_vec(),
+                    object: node_const("absent"),
+                },
+            ],
+            joins: vec![JoinStep { acc_key: 1, rel_key: 0 }],
+        };
+        let err = prove_layer_bgp(&lc, &plan).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("constant not in layer node/value dictionary"));
+    }
+
+    #[test]
+    fn layer_bgp_ground_atom_and_value_subject_are_rejected() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
+        // A fully-ground atom (subject AND object constant) is out of v1 scope.
+        let ground = LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom {
+                    subject: node_const("a"),
+                    predicate_term: KNOWS.to_vec(),
+                    object: node_const("b"),
+                },
+                LayerBgpAtom::all_variables(LIKES.to_vec()),
+            ],
+            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+        };
+        assert!(prove_layer_bgp(&lc, &ground).is_err());
+        // A value literal in the SUBJECT position is rejected.
+        let value_subject = LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom {
+                    subject: AtomTerm::ValueConstant(CanonicalDatatype::String, b"x".to_vec()),
+                    predicate_term: KNOWS.to_vec(),
+                    object: AtomTerm::Variable,
+                },
+                LayerBgpAtom::all_variables(LIKES.to_vec()),
+            ],
+            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+        };
+        assert!(prove_layer_bgp(&lc, &value_subject).is_err());
+    }
 }
