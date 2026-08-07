@@ -620,6 +620,17 @@ pub struct BinaryJoinProof {
     pub n_u: usize,
 }
 
+impl BinaryJoinProof {
+    /// The number of variables the join's pairs-membership sumcheck operates
+    /// over, i.e. `log2` of the join domain `d_j`. The chain verifier
+    /// cross-checks this against each stage's relocation TARGET domain so a stage
+    /// cannot run its join over a different domain than the one its input columns
+    /// were relocated into.
+    pub fn num_vars(&self) -> usize {
+        self.pairs.membership_sumcheck.round_polys.len()
+    }
+}
+
 const LABEL_DOMAIN: &[u8] = b"pow/join2/instance-v1";
 const LABEL_LEN: &[u8] = b"pow/join2/len";
 

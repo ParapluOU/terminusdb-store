@@ -417,6 +417,19 @@ pub fn verify_bgp_chain(
         let d_j = binary_join_domain(n_r, n_s, m_j, n_u)?;
         let d_j_log = d_j.trailing_zeros() as usize;
 
+        // Defense-in-depth (7.6 audit): the relocation TARGET domain `d_j_log` MUST
+        // be exactly the domain the join operates over (`stage.join.num_vars()`).
+        // This is already implied downstream — every input column is relocated into
+        // `d_j_log`, and the join's Dory openings would fail against a differently
+        // sized commitment — but assert it EXPLICITLY here so a stage whose join runs
+        // over a different domain than its columns were relocated into is rejected up
+        // front, rather than relying on an incidental opening failure.
+        if stage.join.num_vars() != d_j_log {
+            return Err(invalid(
+                "bgp stage join domain does not match the relocation target domain",
+            ));
+        }
+
         // Commitment continuity (#1): each accumulator column's join input commitment
         // MUST be relocate-linked to the prior stage's actual output commitment. The
         // relocation TARGET is the very commitment the join consumes, so a fresh/tampered
@@ -532,6 +545,38 @@ mod tests {
         assert_eq!(v_coms[1], commit_column(&exp_y).unwrap());
         assert_eq!(v_coms[2], commit_column(&exp_z).unwrap());
         assert_eq!(v_coms[3], commit_column(&exp_w).unwrap());
+    }
+
+    #[test]
+    fn stage_join_domain_must_equal_relocation_target_domain() {
+        // Honest chain, then drop one round polynomial from stage 0's pairs-membership
+        // sumcheck so the join's reported num_vars no longer equals the relocation
+        // TARGET domain d_j_log. The EXPLICIT per-stage domain check must reject it
+        // (and it fires before the relocations / join, so the specific error surfaces).
+        let (rels, plan) = path_chain();
+        let views: Vec<RelationCommit> = rels.iter().map(|r| r.view()).collect();
+        let mut pt = transcript();
+        let (proof, _c, _m) = prove_bgp_chain(&rels, &plan, &mut pt).unwrap();
+
+        // Sanity: honest proof verifies.
+        let mut vt = transcript();
+        assert!(verify_bgp_chain(&views, &plan, &proof, &mut vt).is_ok());
+
+        let mut tampered = proof.clone();
+        tampered.stages[0]
+            .join
+            .pairs
+            .membership_sumcheck
+            .round_polys
+            .pop();
+        let mut vt2 = transcript();
+        let err = verify_bgp_chain(&views, &plan, &tampered, &mut vt2).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("join domain does not match the relocation target domain"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
