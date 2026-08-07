@@ -966,6 +966,7 @@ pub mod logup;
 pub mod membership;
 pub mod pairs;
 pub mod query;
+pub mod range;
 pub mod relocate;
 pub mod sort;
 

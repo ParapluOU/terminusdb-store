@@ -108,12 +108,14 @@ fn padded(column: &[ArkFr], n: usize) -> Vec<ArkFr> {
     out
 }
 
-/// Low 64 bits of a field element's canonical representation (as 0/1 field
-/// elements). For a value in `[0, 2^64)` these are its exact bits; a larger value
-/// (e.g. a negative difference `= p - d`) has bits that will NOT recompose to it.
-fn low_bits(value: ArkFr) -> Vec<ArkFr> {
+/// The low `num_bits` bits of a field element's canonical representation (as 0/1
+/// field elements). For a value in `[0, 2^num_bits)` these are its exact bits; a
+/// larger value (e.g. a negative difference `= p - d`) has bits that will NOT
+/// recompose to it. Shared with [`super::range`] (which uses a variable bit-width
+/// `B+1`); this gadget always asks for `BITS` (= 64).
+pub(crate) fn low_bits(value: ArkFr, num_bits: usize) -> Vec<ArkFr> {
     let bigint = value.0.into_bigint();
-    (0..BITS)
+    (0..num_bits)
         .map(|j| if bigint.get_bit(j) { f1() } else { f0() })
         .collect()
 }
@@ -147,19 +149,27 @@ fn reciprocal_with_offset(
     }
 }
 
-/// `chi_{n-1} * Sum_j tau^j * bit_j*(bit_j - 1) = 0`.
-fn booleanity_claim(tau: ArkFr) -> SumcheckClaim {
-    let mut terms = Vec::with_capacity(2 * BITS);
+/// `chi_{chi_idx} * Sum_{j<num_bits} tau^j * bit_j*(bit_j - 1) = 0` over the bit
+/// columns `[bit_base, bit_base + num_bits)`. A single fresh `tau` fold makes one
+/// sumcheck claim enforce EVERY bit's booleanity. Shared with [`super::range`],
+/// which batches all `B+1` bits including the sign bit.
+pub(crate) fn booleanity_claim(
+    chi_idx: usize,
+    bit_base: usize,
+    num_bits: usize,
+    tau: ArkFr,
+) -> SumcheckClaim {
+    let mut terms = Vec::with_capacity(2 * num_bits);
     let mut tau_pow = f1();
-    for j in 0..BITS {
-        let bit = Operand::Column(COL_BIT_BASE + j);
+    for j in 0..num_bits {
+        let bit = Operand::Column(bit_base + j);
         terms.push(Term {
             coeff: tau_pow,
-            operands: vec![Operand::Chi(CHI_N1), bit, bit],
+            operands: vec![Operand::Chi(chi_idx), bit, bit],
         });
         terms.push(Term {
             coeff: f0() - tau_pow,
-            operands: vec![Operand::Chi(CHI_N1), bit],
+            operands: vec![Operand::Chi(chi_idx), bit],
         });
         tau_pow = tau_pow * tau;
     }
@@ -223,7 +233,13 @@ fn sort_shape(k: usize, n: usize, alpha: ArkFr, beta: ArkFr, tau: ArkFr) -> Sumc
         num_vars: k,
         num_columns: NUM_COLUMNS,
         chi_bounds: vec![n.saturating_sub(1)],
-        claims: vec![rec_c, rec_d, shift, booleanity_claim(tau), recomposition_claim()],
+        claims: vec![
+            rec_c,
+            rec_d,
+            shift,
+            booleanity_claim(CHI_N1, COL_BIT_BASE, BITS, tau),
+            recomposition_claim(),
+        ],
     }
 }
 
@@ -319,7 +335,7 @@ fn honest_witness(u: &[ArkFr], n: usize, n_domain: usize) -> (Vec<ArkFr>, Vec<Ar
     }
     let mut bit_columns = vec![vec![f0(); n_domain]; BITS];
     for i in 0..n.saturating_sub(1) {
-        let bits = low_bits(u_shift[i] - u_p[i] - f1());
+        let bits = low_bits(u_shift[i] - u_p[i] - f1(), BITS);
         for j in 0..BITS {
             bit_columns[j][i] = bits[j];
         }
