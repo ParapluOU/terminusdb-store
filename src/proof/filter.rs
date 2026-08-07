@@ -975,6 +975,210 @@ pub fn verify_filter(
     )
 }
 
+// ===========================================================================
+// Compaction-only entry: compact kept columns by an EXTERNAL boolean selection.
+// ===========================================================================
+//
+// The full atom filter ([`prove_atom_filter`]) fuses the SELECTION claims (A, B,
+// which derive `sel` from the constant-equality indicator) with the COMPACTION
+// claims (C, D, E, the LogUp dense-compaction) into one sumcheck welded to a single
+// internally-derived `sel`. Range filters need to compact by a COMBINED selection
+// `sel = equality_sel · range_sel` that is NOT the plain equality indicator, so this
+// entry runs ONLY the compaction claims (C, D, E) over an EXTERNAL, already-committed
+// boolean `sel` column plus the kept SOURCE columns:
+//   * C: `cstar[i] = 1/(alpha − fold_beta(sources[i]))`         (reciprocal, Identity)
+//   * D: `dstar[j] = 1/(alpha − fold_beta(kept_out[j]))`         (reciprocal, Identity)
+//   * E: `Σ_i sel[i]·cstar[i] − Σ_j χ_m[j]·dstar[j] = 0`         (LogUp link, ZeroSum)
+// These are BIT-FOR-BIT the C/D/E claims of the full filter (same fold order, same
+// masks), so the audited compaction soundness carries over unchanged.
+//
+// SECURITY TIE (the caller's responsibility): `sel` MUST be boolean and χ_n-masked.
+// This entry does NOT re-prove those properties — they are inherited from whatever
+// pins `com_sel` upstream (for a range atom: `sel = equality_sel · range_sel`, a
+// product of two independently-proven boolean, χ_n-masked columns, tied to THIS
+// `com_sel` by a product Identity). Given that, E proves the multiset
+// `{sources[i] : sel[i]=1}` equals `{kept_out[j] : j < m}` AND pins `m` to the
+// number of selected rows — exactly the audited dense-compaction guarantee.
+
+const CO_LABEL_DOMAIN: &[u8] = b"pow/compaction-only/domain-v1";
+const CO_LABEL_BETA: &[u8] = b"pow/compaction-only/logup-beta";
+const CO_LABEL_ALPHA: &[u8] = b"pow/compaction-only/logup-alpha";
+
+/// A compaction-only proof: the batched sumcheck over the two reciprocal claims
+/// (C, D) and the LogUp link (E), one batched Dory opening of
+/// `[sources.., sel, kept_out.., cstar, dstar]` at `r`, and the two reciprocal
+/// commitments the verifier binds. The kept OUTPUT commitments are returned
+/// separately (the authoritative dense-result columns).
+#[derive(Clone, Debug)]
+pub struct CompactionOnlyProof {
+    pub sumcheck: SumcheckProof,
+    pub opening: ColumnOpening,
+    pub cstar_commitment: ArkGT,
+    pub dstar_commitment: ArkGT,
+}
+
+/// The C/D/E compaction shape over `[sources.., sel, kept_out.., cstar, dstar]`, with
+/// `χ_m` (the output length) the single chi bound. Column indices: sources
+/// `0..num_kept`, `sel` at `num_kept`, kept outputs `num_kept+1..2·num_kept+1`,
+/// `cstar` at `2·num_kept+1`, `dstar` at `2·num_kept+2`.
+fn compaction_only_shape(
+    num_vars: usize,
+    output_len: usize,
+    num_kept: usize,
+    alpha: ArkFr,
+    beta: ArkFr,
+) -> SumcheckShape {
+    let sel_col = num_kept;
+    let kept_out_base = num_kept + 1;
+    let cstar = 2 * num_kept + 1;
+    let dstar = 2 * num_kept + 2;
+    let kept_in: Vec<usize> = (0..num_kept).collect();
+    let kept_out: Vec<usize> = (0..num_kept).map(|d| kept_out_base + d).collect();
+    let claim_c = reciprocal_claim(cstar, &kept_in, alpha, beta);
+    let claim_d = reciprocal_claim(dstar, &kept_out, alpha, beta);
+    // chi index 0 is χ_m (the sole chi bound); sel is the (external) input mask.
+    let claim_e = multiset_link_claim(Operand::Column(sel_col), cstar, Operand::Chi(0), dstar);
+    SumcheckShape {
+        num_vars,
+        num_columns: 2 * num_kept + 3,
+        chi_bounds: vec![output_len],
+        claims: vec![claim_c, claim_d, claim_e],
+    }
+}
+
+/// Bind the compaction-only statement: the domain tag, the kept arity, and the source
+/// / selection / kept-output commitments. Identical on both sides.
+fn bind_compaction_only(
+    transcript: &mut Transcript254,
+    source_commitments: &[ArkGT],
+    com_sel: &ArkGT,
+    com_kept: &[ArkGT],
+) {
+    transcript.append_bytes(CO_LABEL_DOMAIN, b"parture/proof-of-woql/compaction-only/v0");
+    transcript.append_bytes(CO_LABEL_DOMAIN, &(source_commitments.len() as u64).to_le_bytes());
+    for c in source_commitments {
+        transcript.append_group(b"pow/co/com-src", c);
+    }
+    transcript.append_group(b"pow/co/com-sel", com_sel);
+    for c in com_kept {
+        transcript.append_group(b"pow/co/com-kept", c);
+    }
+}
+
+/// Prove that the dense columns `kept_out[0..m]` are EXACTLY the `sel`-compaction of
+/// `sources` (one output column per source, dense prefix + zero tail), for an EXTERNAL
+/// boolean, χ_n-masked `sel` committed as `com_sel`. `source_commitments` must commit
+/// `sources` (root-anchored by the caller). Returns the proof, one commitment per kept
+/// output column, and the match count `m`.
+pub fn prove_compaction_only(
+    sources: &[Vec<ArkFr>],
+    source_commitments: &[ArkGT],
+    sel: &[ArkFr],
+    com_sel: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(CompactionOnlyProof, Vec<ArkGT>, usize)> {
+    let num_kept = sources.len();
+    if num_kept == 0 {
+        return Err(invalid("compaction-only needs at least one kept column"));
+    }
+    if source_commitments.len() != num_kept {
+        return Err(invalid("compaction-only source/commitment count mismatch"));
+    }
+    let size = sel.len();
+    if !size.is_power_of_two() || size < 2 {
+        return Err(invalid("compaction-only column length must be a power of two >= 2"));
+    }
+    if sources.iter().any(|c| c.len() != size) {
+        return Err(invalid("compaction-only source column length mismatch"));
+    }
+    let num_vars = size.trailing_zeros() as usize;
+
+    // Dense compaction of the sources by the external sel.
+    let (kept_out, m) = compact_columns(sources, sel);
+    let mut com_kept = Vec::with_capacity(num_kept);
+    for col in &kept_out {
+        com_kept.push(commit_column(col)?);
+    }
+
+    // Round 1: bind the data commitments, then draw the LogUp challenges.
+    bind_compaction_only(transcript, source_commitments, com_sel, &com_kept);
+    let beta = transcript.challenge_scalar(CO_LABEL_BETA);
+    let alpha = transcript.challenge_scalar(CO_LABEL_ALPHA);
+
+    // Round 2: derived reciprocals, bound AFTER the challenges.
+    let cstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(sources)));
+    let dstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(&kept_out)));
+    let com_cstar = commit_column(&cstar)?;
+    let com_dstar = commit_column(&dstar)?;
+    transcript.append_group(b"pow/co/com-cstar", &com_cstar);
+    transcript.append_group(b"pow/co/com-dstar", &com_dstar);
+
+    let shape = compaction_only_shape(num_vars, m, num_kept, alpha, beta);
+    let mut columns: Vec<Vec<ArkFr>> = sources.to_vec();
+    columns.push(sel.to_vec());
+    columns.extend(kept_out.iter().cloned());
+    columns.push(cstar);
+    columns.push(dstar);
+    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
+    let opening = prove_column_openings(&columns, &r, transcript)?;
+
+    Ok((
+        CompactionOnlyProof {
+            sumcheck,
+            opening,
+            cstar_commitment: com_cstar,
+            dstar_commitment: com_dstar,
+        },
+        com_kept,
+        m,
+    ))
+}
+
+/// Verify a compaction-only proof: `com_kept[0..output_len]` is EXACTLY the
+/// `sel`-compaction of the columns committed by `source_commitments`, for the external
+/// boolean selection committed as `com_sel`. The caller is responsible for the
+/// upstream binding that makes `com_sel` a genuine boolean, χ_n-masked selection.
+pub fn verify_compaction_only(
+    source_commitments: &[ArkGT],
+    com_sel: &ArkGT,
+    com_kept: &[ArkGT],
+    output_len: usize,
+    proof: &CompactionOnlyProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    let num_kept = source_commitments.len();
+    if num_kept == 0 {
+        return Err(invalid("compaction-only needs at least one kept column"));
+    }
+    if com_kept.len() != num_kept {
+        return Err(invalid("compaction-only kept commitment count mismatch"));
+    }
+    let num_vars = proof.sumcheck.round_polys.len();
+    if num_vars == 0 || num_vars >= usize::BITS as usize {
+        return Err(invalid("compaction-only proof has an implausible variable count"));
+    }
+    let size = 1usize << num_vars;
+    if output_len > size {
+        return Err(invalid("compaction-only output length exceeds column length"));
+    }
+
+    bind_compaction_only(transcript, source_commitments, com_sel, com_kept);
+    let beta = transcript.challenge_scalar(CO_LABEL_BETA);
+    let alpha = transcript.challenge_scalar(CO_LABEL_ALPHA);
+    transcript.append_group(b"pow/co/com-cstar", &proof.cstar_commitment);
+    transcript.append_group(b"pow/co/com-dstar", &proof.dstar_commitment);
+
+    let shape = compaction_only_shape(num_vars, output_len, num_kept, alpha, beta);
+    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+
+    let mut coms: Vec<ArkGT> = source_commitments.to_vec();
+    coms.push(*com_sel);
+    coms.extend_from_slice(com_kept);
+    coms.push(proof.cstar_commitment);
+    coms.push(proof.dstar_commitment);
+    verify_column_openings(&coms, &r, &evals, &proof.opening, transcript)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,6 +1217,62 @@ mod tests {
             prove_filter_with_witness(p_col, pred, n, sel, w, &com_p, &mut pt)?;
         let mut vt = transcript();
         verify_filter_indicator(&com_p, pred, n, &com_sel, &com_w, &proof, &mut vt)
+    }
+
+    #[test]
+    fn compaction_only_matches_independent_result_and_rejects_tampering() {
+        // Two "kept" source columns (S/O style) over a 2^3 domain and an EXTERNAL
+        // boolean sel selecting rows 1, 2, 5 (an arbitrary boolean column, NOT a
+        // predicate indicator — exactly the combined-sel case the range layer needs).
+        let size = 8usize;
+        let s: Vec<ArkFr> = [10u64, 11, 12, 13, 14, 15, 16, 17].iter().map(|v| fr(*v)).collect();
+        let o: Vec<ArkFr> = [20u64, 21, 22, 23, 24, 25, 26, 27].iter().map(|v| fr(*v)).collect();
+        let mut sel = vec![f0(); size];
+        for i in [1usize, 2, 5] {
+            sel[i] = f1();
+        }
+        let sources = vec![s.clone(), o.clone()];
+        let com_sources = vec![commit(&s), commit(&o)];
+        let com_sel = commit(&sel);
+
+        let mut pt = transcript();
+        let (proof, com_kept, m) =
+            prove_compaction_only(&sources, &com_sources, &sel, &com_sel, &mut pt).unwrap();
+        let mut vt = transcript();
+        verify_compaction_only(&com_sources, &com_sel, &com_kept, m, &proof, &mut vt).unwrap();
+
+        // m and the kept output commitments equal an INDEPENDENT dense compaction.
+        assert_eq!(m, 3);
+        let (exp, exp_m) = compact_columns(&sources, &sel);
+        assert_eq!(exp_m, m);
+        assert_eq!(com_kept.len(), 2);
+        assert_eq!(com_kept[0], commit(&exp[0]));
+        assert_eq!(com_kept[1], commit(&exp[1]));
+
+        // Tampered kept commitments (columns swapped) are rejected.
+        let mut vt2 = transcript();
+        assert!(verify_compaction_only(
+            &com_sources,
+            &com_sel,
+            &[com_kept[1], com_kept[0]],
+            m,
+            &proof,
+            &mut vt2
+        )
+        .is_err());
+
+        // A wrong output length is rejected.
+        let mut vt3 = transcript();
+        assert!(verify_compaction_only(&com_sources, &com_sel, &com_kept, m + 1, &proof, &mut vt3)
+            .is_err());
+
+        // A different sel commitment than the proof was built over is rejected.
+        let mut other_sel = vec![f0(); size];
+        other_sel[0] = f1();
+        let com_other_sel = commit(&other_sel);
+        let mut vt4 = transcript();
+        assert!(verify_compaction_only(&com_sources, &com_other_sel, &com_kept, m, &proof, &mut vt4)
+            .is_err());
     }
 
     #[test]
