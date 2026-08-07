@@ -29,11 +29,15 @@ use super::bgp::{
 };
 use super::commitment::LayerCommitment;
 use super::ProofHash;
-use super::dict::{hash_term, prove_dict_membership, verify_dict_membership, DictProof};
+use super::dict::{
+    hash_object, hash_term, prove_dict_membership, verify_dict_membership, DictProof,
+};
 use super::filter::{
-    compact_selected, honest_witness, prove_filter, verify_filter, FullFilterProof,
+    atom_kept_columns, compact_selected, honest_witness, prove_atom_filter, prove_filter,
+    verify_atom_filter, verify_filter, AtomFilterProof, AtomFilterSpec, FullFilterProof, Position,
 };
 use super::invalid;
+use super::{CanonicalDatatype, CanonicalObject};
 use super::join::{
     compute_self_join, prove_self_join_complete, self_join_commitments, self_join_domain,
     verify_self_join_complete, SelfJoinCommitments, SelfJoinCompleteProof,
@@ -500,35 +504,72 @@ pub fn verify_layer_graph_pattern2(
 
 const LAYER_BGP_DOMAIN: &[u8] = b"parture/proof-of-woql/qk-layer-bgp-by-iri/v0";
 
-/// One atom of a layer BGP. v1 SCOPE: the PREDICATE is a constant IRI (authenticated by
-/// the layer's predicate dictionary), and the subject/object are VARIABLES (the kept
-/// output columns). Subject/object CONSTANTS need the node/value dictionary commitment
-/// (Phase 7.5, not yet committed) and are intentionally not supported here.
+/// One term (subject or object) of a layer BGP atom: a query VARIABLE (kept as an
+/// output column) or a CONSTANT authenticated against the layer's node/value dictionary.
+/// `NodeConstant` is a node IRI (valid in the subject or object position); `ValueConstant`
+/// is a typed literal (valid in the object position only). A node IRI resolves through the
+/// SAME node/value id whether it appears as a subject or an object constant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AtomTerm {
+    Variable,
+    NodeConstant(Vec<u8>),
+    ValueConstant(CanonicalDatatype, Vec<u8>),
+}
+
+/// One atom of a layer BGP. v1 SCOPE: the PREDICATE is always a constant IRI
+/// (authenticated by the layer's predicate dictionary). The subject/object may each be a
+/// VARIABLE (a kept output column) or a CONSTANT (authenticated against the layer's
+/// node/value dictionary and folded into the atom filter). Constraints (enforced at
+/// prove AND verify): the subject may not be a `ValueConstant` (literals never occupy the
+/// subject position), and at least one of subject/object must be a `Variable` (a
+/// fully-ground atom is an existence check, out of scope for v1).
 #[derive(Clone, Debug)]
 pub struct LayerBgpAtom {
+    pub subject: AtomTerm,
     pub predicate_term: Vec<u8>,
+    pub object: AtomTerm,
+}
+
+impl LayerBgpAtom {
+    /// The classic all-variable atom `t(?s, <predicate_term>, ?o)`: both subject and
+    /// object are query variables (the two kept output columns).
+    pub fn all_variables(predicate_term: Vec<u8>) -> Self {
+        Self {
+            subject: AtomTerm::Variable,
+            predicate_term,
+            object: AtomTerm::Variable,
+        }
+    }
 }
 
 /// A layer BGP plan: `k` atoms and the `k - 1` left-deep join steps. `joins[j]` names
 /// the single shared variable's column on the evolving accumulator (`acc_key`) and on
-/// atom `j + 1`'s relation (`rel_key`). Each atom relation has two columns `[S, O]`, so
-/// the accumulator schema evolves as `[r_other_out.., key, s_other_out..]` per step.
+/// atom `j + 1`'s relation (`rel_key`). Each atom relation has ONE column per VARIABLE
+/// (in S,O order): two for an all-variable atom, one for a subject/object-constant atom.
+/// The accumulator schema evolves as `[r_other_out.., key, s_other_out..]` per step.
 #[derive(Clone, Debug)]
 pub struct LayerBgpPlan {
     pub atoms: Vec<LayerBgpAtom>,
     pub joins: Vec<JoinStep>,
 }
 
-/// The per-atom half of a layer BGP proof: the dictionary binding of the predicate IRI
-/// to its id, the complete predicate filter into `(S_out, O_out)` at the table domain,
-/// and the filter output length.
+/// The per-atom half of a layer BGP proof: the dictionary binding of the predicate IRI to
+/// its id, the optional subject/object CONSTANT bindings (node/value dictionary), the
+/// complete per-atom filter into the dense KEPT (variable) columns, one commitment per
+/// kept column (in S,O order), the filter output length, and the REVEALED subject/object
+/// constant ids. Those ids are public inputs to verification: the verifier feeds the SAME
+/// id to both the membership check (constant -> id) and the filter's constant, so a prover
+/// cannot authenticate one id and filter on another.
 #[derive(Clone, Debug)]
 pub struct LayerBgpAtomProof {
-    pub membership: DictProof,
-    pub filter: FullFilterProof,
-    pub com_sout: ArkGT,
-    pub com_oout: ArkGT,
+    pub predicate_membership: DictProof,
+    pub subject_membership: Option<DictProof>,
+    pub object_membership: Option<DictProof>,
+    pub filter: AtomFilterProof,
+    pub kept_commitments: Vec<ArkGT>,
     pub m: usize,
+    pub subject_id: Option<u64>,
+    pub object_id: Option<u64>,
 }
 
 /// A complete k-atom layer BGP proof: one per-atom (membership + filter) proof, plus the
@@ -539,20 +580,133 @@ pub struct LayerBgpProof {
     pub chain: BgpChainProof,
 }
 
+/// The resolved dictionary ids for one atom's constants: the predicate is always a
+/// constant in v1 (so `predicate_id` is unconditional); `subject_id`/`object_id` are
+/// `Some` iff that position is a constant.
+#[derive(Clone, Copy, Debug)]
+struct AtomIds {
+    predicate_id: u64,
+    subject_id: Option<u64>,
+    object_id: Option<u64>,
+}
+
+/// The canonical dictionary object a constant term resolves through, or `None` for a
+/// variable. A node IRI (subject or object) resolves through `Node(iri)`; a typed literal
+/// through `Value{..}` — both share the node/value id space via `hash_object`.
+fn atom_term_object(term: &AtomTerm) -> Option<CanonicalObject> {
+    match term {
+        AtomTerm::Variable => None,
+        AtomTerm::NodeConstant(iri) => Some(CanonicalObject::Node(iri.clone())),
+        AtomTerm::ValueConstant(datatype, lexical) => Some(CanonicalObject::Value {
+            datatype: *datatype,
+            lexical: lexical.clone(),
+        }),
+    }
+}
+
+/// Resolve a subject/object CONSTANT to its node/value dictionary id in this layer, or
+/// fail closed if the constant is absent (non-membership proofs are deferred, mirroring
+/// [`resolve_predicate_id`]). Subjects share the node/value id space with node objects, so
+/// the same `(hash_object(term), id)` row authenticates the constant in either position.
+fn resolve_node_value_id(layer: &LayerCommitment, object: &CanonicalObject) -> io::Result<u64> {
+    layer
+        .node_value_catalog
+        .iter()
+        .find(|record| &record.triple.object == object)
+        .map(|record| record.object_id)
+        .ok_or_else(|| invalid("constant not in layer node/value dictionary"))
+}
+
+/// Enforce the v1 atom constraints: the subject is a variable or a node constant (never a
+/// value literal), and at least one of subject/object is a variable (fully-ground atoms
+/// are a later existence check).
+fn validate_atom(atom: &LayerBgpAtom) -> io::Result<()> {
+    if matches!(atom.subject, AtomTerm::ValueConstant(..)) {
+        return Err(invalid(
+            "layer BGP subject may not be a value-literal constant",
+        ));
+    }
+    if !matches!(atom.subject, AtomTerm::Variable) && !matches!(atom.object, AtomTerm::Variable) {
+        return Err(invalid(
+            "layer BGP atom must have at least one variable (ground atoms unsupported in v1)",
+        ));
+    }
+    Ok(())
+}
+
+/// The `(constant/id)` presence carried in a proof MUST match the atom's constant
+/// structure: a variable position has no id, a constant position has one. Rejects a
+/// malformed proof that, e.g., claims a subject id for a variable subject (which would
+/// otherwise silently reshape the filter spec).
+fn check_ids_consistent(atom: &LayerBgpAtom, ids: &AtomIds) -> io::Result<()> {
+    let subject_is_constant = !matches!(atom.subject, AtomTerm::Variable);
+    let object_is_constant = !matches!(atom.object, AtomTerm::Variable);
+    if subject_is_constant != ids.subject_id.is_some()
+        || object_is_constant != ids.object_id.is_some()
+    {
+        return Err(invalid(
+            "layer BGP atom constant/id presence does not match the plan",
+        ));
+    }
+    Ok(())
+}
+
+/// The atom's [`AtomFilterSpec`] from its resolved ids: `P` is always a constant; `S`/`O`
+/// are constants iff their id is `Some`; the kept (variable) positions are the constants'
+/// complement in S,P,O order (a subset of `{S, O}` since `P` is always constant). The
+/// constant list order (P, then S, then O) is fixed and identical on both sides.
+fn atom_filter_spec(atom: &LayerBgpAtom, ids: &AtomIds) -> AtomFilterSpec {
+    let mut constants = vec![(Position::P, ArkFr::from_u64(ids.predicate_id))];
+    if let Some(subject_id) = ids.subject_id {
+        constants.push((Position::S, ArkFr::from_u64(subject_id)));
+    }
+    if let Some(object_id) = ids.object_id {
+        constants.push((Position::O, ArkFr::from_u64(object_id)));
+    }
+    let mut kept = Vec::new();
+    if matches!(atom.subject, AtomTerm::Variable) {
+        kept.push(Position::S);
+    }
+    if matches!(atom.object, AtomTerm::Variable) {
+        kept.push(Position::O);
+    }
+    AtomFilterSpec { constants, kept }
+}
+
+/// Bind one atom term (subject or object) plus its optional resolved id into the shared
+/// transcript: a domain-separated tag per variant (variable / node / value) and, for a
+/// constant, the term bytes and revealed id. Identical on both sides.
+fn bind_atom_term(transcript: &mut Transcript254, term: &AtomTerm, id: Option<u64>) {
+    match term {
+        AtomTerm::Variable => transcript.append_bytes(b"pow/bgp-layer/term-variable", &[]),
+        AtomTerm::NodeConstant(iri) => transcript.append_bytes(b"pow/bgp-layer/term-node", iri),
+        AtomTerm::ValueConstant(datatype, lexical) => {
+            transcript.append_bytes(b"pow/bgp-layer/term-value-dt", &[*datatype as u8]);
+            transcript.append_bytes(b"pow/bgp-layer/term-value-lex", lexical);
+        }
+    }
+    if let Some(id) = id {
+        transcript.append_bytes(b"pow/bgp-layer/term-id", &id.to_le_bytes());
+    }
+}
+
 /// Bind the public statement of a layer BGP: the trust anchor (`commitment_root`, which
-/// binds both the column and predicate-dictionary commitments), `k`, and every atom's
-/// predicate IRI + revealed id, then the join plan. Identical on both sides.
+/// binds the column, predicate-dictionary AND node/value-dictionary commitments), `k`, and
+/// every atom's subject term, predicate IRI + id, and object term (each constant carrying
+/// its revealed id), then the join plan. Identical on both sides.
 fn bind_layer_bgp_statement(
     transcript: &mut Transcript254,
     layer: &LayerCommitment,
     plan: &LayerBgpPlan,
-    ids: &[u64],
+    atom_ids: &[AtomIds],
 ) {
     transcript.append_bytes(b"pow/bgp-layer/commitment-root", &layer.state.commitment_root);
     transcript.append_bytes(b"pow/bgp-layer/k", &(plan.atoms.len() as u64).to_le_bytes());
-    for (atom, id) in plan.atoms.iter().zip(ids.iter()) {
+    for (atom, ids) in plan.atoms.iter().zip(atom_ids.iter()) {
+        bind_atom_term(transcript, &atom.subject, ids.subject_id);
         transcript.append_bytes(b"pow/bgp-layer/pred-term", &atom.predicate_term);
-        transcript.append_bytes(b"pow/bgp-layer/pred-id", &id.to_le_bytes());
+        transcript.append_bytes(b"pow/bgp-layer/pred-id", &ids.predicate_id.to_le_bytes());
+        bind_atom_term(transcript, &atom.object, ids.object_id);
     }
     for step in &plan.joins {
         transcript.append_bytes(b"pow/bgp-layer/acc-key", &(step.acc_key as u64).to_le_bytes());
@@ -572,12 +726,14 @@ fn validate_bgp_plan(plan: &LayerBgpPlan) -> io::Result<usize> {
 }
 
 /// Prove the COMPLETE result of a k-atom conjunctive BGP against a materialized base
-/// layer. Each atom is filtered by its (dictionary-authenticated) predicate IRI into the
-/// `(subject, object)` pairs `(S_out, O_out)`; the resulting `k` relations are joined by
-/// the left-deep binary-join chain ([`super::bgp`]) on the plan's shared variables — all
-/// under ONE shared transcript anchored to `commitment_root`. Returns the combined proof,
-/// the final result column commitments (schema `[r_other_out.., key, s_other_out..]`), the
-/// result length `m`, and the REVEALED resolved predicate ids (authenticated by membership).
+/// layer. Each atom is filtered by its (dictionary-authenticated) constant PREDICATE and
+/// any (dictionary-authenticated) subject/object CONSTANTS into its dense KEPT (variable)
+/// columns; the resulting `k` relations (one column per variable, in S,O order) are joined
+/// by the left-deep binary-join chain ([`super::bgp`]) on the plan's shared variables — all
+/// under ONE shared transcript anchored to `commitment_root`. Returns the combined proof
+/// (whose per-atom parts carry the revealed subject/object constant ids), the final result
+/// column commitments (schema `[r_other_out.., key, s_other_out..]`), the result length `m`,
+/// and the REVEALED resolved predicate ids (authenticated by membership).
 pub fn prove_layer_bgp(
     layer: &LayerCommitment,
     plan: &LayerBgpPlan,
@@ -585,58 +741,121 @@ pub fn prove_layer_bgp(
     let k = validate_bgp_plan(plan)?;
     let (s, p, o, n) = base_layer_columns(layer)?;
 
-    // Resolve every predicate IRI up front (fail closed if any is absent).
-    let mut resolved_ids = Vec::with_capacity(k);
+    // Resolve every atom's constant ids up front (fail closed if any is absent): the
+    // predicate IRI via the predicate dictionary, each subject/object constant via the
+    // node/value dictionary.
+    let mut atom_ids = Vec::with_capacity(k);
     for atom in &plan.atoms {
-        resolved_ids.push(resolve_predicate_id(layer, &atom.predicate_term)?);
+        validate_atom(atom)?;
+        let predicate_id = resolve_predicate_id(layer, &atom.predicate_term)?;
+        let subject_id = match atom_term_object(&atom.subject) {
+            Some(object) => Some(resolve_node_value_id(layer, &object)?),
+            None => None,
+        };
+        let object_id = match atom_term_object(&atom.object) {
+            Some(object) => Some(resolve_node_value_id(layer, &object)?),
+            None => None,
+        };
+        atom_ids.push(AtomIds {
+            predicate_id,
+            subject_id,
+            object_id,
+        });
     }
+    let predicate_ids: Vec<u64> = atom_ids.iter().map(|ids| ids.predicate_id).collect();
 
-    let (dict_hash, dict_id) = layer.predicate_dictionary_columns()?;
-    let com_dict_hash = layer.predicate_dict_commitments.0;
-    let com_dict_id = layer.predicate_dict_commitments.1;
+    let (pred_dict_hash, pred_dict_id) = layer.predicate_dictionary_columns()?;
+    let com_pred_hash = layer.predicate_dict_commitments.0;
+    let com_pred_id = layer.predicate_dict_commitments.1;
+    let (nv_dict_hash, nv_dict_id) = layer.node_value_dictionary_columns()?;
+    let com_nv_hash = layer.node_value_dict_commitments.0;
+    let com_nv_id = layer.node_value_dict_commitments.1;
     let com_s = layer.column_commitments[0];
     let com_p = layer.column_commitments[1];
     let com_o = layer.column_commitments[2];
     let a = padded_len(n)?.trailing_zeros() as usize;
 
     let mut transcript = Transcript254::new(LAYER_BGP_DOMAIN);
-    bind_layer_bgp_statement(&mut transcript, layer, plan, &resolved_ids);
+    bind_layer_bgp_statement(&mut transcript, layer, plan, &atom_ids);
 
     let mut atom_proofs = Vec::with_capacity(k);
     let mut relations: Vec<RelationWitness> = Vec::with_capacity(k);
-    for (atom, &pred_id) in plan.atoms.iter().zip(resolved_ids.iter()) {
-        // (1) Q3 membership: (hash_term(IRI), id) is a genuine dictionary row.
-        let q_hash = hash_term(&atom.predicate_term);
-        let id = ArkFr::from_u64(pred_id);
-        let membership = prove_dict_membership(
-            &dict_hash, &dict_id, &com_dict_hash, &com_dict_id, q_hash, id, &mut transcript,
+    for (atom, ids) in plan.atoms.iter().zip(atom_ids.iter()) {
+        // (1) Predicate IRI -> id, authenticated by the predicate dictionary.
+        let predicate_membership = prove_dict_membership(
+            &pred_dict_hash,
+            &pred_dict_id,
+            &com_pred_hash,
+            &com_pred_id,
+            hash_term(&atom.predicate_term),
+            ArkFr::from_u64(ids.predicate_id),
+            &mut transcript,
         )?;
-        // (2) Q1 complete filter: (S_out, O_out) = the predicate's (subject, object) pairs
-        // at the TABLE domain, root-anchored via the filter argument.
-        let pred = ArkFr::from_u64(pred_id);
-        let (filter, com_sout, com_oout, m) =
-            prove_filter(&s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript)?;
-        // Recompute the dense filter output (same witness the filter used) as the chain
-        // relation's columns; `com_sout`/`com_oout` are their table-domain commitments.
-        let (sel, _w) = honest_witness(&p, pred, n);
-        let (s_out, o_out, _m) = compact_selected(&s, &o, &sel);
-        atom_proofs.push(LayerBgpAtomProof { membership, filter, com_sout, com_oout, m });
+        // (2) Subject / object CONSTANT -> id, authenticated by the node/value dictionary.
+        // The SAME id is folded into the atom filter below, so a prover cannot authenticate
+        // one id here and filter on a different one.
+        let subject_membership = match (atom_term_object(&atom.subject), ids.subject_id) {
+            (Some(object), Some(subject_id)) => Some(prove_dict_membership(
+                &nv_dict_hash,
+                &nv_dict_id,
+                &com_nv_hash,
+                &com_nv_id,
+                hash_object(&object),
+                ArkFr::from_u64(subject_id),
+                &mut transcript,
+            )?),
+            _ => None,
+        };
+        let object_membership = match (atom_term_object(&atom.object), ids.object_id) {
+            (Some(object), Some(object_id)) => Some(prove_dict_membership(
+                &nv_dict_hash,
+                &nv_dict_id,
+                &com_nv_hash,
+                &com_nv_id,
+                hash_object(&object),
+                ArkFr::from_u64(object_id),
+                &mut transcript,
+            )?),
+            _ => None,
+        };
+        // (3) The complete per-atom filter (predicate + any subject/object constants) into
+        // the dense KEPT (variable) columns, root-anchored via the filter argument.
+        let spec = atom_filter_spec(atom, ids);
+        let (filter, kept_commitments, m) =
+            prove_atom_filter(&spec, &s, &p, &o, n, &com_s, &com_p, &com_o, &mut transcript)?;
+        // (4) The dense kept columns (== what prove_atom_filter committed) as the chain
+        // relation; its arity equals the number of variables in the atom.
+        let (kept_columns, m_columns) = atom_kept_columns(&spec, &s, &p, &o, n)?;
+        debug_assert_eq!(m_columns, m);
         relations.push(RelationWitness {
-            columns: vec![s_out, o_out],
-            commitments: vec![com_sout, com_oout],
+            columns: kept_columns,
+            commitments: kept_commitments.clone(),
             log_domain: a,
             n: m,
         });
+        atom_proofs.push(LayerBgpAtomProof {
+            predicate_membership,
+            subject_membership,
+            object_membership,
+            filter,
+            kept_commitments,
+            m,
+            subject_id: ids.subject_id,
+            object_id: ids.object_id,
+        });
     }
 
-    // (3) The left-deep chain over the k filtered relations, same shared transcript.
+    // (5) The left-deep chain over the k filtered relations, same shared transcript.
     let (chain, result_coms, result_m) = prove_bgp_chain(&relations, &plan.joins, &mut transcript)?;
 
     Ok((
-        LayerBgpProof { atoms: atom_proofs, chain },
+        LayerBgpProof {
+            atoms: atom_proofs,
+            chain,
+        },
         result_coms,
         result_m,
-        resolved_ids,
+        predicate_ids,
     ))
 }
 
@@ -678,48 +897,123 @@ pub fn verify_layer_bgp(
     let n = layer.state.addition_count as usize;
     let a = padded_len(n)?.trailing_zeros() as usize;
 
-    let mut transcript = Transcript254::new(LAYER_BGP_DOMAIN);
-    bind_layer_bgp_statement(&mut transcript, layer, plan, predicate_ids);
+    // Reconstruct each atom's resolved ids from the public predicate ids + the
+    // proof-carried subject/object constant ids, checking the id presence matches the
+    // atom's constant structure (and the atom itself satisfies the v1 constraints).
+    let mut atom_ids = Vec::with_capacity(k);
+    for (i, (atom, ap)) in plan.atoms.iter().zip(proof.atoms.iter()).enumerate() {
+        validate_atom(atom)?;
+        let ids = AtomIds {
+            predicate_id: predicate_ids[i],
+            subject_id: ap.subject_id,
+            object_id: ap.object_id,
+        };
+        check_ids_consistent(atom, &ids)?;
+        // The membership presence must match the constant structure too.
+        if ids.subject_id.is_some() != ap.subject_membership.is_some()
+            || ids.object_id.is_some() != ap.object_membership.is_some()
+        {
+            return Err(invalid(
+                "layer BGP atom membership presence does not match the plan",
+            ));
+        }
+        atom_ids.push(ids);
+    }
 
+    let mut transcript = Transcript254::new(LAYER_BGP_DOMAIN);
+    bind_layer_bgp_statement(&mut transcript, layer, plan, &atom_ids);
+
+    let com_pred_hash = layer.predicate_dict_commitments.0;
+    let com_pred_id = layer.predicate_dict_commitments.1;
+    let com_nv_hash = layer.node_value_dict_commitments.0;
+    let com_nv_id = layer.node_value_dict_commitments.1;
     let com_s = layer.column_commitments[0];
     let com_p = layer.column_commitments[1];
     let com_o = layer.column_commitments[2];
 
     let mut relations: Vec<RelationCommit> = Vec::with_capacity(k);
-    for (atom, ap) in plan.atoms.iter().zip(proof.atoms.iter()) {
-        let pred_id = predicate_ids[relations.len()];
-        // The filter dimension must match the layer's committed table columns.
-        if ap.filter.sumcheck.round_polys.len() != a {
-            return Err(invalid(
-                "atom filter dimension does not match the layer's committed columns",
-            ));
+    for ((atom, ap), ids) in plan
+        .atoms
+        .iter()
+        .zip(proof.atoms.iter())
+        .zip(atom_ids.iter())
+    {
+        // A compacted atom filter's dimension must match the layer's committed table
+        // columns (defense-in-depth; the Dory openings would also catch a mismatch).
+        if let AtomFilterProof::Compacted(inner) = &ap.filter {
+            if inner.sumcheck.round_polys.len() != a {
+                return Err(invalid(
+                    "atom filter dimension does not match the layer's committed columns",
+                ));
+            }
         }
-        // (1) Membership: the revealed id is authentic for this IRI.
-        let q_hash = hash_term(&atom.predicate_term);
-        let id = ArkFr::from_u64(pred_id);
+        // (1) Predicate membership: the revealed id is authentic for this IRI.
         verify_dict_membership(
-            &layer.predicate_dict_commitments.0,
-            &layer.predicate_dict_commitments.1,
-            q_hash,
-            id,
-            &ap.membership,
+            &com_pred_hash,
+            &com_pred_id,
+            hash_term(&atom.predicate_term),
+            ArkFr::from_u64(ids.predicate_id),
+            &ap.predicate_membership,
             &mut transcript,
         )?;
-        // (2) Filter: (S_out, O_out) is the complete predicate result (length m).
-        let pred = ArkFr::from_u64(pred_id);
-        verify_filter(
-            &com_s, &com_p, &com_o, pred, n, &ap.com_sout, &ap.com_oout, ap.m, &ap.filter,
+        // (2) Subject / object constant memberships, in the SAME order as the prover. The
+        // authenticated id is reused verbatim in the filter spec below (the security tie).
+        if let Some(subject_id) = ids.subject_id {
+            let object = atom_term_object(&atom.subject)
+                .ok_or_else(|| invalid("subject id present for a variable subject"))?;
+            let membership = ap
+                .subject_membership
+                .as_ref()
+                .ok_or_else(|| invalid("missing subject constant membership"))?;
+            verify_dict_membership(
+                &com_nv_hash,
+                &com_nv_id,
+                hash_object(&object),
+                ArkFr::from_u64(subject_id),
+                membership,
+                &mut transcript,
+            )?;
+        }
+        if let Some(object_id) = ids.object_id {
+            let object = atom_term_object(&atom.object)
+                .ok_or_else(|| invalid("object id present for a variable object"))?;
+            let membership = ap
+                .object_membership
+                .as_ref()
+                .ok_or_else(|| invalid("missing object constant membership"))?;
+            verify_dict_membership(
+                &com_nv_hash,
+                &com_nv_id,
+                hash_object(&object),
+                ArkFr::from_u64(object_id),
+                membership,
+                &mut transcript,
+            )?;
+        }
+        // (3) Filter: `kept_commitments[0..m]` is the complete per-atom result. The spec
+        // reuses the SAME ids the memberships authenticated.
+        let spec = atom_filter_spec(atom, ids);
+        verify_atom_filter(
+            &spec,
+            n,
+            &com_s,
+            &com_p,
+            &com_o,
+            &ap.kept_commitments,
+            ap.m,
+            &ap.filter,
             &mut transcript,
         )?;
         relations.push(RelationCommit {
-            commitments: vec![ap.com_sout, ap.com_oout],
+            commitments: ap.kept_commitments.clone(),
             log_domain: a,
             n: ap.m,
         });
     }
 
-    // (3) The left-deep chain over the k filtered relations.
-    let (chain_coms, chain_m) = verify_bgp_chain(&relations, &plan.joins, &proof.chain, &mut transcript)?;
+    // (4) The left-deep chain over the k filtered relations.
+    let (chain_coms, chain_m) =
+        verify_bgp_chain(&relations, &plan.joins, &proof.chain, &mut transcript)?;
     if chain_m != m || chain_coms.as_slice() != result_coms {
         return Err(invalid(
             "layer BGP result does not match the proof's chain output",
@@ -1015,7 +1309,7 @@ mod tests {
     const OWNS: &[u8] = b"http://ex/owns";
 
     fn atom(term: &[u8]) -> LayerBgpAtom {
-        LayerBgpAtom { predicate_term: term.to_vec() }
+        LayerBgpAtom::all_variables(term.to_vec())
     }
 
     // The two (subject, object) columns of one atom relation, filtered from the layer's

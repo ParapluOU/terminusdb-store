@@ -624,6 +624,35 @@ fn slices(cols: &[Vec<ArkFr>]) -> Vec<&[ArkFr]> {
     cols.iter().map(|c| c.as_slice()).collect()
 }
 
+/// The DENSE kept OUTPUT columns that [`prove_atom_filter`] commits (`com_kept`),
+/// plus the match count `m`, WITHOUT rerunning the sumcheck. For |C| = 0 the kept
+/// columns ARE the base columns (full padded length, `m = real_rows`); for |C| >= 1
+/// they are the `sel`-compaction of the kept-source columns (dense prefix in
+/// `[0, m)`, zero tail, each length `s.len()`). The returned columns equal what
+/// `prove_atom_filter` committed bit-for-bit — it derives them via the very same
+/// `kept_source_columns`/`atom_sel`/`compact_columns` pipeline — so the query layer
+/// can build a chain relation whose per-column commitments are exactly `com_kept`.
+pub(crate) fn atom_kept_columns(
+    spec: &AtomFilterSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    real_rows: usize,
+) -> io::Result<(Vec<Vec<ArkFr>>, usize)> {
+    spec.validate()?;
+    if spec.constants.is_empty() {
+        let cols = spec
+            .kept
+            .iter()
+            .map(|pos| base_column(*pos, s, p, o).to_vec())
+            .collect();
+        return Ok((cols, real_rows));
+    }
+    let sources = kept_source_columns(spec, s, p, o);
+    let sel = atom_sel(spec, s, p, o, real_rows);
+    Ok(compact_columns(&sources, &sel))
+}
+
 /// Prove the selection + compaction argument for an EXPLICIT `sel`/`kept_out` witness
 /// (the honest entry derives them; tests inject malicious ones). `sources` are the
 /// kept-source INPUT columns; `w`/`cstar`/`dstar` are always derived honestly (`w`
