@@ -28,19 +28,17 @@ use super::bgp::{
     prove_bgp_chain, verify_bgp_chain, BgpChainProof, JoinStep, RelationCommit, RelationWitness,
 };
 use super::commitment::LayerCommitment;
-use super::ProofHash;
 use super::dict::{
     hash_object, hash_term, prove_dict_membership, verify_dict_membership, DictProof,
 };
 use super::filter::{
-    atom_kept_columns, compact_selected, honest_witness, prove_atom_filter,
-    prove_boolean_product, prove_compaction_only, prove_filter, prove_selection_only,
-    verify_atom_filter, verify_boolean_product, verify_compaction_only, verify_filter,
-    verify_selection_only, AtomFilterProof, AtomFilterSpec, BooleanProductProof,
-    CompactionOnlyProof, FullFilterProof, Position, SelectionOnlyProof,
+    atom_kept_columns, compact_selected, honest_witness, prove_atom_filter, prove_boolean_product,
+    prove_compaction_only, prove_filter, prove_selection_only, verify_atom_filter,
+    verify_boolean_product, verify_compaction_only, verify_filter, verify_selection_only,
+    AtomFilterProof, AtomFilterSpec, BooleanProductProof, CompactionOnlyProof, FullFilterProof,
+    Position, SelectionOnlyProof,
 };
 use super::invalid;
-use super::{CanonicalDatatype, CanonicalObject};
 use super::join::{
     compute_self_join, prove_self_join_complete, self_join_commitments, self_join_domain,
     verify_self_join_complete, SelfJoinCommitments, SelfJoinCompleteProof,
@@ -50,6 +48,8 @@ use super::range::{
     ObjectRangeProof, RangeOp,
 };
 use super::relocate::{prove_column_relocation, verify_column_relocation, RelocationProof};
+use super::ProofHash;
+use super::{CanonicalDatatype, CanonicalObject};
 
 const QUERY_DOMAIN: &[u8] = b"parture/proof-of-woql/q1-query-by-iri/v0";
 
@@ -389,8 +389,7 @@ pub fn prove_layer_graph_pattern2(
     let (x, y, z, rho_l, rho_r, u, w_l, w_r, m_j) = compute_self_join(sf, of);
     let n_u = u.len();
     let n_join = self_join_domain(m, m_j, n_u)?;
-    let jcom =
-        self_join_commitments(sf, of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r)?;
+    let jcom = self_join_commitments(sf, of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r)?;
 
     // (4) Relocate F from the table domain to the join domain (positional equality).
     let target_sf = pad(sf, n_join);
@@ -402,7 +401,19 @@ pub fn prove_layer_graph_pattern2(
 
     // (5) The complete self-join argument over the relocated F.
     let join = prove_self_join_complete(
-        sf, of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r, m_j, &jcom, &mut transcript,
+        sf,
+        of,
+        &x,
+        &y,
+        &z,
+        &rho_l,
+        &rho_r,
+        &u,
+        &w_l,
+        &w_r,
+        m_j,
+        &jcom,
+        &mut transcript,
     )?;
 
     let (com_x, com_y, com_z) = (jcom.x, jcom.y, jcom.z);
@@ -572,6 +583,12 @@ pub enum AtomTerm {
 /// bit-width (`64` for the store's `<= 8`-byte numerics — see [`super::range`]). Bound
 /// into the layer BGP statement so the query is fully pinned.
 #[derive(Clone, Debug)]
+pub struct ObjectRangeBound {
+    pub op: RangeOp,
+    pub c: ArkFr,
+}
+
+#[derive(Clone, Debug)]
 pub struct ObjectRangeSpec {
     pub op: RangeOp,
     /// The datatype discriminant `T` the object must match (a `CanonicalDatatype as u64`
@@ -580,6 +597,9 @@ pub struct ObjectRangeSpec {
     /// The order-preserving-encoded comparison constant `c`, as a field element.
     pub c: ArkFr,
     pub b_bits: usize,
+    /// Optional second bound over the same datatype and bit-width. This represents an
+    /// intersection, e.g. `V >= low AND V < high` for WOQL's half-open ranges.
+    pub second: Option<ObjectRangeBound>,
 }
 
 /// One atom of a layer BGP. v1 SCOPE: the PREDICATE is always a constant IRI
@@ -620,6 +640,18 @@ impl LayerBgpAtom {
     }
 }
 
+/// The additional authenticated selection and table-domain intersection used when an
+/// object range has a second bound.
+#[derive(Clone, Debug)]
+pub struct SecondRangeSubproof {
+    pub object_range: ObjectRangeProof,
+    pub com_range_sel_at_d: ArkGT,
+    pub relocate_range_sel: RelocationProof,
+    pub com_range_sel_at_table: ArkGT,
+    pub intersect: BooleanProductProof,
+    pub com_intersection_sel: ArkGT,
+}
+
 /// A layer BGP plan: `k` atoms and the `k - 1` left-deep join steps. `joins[j]` names
 /// the single shared variable's column on the evolving accumulator (`acc_key`) and on
 /// atom `j + 1`'s relation (`rel_key`). Each atom relation has ONE column per VARIABLE
@@ -658,6 +690,8 @@ pub struct RangeAtomSubproof {
     /// `range_sel` relocated from `D` back to the table domain, and its commitment.
     pub relocate_range_sel: RelocationProof,
     pub com_range_sel_at_table: ArkGT,
+    /// Present exactly when the public range spec carries a second bound.
+    pub second: Option<SecondRangeSubproof>,
     /// The constant-equality selection (predicate + any subject constant) and `Com(sel)`.
     pub equality: SelectionOnlyProof,
     pub com_equality_sel: ArkGT,
@@ -756,9 +790,7 @@ fn validate_atom(atom: &LayerBgpAtom) -> io::Result<()> {
         // A ranged object must be a KEPT variable — never a constant (a range on a
         // fixed object is a compile-time-true/false, out of v1 scope).
         if !matches!(atom.object, AtomTerm::Variable) {
-            return Err(invalid(
-                "layer BGP object range requires a variable object",
-            ));
+            return Err(invalid("layer BGP object range requires a variable object"));
         }
         if !(1..=252).contains(&range.b_bits) {
             return Err(invalid(
@@ -835,7 +867,10 @@ fn bind_layer_bgp_statement(
     plan: &LayerBgpPlan,
     atom_ids: &[AtomIds],
 ) {
-    transcript.append_bytes(b"pow/bgp-layer/commitment-root", &layer.state.commitment_root);
+    transcript.append_bytes(
+        b"pow/bgp-layer/commitment-root",
+        &layer.state.commitment_root,
+    );
     transcript.append_bytes(b"pow/bgp-layer/k", &(plan.atoms.len() as u64).to_le_bytes());
     for (atom, ids) in plan.atoms.iter().zip(atom_ids.iter()) {
         bind_atom_term(transcript, &atom.subject, ids.subject_id);
@@ -860,12 +895,31 @@ fn bind_layer_bgp_statement(
                     b"pow/bgp-layer/obj-range-bbits",
                     &(range.b_bits as u64).to_le_bytes(),
                 );
+                match &range.second {
+                    None => transcript.append_bytes(b"pow/bgp-layer/obj-range-second-none", &[]),
+                    Some(second) => {
+                        let op_tag: u8 = match second.op {
+                            RangeOp::Lt => 0,
+                            RangeOp::Le => 1,
+                            RangeOp::Gt => 2,
+                            RangeOp::Ge => 3,
+                        };
+                        transcript.append_bytes(b"pow/bgp-layer/obj-range-second-op", &[op_tag]);
+                        transcript.append_field(b"pow/bgp-layer/obj-range-second-c", &second.c);
+                    }
+                }
             }
         }
     }
     for step in &plan.joins {
-        transcript.append_bytes(b"pow/bgp-layer/acc-key", &(step.acc_key as u64).to_le_bytes());
-        transcript.append_bytes(b"pow/bgp-layer/rel-key", &(step.rel_key as u64).to_le_bytes());
+        transcript.append_bytes(
+            b"pow/bgp-layer/acc-key",
+            &(step.acc_key as u64).to_le_bytes(),
+        );
+        transcript.append_bytes(
+            b"pow/bgp-layer/rel-key",
+            &(step.rel_key as u64).to_le_bytes(),
+        );
     }
 }
 
@@ -997,8 +1051,13 @@ fn prove_ranged_atom(
 
     let dict_id_at_d = pad(&dict_id, d);
     let com_dict_id_at_d = commit_column(&dict_id_at_d)?;
-    let relocate_dict_id =
-        prove_column_relocation(&dict_id, &com_dict_id, &dict_id_at_d, &com_dict_id_at_d, transcript)?;
+    let relocate_dict_id = prove_column_relocation(
+        &dict_id,
+        &com_dict_id,
+        &dict_id_at_d,
+        &com_dict_id_at_d,
+        transcript,
+    )?;
 
     let dict_value_at_d = pad(&dict_value, d);
     let com_dict_value_at_d = commit_column(&dict_value_at_d)?;
@@ -1066,6 +1125,77 @@ fn prove_ranged_atom(
         transcript,
     )?;
 
+    // (c2) A second public bound reuses the already authenticated/relocated object and
+    // dictionary columns. Prove its selection independently, relocate it to the table
+    // domain, then authenticate the intersection of both masks.
+    let (effective_range_sel, com_effective_range_sel, second) =
+        if let Some(second_bound) = &range.second {
+            let (second_object_range, second_com_at_d) = prove_object_range_select(
+                &o_at_d,
+                &com_object_at_d,
+                &dict_id_at_d,
+                &dict_value_at_d,
+                &dict_datatype_at_d,
+                &com_dict_id_at_d,
+                &com_dict_value_at_d,
+                &com_dict_datatype_at_d,
+                n_dict,
+                range.datatype,
+                second_bound.op,
+                second_bound.c,
+                range.b_bits,
+                n,
+                transcript,
+            )?;
+            let second_sel_at_d = object_range_sel_column(
+                &o_at_d,
+                &dict_id_at_d,
+                &dict_value_at_d,
+                &dict_datatype_at_d,
+                n_dict,
+                range.datatype,
+                second_bound.op,
+                second_bound.c,
+                range.b_bits,
+                n,
+            );
+            let second_sel_at_table = second_sel_at_d[..table].to_vec();
+            let second_com_at_table = commit_column(&second_sel_at_table)?;
+            let second_relocate = prove_column_relocation(
+                &second_sel_at_d,
+                &second_com_at_d,
+                &second_sel_at_table,
+                &second_com_at_table,
+                transcript,
+            )?;
+            let (intersect, com_intersection_sel) = prove_boolean_product(
+                &range_sel_at_table,
+                &second_sel_at_table,
+                &com_range_sel_at_table,
+                &second_com_at_table,
+                transcript,
+            )?;
+            let intersection: Vec<ArkFr> = range_sel_at_table
+                .iter()
+                .zip(second_sel_at_table.iter())
+                .map(|(x, y)| *x * *y)
+                .collect();
+            (
+                intersection,
+                com_intersection_sel,
+                Some(SecondRangeSubproof {
+                    object_range: second_object_range,
+                    com_range_sel_at_d: second_com_at_d,
+                    relocate_range_sel: second_relocate,
+                    com_range_sel_at_table: second_com_at_table,
+                    intersect,
+                    com_intersection_sel,
+                }),
+            )
+        } else {
+            (range_sel_at_table.clone(), com_range_sel_at_table, None)
+        };
+
     // (d) Constant-equality selection (predicate + any subject constant) at the table
     // domain — pins com_equality_sel to the equality indicator (never touches the object).
     let (equality, com_equality_sel, eq_sel) =
@@ -1074,14 +1204,14 @@ fn prove_ranged_atom(
     // (e) Combined selection = equality_sel ⊙ range_sel (both boolean + χ_n-masked).
     let (combine, com_combined_sel) = prove_boolean_product(
         &eq_sel,
-        &range_sel_at_table,
+        &effective_range_sel,
         &com_equality_sel,
-        &com_range_sel_at_table,
+        &com_effective_range_sel,
         transcript,
     )?;
     let combined_sel: Vec<ArkFr> = eq_sel
         .iter()
-        .zip(range_sel_at_table.iter())
+        .zip(effective_range_sel.iter())
         .map(|(x, y)| *x * *y)
         .collect();
 
@@ -1096,8 +1226,13 @@ fn prove_ranged_atom(
         .iter()
         .map(|pos| kept_base_commitment(*pos, com_s, com_p, com_o))
         .collect();
-    let (compaction, kept_commitments, kept_columns, m) =
-        prove_compaction_only(&sources, &source_coms, &combined_sel, &com_combined_sel, transcript)?;
+    let (compaction, kept_commitments, kept_columns, m) = prove_compaction_only(
+        &sources,
+        &source_coms,
+        &combined_sel,
+        &com_combined_sel,
+        transcript,
+    )?;
 
     Ok((
         RangeAtomSubproof {
@@ -1113,6 +1248,7 @@ fn prove_ranged_atom(
             com_range_sel_at_d,
             relocate_range_sel,
             com_range_sel_at_table,
+            second,
             equality,
             com_equality_sel,
             combine,
@@ -1173,10 +1309,36 @@ fn verify_ranged_atom(
             ));
         }
     }
+    if let Some(second) = &sub.second {
+        for rounds in [
+            second.object_range.lookup.sumcheck.round_polys.len(),
+            second.object_range.datatype.sumcheck.round_polys.len(),
+            second.object_range.range.sumcheck.round_polys.len(),
+            second.object_range.combine.sumcheck.round_polys.len(),
+        ] {
+            if rounds != d_log {
+                return Err(invalid(
+                    "second range sub-proof dimension does not match the dictionary domain",
+                ));
+            }
+        }
+        if second.intersect.sumcheck.round_polys.len() != a {
+            return Err(invalid(
+                "range-intersection dimension does not match the table domain",
+            ));
+        }
+    }
 
     // (a) Verify the four relocations to the common domain D against the root-bound
     // originals (com_o + the three dict commitments).
-    verify_column_relocation(com_o, a, &sub.com_object_at_d, d_log, &sub.relocate_object, transcript)?;
+    verify_column_relocation(
+        com_o,
+        a,
+        &sub.com_object_at_d,
+        d_log,
+        &sub.relocate_object,
+        transcript,
+    )?;
     verify_column_relocation(
         &com_dict_id,
         dict_log,
@@ -1229,13 +1391,66 @@ fn verify_ranged_atom(
         transcript,
     )?;
 
+    // (c2) A public second bound requires exactly one matching subproof. Its selection
+    // is authenticated against the same relocated columns and intersected with the first.
+    let com_effective_range_sel = match (&range.second, &sub.second) {
+        (None, None) => sub.com_range_sel_at_table,
+        (Some(bound), Some(second)) => {
+            verify_object_range_select(
+                &sub.com_object_at_d,
+                &sub.com_dict_id_at_d,
+                &sub.com_dict_value_at_d,
+                &sub.com_dict_datatype_at_d,
+                n_dict,
+                range.datatype,
+                bound.op,
+                bound.c,
+                range.b_bits,
+                n,
+                &second.com_range_sel_at_d,
+                &second.object_range,
+                transcript,
+            )?;
+            verify_column_relocation(
+                &second.com_range_sel_at_d,
+                d_log,
+                &second.com_range_sel_at_table,
+                a,
+                &second.relocate_range_sel,
+                transcript,
+            )?;
+            verify_boolean_product(
+                &sub.com_range_sel_at_table,
+                &second.com_range_sel_at_table,
+                &second.com_intersection_sel,
+                &second.intersect,
+                transcript,
+            )?;
+            second.com_intersection_sel
+        }
+        _ => {
+            return Err(invalid(
+                "second range subproof presence does not match the public plan",
+            ))
+        }
+    };
+
     // (d) Verify the constant-equality selection.
-    verify_selection_only(spec, n, com_s, com_p, com_o, &sub.com_equality_sel, &sub.equality, transcript)?;
+    verify_selection_only(
+        spec,
+        n,
+        com_s,
+        com_p,
+        com_o,
+        &sub.com_equality_sel,
+        &sub.equality,
+        transcript,
+    )?;
 
     // (e) Verify the combined selection = equality_sel · range_sel.
     verify_boolean_product(
         &sub.com_equality_sel,
-        &sub.com_range_sel_at_table,
+        &com_effective_range_sel,
         &sub.com_combined_sel,
         &sub.combine,
         transcript,
@@ -1359,7 +1574,15 @@ pub fn prove_layer_bgp(
         let (filter, range, kept_commitments, kept_columns, m) = match &atom.object_range {
             None => {
                 let (filter, kept_commitments, m) = prove_atom_filter(
-                    &spec, &s, &p, &o, n, &com_s, &com_p, &com_o, &mut transcript,
+                    &spec,
+                    &s,
+                    &p,
+                    &o,
+                    n,
+                    &com_s,
+                    &com_p,
+                    &com_o,
+                    &mut transcript,
                 )?;
                 // The dense kept columns (== what prove_atom_filter committed) as the
                 // chain relation; its arity equals the number of variables in the atom.
@@ -1369,7 +1592,17 @@ pub fn prove_layer_bgp(
             }
             Some(object_range) => {
                 let (sub, kept_commitments, kept_columns, m) = prove_ranged_atom(
-                    &spec, object_range, &s, &p, &o, n, a, &com_s, &com_p, &com_o, layer,
+                    &spec,
+                    object_range,
+                    &s,
+                    &p,
+                    &o,
+                    n,
+                    a,
+                    &com_s,
+                    &com_p,
+                    &com_o,
+                    layer,
                     &mut transcript,
                 )?;
                 (None, Some(sub), kept_commitments, kept_columns, m)
@@ -1559,9 +1792,7 @@ pub fn verify_layer_bgp(
         match &atom.object_range {
             None => {
                 if ap.range.is_some() {
-                    return Err(invalid(
-                        "plain layer BGP atom carries a range subproof",
-                    ));
+                    return Err(invalid("plain layer BGP atom carries a range subproof"));
                 }
                 let filter = ap
                     .filter
@@ -1704,7 +1935,17 @@ mod tests {
         let (proof, com_sout, com_oout, m, resolved_id) = prove_layer_filter(&lc, P1).unwrap();
         // The verifier is given ONLY the IRI bytes + the revealed id (authenticated
         // by membership) -- never an out-of-band id.
-        verify_layer_filter(&lc, lc.state.commitment_root, P1,resolved_id, &com_sout, &com_oout, m, &proof).unwrap();
+        verify_layer_filter(
+            &lc,
+            lc.state.commitment_root,
+            P1,
+            resolved_id,
+            &com_sout,
+            &com_oout,
+            m,
+            &proof,
+        )
+        .unwrap();
 
         // Result is EXACTLY the p1 rows (count + contents).
         assert_eq!(m, 4);
@@ -1720,10 +1961,17 @@ mod tests {
         let (proof, com_sout, com_oout, m, resolved_id) = prove_layer_filter(&lc, P1).unwrap();
         // Claim a different id for the same IRI -> membership fails.
         let wrong = resolved_id.wrapping_add(1);
-        assert!(
-            verify_layer_filter(&lc, lc.state.commitment_root, P1, wrong, &com_sout, &com_oout, m, &proof)
-                .is_err()
-        );
+        assert!(verify_layer_filter(
+            &lc,
+            lc.state.commitment_root,
+            P1,
+            wrong,
+            &com_sout,
+            &com_oout,
+            m,
+            &proof
+        )
+        .is_err());
     }
 
     #[test]
@@ -1733,17 +1981,26 @@ mod tests {
         // p2's genuine id, but paired with p1's IRI: (hash_term(p1), id_p2) is not a
         // dictionary row -> membership fails.
         let p2_id = resolve_predicate_id(&lc, P2).unwrap();
-        assert!(
-            verify_layer_filter(&lc, lc.state.commitment_root, P1, p2_id, &com_sout, &com_oout, m, &proof)
-                .is_err()
-        );
+        assert!(verify_layer_filter(
+            &lc,
+            lc.state.commitment_root,
+            P1,
+            p2_id,
+            &com_sout,
+            &com_oout,
+            m,
+            &proof
+        )
+        .is_err());
     }
 
     #[test]
     fn absent_predicate_iri_fails_closed() {
         let lc = sample_layer();
         let err = prove_layer_filter(&lc, b"http://ex/absent").unwrap_err();
-        assert!(err.to_string().contains("predicate not in layer dictionary"));
+        assert!(err
+            .to_string()
+            .contains("predicate not in layer dictionary"));
     }
 
     #[test]
@@ -1751,11 +2008,29 @@ mod tests {
         let lc = sample_layer();
         let (proof, com_sout, com_oout, m, resolved_id) = prove_layer_filter(&lc, P1).unwrap();
         // Wrong S_out commitment (use the O_out one) -> filter opening fails.
-        assert!(
-            verify_layer_filter(&lc, lc.state.commitment_root, P1,resolved_id, &com_oout, &com_oout, m, &proof).is_err()
-        );
+        assert!(verify_layer_filter(
+            &lc,
+            lc.state.commitment_root,
+            P1,
+            resolved_id,
+            &com_oout,
+            &com_oout,
+            m,
+            &proof
+        )
+        .is_err());
         // Honest still verifies.
-        verify_layer_filter(&lc, lc.state.commitment_root, P1,resolved_id, &com_sout, &com_oout, m, &proof).unwrap();
+        verify_layer_filter(
+            &lc,
+            lc.state.commitment_root,
+            P1,
+            resolved_id,
+            &com_sout,
+            &com_oout,
+            m,
+            &proof,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1854,10 +2129,20 @@ mod tests {
             ("a", "knows", "e"),
             ("a", "likes", "zz"),
         ]);
-        let (proof, com_x, com_y, com_z, m_j, id) =
-            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        let (proof, com_x, com_y, com_z, m_j, id) = prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         // Verifier sees ONLY the IRI + revealed id + result commitments.
-        verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
+        verify_layer_graph_pattern2(
+            &lc,
+            lc.state.commitment_root,
+            KNOWS,
+            id,
+            &com_x,
+            &com_y,
+            &com_z,
+            m_j,
+            &proof,
+        )
+        .unwrap();
 
         // Result is EXACTLY the two 2-hop paths (count + contents).
         assert_eq!(m_j, 2);
@@ -1870,56 +2155,111 @@ mod tests {
 
     #[test]
     fn graph_pattern2_mismatched_result_or_count_is_rejected() {
-        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c"), ("c", "knows", "d")]);
-        let (proof, com_x, com_y, com_z, m_j, id) =
-            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("c", "knows", "d"),
+        ]);
+        let (proof, com_x, com_y, com_z, m_j, id) = prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         // Wrong result commitment (pass Com Z for Com X) -> mismatch with proof output.
-        assert!(
-            verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &com_z, &com_y, &com_z, m_j, &proof)
-                .is_err()
-        );
+        assert!(verify_layer_graph_pattern2(
+            &lc,
+            lc.state.commitment_root,
+            KNOWS,
+            id,
+            &com_z,
+            &com_y,
+            &com_z,
+            m_j,
+            &proof
+        )
+        .is_err());
         // Wrong claimed count.
-        assert!(
-            verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &com_x, &com_y, &com_z, m_j + 1, &proof)
-                .is_err()
-        );
+        assert!(verify_layer_graph_pattern2(
+            &lc,
+            lc.state.commitment_root,
+            KNOWS,
+            id,
+            &com_x,
+            &com_y,
+            &com_z,
+            m_j + 1,
+            &proof
+        )
+        .is_err());
         // Honest verifies.
-        verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
+        verify_layer_graph_pattern2(
+            &lc,
+            lc.state.commitment_root,
+            KNOWS,
+            id,
+            &com_x,
+            &com_y,
+            &com_z,
+            m_j,
+            &proof,
+        )
+        .unwrap();
     }
 
     #[test]
     fn graph_pattern2_fabricated_join_output_is_rejected() {
         // Fabricate a bogus X-commitment and pass it consistently (defeats the equality
         // gate); the self-join column opening still binds X to the sumcheck -> REJECT.
-        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c"), ("c", "knows", "d")]);
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("c", "knows", "d"),
+        ]);
         let (proof, _com_x, com_y, com_z, m_j, id) =
             prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         let (_, _, _, n_join, _) = expected_join(&lc, id);
         let fake_x = commit_column(&pad(&[ArkFr::from_u64(424242)], n_join)).unwrap();
         let mut bad = proof.clone();
         bad.join_commitments.x = fake_x;
-        assert!(
-            verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &fake_x, &com_y, &com_z, m_j, &bad)
-                .is_err()
-        );
+        assert!(verify_layer_graph_pattern2(
+            &lc,
+            lc.state.commitment_root,
+            KNOWS,
+            id,
+            &fake_x,
+            &com_y,
+            &com_z,
+            m_j,
+            &bad
+        )
+        .is_err());
     }
 
     #[test]
     fn graph_pattern2_no_two_hop_paths_empty_verifies() {
         // Disjoint edges a->b and c->d: no y with x->y and y->z, so the result is empty.
         let lc = build_layer(&[("a", "knows", "b"), ("c", "knows", "d")]);
-        let (proof, com_x, com_y, com_z, m_j, id) =
-            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        let (proof, com_x, com_y, com_z, m_j, id) = prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         assert_eq!(m_j, 0);
-        verify_layer_graph_pattern2(&lc, lc.state.commitment_root, KNOWS,id, &com_x, &com_y, &com_z, m_j, &proof).unwrap();
+        verify_layer_graph_pattern2(
+            &lc,
+            lc.state.commitment_root,
+            KNOWS,
+            id,
+            &com_x,
+            &com_y,
+            &com_z,
+            m_j,
+            &proof,
+        )
+        .unwrap();
     }
 
     #[test]
     fn graph_pattern2_tampered_layer_root_is_rejected() {
-        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c"), ("c", "knows", "d")]);
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("c", "knows", "d"),
+        ]);
         let good_root = lc.state.commitment_root;
-        let (proof, com_x, com_y, com_z, m_j, id) =
-            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        let (proof, com_x, com_y, com_z, m_j, id) = prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         // Corrupt the anchor: a layer whose stored root does not bind its columns.
         let mut tampered = (*lc).clone();
         tampered.state.commitment_root[0] ^= 0xff;
@@ -1935,9 +2275,12 @@ mod tests {
     fn graph_pattern2_wrong_expected_root_is_rejected() {
         // FIX 4 (external-root anchor): an honest proof against an honest layer must
         // still REJECT when the verifier pins a DIFFERENT externally-trusted root.
-        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c"), ("c", "knows", "d")]);
-        let (proof, com_x, com_y, com_z, m_j, id) =
-            prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("c", "knows", "d"),
+        ]);
+        let (proof, com_x, com_y, com_z, m_j, id) = prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         let mut wrong_root = lc.state.commitment_root;
         wrong_root[0] ^= 0xff;
         assert!(verify_layer_graph_pattern2(
@@ -2038,13 +2381,28 @@ mod tests {
         let plan = LayerBgpPlan {
             atoms: vec![atom(KNOWS), atom(LIKES), atom(OWNS)],
             joins: vec![
-                JoinStep { acc_key: 1, rel_key: 0 }, // y = O(knows) == S(likes)
-                JoinStep { acc_key: 2, rel_key: 0 }, // z = O(likes) == S(owns)
+                JoinStep {
+                    acc_key: 1,
+                    rel_key: 0,
+                }, // y = O(knows) == S(likes)
+                JoinStep {
+                    acc_key: 2,
+                    rel_key: 0,
+                }, // z = O(likes) == S(owns)
             ],
         };
         let (proof, result_coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
         // Verifier sees ONLY the IRIs + revealed ids + result commitments.
-        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &result_coms, m, &proof).unwrap();
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &ids,
+            &result_coms,
+            m,
+            &proof,
+        )
+        .unwrap();
 
         // Result is EXACTLY the three 3-hop paths (count + committed columns).
         assert_eq!(m, 3);
@@ -2071,13 +2429,24 @@ mod tests {
         let (gp, com_x, com_y, com_z, gp_m, gp_id) =
             prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         verify_layer_graph_pattern2(
-            &lc, lc.state.commitment_root, KNOWS, gp_id, &com_x, &com_y, &com_z, gp_m, &gp,
+            &lc,
+            lc.state.commitment_root,
+            KNOWS,
+            gp_id,
+            &com_x,
+            &com_y,
+            &com_z,
+            gp_m,
+            &gp,
         )
         .unwrap();
 
         let plan = LayerBgpPlan {
             atoms: vec![atom(KNOWS), atom(KNOWS)],
-            joins: vec![JoinStep { acc_key: 1, rel_key: 0 }],
+            joins: vec![JoinStep {
+                acc_key: 1,
+                rel_key: 0,
+            }],
         };
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
         verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
@@ -2099,16 +2468,7 @@ mod tests {
         };
 
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
-        verify_layer_bgp(
-            &lc,
-            lc.state.commitment_root,
-            &plan,
-            &ids,
-            &coms,
-            m,
-            &proof,
-        )
-        .unwrap();
+        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
 
         assert_eq!(m, 2);
         assert!(proof.chain.is_none());
@@ -2125,46 +2485,51 @@ mod tests {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
         let plan = LayerBgpPlan {
             atoms: vec![atom(KNOWS), atom(KNOWS)],
-            joins: vec![JoinStep { acc_key: 1, rel_key: 0 }],
+            joins: vec![JoinStep {
+                acc_key: 1,
+                rel_key: 0,
+            }],
         };
         let (mut proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
         proof.chain = None;
-        assert!(verify_layer_bgp(
-            &lc,
-            lc.state.commitment_root,
-            &plan,
-            &ids,
-            &coms,
-            m,
-            &proof,
-        )
-        .is_err());
+        assert!(
+            verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof,)
+                .is_err()
+        );
     }
 
     #[test]
     fn layer_bgp_wrong_expected_root_is_rejected() {
-        let lc = build_layer(&[
-            ("a", "knows", "b"),
-            ("b", "likes", "c"),
-            ("c", "owns", "d"),
-        ]);
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c"), ("c", "owns", "d")]);
         let plan = LayerBgpPlan {
             atoms: vec![atom(KNOWS), atom(LIKES), atom(OWNS)],
             joins: vec![
-                JoinStep { acc_key: 1, rel_key: 0 },
-                JoinStep { acc_key: 2, rel_key: 0 },
+                JoinStep {
+                    acc_key: 1,
+                    rel_key: 0,
+                },
+                JoinStep {
+                    acc_key: 2,
+                    rel_key: 0,
+                },
             ],
         };
         let (proof, result_coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
         // A DIFFERENT externally-trusted root must reject even an honest proof.
         let mut wrong_root = lc.state.commitment_root;
         wrong_root[0] ^= 0xff;
-        assert!(
-            verify_layer_bgp(&lc, wrong_root, &plan, &ids, &result_coms, m, &proof).is_err()
-        );
+        assert!(verify_layer_bgp(&lc, wrong_root, &plan, &ids, &result_coms, m, &proof).is_err());
         // The correct external root still verifies.
-        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &result_coms, m, &proof)
-            .unwrap();
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &ids,
+            &result_coms,
+            m,
+            &proof,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2172,7 +2537,10 @@ mod tests {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
         let plan = LayerBgpPlan {
             atoms: vec![atom(KNOWS), atom(b"http://ex/absent")],
-            joins: vec![JoinStep { acc_key: 1, rel_key: 0 }],
+            joins: vec![JoinStep {
+                acc_key: 1,
+                rel_key: 0,
+            }],
         };
         assert!(prove_layer_bgp(&lc, &plan).is_err());
     }
@@ -2256,7 +2624,13 @@ mod tests {
             (k, other)
         };
         let rel = |i: usize| {
-            kept_relation(lc, &atoms[i], predicate_ids[i], subject_ids[i], object_ids[i])
+            kept_relation(
+                lc,
+                &atoms[i],
+                predicate_ids[i],
+                subject_ids[i],
+                object_ids[i],
+            )
         };
         let mut acc = rel(0);
         let mut acc_len = acc[0].len();
@@ -2287,11 +2661,21 @@ mod tests {
         assert_eq!(m, expected_m);
         let subject_ids: Vec<Option<u64>> = proof.atoms.iter().map(|a| a.subject_id).collect();
         let object_ids: Vec<Option<u64>> = proof.atoms.iter().map(|a| a.object_id).collect();
-        let (exp_cols, domain) =
-            expected_const_bgp(lc, &plan.atoms, &ids, &subject_ids, &object_ids, &plan.joins);
+        let (exp_cols, domain) = expected_const_bgp(
+            lc,
+            &plan.atoms,
+            &ids,
+            &subject_ids,
+            &object_ids,
+            &plan.joins,
+        );
         assert_eq!(coms.len(), exp_cols.len());
         for (c, col) in exp_cols.iter().enumerate() {
-            assert_eq!(commit_column(&pad(col, domain)).unwrap(), coms[c], "column {c}");
+            assert_eq!(
+                commit_column(&pad(col, domain)).unwrap(),
+                coms[c],
+                "column {c}"
+            );
         }
     }
 
@@ -2320,12 +2704,16 @@ mod tests {
                     object_range: None,
                 },
             ],
-            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }], // x = S(likes) == S(knows)
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+            }], // x = S(likes) == S(knows)
         };
         let (proof, _coms, _m, _ids) = prove_layer_bgp(&lc, &plan).unwrap();
         // The revealed object id equals <b>'s node/value dictionary id; the variable
         // atom reveals no constant ids.
-        let b_id = resolve_node_value_id(&lc, &CanonicalObject::Node(iri("b").into_bytes())).unwrap();
+        let b_id =
+            resolve_node_value_id(&lc, &CanonicalObject::Node(iri("b").into_bytes())).unwrap();
         assert_eq!(proof.atoms[1].object_id, Some(b_id));
         assert_eq!(proof.atoms[1].subject_id, None);
         assert_eq!(proof.atoms[0].subject_id, None);
@@ -2350,7 +2738,8 @@ mod tests {
         // Recover the EXACT canonical "hi" value object from the catalog (its lexical bytes
         // are the store's typed encoding, not literally b"hi"): find a's name-triple object.
         let name_id = resolve_predicate_id(&lc, NAME).unwrap();
-        let a_id = resolve_node_value_id(&lc, &CanonicalObject::Node(iri("a").into_bytes())).unwrap();
+        let a_id =
+            resolve_node_value_id(&lc, &CanonicalObject::Node(iri("a").into_bytes())).unwrap();
         let hi_id = lc
             .additions
             .iter()
@@ -2378,7 +2767,10 @@ mod tests {
                 },
                 LayerBgpAtom::all_variables(KNOWS.to_vec()),
             ],
-            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }], // x = S(name) == S(knows)
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+            }], // x = S(name) == S(knows)
         };
         let (proof, _coms, _m, _ids) = prove_layer_bgp(&lc, &plan).unwrap();
         assert_eq!(proof.atoms[0].object_id, Some(hi_id));
@@ -2410,10 +2802,14 @@ mod tests {
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
-            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }], // y = O(knows) == S(likes)
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+            }], // y = O(knows) == S(likes)
         };
         let (proof, _coms, _m, _ids) = prove_layer_bgp(&lc, &plan).unwrap();
-        let a_id = resolve_node_value_id(&lc, &CanonicalObject::Node(iri("a").into_bytes())).unwrap();
+        let a_id =
+            resolve_node_value_id(&lc, &CanonicalObject::Node(iri("a").into_bytes())).unwrap();
         assert_eq!(proof.atoms[0].subject_id, Some(a_id));
         assert_eq!(proof.atoms[0].object_id, None);
         // Result [y, z] = {(b,m),(b,o),(c,n)}.
@@ -2443,7 +2839,10 @@ mod tests {
                     object_range: None,
                 },
             ],
-            joins: vec![JoinStep { acc_key: 1, rel_key: 0 }], // y = O(knows) == S(likes)
+            joins: vec![JoinStep {
+                acc_key: 1,
+                rel_key: 0,
+            }], // y = O(knows) == S(likes)
         };
         // Honest: result [x, y] = {(a,b),(c,b)}.
         check_const_bgp(&lc, &plan, 2);
@@ -2456,25 +2855,38 @@ mod tests {
         // breaks the node/value membership (the pair is no longer a dictionary row).
         let mut bad_id = proof.clone();
         bad_id.atoms[1].object_id = Some(proof.atoms[1].object_id.unwrap().wrapping_add(1));
-        assert!(
-            verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &bad_id).is_err()
-        );
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &ids,
+            &coms,
+            m,
+            &bad_id
+        )
+        .is_err());
 
         // Substituting a DIFFERENT genuine node id (here <b>'s id) for <g> is also rejected:
         // membership binds the PAIR (hash_object(<g>), id), so <b>'s id fails for <g>.
-        let b_id = resolve_node_value_id(&lc, &CanonicalObject::Node(iri("b").into_bytes())).unwrap();
+        let b_id =
+            resolve_node_value_id(&lc, &CanonicalObject::Node(iri("b").into_bytes())).unwrap();
         let mut sub_id = proof.clone();
         sub_id.atoms[1].object_id = Some(b_id);
-        assert!(
-            verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &sub_id).is_err()
-        );
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &ids,
+            &coms,
+            m,
+            &sub_id
+        )
+        .is_err());
 
         // Wrong externally-trusted root rejects even an honest proof.
         let mut wrong_root = lc.state.commitment_root;
         wrong_root[0] ^= 0xff;
-        assert!(
-            verify_layer_bgp(&lc, wrong_root, &plan, &ids, &coms, m, &proof).is_err()
-        );
+        assert!(verify_layer_bgp(&lc, wrong_root, &plan, &ids, &coms, m, &proof).is_err());
 
         // Honest still verifies.
         verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
@@ -2494,7 +2906,10 @@ mod tests {
                     object_range: None,
                 },
             ],
-            joins: vec![JoinStep { acc_key: 1, rel_key: 0 }],
+            joins: vec![JoinStep {
+                acc_key: 1,
+                rel_key: 0,
+            }],
         };
         let err = prove_layer_bgp(&lc, &plan).unwrap_err();
         assert!(err
@@ -2516,7 +2931,10 @@ mod tests {
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
-            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+            }],
         };
         assert!(prove_layer_bgp(&lc, &ground).is_err());
         // A value literal in the SUBJECT position is rejected.
@@ -2530,7 +2948,10 @@ mod tests {
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
-            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+            }],
         };
         assert!(prove_layer_bgp(&lc, &value_subject).is_err());
     }
@@ -2570,7 +2991,11 @@ mod tests {
             ("erin", 18),
         ] {
             builder
-                .add_value_triple(ValueTriple::new_value(&iri(person), &age, u32::make_entry(&a)))
+                .add_value_triple(ValueTriple::new_value(
+                    &iri(person),
+                    &age,
+                    u32::make_entry(&a),
+                ))
                 .unwrap();
             builder
                 .add_value_triple(ValueTriple::new_node(
@@ -2597,7 +3022,11 @@ mod tests {
         let name = iri("name");
         for (person, a) in [("p1", 10u32), ("p2", 25), ("p3", 5)] {
             builder
-                .add_value_triple(ValueTriple::new_value(&iri(person), &age, u32::make_entry(&a)))
+                .add_value_triple(ValueTriple::new_value(
+                    &iri(person),
+                    &age,
+                    u32::make_entry(&a),
+                ))
                 .unwrap();
             builder
                 .add_value_triple(ValueTriple::new_node(
@@ -2635,11 +3064,15 @@ mod tests {
                     datatype: fr(UINT32_TAG),
                     c: fr(c),
                     b_bits: 64,
+                    second: None,
                 }),
                 LayerBgpAtom::all_variables(NAME.to_vec()),
             ],
             // x = S(age) == S(name).
-            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+            }],
         }
     }
 
@@ -2742,6 +3175,57 @@ mod tests {
     }
 
     #[test]
+    fn layer_bgp_two_sided_object_range_intersects_both_bounds() {
+        // Half-open [18, 40): carol=18, erin=18, alice=30 are included; bob=15 and
+        // dave=40 are excluded. The second mask must be present and multiplied with the
+        // first before the age relation is compacted.
+        let lc = build_age_name_layer();
+        let mut plan = age_range_plan(RangeOp::Ge, 18);
+        plan.atoms[0].object_range.as_mut().unwrap().second = Some(ObjectRangeBound {
+            op: RangeOp::Lt,
+            c: fr(40),
+        });
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        assert_eq!(m, 3);
+        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+
+        // The upper bound is part of the public statement and its own authenticated
+        // selection. Changing it cannot verify against the original proof.
+        let mut wrong_bound = plan.clone();
+        wrong_bound.atoms[0]
+            .object_range
+            .as_mut()
+            .unwrap()
+            .second
+            .as_mut()
+            .unwrap()
+            .c = fr(41);
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &wrong_bound,
+            &ids,
+            &coms,
+            m,
+            &proof,
+        )
+        .is_err());
+
+        let mut missing_second = proof.clone();
+        missing_second.atoms[0].range.as_mut().unwrap().second = None;
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &ids,
+            &coms,
+            m,
+            &missing_second,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn layer_bgp_object_range_wrong_expected_root_is_rejected() {
         let lc = build_age_name_layer();
         let plan = age_range_plan(RangeOp::Gt, 18);
@@ -2762,10 +3246,16 @@ mod tests {
         // Verifying against a DIFFERENT range constant: the constant is bound into the
         // statement AND the object-range sub-proof, so the transcript diverges -> REJECT.
         let plan_wrong_c = age_range_plan(RangeOp::Gt, 19);
-        assert!(
-            verify_layer_bgp(&lc, lc.state.commitment_root, &plan_wrong_c, &ids, &coms, m, &proof)
-                .is_err()
-        );
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan_wrong_c,
+            &ids,
+            &coms,
+            m,
+            &proof
+        )
+        .is_err());
 
         // Verifying against a DIFFERENT datatype tag (Boolean instead of UInt32) -> REJECT.
         let plan_wrong_dt = LayerBgpPlan {
@@ -2775,22 +3265,38 @@ mod tests {
                     datatype: fr(BOOLEAN_TAG),
                     c: fr(18),
                     b_bits: 64,
+                    second: None,
                 }),
                 LayerBgpAtom::all_variables(NAME.to_vec()),
             ],
-            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+            }],
         };
-        assert!(
-            verify_layer_bgp(&lc, lc.state.commitment_root, &plan_wrong_dt, &ids, &coms, m, &proof)
-                .is_err()
-        );
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan_wrong_dt,
+            &ids,
+            &coms,
+            m,
+            &proof
+        )
+        .is_err());
 
         // A DIFFERENT operator (Ge instead of Gt) -> REJECT (and would also change m).
         let plan_wrong_op = age_range_plan(RangeOp::Ge, 18);
-        assert!(
-            verify_layer_bgp(&lc, lc.state.commitment_root, &plan_wrong_op, &ids, &coms, m, &proof)
-                .is_err()
-        );
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan_wrong_op,
+            &ids,
+            &coms,
+            m,
+            &proof
+        )
+        .is_err());
 
         // Honest still verifies.
         verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
@@ -2811,11 +3317,15 @@ mod tests {
                         datatype: fr(UINT32_TAG),
                         c: fr(18),
                         b_bits: 64,
+                        second: None,
                     }),
                 },
                 LayerBgpAtom::all_variables(NAME.to_vec()),
             ],
-            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+            }],
         };
         assert!(prove_layer_bgp(&lc, &plan).is_err());
     }
