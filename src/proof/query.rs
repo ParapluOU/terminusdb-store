@@ -692,11 +692,13 @@ pub struct LayerBgpAtomProof {
 }
 
 /// A complete k-atom layer BGP proof: one per-atom (membership + filter) proof, plus the
-/// left-deep binary-join chain over the filtered relations, all under one transcript.
+/// left-deep binary-join chain over the filtered relations when `k >= 2`, all under one
+/// transcript. A single-atom query needs no join proof: its complete filtered relation is
+/// already the complete query result.
 #[derive(Clone, Debug)]
 pub struct LayerBgpProof {
     pub atoms: Vec<LayerBgpAtomProof>,
-    pub chain: BgpChainProof,
+    pub chain: Option<BgpChainProof>,
 }
 
 /// The resolved dictionary ids for one atom's constants: the predicate is always a
@@ -869,8 +871,8 @@ fn bind_layer_bgp_statement(
 
 fn validate_bgp_plan(plan: &LayerBgpPlan) -> io::Result<usize> {
     let k = plan.atoms.len();
-    if k < 2 {
-        return Err(invalid("layer BGP needs at least two atoms"));
+    if k == 0 {
+        return Err(invalid("layer BGP needs at least one atom"));
     }
     if plan.joins.len() != k - 1 {
         return Err(invalid("layer BGP plan must have exactly k-1 join steps"));
@@ -1394,8 +1396,16 @@ pub fn prove_layer_bgp(
         });
     }
 
-    // (5) The left-deep chain over the k filtered relations, same shared transcript.
-    let (chain, result_coms, result_m) = prove_bgp_chain(&relations, &plan.joins, &mut transcript)?;
+    // (5) The left-deep chain over the filtered relations, when there is something to
+    // join. For k=1 the complete atom filter result is already the query result.
+    let (chain, result_coms, result_m) = if k == 1 {
+        let relation = &relations[0];
+        (None, relation.commitments.clone(), relation.n)
+    } else {
+        let (chain, result_coms, result_m) =
+            prove_bgp_chain(&relations, &plan.joins, &mut transcript)?;
+        (Some(chain), result_coms, result_m)
+    };
 
     Ok((
         LayerBgpProof {
@@ -1602,9 +1612,21 @@ pub fn verify_layer_bgp(
         });
     }
 
-    // (4) The left-deep chain over the k filtered relations.
-    let (chain_coms, chain_m) =
-        verify_bgp_chain(&relations, &plan.joins, &proof.chain, &mut transcript)?;
+    // (4) The left-deep chain over the filtered relations, when k >= 2. A k=1 proof
+    // must not smuggle in an unrelated chain: its public result is exactly the verified
+    // atom-filter output.
+    let (chain_coms, chain_m) = if k == 1 {
+        if proof.chain.is_some() {
+            return Err(invalid("single-atom layer BGP carries a join-chain proof"));
+        }
+        (relations[0].commitments.clone(), relations[0].n)
+    } else {
+        let chain = proof
+            .chain
+            .as_ref()
+            .ok_or_else(|| invalid("multi-atom layer BGP is missing its join-chain proof"))?;
+        verify_bgp_chain(&relations, &plan.joins, chain, &mut transcript)?
+    };
     if chain_m != m || chain_coms.as_slice() != result_coms {
         return Err(invalid(
             "layer BGP result does not match the proof's chain output",
@@ -2062,6 +2084,61 @@ mod tests {
 
         assert_eq!(m, gp_m);
         assert_eq!(coms, vec![com_x, com_y, com_z]);
+    }
+
+    #[test]
+    fn layer_bgp_k1_is_exactly_the_complete_atom_filter() {
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("x", "likes", "y"),
+        ]);
+        let plan = LayerBgpPlan {
+            atoms: vec![atom(KNOWS)],
+            joins: vec![],
+        };
+
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &ids,
+            &coms,
+            m,
+            &proof,
+        )
+        .unwrap();
+
+        assert_eq!(m, 2);
+        assert!(proof.chain.is_none());
+        let expected = atom_relation(&lc, ids[0]);
+        let domain = padded_len(lc.additions.len()).unwrap();
+        assert_eq!(coms.len(), 2);
+        for (commitment, column) in coms.iter().zip(expected.iter()) {
+            assert_eq!(*commitment, commit_column(&pad(column, domain)).unwrap());
+        }
+    }
+
+    #[test]
+    fn layer_bgp_k2_rejects_a_missing_join_chain() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
+        let plan = LayerBgpPlan {
+            atoms: vec![atom(KNOWS), atom(KNOWS)],
+            joins: vec![JoinStep { acc_key: 1, rel_key: 0 }],
+        };
+        let (mut proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        proof.chain = None;
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &ids,
+            &coms,
+            m,
+            &proof,
+        )
+        .is_err());
     }
 
     #[test]
