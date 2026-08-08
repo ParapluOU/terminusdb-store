@@ -969,6 +969,16 @@ pub fn prove_object_range_select(
     real_n: usize,
     transcript: &mut Transcript254,
 ) -> io::Result<(ObjectRangeProof, ArkGT)> {
+    // Pin the bit-width: authenticated dict OP values are order-preserving numerics
+    // `< 2^64`, so the object-range gadget ALWAYS uses `b_bits = 64`. A too-small
+    // `b_bits` cannot forge a sign (the values genuinely fit), but it would make the
+    // recomposition fail to complete with a confusing bit-decomposition error; a
+    // too-large one wastes bits. Reject anything but the canonical width up front.
+    if b_bits != OBJECT_RANGE_B_BITS {
+        return Err(invalid(format!(
+            "object-range b_bits must be {OBJECT_RANGE_B_BITS} (authenticated dict values are < 2^64); got {b_bits}"
+        )));
+    }
     // 1) Derive + prove the authenticated (v_val, v_dt) for every obj_id row.
     let (v_val, v_dt, w) =
         honest_dict_lookup(obj_id, dict_id, dict_value, dict_datatype, real_n, n_dict);
@@ -1038,6 +1048,15 @@ pub fn verify_object_range_select(
     proof: &ObjectRangeProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
+    // Pin the bit-width to the canonical object-range width (see the prover): the
+    // authenticated dict values are `< 2^64`, so `b_bits` MUST be 64. Reject any
+    // other value with a clear error rather than letting the range sub-proof fail
+    // confusingly downstream.
+    if b_bits != OBJECT_RANGE_B_BITS {
+        return Err(invalid(format!(
+            "object-range b_bits must be {OBJECT_RANGE_B_BITS} (authenticated dict values are < 2^64); got {b_bits}"
+        )));
+    }
     verify_dict_value_lookup(
         com_obj_id,
         com_dict_id,
@@ -1894,6 +1913,45 @@ mod object_range_tests {
             &com_obj_id, &fx.com_id, &fx.com_value, &fx.com_datatype, fx.n_dict,
             ArkFr::from_u64(UINT32_TAG), RangeOp::Ge, ArkFr::from_u64(40), OBJECT_RANGE_B_BITS,
             real_n, &bogus, &proof, &mut vt,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn non_canonical_b_bits_is_rejected_by_object_range() {
+        // The object-range entry points PIN b_bits to OBJECT_RANGE_B_BITS (64): the
+        // authenticated dict values are < 2^64, so any other width is rejected up front
+        // with a clear error (rather than failing confusingly inside the range gadget).
+        let fx = build_dict_fixture();
+        let rows = mixed_rows(&fx);
+        let (obj_id, real_n) = query_columns(&fx, &rows);
+        let com_obj_id = commit(&obj_id);
+        // Prover rejects a too-small width.
+        let mut pt = transcript();
+        assert!(prove_object_range_select(
+            &obj_id, &com_obj_id, &fx.dict_id, &fx.dict_value, &fx.dict_datatype,
+            &fx.com_id, &fx.com_value, &fx.com_datatype, fx.n_dict,
+            ArkFr::from_u64(UINT32_TAG), RangeOp::Ge, ArkFr::from_u64(40),
+            32, // != OBJECT_RANGE_B_BITS
+            real_n, &mut pt,
+        )
+        .is_err());
+        // An HONEST proof at 64 bits, but the verifier is asked to check at a different
+        // width -> rejected before any sub-proof runs.
+        let mut pt2 = transcript();
+        let (proof, com_sel) = prove_object_range_select(
+            &obj_id, &com_obj_id, &fx.dict_id, &fx.dict_value, &fx.dict_datatype,
+            &fx.com_id, &fx.com_value, &fx.com_datatype, fx.n_dict,
+            ArkFr::from_u64(UINT32_TAG), RangeOp::Ge, ArkFr::from_u64(40), OBJECT_RANGE_B_BITS,
+            real_n, &mut pt2,
+        )
+        .unwrap();
+        let mut vt = transcript();
+        assert!(verify_object_range_select(
+            &com_obj_id, &fx.com_id, &fx.com_value, &fx.com_datatype, fx.n_dict,
+            ArkFr::from_u64(UINT32_TAG), RangeOp::Ge, ArkFr::from_u64(40),
+            128, // != OBJECT_RANGE_B_BITS
+            real_n, &com_sel, &proof, &mut vt,
         )
         .is_err());
     }

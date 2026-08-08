@@ -880,6 +880,32 @@ fn range_common_domain(a: usize, n_dict: usize) -> io::Result<(usize, usize)> {
     Ok((a.max(dict_log), dict_log))
 }
 
+/// The root-bound count of node/value dictionary rows THIS layer commits in its
+/// `node_value_catalog` columns. Taken from the root-bound state scalars
+/// (`node_value_count − parent_node_value_count`) rather than
+/// `node_value_catalog.len()`, for parity with how the table length `n` is taken from
+/// the root-bound `state.addition_count` rather than `additions.len()`. The two are
+/// pinned equal by `validate_complete_catalog` (which enforces
+/// `node_value_catalog.len() == node_value_count − parent_node_value_count`) and both
+/// are bound by `commitment_root`, so we also assert equality as defense-in-depth. For
+/// a MATERIALIZED BASE layer `parent_node_value_count == 0`, so this equals
+/// `node_value_count` — the whole authenticated dictionary — which is exactly what the
+/// object-range gadget must range over.
+fn root_bound_n_dict(layer: &LayerCommitment) -> io::Result<usize> {
+    let n_dict = layer
+        .state
+        .node_value_count
+        .checked_sub(layer.state.parent_node_value_count)
+        .ok_or_else(|| invalid("node/value dictionary count decreased below its parent"))?
+        as usize;
+    if n_dict != layer.node_value_catalog.len() {
+        return Err(invalid(
+            "root-bound node/value dictionary count does not match the committed catalog length",
+        ));
+    }
+    Ok(n_dict)
+}
+
 /// Prove one RANGED atom `t(?s, <p>, ?a) [?a op c]`: relocate the object column + the
 /// three dict columns to the common domain `D`, prove the authenticated object-range
 /// selection at `D`, relocate that `range_sel` back to the table domain, prove the
@@ -902,7 +928,7 @@ fn prove_ranged_atom(
     layer: &LayerCommitment,
     transcript: &mut Transcript254,
 ) -> io::Result<(RangeAtomSubproof, Vec<ArkGT>, Vec<Vec<ArkFr>>, usize)> {
-    let n_dict = layer.node_value_catalog.len();
+    let n_dict = root_bound_n_dict(layer)?;
     let (d_log, dict_log) = range_common_domain(a, n_dict)?;
     let d = 1usize << d_log;
 
@@ -1075,11 +1101,33 @@ fn verify_ranged_atom(
     m: usize,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    let n_dict = layer.node_value_catalog.len();
+    let n_dict = root_bound_n_dict(layer)?;
     let (d_log, dict_log) = range_common_domain(a, n_dict)?;
     let com_dict_id = layer.node_value_dict_commitments.1;
     let com_dict_value = layer.node_value_dict_range_commitments.0;
     let com_dict_datatype = layer.node_value_dict_range_commitments.1;
+
+    // Explicit sumcheck-dimension checks on the ranged sub-proofs, mirroring the
+    // plain-atom path's `filter.sumcheck.round_polys.len() == a` check (defense-in-depth;
+    // the Dory openings already pin these transitively). The object-range gadget runs
+    // entirely at the common domain `D` (its lookup/datatype-mask/range/combine sumchecks
+    // each have `d_log` variables); the constant-equality selection, the combined-selection
+    // product, and the compaction all run at the table domain (`a` variables).
+    for (rounds, expected) in [
+        (sub.object_range.lookup.sumcheck.round_polys.len(), d_log),
+        (sub.object_range.datatype.sumcheck.round_polys.len(), d_log),
+        (sub.object_range.range.sumcheck.round_polys.len(), d_log),
+        (sub.object_range.combine.sumcheck.round_polys.len(), d_log),
+        (sub.equality.sumcheck.round_polys.len(), a),
+        (sub.combine.sumcheck.round_polys.len(), a),
+        (sub.compaction.sumcheck.round_polys.len(), a),
+    ] {
+        if rounds != expected {
+            return Err(invalid(
+                "ranged atom sub-proof dimension does not match the layer's committed domains",
+            ));
+        }
+    }
 
     // (a) Verify the four relocations to the common domain D against the root-bound
     // originals (com_o + the three dict commitments).
