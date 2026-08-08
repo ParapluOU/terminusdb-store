@@ -106,6 +106,45 @@ fn base_layer_columns(
     Ok((s, p, o, n))
 }
 
+/// Guard the query proof paths against a NON-materialized (delta-only) layer.
+///
+/// Every query proof path commits and ranges over `layer.additions` as if it were the
+/// COMPLETE current triple set (see [`base_layer_columns`]). That equivalence holds ONLY
+/// for a materialized BASE layer. `LayerStore::rebuild_proof_layer` builds proof state from
+/// the ORIGINAL, UNROLLED layer chain (`get_unrolled_layer`, following the physical
+/// parent-file chain — NOT any rollup substitution), taking `additions` from
+/// `triple_additions(name)`. For a layer WITH a parent that is just the layer's DELTA
+/// additions, not the inherited triples, so a "complete result" over it would be complete
+/// over the delta only — an incomplete answer over the whole database (a completeness gap,
+/// not a soundness hole). A genuine base layer (`parent_state_root.is_none()`) has no
+/// parent: its `additions` ARE the whole triple set, its `removals` are empty, and its
+/// dictionary is fully self-contained (`CommitmentState::validate` forces the parent
+/// dictionary counts to 0 when `parent_state_root.is_none()`).
+///
+/// We therefore require `parent_state_root.is_none()` in addition to the caller's existing
+/// `removal_count == 0` check. This is CONSERVATIVE-but-SOUND: it never accepts a layer
+/// whose committed `additions` are incomplete. Rollups do not make it over-restrictive —
+/// a rollup is a PHYSICAL read optimization, and the proof pipeline always rebuilds from
+/// the original delta chain, so no rollup currently produces a parent-ful layer whose
+/// committed `additions` are the full materialized set. Hence this guard rejects no valid
+/// materialized result today.
+///
+/// TODO: relax for materialized rollups once the proof pipeline can admit a squashed layer
+/// whose committed `additions` are the FULL materialized triple set while it still carries a
+/// parent (`parent_state_root.is_some()`) — e.g. a root-bound per-layer "fully materialized"
+/// flag set by `rebuild_proof_layer` when it commits over the rolled-up (not delta) triple
+/// set. Until such a flag exists and is bound by `commitment_root`, a parent-ful layer
+/// cannot be trusted to commit the complete set, so it must be rejected here.
+fn require_materialized_base_layer(layer: &LayerCommitment) -> io::Result<()> {
+    if layer.state.parent_state_root.is_some() {
+        return Err(invalid(
+            "query proof requires a fully-materialized base layer: this layer commits only a \
+             delta over a parent, so its committed additions are not the complete triple set",
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve a predicate IRI (term bytes) to its dictionary id in this layer, or
 /// fail closed if the term is not present (non-membership proofs are deferred).
 fn resolve_predicate_id(layer: &LayerCommitment, predicate_term: &[u8]) -> io::Result<u64> {
@@ -209,6 +248,8 @@ pub fn verify_layer_filter(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
+    // The committed additions must be the COMPLETE materialized triple set, not a delta.
+    require_materialized_base_layer(layer)?;
     if layer.state.removal_count != 0 {
         return Err(invalid(
             "layer filter requires a materialized base layer (no removals)",
@@ -410,6 +451,8 @@ pub fn verify_layer_graph_pattern2(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
+    // The committed additions must be the COMPLETE materialized triple set, not a delta.
+    require_materialized_base_layer(layer)?;
     if layer.state.removal_count != 0 {
         return Err(invalid(
             "layer graph-pattern query requires a materialized base layer (no removals)",
@@ -1391,6 +1434,8 @@ pub fn verify_layer_bgp(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
+    // The committed additions must be the COMPLETE materialized triple set, not a delta.
+    require_materialized_base_layer(layer)?;
     if layer.state.removal_count != 0 {
         return Err(invalid(
             "layer BGP query requires a materialized base layer (no removals)",
@@ -1708,6 +1753,49 @@ mod tests {
         let (head, _) = child.commit_with_proof().unwrap();
         let lc = head.proof_commitment().unwrap().unwrap();
         assert!(prove_layer_filter(&lc, P1).is_err());
+    }
+
+    #[test]
+    fn delta_only_child_layer_is_rejected_by_the_completeness_guard() {
+        // A child that ONLY adds triples has removal_count == 0 (so the pre-existing
+        // "no removals" gate passed), yet its committed `additions` are just the DELTA,
+        // not the whole triple set. Verification must reject such a non-materialized
+        // layer even though the prover can build a (delta-scoped) proof for it.
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (s, p, o) in [("a1", "p1", "b1"), ("a2", "p1", "b2")] {
+            builder
+                .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
+                .unwrap();
+        }
+        let (base, _) = builder.commit_with_proof().unwrap();
+        // Add >= 2 triples under a NEW predicate so the delta proof is well-formed (>= 2
+        // rows) and the predicate resolves in the child's own (delta) dictionary.
+        let child = base.open_write().unwrap();
+        for (s, o) in [("a3", "b3"), ("a4", "b4")] {
+            child
+                .add_value_triple(ValueTriple::new_node(&iri(s), &iri("pn"), &iri(o)))
+                .unwrap();
+        }
+        let (head, _) = child.commit_with_proof().unwrap();
+        let lc = head.proof_commitment().unwrap().unwrap();
+        // Precondition: the old gate (removals only) would NOT have caught this.
+        assert_eq!(lc.state.removal_count, 0);
+        assert!(lc.state.parent_state_root.is_some());
+
+        let pn: &[u8] = b"http://ex/pn";
+        let (proof, com_sout, com_oout, m, id) = prove_layer_filter(&lc, pn).unwrap();
+        assert!(verify_layer_filter(
+            &lc,
+            lc.state.commitment_root,
+            pn,
+            id,
+            &com_sout,
+            &com_oout,
+            m,
+            &proof,
+        )
+        .is_err());
     }
 
     // ---- Q2: 2-atom graph-pattern (self-join) end-to-end ----
