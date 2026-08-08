@@ -2,13 +2,12 @@
 //!
 //! This module keeps the scheme-independent pieces of the proof pipeline: the
 //! canonical datatype/object/triple model, the dictionary-encoded `ProofRecord`
-//! column tables, the query pattern model, deterministic per-index ordering, and
-//! the framing/resource-limit helpers used to (de)serialize sidecars.
+//! column tables, deterministic per-index ordering, and the framing/resource-limit
+//! helpers used to (de)serialize commitment files.
 //!
 //! The per-layer sidecar payload itself lives in [`commitment`], which replaces
 //! the abandoned SHA-256 Merkle scheme with a homomorphic column-commitment
-//! scheme ("Proof-of-WOQL"). The commitment logic is presently a STUB; see the
-//! `TODO(proof-of-woql)` markers.
+//! scheme ("Proof-of-WOQL").
 
 use std::cmp::Ordering;
 use std::convert::{TryFrom, TryInto};
@@ -798,11 +797,9 @@ pub mod sort;
 /// `ProofLayerState`). It exposes the same shape the storage plumbing depends
 /// on: a validated per-layer payload carrying a small [`CommitmentState`]
 /// (parent root + counts + a single root hash) plus the dictionary-encoded
-/// column tables that Phase 1 will commit over.
-///
-/// The commitment itself is a STUB: `commitment_root` is currently a
-/// domain-separated placeholder digest over the encoded body. See the
-/// `TODO(proof-of-woql)` markers.
+/// column tables and their Dory commitments. `commitment_root` is the
+/// domain-separated digest that binds those commitments, dictionaries, counts,
+/// and parent root into the portable trust anchor.
 pub mod commitment {
     use super::*;
     use sha2::{Digest, Sha256};
@@ -1224,8 +1221,6 @@ pub mod commitment {
         pub parent_predicate_count: u64,
         pub node_value_count: u64,
         pub predicate_count: u64,
-        // TODO(proof-of-woql): replace this placeholder digest with the real
-        // homomorphic column-commitment root (Dory) over the committed columns.
         pub commitment_root: ProofHash,
     }
 
@@ -2713,13 +2708,9 @@ pub mod commitment {
     }
 }
 
-/// Phase 1a smoke test: prove the permissive `dory-pcs` BN254 crypto stack links
-/// and that Dory commit/open/verify works end-to-end (and rejects a tampered
-/// evaluation). This exercises the REAL crate API only; it does not touch
-/// `LayerCommitment`/`CommitmentState` logic, which still carry a placeholder
-/// root. Phase 1b will wire the real column commitment through this API.
-// TODO(proof-of-woql): replace this smoke test with the real per-column Dory
-// commitment inside `proof::commitment` once the wiring lands.
+/// Independent smoke test that the `dory-pcs` BN254 commit/open/verify API works
+/// end-to-end and rejects a tampered evaluation. LayerCommitment integration is
+/// covered separately by the commitment and query-proof tests above.
 #[cfg(test)]
 mod dory_smoke {
     use dory_pcs::backends::arkworks::{

@@ -30,9 +30,9 @@
 //!    multiset is unchanged.) `com(i_eval)` is derived homomorphically as
 //!    `C*com(rho_l) + com(rho_r)` -- no extra commitment.
 //!
-//! This proves the output is a SET of distinct genuine key-matching F-pairs
-//! (subsuming 2c-1's plain memberships). It is NOT yet complete: 2c-2e adds
-//! U-distinctness + U-membership + `count m_J = Sum w_L*w_R` to force these
+//! This subargument proves the output is a SET of distinct genuine key-matching
+//! F-pairs (subsuming 2c-1's plain memberships). `proof::join` composes it with
+//! U-distinctness, U-membership, and `count m_J = Sum w_L*w_R` to force these
 //! distinct valid pairs to be ALL of them.
 
 use std::io;

@@ -64,8 +64,8 @@
 //! [`out_of_range_v_breaks_the_sign_precondition`] demonstrates the bound is
 //! load-bearing.
 //!
-//! CP-B1 scope: the STANDALONE gadget only. It is NOT yet wired into the
-//! dict/atom/BGP pipeline (CP-B2 / CP-C).
+//! The object-range composition below authenticates the dictionary lookup and
+//! wires this gadget into the atom/BGP query pipeline.
 
 use std::io;
 
