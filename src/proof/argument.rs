@@ -34,7 +34,7 @@ use dory_pcs::primitives::poly::Polynomial;
 use dory_pcs::primitives::transcript::Transcript;
 use dory_pcs::{prove, verify, DoryProof, Transparent};
 
-use super::commitment::{matrix_dims, prover_setup, verifier_setup};
+use super::commitment::{matrix_dims, prover_setup, setup_parameter_id, verifier_setup};
 use super::invalid;
 
 /// The concrete Fiat-Shamir transcript shared by our sumcheck and Dory's
@@ -633,7 +633,7 @@ pub fn verify_sumcheck(
 // Dory evaluation glue: batch column openings at r into one Dory opening
 // ---------------------------------------------------------------------------
 
-/// Commit to a raw column (length `2^k`) with the global deterministic setup,
+/// Commit to a raw column (length `2^k`) with its deterministic parameter tier,
 /// returning its succinct GT (tier-2) commitment. Uses the shared matrix layout.
 ///
 /// Exposed `pub` so external consumers (e.g. the `woql-proof` plan compiler's
@@ -641,9 +641,10 @@ pub fn verify_sumcheck(
 /// commitments and compare them to a BGP proof's output. Pure and deterministic.
 pub fn commit_column(column: &[ArkFr]) -> io::Result<ArkGT> {
     let (nu, sigma) = column_dims(column.len())?;
+    let num_vars = column.len().trailing_zeros() as usize;
     let poly = ArkworksPolynomial::new(column.to_vec());
     let (tier_2, _rows, _blind) = poly
-        .commit::<BN254, Transparent, G1Routines>(nu, sigma, prover_setup())
+        .commit::<BN254, Transparent, G1Routines>(nu, sigma, prover_setup(num_vars)?)
         .map_err(|error| invalid(format!("column commitment failed: {error}")))?;
     Ok(tier_2)
 }
@@ -680,6 +681,7 @@ pub fn prove_column_openings(
         return Err(invalid("column length does not match evaluation point"));
     }
     let (nu, sigma) = column_dims(size)?;
+    transcript.append_bytes(b"pow/dory/parameter-set", &setup_parameter_id(r.len())?);
     let gamma = transcript.challenge_scalar(LABEL_DORY_GAMMA);
     let gammas = powers(gamma, column_tables.len());
 
@@ -692,7 +694,7 @@ pub fn prove_column_openings(
 
     let poly = ArkworksPolynomial::new(combined);
     let (_tier_2, row_commitments, blind) = poly
-        .commit::<BN254, Transparent, G1Routines>(nu, sigma, prover_setup())
+        .commit::<BN254, Transparent, G1Routines>(nu, sigma, prover_setup(r.len())?)
         .map_err(|error| invalid(format!("batched column commitment failed: {error}")))?;
     let (proof, _) = prove::<_, BN254, G1Routines, G2Routines, _, _, Transparent>(
         &poly,
@@ -701,7 +703,7 @@ pub fn prove_column_openings(
         blind,
         nu,
         sigma,
-        prover_setup(),
+        prover_setup(r.len())?,
         transcript,
     )
     .map_err(|error| invalid(format!("dory opening proof failed: {error}")))?;
@@ -721,6 +723,7 @@ pub fn verify_column_openings(
     if column_commitments.len() != claimed_evals.len() {
         return Err(invalid("commitment/eval count mismatch in batched opening"));
     }
+    transcript.append_bytes(b"pow/dory/parameter-set", &setup_parameter_id(r.len())?);
     let gamma = transcript.challenge_scalar(LABEL_DORY_GAMMA);
     let (combined_commitment, combined_eval) = combine(column_commitments, claimed_evals, gamma);
     verify::<_, BN254, G1Routines, G2Routines, _>(
@@ -728,7 +731,7 @@ pub fn verify_column_openings(
         combined_eval,
         r,
         opening,
-        verifier_setup().clone(),
+        verifier_setup(r.len())?.clone(),
         transcript,
     )
     .map_err(|error| invalid(format!("dory batched opening rejected: {error}")))

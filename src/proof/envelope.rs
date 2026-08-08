@@ -31,7 +31,10 @@ use super::sort::SortedProof;
 use super::{CanonicalDatatype, CanonicalObject, ProofHash};
 
 const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
-const VERSION: u32 = 1;
+// v2 binds the deterministic Dory parameter-set identity into every opening
+// transcript. v1 envelopes fail explicitly instead of reaching cryptographic
+// verification under an ambiguously different transcript.
+const VERSION: u32 = 2;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -737,7 +740,7 @@ mod tests {
         assert!(LayerBgpEnvelope::decode(&corrupt).is_err());
 
         let mut wrong_version = encoded.clone();
-        wrong_version[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&2u32.to_le_bytes());
+        wrong_version[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&3u32.to_le_bytes());
         refresh_checksum(&mut wrong_version);
         assert!(LayerBgpEnvelope::decode(&wrong_version).is_err());
 

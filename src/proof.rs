@@ -21,7 +21,12 @@ use tdb_succinct::Datatype;
 pub type ProofHash = [u8; 32];
 
 const MAX_RECORDS: usize = 10_000_000;
-const MAX_DECODED_RECORDS: usize = 4_000_000;
+const PERSISTED_TABLE_COUNT: usize = 5;
+// Every one of v4's five persisted sections has the same per-table record cap.
+// Aggregate admission is subsequently constrained much more tightly by the
+// checked file and decoded-heap budgets; this count guard exists for overflow and
+// structural consistency, not as a contradictory lower deployment ceiling.
+const MAX_DECODED_RECORDS: usize = MAX_RECORDS * PERSISTED_TABLE_COUNT;
 const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PROOF_LAYER_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_DECODED_PROOF_BYTES: usize = 512 * 1024 * 1024;
@@ -692,6 +697,16 @@ fn validate_decoded_heap_budget(
         catalog_entries
             .checked_mul(64)
             .ok_or_else(|| invalid("decoded proof catalog estimate overflow"))?,
+    )?;
+    checked_heap_add(
+        &mut total,
+        commitment::construction_commitment_scratch_bytes(&[
+            additions.len(),
+            removals.len(),
+            materialized.len(),
+            predicates.len(),
+            objects.len(),
+        ])?,
     )
 }
 
@@ -772,6 +787,16 @@ fn validate_construction_heap_budget(
         catalog_entries
             .checked_mul(64)
             .ok_or_else(|| invalid("proof construction catalog estimate overflow"))?,
+    )?;
+    checked_heap_add(
+        &mut total,
+        commitment::construction_commitment_scratch_bytes(&[
+            additions.len(),
+            removals.len(),
+            materialized.len(),
+            node_values.len(),
+            predicates.len(),
+        ])?,
     )
 }
 
@@ -832,12 +857,13 @@ pub mod commitment {
     pub const COLUMN_COUNT: usize = 6;
     pub const MATERIALIZED_COLUMN_COUNT: usize = 3;
 
-    /// Fixed size of the global transparent Dory setup. `max_log_n = 20` supports
-    /// polynomials of up to `2^20` coefficients, i.e. a padded per-column length of
-    /// up to ~1,048,576 dictionary ids. A single-layer delta whose additions or
-    /// removals exceed that count fails closed until the global setup is enlarged
-    /// (Phase 1b cap; cross-layer composition + larger setups are later phases).
-    pub const SETUP_MAX_LOG_N: usize = 20;
+    /// Largest deterministic Dory domain needed by any structurally admissible
+    /// PF4 table. `MAX_RECORDS = 10,000,000` pads to `2^24`; no native layer can
+    /// reach a larger proof column without first violating the PF4 record cap.
+    pub const SETUP_MAX_LOG_N: usize = 24;
+    const LEGACY_SETUP_LOG_N: usize = 20;
+    const SETUP_TIER_LOG_N: [usize; 3] = [LEGACY_SETUP_LOG_N, 22, SETUP_MAX_LOG_N];
+    const MAX_SETUP_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
     /// Domain-separated 32-byte seed for the transparent setup. Derived by hashing
     /// a fixed public label ("nothing up my sleeve"), so it is fully reproducible.
@@ -881,10 +907,114 @@ pub mod commitment {
         }
     }
 
-    /// One global, lazily-derived, deterministic transparent prover setup.
-    fn dory_prover_setup() -> &'static ProverSetup<BN254> {
-        static SETUP: OnceLock<ProverSetup<BN254>> = OnceLock::new();
-        SETUP.get_or_init(|| deterministic_prover_setup(SETUP_MAX_LOG_N))
+    fn setup_tier_for_num_vars(num_vars: usize) -> io::Result<usize> {
+        SETUP_TIER_LOG_N
+            .iter()
+            .copied()
+            .find(|tier| num_vars <= *tier)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "proof domain 2^{num_vars} exceeds PF4's maximum 2^{SETUP_MAX_LOG_N}"
+                ))
+            })
+    }
+
+    fn setup_generator_count(tier: usize) -> io::Result<usize> {
+        1usize
+            .checked_shl(tier.div_ceil(2) as u32)
+            .ok_or_else(|| invalid("Dory setup generator count overflow"))
+    }
+
+    fn setup_retained_bytes(tier: usize) -> io::Result<usize> {
+        setup_generator_count(tier)?
+            .checked_mul(std::mem::size_of::<ArkG1>() + std::mem::size_of::<ArkG2>())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    std::mem::size_of::<ArkG1>()
+                        + std::mem::size_of::<ArkG2>()
+                        + std::mem::size_of::<ArkGT>(),
+                )
+            })
+            .ok_or_else(|| invalid("Dory setup retained-byte estimate overflow"))
+    }
+
+    fn preflight_setup_tier(tier: usize) -> io::Result<()> {
+        let retained = setup_retained_bytes(tier)?;
+        if retained > MAX_SETUP_RETAINED_BYTES {
+            return Err(invalid(format!(
+                "Dory setup tier 2^{tier} requires {retained} retained bytes, above the PF4 setup budget"
+            )));
+        }
+        Ok(())
+    }
+
+    fn padded_domain_for_rows(rows: usize) -> io::Result<(usize, usize)> {
+        if rows == 0 {
+            return Ok((0, 0));
+        }
+        if rows > MAX_RECORDS {
+            return Err(invalid(format!(
+                "proof table has {rows} records, above the PF4 limit of {MAX_RECORDS}"
+            )));
+        }
+        let padded = rows
+            .checked_next_power_of_two()
+            .ok_or_else(|| invalid("proof column length overflow"))?
+            .max(2);
+        let num_vars = padded.trailing_zeros() as usize;
+        setup_tier_for_num_vars(num_vars)?;
+        Ok((padded, num_vars))
+    }
+
+    /// Peak transient allocation retained by the optimized storage-side
+    /// commitment builder: one padded field column plus Dory's row commitments.
+    /// Columns are constructed sequentially, so only the largest table counts.
+    pub(super) fn construction_commitment_scratch_bytes(row_counts: &[usize]) -> io::Result<usize> {
+        row_counts.iter().try_fold(0usize, |peak, rows| {
+            let (padded, num_vars) = padded_domain_for_rows(*rows)?;
+            if padded == 0 {
+                return Ok(peak);
+            }
+            let (nu, _) = matrix_dims(num_vars);
+            let row_commitments = 1usize
+                .checked_shl(nu as u32)
+                .and_then(|count| count.checked_mul(std::mem::size_of::<ArkG1>()))
+                .ok_or_else(|| invalid("Dory row-commitment scratch estimate overflow"))?;
+            let bytes = padded
+                .checked_mul(std::mem::size_of::<ArkFr>())
+                .and_then(|value| value.checked_add(row_commitments))
+                .ok_or_else(|| invalid("Dory commitment scratch estimate overflow"))?;
+            Ok(peak.max(bytes))
+        })
+    }
+
+    /// Stable public identity of the exact parameter tier selected for a domain.
+    /// The legacy tier retains its old generator stream; larger tiers are distinct
+    /// deterministic parameter sets. Query transcripts bind this identity.
+    pub(crate) fn setup_parameter_id(num_vars: usize) -> io::Result<ProofHash> {
+        let tier = setup_tier_for_num_vars(num_vars)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"terminus-store/proof-of-woql/dory-parameter-set/v0");
+        hasher.update(setup_seed());
+        hasher.update((tier as u64).to_be_bytes());
+        hasher.update(b"matrix:sigma-ceil-nu-floor;coeff:row-major-lsb-first");
+        Ok(hasher.finalize().into())
+    }
+
+    /// Lazily derive only the deterministic tier required by this domain. Keeping
+    /// 2^20 as its own tier preserves all existing v4 commitments byte-for-byte.
+    fn dory_prover_setup(num_vars: usize) -> io::Result<&'static ProverSetup<BN254>> {
+        static SETUP_20: OnceLock<ProverSetup<BN254>> = OnceLock::new();
+        static SETUP_22: OnceLock<ProverSetup<BN254>> = OnceLock::new();
+        static SETUP_24: OnceLock<ProverSetup<BN254>> = OnceLock::new();
+        let tier = setup_tier_for_num_vars(num_vars)?;
+        preflight_setup_tier(tier)?;
+        Ok(match tier {
+            20 => SETUP_20.get_or_init(|| deterministic_prover_setup(20)),
+            22 => SETUP_22.get_or_init(|| deterministic_prover_setup(22)),
+            24 => SETUP_24.get_or_init(|| deterministic_prover_setup(24)),
+            _ => unreachable!("setup tier selection returned an unknown tier"),
+        })
     }
 
     /// The single source of truth for the row/column matrix layout of a padded
@@ -900,15 +1030,24 @@ pub mod commitment {
         (nu, sigma)
     }
 
-    /// The global deterministic prover setup, for the query argument's openings.
-    pub(crate) fn prover_setup() -> &'static ProverSetup<BN254> {
-        dory_prover_setup()
+    /// The deterministic prover parameter tier selected for this proof domain.
+    pub(crate) fn prover_setup(num_vars: usize) -> io::Result<&'static ProverSetup<BN254>> {
+        dory_prover_setup(num_vars)
     }
 
     /// The verifier setup derived once from the global prover setup.
-    pub(crate) fn verifier_setup() -> &'static VerifierSetup<BN254> {
-        static VERIFIER_SETUP: OnceLock<VerifierSetup<BN254>> = OnceLock::new();
-        VERIFIER_SETUP.get_or_init(|| dory_prover_setup().to_verifier_setup())
+    pub(crate) fn verifier_setup(num_vars: usize) -> io::Result<&'static VerifierSetup<BN254>> {
+        static SETUP_20: OnceLock<VerifierSetup<BN254>> = OnceLock::new();
+        static SETUP_22: OnceLock<VerifierSetup<BN254>> = OnceLock::new();
+        static SETUP_24: OnceLock<VerifierSetup<BN254>> = OnceLock::new();
+        let tier = setup_tier_for_num_vars(num_vars)?;
+        let prover = dory_prover_setup(num_vars)?;
+        Ok(match tier {
+            20 => SETUP_20.get_or_init(|| prover.to_verifier_setup()),
+            22 => SETUP_22.get_or_init(|| prover.to_verifier_setup()),
+            24 => SETUP_24.get_or_init(|| prover.to_verifier_setup()),
+            _ => unreachable!("setup tier selection returned an unknown tier"),
+        })
     }
 
     /// Commit to one dictionary-id column via Dory, returning its succinct GT
@@ -920,30 +1059,44 @@ pub mod commitment {
     /// non-square constraint, and `2^sigma <= 2^ceil(SETUP_MAX_LOG_N/2)` fits the
     /// global generator vectors). In Transparent mode the commitment carries no
     /// blinding, so it is a deterministic function of the ids and the setup.
-    fn commit_id_column(ids: &[u64]) -> io::Result<ArkGT> {
-        if ids.is_empty() {
+    fn commit_record_id_column(
+        records: &[ProofRecord],
+        select: fn(&ProofRecord) -> u64,
+    ) -> io::Result<ArkGT> {
+        if records.is_empty() {
             return Ok(<ArkGT as Group>::identity());
         }
-        let padded_len = ids
+        let padded_len = records
             .len()
             .checked_next_power_of_two()
             .ok_or_else(|| invalid("proof column length overflow"))?;
         let m = padded_len.trailing_zeros() as usize;
-        if m > SETUP_MAX_LOG_N {
-            return Err(invalid(
-                "proof column exceeds the global Dory setup capacity",
-            ));
-        }
+        setup_tier_for_num_vars(m)?;
         let (nu, sigma) = matrix_dims(m);
-        let mut coefficients: Vec<ArkFr> = Vec::with_capacity(padded_len);
-        for id in ids {
-            coefficients.push(<ArkFr as DoryField>::from_u64(*id));
+        let mut coefficients = vec![<ArkFr as DoryField>::zero(); padded_len];
+        for (slot, record) in coefficients.iter_mut().zip(records) {
+            *slot = <ArkFr as DoryField>::from_u64(select(record));
         }
-        coefficients.resize(padded_len, <ArkFr as DoryField>::zero());
         let poly = ArkworksPolynomial::new(coefficients);
         let (tier_2, _row_commitments, _blind) = poly
-            .commit::<BN254, Transparent, G1Routines>(nu, sigma, dory_prover_setup())
+            .commit::<BN254, Transparent, G1Routines>(nu, sigma, dory_prover_setup(m)?)
             .map_err(|error| invalid(format!("dory column commitment failed: {error}")))?;
+        Ok(tier_2)
+    }
+
+    fn commit_owned_field_column(coefficients: Vec<ArkFr>) -> io::Result<ArkGT> {
+        if coefficients.is_empty() {
+            return Ok(<ArkGT as Group>::identity());
+        }
+        if !coefficients.len().is_power_of_two() {
+            return Err(invalid("committed field column is not power-of-two padded"));
+        }
+        let m = coefficients.len().trailing_zeros() as usize;
+        let (nu, sigma) = matrix_dims(m);
+        let poly = ArkworksPolynomial::new(coefficients);
+        let (tier_2, _row_commitments, _blind) = poly
+            .commit::<BN254, Transparent, G1Routines>(nu, sigma, dory_prover_setup(m)?)
+            .map_err(|error| invalid(format!("dory field commitment failed: {error}")))?;
         Ok(tier_2)
     }
 
@@ -957,30 +1110,23 @@ pub mod commitment {
         additions: &[ProofRecord],
         removals: &[ProofRecord],
     ) -> io::Result<[ArkGT; COLUMN_COUNT]> {
-        let subjects =
-            |table: &[ProofRecord]| table.iter().map(|r| r.subject_id).collect::<Vec<_>>();
-        let predicates =
-            |table: &[ProofRecord]| table.iter().map(|r| r.predicate_id).collect::<Vec<_>>();
-        let objects = |table: &[ProofRecord]| table.iter().map(|r| r.object_id).collect::<Vec<_>>();
         Ok([
-            commit_id_column(&subjects(additions))?,
-            commit_id_column(&predicates(additions))?,
-            commit_id_column(&objects(additions))?,
-            commit_id_column(&subjects(removals))?,
-            commit_id_column(&predicates(removals))?,
-            commit_id_column(&objects(removals))?,
+            commit_record_id_column(additions, |record| record.subject_id)?,
+            commit_record_id_column(additions, |record| record.predicate_id)?,
+            commit_record_id_column(additions, |record| record.object_id)?,
+            commit_record_id_column(removals, |record| record.subject_id)?,
+            commit_record_id_column(removals, |record| record.predicate_id)?,
+            commit_record_id_column(removals, |record| record.object_id)?,
         ])
     }
 
     fn commit_materialized_columns(
         records: &[ProofRecord],
     ) -> io::Result<[ArkGT; MATERIALIZED_COLUMN_COUNT]> {
-        let column =
-            |select: fn(&ProofRecord) -> u64| records.iter().map(select).collect::<Vec<_>>();
         Ok([
-            commit_id_column(&column(|record| record.subject_id))?,
-            commit_id_column(&column(|record| record.predicate_id))?,
-            commit_id_column(&column(|record| record.object_id))?,
+            commit_record_id_column(records, |record| record.subject_id)?,
+            commit_record_id_column(records, |record| record.predicate_id)?,
+            commit_record_id_column(records, |record| record.object_id)?,
         ])
     }
 
@@ -998,15 +1144,7 @@ pub mod commitment {
         if d == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
-        let padded = d
-            .checked_next_power_of_two()
-            .ok_or_else(|| invalid("predicate dictionary length overflow"))?
-            .max(2);
-        if padded.trailing_zeros() as usize > SETUP_MAX_LOG_N {
-            return Err(invalid(
-                "predicate dictionary exceeds the global Dory setup capacity",
-            ));
-        }
+        let (padded, _) = padded_domain_for_rows(d)?;
         let zero = <ArkFr as DoryField>::zero();
         let mut hashes = vec![zero; padded];
         let mut ids = vec![zero; padded];
@@ -1023,15 +1161,21 @@ pub mod commitment {
     fn commit_predicate_dictionary(
         predicate_catalog: &[ProofRecord],
     ) -> io::Result<(ArkGT, ArkGT)> {
-        let (hashes, ids) = predicate_dict_columns_from_catalog(predicate_catalog)?;
-        if hashes.is_empty() {
+        if predicate_catalog.is_empty() {
             let identity = <ArkGT as Group>::identity();
             return Ok((identity, identity));
         }
-        Ok((
-            super::argument::commit_column(&hashes)?,
-            super::argument::commit_column(&ids)?,
-        ))
+        let (padded, _) = padded_domain_for_rows(predicate_catalog.len())?;
+        let mut hashes = vec![<ArkFr as DoryField>::zero(); padded];
+        for (slot, record) in hashes.iter_mut().zip(predicate_catalog) {
+            *slot = super::dict::hash_term(&record.triple.predicate);
+        }
+        let hash_commitment = commit_owned_field_column(hashes)?;
+        let mut ids = vec![<ArkFr as DoryField>::zero(); padded];
+        for (slot, record) in ids.iter_mut().zip(predicate_catalog) {
+            *slot = <ArkFr as DoryField>::from_u64(record.predicate_id);
+        }
+        Ok((hash_commitment, commit_owned_field_column(ids)?))
     }
 
     /// Build the two node/value-dictionary columns from the node/value catalog
@@ -1067,15 +1211,21 @@ pub mod commitment {
     fn commit_node_value_dictionary(
         node_value_catalog: &[ProofRecord],
     ) -> io::Result<(ArkGT, ArkGT)> {
-        let (hashes, ids) = node_value_dict_columns_from_catalog(node_value_catalog)?;
-        if hashes.is_empty() {
+        let padded = node_value_dict_padded_len(node_value_catalog.len())?;
+        if padded == 0 {
             let identity = <ArkGT as Group>::identity();
             return Ok((identity, identity));
         }
-        Ok((
-            super::argument::commit_column(&hashes)?,
-            super::argument::commit_column(&ids)?,
-        ))
+        let mut hashes = vec![<ArkFr as DoryField>::zero(); padded];
+        for (slot, record) in hashes.iter_mut().zip(node_value_catalog) {
+            *slot = super::dict::hash_object(&record.triple.object);
+        }
+        let hash_commitment = commit_owned_field_column(hashes)?;
+        let mut ids = vec![<ArkFr as DoryField>::zero(); padded];
+        for (slot, record) in ids.iter_mut().zip(node_value_catalog) {
+            *slot = <ArkFr as DoryField>::from_u64(record.object_id);
+        }
+        Ok((hash_commitment, commit_owned_field_column(ids)?))
     }
 
     /// Reserved datatype tag for a `Node` entry in the node/value datatype column.
@@ -1094,16 +1244,7 @@ pub mod commitment {
         if catalog_len == 0 {
             return Ok(0);
         }
-        let padded = catalog_len
-            .checked_next_power_of_two()
-            .ok_or_else(|| invalid("node/value dictionary length overflow"))?
-            .max(2);
-        if padded.trailing_zeros() as usize > SETUP_MAX_LOG_N {
-            return Err(invalid(
-                "node/value dictionary exceeds the global Dory setup capacity",
-            ));
-        }
-        Ok(padded)
+        padded_domain_for_rows(catalog_len).map(|(padded, _)| padded)
     }
 
     /// Fixed byte width of a SUPPORTED fixed-width order-preserving numeric
@@ -1207,15 +1348,13 @@ pub mod commitment {
         node_value_catalog: &[ProofRecord],
     ) -> io::Result<(ArkGT, ArkGT)> {
         let values = node_value_dict_value_column(node_value_catalog)?;
-        let datatypes = node_value_dict_datatype_column(node_value_catalog)?;
         if values.is_empty() {
             let identity = <ArkGT as Group>::identity();
             return Ok((identity, identity));
         }
-        Ok((
-            super::argument::commit_column(&values)?,
-            super::argument::commit_column(&datatypes)?,
-        ))
+        let value_commitment = commit_owned_field_column(values)?;
+        let datatypes = node_value_dict_datatype_column(node_value_catalog)?;
+        Ok((value_commitment, commit_owned_field_column(datatypes)?))
     }
 
     fn serialize_commitment(commitment: &ArkGT) -> io::Result<Vec<u8>> {
@@ -2683,6 +2822,69 @@ pub mod commitment {
         #[test]
         fn commitment_format_version_is_four() {
             assert_eq!(COMMITMENT_FORMAT_VERSION, 4);
+        }
+
+        #[test]
+        fn setup_tiers_cover_the_full_pf4_record_domain() {
+            assert_eq!(MAX_DECODED_RECORDS, MAX_RECORDS * PERSISTED_TABLE_COUNT);
+            assert_eq!(padded_domain_for_rows(1 << 20).unwrap(), (1 << 20, 20));
+            assert_eq!(
+                padded_domain_for_rows((1 << 20) + 1).unwrap(),
+                (1 << 21, 21)
+            );
+            assert_eq!(setup_tier_for_num_vars(20).unwrap(), 20);
+            assert_eq!(setup_tier_for_num_vars(21).unwrap(), 22);
+            assert_eq!(setup_tier_for_num_vars(22).unwrap(), 22);
+            assert_eq!(setup_tier_for_num_vars(23).unwrap(), 24);
+            assert_eq!(setup_tier_for_num_vars(24).unwrap(), 24);
+            assert!(setup_tier_for_num_vars(25)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds PF4's maximum"));
+
+            let (padded, log) = padded_domain_for_rows(MAX_RECORDS).unwrap();
+            assert_eq!(padded, 1 << SETUP_MAX_LOG_N);
+            assert_eq!(log, SETUP_MAX_LOG_N);
+            assert!(padded_domain_for_rows(MAX_RECORDS + 1)
+                .unwrap_err()
+                .to_string()
+                .contains("above the PF4 limit"));
+        }
+
+        #[test]
+        fn setup_memory_and_commitment_scratch_are_preflighted() {
+            assert_eq!(setup_generator_count(20).unwrap(), 1 << 10);
+            assert_eq!(setup_generator_count(22).unwrap(), 1 << 11);
+            assert_eq!(setup_generator_count(24).unwrap(), 1 << 12);
+            let retained = setup_retained_bytes(SETUP_MAX_LOG_N).unwrap();
+            assert!(retained <= MAX_SETUP_RETAINED_BYTES);
+            preflight_setup_tier(SETUP_MAX_LOG_N).unwrap();
+
+            let former_boundary = construction_commitment_scratch_bytes(&[(1 << 20) + 1]).unwrap();
+            assert!(former_boundary > (1 << 21) * std::mem::size_of::<ArkFr>());
+            assert!(former_boundary < MAX_DECODED_PROOF_BYTES);
+            let structural_max = construction_commitment_scratch_bytes(&[MAX_RECORDS]).unwrap();
+            assert!(structural_max > MAX_DECODED_PROOF_BYTES);
+        }
+
+        #[test]
+        fn setup_identity_is_deterministic_and_legacy_tier_is_prefix_compatible() {
+            assert_eq!(
+                setup_parameter_id(19).unwrap(),
+                setup_parameter_id(20).unwrap()
+            );
+            assert_ne!(
+                setup_parameter_id(20).unwrap(),
+                setup_parameter_id(21).unwrap()
+            );
+            assert_ne!(
+                setup_parameter_id(22).unwrap(),
+                setup_parameter_id(23).unwrap()
+            );
+            let selected = dory_prover_setup(20).unwrap();
+            let independently_rebuilt = deterministic_prover_setup(20);
+            assert_eq!(selected.g1_vec, independently_rebuilt.g1_vec);
+            assert_eq!(selected.g2_vec, independently_rebuilt.g2_vec);
         }
 
         #[test]
