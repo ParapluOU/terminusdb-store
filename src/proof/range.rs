@@ -1076,6 +1076,39 @@ pub fn verify_object_range_select(
     )
 }
 
+/// The honest combined object-range selection column
+/// `sel[i] = χ_n[i] · [datatype(obj_id[i]) == T] · [value(obj_id[i]) op c]` that
+/// [`prove_object_range_select`] commits as its returned `Com(sel)`. Exposed so a
+/// composing layer (the BGP) can obtain the SAME column that `Com(sel)` commits — to
+/// relocate it across domains and multiply it into a combined selection — WITHOUT
+/// re-deriving the private lookup/mask/range witnesses. MUST mirror the combine that
+/// [`prove_object_range_select`] runs internally (steps 1, 2, 3, 4 there): this is the
+/// elementwise product of the datatype-mask indicator over the authenticated `v_dt`
+/// and the range indicator over the authenticated `v_val`.
+#[allow(clippy::too_many_arguments)]
+pub fn object_range_sel_column(
+    obj_id: &[ArkFr],
+    dict_id: &[ArkFr],
+    dict_value: &[ArkFr],
+    dict_datatype: &[ArkFr],
+    n_dict: usize,
+    datatype_t: ArkFr,
+    op: RangeOp,
+    c: ArkFr,
+    b_bits: usize,
+    real_n: usize,
+) -> Vec<ArkFr> {
+    let (v_val, v_dt, _w) =
+        honest_dict_lookup(obj_id, dict_id, dict_value, dict_datatype, real_n, n_dict);
+    let (dt_match, _dt_w) = filter::honest_witness(&v_dt, datatype_t, real_n);
+    let (_bits, range_sel) = honest_witness(&v_val, real_n, op, c, b_bits);
+    dt_match
+        .iter()
+        .zip(range_sel.iter())
+        .map(|(a, b)| *a * *b)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

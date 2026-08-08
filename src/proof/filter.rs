@@ -976,6 +976,262 @@ pub fn verify_filter(
 }
 
 // ===========================================================================
+// Selection-only entry: prove a committed `sel` equals the constant-equality
+// indicator, WITHOUT compacting (claims A, B only).
+// ===========================================================================
+//
+// The counterpart to compaction-only: a range atom needs the EQUALITY part of its
+// selection (predicate + any subject constant) as a separately committed boolean
+// column so it can be multiplied by the (independently proven) range selection. This
+// runs ONLY the selection claims A, B — bit-for-bit the full filter's A, B (the same
+// generalized `selection_claims` with the PUBLIC `beta_c` constant fold) — over
+// `[S, P, O, sel, w]`, pinning `sel[i] = χ_n[i]·Π_c[base_c[i] == const_c]`. It does
+// NOT compact, so no kept columns or LogUp reciprocals appear.
+
+const SO_LABEL_DOMAIN: &[u8] = b"pow/selection-only/domain-v1";
+const SO_LABEL_BETA_C: &[u8] = b"pow/selection-only/const-beta";
+
+/// A selection-only proof: the batched sumcheck over claims A, B and one batched Dory
+/// opening of `[S, P, O, sel, w]` at `r`, plus the `w` commitment the verifier binds.
+/// `Com(sel)` is returned separately (the authoritative equality-selection column).
+#[derive(Clone, Debug)]
+pub struct SelectionOnlyProof {
+    pub sumcheck: SumcheckProof,
+    pub opening: ColumnOpening,
+    pub w_commitment: ArkGT,
+}
+
+/// Claims A, B for `spec` over `[S, P, O, sel, w]` (indices S=0,P=1,O=2,sel=3,w=4),
+/// with `χ_n` the single chi bound.
+fn selection_only_shape(
+    spec: &AtomFilterSpec,
+    num_vars: usize,
+    real_rows: usize,
+    beta_c: ArkFr,
+) -> SumcheckShape {
+    let (claim_a, claim_b) = selection_claims(spec, beta_c);
+    SumcheckShape {
+        num_vars,
+        num_columns: 5,
+        chi_bounds: vec![real_rows],
+        claims: vec![claim_a, claim_b],
+    }
+}
+
+/// Prove that `Com(sel)` (returned) commits EXACTLY the constant-equality indicator of
+/// `spec` over the first `real_rows` rows: `sel[i] = 1` iff `i < real_rows` and every
+/// constant position of `spec` matches, else `0`. Requires at least one constant. Also
+/// returns the `sel` column itself so a composing layer can reuse the very column this
+/// proof committed (e.g. as a factor of a combined selection).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_selection_only(
+    spec: &AtomFilterSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    real_rows: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(SelectionOnlyProof, ArkGT, Vec<ArkFr>)> {
+    spec.validate()?;
+    if spec.constants.is_empty() {
+        return Err(invalid("selection-only requires at least one constant position"));
+    }
+    let size = s.len();
+    if !size.is_power_of_two() || size < 2 {
+        return Err(invalid("selection-only column length must be a power of two >= 2"));
+    }
+    if p.len() != size || o.len() != size {
+        return Err(invalid("selection-only column length mismatch"));
+    }
+    if real_rows > size {
+        return Err(invalid("selection-only row count exceeds column length"));
+    }
+    let num_vars = size.trailing_zeros() as usize;
+
+    let sel = atom_sel(spec, s, p, o, real_rows);
+    let com_sel = commit_column(&sel)?;
+
+    bind_spec(transcript, spec);
+    transcript.append_bytes(SO_LABEL_DOMAIN, b"parture/proof-of-woql/selection-only/v0");
+    transcript.append_group(b"pow/so/com-s", com_s);
+    transcript.append_group(b"pow/so/com-p", com_p);
+    transcript.append_group(b"pow/so/com-o", com_o);
+    transcript.append_group(b"pow/so/com-sel", &com_sel);
+    let beta_c = transcript.challenge_scalar(SO_LABEL_BETA_C);
+
+    let w = atom_w(spec, s, p, o, real_rows, beta_c);
+    let com_w = commit_column(&w)?;
+    transcript.append_group(b"pow/so/com-w", &com_w);
+
+    let shape = selection_only_shape(spec, num_vars, real_rows, beta_c);
+    let columns = vec![s.to_vec(), p.to_vec(), o.to_vec(), sel.clone(), w];
+    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
+    let opening = prove_column_openings(&columns, &r, transcript)?;
+
+    Ok((
+        SelectionOnlyProof {
+            sumcheck,
+            opening,
+            w_commitment: com_w,
+        },
+        com_sel,
+        sel,
+    ))
+}
+
+/// Verify a selection-only proof: `com_sel` commits EXACTLY the constant-equality
+/// indicator of `spec` over the first `real_rows` rows.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_selection_only(
+    spec: &AtomFilterSpec,
+    real_rows: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    com_sel: &ArkGT,
+    proof: &SelectionOnlyProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    spec.validate()?;
+    if spec.constants.is_empty() {
+        return Err(invalid("selection-only requires at least one constant position"));
+    }
+    let num_vars = proof.sumcheck.round_polys.len();
+    if num_vars == 0 || num_vars >= usize::BITS as usize {
+        return Err(invalid("selection-only proof has an implausible variable count"));
+    }
+    if real_rows > (1usize << num_vars) {
+        return Err(invalid("selection-only row count exceeds column length"));
+    }
+
+    bind_spec(transcript, spec);
+    transcript.append_bytes(SO_LABEL_DOMAIN, b"parture/proof-of-woql/selection-only/v0");
+    transcript.append_group(b"pow/so/com-s", com_s);
+    transcript.append_group(b"pow/so/com-p", com_p);
+    transcript.append_group(b"pow/so/com-o", com_o);
+    transcript.append_group(b"pow/so/com-sel", com_sel);
+    let beta_c = transcript.challenge_scalar(SO_LABEL_BETA_C);
+    transcript.append_group(b"pow/so/com-w", &proof.w_commitment);
+
+    let shape = selection_only_shape(spec, num_vars, real_rows, beta_c);
+    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    verify_column_openings(
+        &[*com_s, *com_p, *com_o, *com_sel, proof.w_commitment],
+        &r,
+        &evals,
+        &proof.opening,
+        transcript,
+    )
+}
+
+// ===========================================================================
+// Boolean-product entry: commit `sel = a ⊙ b` and prove the Identity `sel − a·b = 0`.
+// ===========================================================================
+//
+// Combines two committed boolean, χ_n-masked columns into their elementwise product,
+// the way a range atom forms `combined_sel = equality_sel · range_sel`. The Identity
+// `sel[i] − a[i]·b[i] = 0` at EVERY row pins `sel` to the product (and, when `a`/`b`
+// are boolean and zero on padding, makes `sel` boolean and zero on padding too).
+
+const PR_LABEL_DOMAIN: &[u8] = b"pow/bool-product/domain-v1";
+
+/// A boolean-product proof: the Identity sumcheck over `[a, b, sel]` and its opening.
+#[derive(Clone, Debug)]
+pub struct BooleanProductProof {
+    pub sumcheck: SumcheckProof,
+    pub opening: ColumnOpening,
+}
+
+fn boolean_product_shape(num_vars: usize) -> SumcheckShape {
+    // sel − a·b = 0  (a=col0, b=col1, sel=col2).
+    let claim = SumcheckClaim {
+        shape: ClaimShape::Identity,
+        expr: Expr {
+            terms: vec![
+                Term {
+                    coeff: f1(),
+                    operands: vec![Operand::Column(2)],
+                },
+                Term {
+                    coeff: f0() - f1(),
+                    operands: vec![Operand::Column(0), Operand::Column(1)],
+                },
+            ],
+        },
+        target: f0(),
+    };
+    SumcheckShape {
+        num_vars,
+        num_columns: 3,
+        chi_bounds: Vec::new(),
+        claims: vec![claim],
+    }
+}
+
+/// Commit `sel = a ⊙ b` and prove `sel − a·b = 0`. Returns the proof and `Com(sel)`.
+pub fn prove_boolean_product(
+    a: &[ArkFr],
+    b: &[ArkFr],
+    com_a: &ArkGT,
+    com_b: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(BooleanProductProof, ArkGT)> {
+    let size = a.len();
+    if b.len() != size {
+        return Err(invalid("boolean-product column length mismatch"));
+    }
+    if !size.is_power_of_two() || size < 2 {
+        return Err(invalid("boolean-product column length must be a power of two >= 2"));
+    }
+    let num_vars = size.trailing_zeros() as usize;
+    let sel: Vec<ArkFr> = a.iter().zip(b.iter()).map(|(x, y)| *x * *y).collect();
+    let com_sel = commit_column(&sel)?;
+
+    transcript.append_bytes(PR_LABEL_DOMAIN, b"parture/proof-of-woql/bool-product/v0");
+    transcript.append_group(b"pow/prod/com-a", com_a);
+    transcript.append_group(b"pow/prod/com-b", com_b);
+    transcript.append_group(b"pow/prod/com-sel", &com_sel);
+
+    let shape = boolean_product_shape(num_vars);
+    let columns = vec![a.to_vec(), b.to_vec(), sel];
+    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
+    let opening = prove_column_openings(&columns, &r, transcript)?;
+    Ok((BooleanProductProof { sumcheck, opening }, com_sel))
+}
+
+/// Verify a boolean-product proof: `com_sel` commits the elementwise product of the
+/// columns committed by `com_a` and `com_b`.
+pub fn verify_boolean_product(
+    com_a: &ArkGT,
+    com_b: &ArkGT,
+    com_sel: &ArkGT,
+    proof: &BooleanProductProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    let num_vars = proof.sumcheck.round_polys.len();
+    if num_vars == 0 || num_vars >= usize::BITS as usize {
+        return Err(invalid("boolean-product proof has an implausible variable count"));
+    }
+    transcript.append_bytes(PR_LABEL_DOMAIN, b"parture/proof-of-woql/bool-product/v0");
+    transcript.append_group(b"pow/prod/com-a", com_a);
+    transcript.append_group(b"pow/prod/com-b", com_b);
+    transcript.append_group(b"pow/prod/com-sel", com_sel);
+
+    let shape = boolean_product_shape(num_vars);
+    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    verify_column_openings(
+        &[*com_a, *com_b, *com_sel],
+        &r,
+        &evals,
+        &proof.opening,
+        transcript,
+    )
+}
+
+// ===========================================================================
 // Compaction-only entry: compact kept columns by an EXTERNAL boolean selection.
 // ===========================================================================
 //
@@ -1069,14 +1325,15 @@ fn bind_compaction_only(
 /// `sources` (one output column per source, dense prefix + zero tail), for an EXTERNAL
 /// boolean, χ_n-masked `sel` committed as `com_sel`. `source_commitments` must commit
 /// `sources` (root-anchored by the caller). Returns the proof, one commitment per kept
-/// output column, and the match count `m`.
+/// output column, the dense kept output columns themselves (full padded length, for a
+/// composing layer's witness), and the match count `m`.
 pub fn prove_compaction_only(
     sources: &[Vec<ArkFr>],
     source_commitments: &[ArkGT],
     sel: &[ArkFr],
     com_sel: &ArkGT,
     transcript: &mut Transcript254,
-) -> io::Result<(CompactionOnlyProof, Vec<ArkGT>, usize)> {
+) -> io::Result<(CompactionOnlyProof, Vec<ArkGT>, Vec<Vec<ArkFr>>, usize)> {
     let num_kept = sources.len();
     if num_kept == 0 {
         return Err(invalid("compaction-only needs at least one kept column"));
@@ -1130,6 +1387,7 @@ pub fn prove_compaction_only(
             dstar_commitment: com_dstar,
         },
         com_kept,
+        kept_out,
         m,
     ))
 }
@@ -1236,7 +1494,7 @@ mod tests {
         let com_sel = commit(&sel);
 
         let mut pt = transcript();
-        let (proof, com_kept, m) =
+        let (proof, com_kept, kept_cols, m) =
             prove_compaction_only(&sources, &com_sources, &sel, &com_sel, &mut pt).unwrap();
         let mut vt = transcript();
         verify_compaction_only(&com_sources, &com_sel, &com_kept, m, &proof, &mut vt).unwrap();
@@ -1248,6 +1506,8 @@ mod tests {
         assert_eq!(com_kept.len(), 2);
         assert_eq!(com_kept[0], commit(&exp[0]));
         assert_eq!(com_kept[1], commit(&exp[1]));
+        // The returned dense kept columns match the independent compaction too.
+        assert_eq!(kept_cols, exp);
 
         // Tampered kept commitments (columns swapped) are rejected.
         let mut vt2 = transcript();

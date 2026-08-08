@@ -23,7 +23,7 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::Transcript254;
+use super::argument::{commit_column, Transcript254};
 use super::bgp::{
     prove_bgp_chain, verify_bgp_chain, BgpChainProof, JoinStep, RelationCommit, RelationWitness,
 };
@@ -33,14 +33,21 @@ use super::dict::{
     hash_object, hash_term, prove_dict_membership, verify_dict_membership, DictProof,
 };
 use super::filter::{
-    atom_kept_columns, compact_selected, honest_witness, prove_atom_filter, prove_filter,
-    verify_atom_filter, verify_filter, AtomFilterProof, AtomFilterSpec, FullFilterProof, Position,
+    atom_kept_columns, compact_selected, honest_witness, prove_atom_filter,
+    prove_boolean_product, prove_compaction_only, prove_filter, prove_selection_only,
+    verify_atom_filter, verify_boolean_product, verify_compaction_only, verify_filter,
+    verify_selection_only, AtomFilterProof, AtomFilterSpec, BooleanProductProof,
+    CompactionOnlyProof, FullFilterProof, Position, SelectionOnlyProof,
 };
 use super::invalid;
 use super::{CanonicalDatatype, CanonicalObject};
 use super::join::{
     compute_self_join, prove_self_join_complete, self_join_commitments, self_join_domain,
     verify_self_join_complete, SelfJoinCommitments, SelfJoinCompleteProof,
+};
+use super::range::{
+    object_range_sel_column, prove_object_range_select, verify_object_range_select,
+    ObjectRangeProof, RangeOp,
 };
 use super::relocate::{prove_column_relocation, verify_column_relocation, RelocationProof};
 
@@ -516,29 +523,57 @@ pub enum AtomTerm {
     ValueConstant(CanonicalDatatype, Vec<u8>),
 }
 
+/// A numeric RANGE filter on an atom's VARIABLE object: `?o op c`, where the object's
+/// dict-authenticated typed value (of datatype discriminant `T`) is compared to the
+/// PUBLIC order-preserving-encoded constant `c`. `b_bits` is the range gadget's
+/// bit-width (`64` for the store's `<= 8`-byte numerics — see [`super::range`]). Bound
+/// into the layer BGP statement so the query is fully pinned.
+#[derive(Clone, Debug)]
+pub struct ObjectRangeSpec {
+    pub op: RangeOp,
+    /// The datatype discriminant `T` the object must match (a `CanonicalDatatype as u64`
+    /// tag, or the Node tag), as a field element.
+    pub datatype: ArkFr,
+    /// The order-preserving-encoded comparison constant `c`, as a field element.
+    pub c: ArkFr,
+    pub b_bits: usize,
+}
+
 /// One atom of a layer BGP. v1 SCOPE: the PREDICATE is always a constant IRI
 /// (authenticated by the layer's predicate dictionary). The subject/object may each be a
 /// VARIABLE (a kept output column) or a CONSTANT (authenticated against the layer's
-/// node/value dictionary and folded into the atom filter). Constraints (enforced at
-/// prove AND verify): the subject may not be a `ValueConstant` (literals never occupy the
-/// subject position), and at least one of subject/object must be a `Variable` (a
-/// fully-ground atom is an existence check, out of scope for v1).
+/// node/value dictionary and folded into the atom filter). An optional `object_range`
+/// adds a numeric RANGE filter on the object — valid ONLY when the object is a
+/// `Variable` (a ranged object is a kept variable, never a constant). Constraints
+/// (enforced at prove AND verify): the subject may not be a `ValueConstant` (literals
+/// never occupy the subject position), at least one of subject/object must be a
+/// `Variable` (a fully-ground atom is an existence check, out of scope for v1), and an
+/// `object_range` requires a `Variable` object with a valid bit-width.
 #[derive(Clone, Debug)]
 pub struct LayerBgpAtom {
     pub subject: AtomTerm,
     pub predicate_term: Vec<u8>,
     pub object: AtomTerm,
+    pub object_range: Option<ObjectRangeSpec>,
 }
 
 impl LayerBgpAtom {
     /// The classic all-variable atom `t(?s, <predicate_term>, ?o)`: both subject and
-    /// object are query variables (the two kept output columns).
+    /// object are query variables (the two kept output columns), no object range.
     pub fn all_variables(predicate_term: Vec<u8>) -> Self {
         Self {
             subject: AtomTerm::Variable,
             predicate_term,
             object: AtomTerm::Variable,
+            object_range: None,
         }
+    }
+
+    /// Attach a numeric object-value range filter to this atom (the object must be a
+    /// `Variable`; enforced at prove/verify by [`validate_atom`]).
+    pub fn with_object_range(mut self, range: ObjectRangeSpec) -> Self {
+        self.object_range = Some(range);
+        self
     }
 }
 
@@ -553,19 +588,60 @@ pub struct LayerBgpPlan {
     pub joins: Vec<JoinStep>,
 }
 
+/// The composed sub-proofs for a RANGED atom `t(?s, <p>, ?a) [?a op c]`: the object
+/// column and the three node/value dictionary columns relocated to a common
+/// power-of-two domain `D = 2^max(a, dict_log)` (each tied to its root-bound original),
+/// the authenticated object-range selection at `D`, the range selection relocated back
+/// to the table domain, the constant-equality selection, their product (the combined
+/// selection), and the compaction of the kept columns by that combined selection.
+/// `d_log`/`n_dict` are re-derived by the verifier from the (root-verified) layer, so
+/// they are NOT carried here; every commitment below is authenticated against a
+/// root-bound source (the relocations) or the shared transcript.
+#[derive(Clone, Debug)]
+pub struct RangeAtomSubproof {
+    /// Object column (table -> D) + the three dict columns (dict -> D) relocations.
+    pub relocate_object: RelocationProof,
+    pub relocate_dict_id: RelocationProof,
+    pub relocate_dict_value: RelocationProof,
+    pub relocate_dict_datatype: RelocationProof,
+    /// The relocated copies at domain `D` (targets; sources are root-bound).
+    pub com_object_at_d: ArkGT,
+    pub com_dict_id_at_d: ArkGT,
+    pub com_dict_value_at_d: ArkGT,
+    pub com_dict_datatype_at_d: ArkGT,
+    /// The authenticated object-range selection at `D` and its `Com(range_sel)`.
+    pub object_range: ObjectRangeProof,
+    pub com_range_sel_at_d: ArkGT,
+    /// `range_sel` relocated from `D` back to the table domain, and its commitment.
+    pub relocate_range_sel: RelocationProof,
+    pub com_range_sel_at_table: ArkGT,
+    /// The constant-equality selection (predicate + any subject constant) and `Com(sel)`.
+    pub equality: SelectionOnlyProof,
+    pub com_equality_sel: ArkGT,
+    /// The product `combined_sel = equality_sel · range_sel` and its commitment.
+    pub combine: BooleanProductProof,
+    pub com_combined_sel: ArkGT,
+    /// The compaction of the kept columns by `combined_sel` (kept commitments live on the
+    /// enclosing [`LayerBgpAtomProof`]).
+    pub compaction: CompactionOnlyProof,
+}
+
 /// The per-atom half of a layer BGP proof: the dictionary binding of the predicate IRI to
 /// its id, the optional subject/object CONSTANT bindings (node/value dictionary), the
-/// complete per-atom filter into the dense KEPT (variable) columns, one commitment per
-/// kept column (in S,O order), the filter output length, and the REVEALED subject/object
-/// constant ids. Those ids are public inputs to verification: the verifier feeds the SAME
-/// id to both the membership check (constant -> id) and the filter's constant, so a prover
-/// cannot authenticate one id and filter on another.
+/// per-atom selection (EITHER a plain constant `filter` OR a `range` subproof, matching
+/// the plan atom), one commitment per kept column (in S,O order), the result length, and
+/// the REVEALED subject/object constant ids. Those ids are public inputs to verification:
+/// the verifier feeds the SAME id to both the membership check (constant -> id) and the
+/// filter's constant, so a prover cannot authenticate one id and filter on another.
+/// Exactly one of `filter`/`range` is `Some`, determined by the PLAN atom's
+/// `object_range` (never by the prover-supplied proof).
 #[derive(Clone, Debug)]
 pub struct LayerBgpAtomProof {
     pub predicate_membership: DictProof,
     pub subject_membership: Option<DictProof>,
     pub object_membership: Option<DictProof>,
-    pub filter: AtomFilterProof,
+    pub filter: Option<AtomFilterProof>,
+    pub range: Option<RangeAtomSubproof>,
     pub kept_commitments: Vec<ArkGT>,
     pub m: usize,
     pub subject_id: Option<u64>,
@@ -630,6 +706,20 @@ fn validate_atom(atom: &LayerBgpAtom) -> io::Result<()> {
         return Err(invalid(
             "layer BGP atom must have at least one variable (ground atoms unsupported in v1)",
         ));
+    }
+    if let Some(range) = &atom.object_range {
+        // A ranged object must be a KEPT variable — never a constant (a range on a
+        // fixed object is a compile-time-true/false, out of v1 scope).
+        if !matches!(atom.object, AtomTerm::Variable) {
+            return Err(invalid(
+                "layer BGP object range requires a variable object",
+            ));
+        }
+        if !(1..=252).contains(&range.b_bits) {
+            return Err(invalid(
+                "layer BGP object range bit-width out of range (need 1 <= B <= 252)",
+            ));
+        }
     }
     Ok(())
 }
@@ -707,6 +797,26 @@ fn bind_layer_bgp_statement(
         transcript.append_bytes(b"pow/bgp-layer/pred-term", &atom.predicate_term);
         transcript.append_bytes(b"pow/bgp-layer/pred-id", &ids.predicate_id.to_le_bytes());
         bind_atom_term(transcript, &atom.object, ids.object_id);
+        // Pin the optional object range (op, datatype T, constant c, bit-width) so the
+        // whole comparison is part of the statement the challenges depend on.
+        match &atom.object_range {
+            None => transcript.append_bytes(b"pow/bgp-layer/obj-range-none", &[]),
+            Some(range) => {
+                let op_tag: u8 = match range.op {
+                    RangeOp::Lt => 0,
+                    RangeOp::Le => 1,
+                    RangeOp::Gt => 2,
+                    RangeOp::Ge => 3,
+                };
+                transcript.append_bytes(b"pow/bgp-layer/obj-range-op", &[op_tag]);
+                transcript.append_field(b"pow/bgp-layer/obj-range-dt", &range.datatype);
+                transcript.append_field(b"pow/bgp-layer/obj-range-c", &range.c);
+                transcript.append_bytes(
+                    b"pow/bgp-layer/obj-range-bbits",
+                    &(range.b_bits as u64).to_le_bytes(),
+                );
+            }
+        }
     }
     for step in &plan.joins {
         transcript.append_bytes(b"pow/bgp-layer/acc-key", &(step.acc_key as u64).to_le_bytes());
@@ -723,6 +833,335 @@ fn validate_bgp_plan(plan: &LayerBgpPlan) -> io::Result<usize> {
         return Err(invalid("layer BGP plan must have exactly k-1 join steps"));
     }
     Ok(k)
+}
+
+/// The padded power-of-two length of every committed node/value dictionary column,
+/// derived from the (root-verified) real dict-row count `n_dict` — the SAME
+/// `next_pow2(n_dict).max(2)` convention `commit_node_value_dict*` uses. A ranged atom
+/// needs a non-empty dictionary (an empty dict cannot authenticate any object value).
+fn dict_domain_len(n_dict: usize) -> io::Result<usize> {
+    if n_dict == 0 {
+        return Err(invalid(
+            "layer BGP object range requires a non-empty node/value dictionary",
+        ));
+    }
+    let padded = n_dict
+        .checked_next_power_of_two()
+        .ok_or_else(|| invalid("node/value dictionary length overflow"))?
+        .max(2);
+    Ok(padded)
+}
+
+/// The full (padded) base column for a kept position — a subset of `{S, O}` for a ranged
+/// atom (predicate is always constant; a ranged object is a variable).
+fn kept_base_column(pos: Position, s: &[ArkFr], p: &[ArkFr], o: &[ArkFr]) -> Vec<ArkFr> {
+    match pos {
+        Position::S => s.to_vec(),
+        Position::P => p.to_vec(),
+        Position::O => o.to_vec(),
+    }
+}
+
+/// The root-bound commitment for a kept position (mirrors [`kept_base_column`]).
+fn kept_base_commitment(pos: Position, com_s: &ArkGT, com_p: &ArkGT, com_o: &ArkGT) -> ArkGT {
+    match pos {
+        Position::S => *com_s,
+        Position::P => *com_p,
+        Position::O => *com_o,
+    }
+}
+
+/// The common relocation domain for a ranged atom: `D = 2^max(a, dict_log)`, large
+/// enough to hold BOTH the table object column (`2^a`) and the dict columns
+/// (`2^dict_log`), so both can be relocated in and the range gadget run over one domain.
+fn range_common_domain(a: usize, n_dict: usize) -> io::Result<(usize, usize)> {
+    let dict_len = dict_domain_len(n_dict)?;
+    let dict_log = dict_len.trailing_zeros() as usize;
+    Ok((a.max(dict_log), dict_log))
+}
+
+/// Prove one RANGED atom `t(?s, <p>, ?a) [?a op c]`: relocate the object column + the
+/// three dict columns to the common domain `D`, prove the authenticated object-range
+/// selection at `D`, relocate that `range_sel` back to the table domain, prove the
+/// constant-equality selection, multiply them into the combined selection, and compact
+/// the kept columns by it. Returns the range subproof, the kept-column commitments (S,O
+/// order), the dense kept columns (for the chain witness), and the result length `m`.
+/// All sub-proofs run on the SHARED `transcript` in this exact order.
+#[allow(clippy::too_many_arguments)]
+fn prove_ranged_atom(
+    spec: &AtomFilterSpec,
+    range: &ObjectRangeSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    n: usize,
+    a: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    layer: &LayerCommitment,
+    transcript: &mut Transcript254,
+) -> io::Result<(RangeAtomSubproof, Vec<ArkGT>, Vec<Vec<ArkFr>>, usize)> {
+    let n_dict = layer.node_value_catalog.len();
+    let (d_log, dict_log) = range_common_domain(a, n_dict)?;
+    let d = 1usize << d_log;
+
+    // Root-bound dict columns/commitments (format v3).
+    let (_nv_hash, dict_id) = layer.node_value_dictionary_columns()?;
+    let dict_value = layer.node_value_dictionary_value_column()?;
+    let dict_datatype = layer.node_value_dictionary_datatype_column()?;
+    let com_dict_id = layer.node_value_dict_commitments.1;
+    let com_dict_value = layer.node_value_dict_range_commitments.0;
+    let com_dict_datatype = layer.node_value_dict_range_commitments.1;
+    if dict_id.len() != (1usize << dict_log) {
+        return Err(invalid("node/value dictionary column length inconsistent"));
+    }
+
+    // (a) Relocate the object column (table -> D) and the three dict columns (dict -> D),
+    // each tied to its root-bound original. When a domain already equals D the relocation
+    // is same-domain (still authenticates the fresh copy).
+    let o_at_d = pad(o, d);
+    let com_object_at_d = commit_column(&o_at_d)?;
+    let relocate_object = prove_column_relocation(o, com_o, &o_at_d, &com_object_at_d, transcript)?;
+
+    let dict_id_at_d = pad(&dict_id, d);
+    let com_dict_id_at_d = commit_column(&dict_id_at_d)?;
+    let relocate_dict_id =
+        prove_column_relocation(&dict_id, &com_dict_id, &dict_id_at_d, &com_dict_id_at_d, transcript)?;
+
+    let dict_value_at_d = pad(&dict_value, d);
+    let com_dict_value_at_d = commit_column(&dict_value_at_d)?;
+    let relocate_dict_value = prove_column_relocation(
+        &dict_value,
+        &com_dict_value,
+        &dict_value_at_d,
+        &com_dict_value_at_d,
+        transcript,
+    )?;
+
+    let dict_datatype_at_d = pad(&dict_datatype, d);
+    let com_dict_datatype_at_d = commit_column(&dict_datatype_at_d)?;
+    let relocate_dict_datatype = prove_column_relocation(
+        &dict_datatype,
+        &com_dict_datatype,
+        &dict_datatype_at_d,
+        &com_dict_datatype_at_d,
+        transcript,
+    )?;
+
+    // (b) Authenticated object-range selection over the relocated columns at D.
+    let (object_range, com_range_sel_at_d) = prove_object_range_select(
+        &o_at_d,
+        &com_object_at_d,
+        &dict_id_at_d,
+        &dict_value_at_d,
+        &dict_datatype_at_d,
+        &com_dict_id_at_d,
+        &com_dict_value_at_d,
+        &com_dict_datatype_at_d,
+        n_dict,
+        range.datatype,
+        range.op,
+        range.c,
+        range.b_bits,
+        n,
+        transcript,
+    )?;
+    // The SAME sel column that Com(range_sel) commits (χ_n-masked, so zero beyond n).
+    let range_sel_at_d = object_range_sel_column(
+        &o_at_d,
+        &dict_id_at_d,
+        &dict_value_at_d,
+        &dict_datatype_at_d,
+        n_dict,
+        range.datatype,
+        range.op,
+        range.c,
+        range.b_bits,
+        n,
+    );
+
+    // (c) Relocate range_sel from D back to the table domain (its support is [0, n) ⊆
+    // [0, 2^a), so truncating to the table domain is lossless; the relocation ties the
+    // table copy to the authoritative Com(range_sel) at D).
+    let table = 1usize << a;
+    let range_sel_at_table = range_sel_at_d[..table].to_vec();
+    let com_range_sel_at_table = commit_column(&range_sel_at_table)?;
+    let relocate_range_sel = prove_column_relocation(
+        &range_sel_at_d,
+        &com_range_sel_at_d,
+        &range_sel_at_table,
+        &com_range_sel_at_table,
+        transcript,
+    )?;
+
+    // (d) Constant-equality selection (predicate + any subject constant) at the table
+    // domain — pins com_equality_sel to the equality indicator (never touches the object).
+    let (equality, com_equality_sel, eq_sel) =
+        prove_selection_only(spec, s, p, o, n, com_s, com_p, com_o, transcript)?;
+
+    // (e) Combined selection = equality_sel ⊙ range_sel (both boolean + χ_n-masked).
+    let (combine, com_combined_sel) = prove_boolean_product(
+        &eq_sel,
+        &range_sel_at_table,
+        &com_equality_sel,
+        &com_range_sel_at_table,
+        transcript,
+    )?;
+    let combined_sel: Vec<ArkFr> = eq_sel
+        .iter()
+        .zip(range_sel_at_table.iter())
+        .map(|(x, y)| *x * *y)
+        .collect();
+
+    // (f) Compact the kept variable columns by the combined selection.
+    let sources: Vec<Vec<ArkFr>> = spec
+        .kept
+        .iter()
+        .map(|pos| kept_base_column(*pos, s, p, o))
+        .collect();
+    let source_coms: Vec<ArkGT> = spec
+        .kept
+        .iter()
+        .map(|pos| kept_base_commitment(*pos, com_s, com_p, com_o))
+        .collect();
+    let (compaction, kept_commitments, kept_columns, m) =
+        prove_compaction_only(&sources, &source_coms, &combined_sel, &com_combined_sel, transcript)?;
+
+    Ok((
+        RangeAtomSubproof {
+            relocate_object,
+            relocate_dict_id,
+            relocate_dict_value,
+            relocate_dict_datatype,
+            com_object_at_d,
+            com_dict_id_at_d,
+            com_dict_value_at_d,
+            com_dict_datatype_at_d,
+            object_range,
+            com_range_sel_at_d,
+            relocate_range_sel,
+            com_range_sel_at_table,
+            equality,
+            com_equality_sel,
+            combine,
+            com_combined_sel,
+            compaction,
+        },
+        kept_commitments,
+        kept_columns,
+        m,
+    ))
+}
+
+/// Verify one RANGED atom's sub-proofs, mirroring [`prove_ranged_atom`] on the SHARED
+/// `transcript` in prover order: the four relocations to `D`, the authenticated
+/// object-range selection at `D`, the range selection relocated back to the table
+/// domain, the constant-equality selection, the combined-selection product, and the
+/// compaction of the kept columns into `kept_commitments[0..m]`. Anchoring/root checks
+/// happen once in the caller BEFORE this runs.
+#[allow(clippy::too_many_arguments)]
+fn verify_ranged_atom(
+    spec: &AtomFilterSpec,
+    range: &ObjectRangeSpec,
+    n: usize,
+    a: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    layer: &LayerCommitment,
+    sub: &RangeAtomSubproof,
+    kept_commitments: &[ArkGT],
+    m: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    let n_dict = layer.node_value_catalog.len();
+    let (d_log, dict_log) = range_common_domain(a, n_dict)?;
+    let com_dict_id = layer.node_value_dict_commitments.1;
+    let com_dict_value = layer.node_value_dict_range_commitments.0;
+    let com_dict_datatype = layer.node_value_dict_range_commitments.1;
+
+    // (a) Verify the four relocations to the common domain D against the root-bound
+    // originals (com_o + the three dict commitments).
+    verify_column_relocation(com_o, a, &sub.com_object_at_d, d_log, &sub.relocate_object, transcript)?;
+    verify_column_relocation(
+        &com_dict_id,
+        dict_log,
+        &sub.com_dict_id_at_d,
+        d_log,
+        &sub.relocate_dict_id,
+        transcript,
+    )?;
+    verify_column_relocation(
+        &com_dict_value,
+        dict_log,
+        &sub.com_dict_value_at_d,
+        d_log,
+        &sub.relocate_dict_value,
+        transcript,
+    )?;
+    verify_column_relocation(
+        &com_dict_datatype,
+        dict_log,
+        &sub.com_dict_datatype_at_d,
+        d_log,
+        &sub.relocate_dict_datatype,
+        transcript,
+    )?;
+
+    // (b) Verify the authenticated object-range selection at D.
+    verify_object_range_select(
+        &sub.com_object_at_d,
+        &sub.com_dict_id_at_d,
+        &sub.com_dict_value_at_d,
+        &sub.com_dict_datatype_at_d,
+        n_dict,
+        range.datatype,
+        range.op,
+        range.c,
+        range.b_bits,
+        n,
+        &sub.com_range_sel_at_d,
+        &sub.object_range,
+        transcript,
+    )?;
+
+    // (c) Verify range_sel relocated from D back to the table domain.
+    verify_column_relocation(
+        &sub.com_range_sel_at_d,
+        d_log,
+        &sub.com_range_sel_at_table,
+        a,
+        &sub.relocate_range_sel,
+        transcript,
+    )?;
+
+    // (d) Verify the constant-equality selection.
+    verify_selection_only(spec, n, com_s, com_p, com_o, &sub.com_equality_sel, &sub.equality, transcript)?;
+
+    // (e) Verify the combined selection = equality_sel · range_sel.
+    verify_boolean_product(
+        &sub.com_equality_sel,
+        &sub.com_range_sel_at_table,
+        &sub.com_combined_sel,
+        &sub.combine,
+        transcript,
+    )?;
+
+    // (f) Verify the compaction of the kept columns by the combined selection.
+    let source_coms: Vec<ArkGT> = spec
+        .kept
+        .iter()
+        .map(|pos| kept_base_commitment(*pos, com_s, com_p, com_o))
+        .collect();
+    verify_compaction_only(
+        &source_coms,
+        &sub.com_combined_sel,
+        kept_commitments,
+        m,
+        &sub.compaction,
+        transcript,
+    )
 }
 
 /// Prove the COMPLETE result of a k-atom conjunctive BGP against a materialized base
@@ -818,15 +1257,33 @@ pub fn prove_layer_bgp(
             )?),
             _ => None,
         };
-        // (3) The complete per-atom filter (predicate + any subject/object constants) into
-        // the dense KEPT (variable) columns, root-anchored via the filter argument.
+        // (3) The complete per-atom selection into the dense KEPT (variable) columns,
+        // root-anchored. A PLAIN atom folds predicate + any subject/object constants via
+        // the fused atom filter; a RANGED atom ANDs the equality selection with an
+        // authenticated object-value range (relocations + object-range + combine +
+        // compaction). Both yield the same shape of result: kept commitments + columns + m.
         let spec = atom_filter_spec(atom, ids);
-        let (filter, kept_commitments, m) =
-            prove_atom_filter(&spec, &s, &p, &o, n, &com_s, &com_p, &com_o, &mut transcript)?;
-        // (4) The dense kept columns (== what prove_atom_filter committed) as the chain
-        // relation; its arity equals the number of variables in the atom.
-        let (kept_columns, m_columns) = atom_kept_columns(&spec, &s, &p, &o, n)?;
-        debug_assert_eq!(m_columns, m);
+        let (filter, range, kept_commitments, kept_columns, m) = match &atom.object_range {
+            None => {
+                let (filter, kept_commitments, m) = prove_atom_filter(
+                    &spec, &s, &p, &o, n, &com_s, &com_p, &com_o, &mut transcript,
+                )?;
+                // The dense kept columns (== what prove_atom_filter committed) as the
+                // chain relation; its arity equals the number of variables in the atom.
+                let (kept_columns, m_columns) = atom_kept_columns(&spec, &s, &p, &o, n)?;
+                debug_assert_eq!(m_columns, m);
+                (Some(filter), None, kept_commitments, kept_columns, m)
+            }
+            Some(object_range) => {
+                let (sub, kept_commitments, kept_columns, m) = prove_ranged_atom(
+                    &spec, object_range, &s, &p, &o, n, a, &com_s, &com_p, &com_o, layer,
+                    &mut transcript,
+                )?;
+                (None, Some(sub), kept_commitments, kept_columns, m)
+            }
+        };
+        // (4) Register the filtered relation for the left-deep chain (same layout for a
+        // plain or a ranged atom: kept columns at the table domain, real length m).
         relations.push(RelationWitness {
             columns: kept_columns,
             commitments: kept_commitments.clone(),
@@ -838,6 +1295,7 @@ pub fn prove_layer_bgp(
             subject_membership,
             object_membership,
             filter,
+            range,
             kept_commitments,
             m,
             subject_id: ids.subject_id,
@@ -938,9 +1396,9 @@ pub fn verify_layer_bgp(
         .zip(proof.atoms.iter())
         .zip(atom_ids.iter())
     {
-        // A compacted atom filter's dimension must match the layer's committed table
-        // columns (defense-in-depth; the Dory openings would also catch a mismatch).
-        if let AtomFilterProof::Compacted(inner) = &ap.filter {
+        // A compacted PLAIN atom filter's dimension must match the layer's committed
+        // table columns (defense-in-depth; the Dory openings would also catch a mismatch).
+        if let Some(AtomFilterProof::Compacted(inner)) = &ap.filter {
             if inner.sumcheck.round_polys.len() != a {
                 return Err(invalid(
                     "atom filter dimension does not match the layer's committed columns",
@@ -990,20 +1448,60 @@ pub fn verify_layer_bgp(
                 &mut transcript,
             )?;
         }
-        // (3) Filter: `kept_commitments[0..m]` is the complete per-atom result. The spec
-        // reuses the SAME ids the memberships authenticated.
+        // (3) Selection: `kept_commitments[0..m]` is the complete per-atom result. Which
+        // path runs is decided by the PLAN atom's `object_range` (public), NOT by the
+        // prover-supplied proof — a plain atom must carry a `filter`, a ranged atom a
+        // `range`. The spec reuses the SAME ids the memberships authenticated.
         let spec = atom_filter_spec(atom, ids);
-        verify_atom_filter(
-            &spec,
-            n,
-            &com_s,
-            &com_p,
-            &com_o,
-            &ap.kept_commitments,
-            ap.m,
-            &ap.filter,
-            &mut transcript,
-        )?;
+        match &atom.object_range {
+            None => {
+                if ap.range.is_some() {
+                    return Err(invalid(
+                        "plain layer BGP atom carries a range subproof",
+                    ));
+                }
+                let filter = ap
+                    .filter
+                    .as_ref()
+                    .ok_or_else(|| invalid("plain layer BGP atom missing its filter proof"))?;
+                verify_atom_filter(
+                    &spec,
+                    n,
+                    &com_s,
+                    &com_p,
+                    &com_o,
+                    &ap.kept_commitments,
+                    ap.m,
+                    filter,
+                    &mut transcript,
+                )?;
+            }
+            Some(object_range) => {
+                if ap.filter.is_some() {
+                    return Err(invalid(
+                        "ranged layer BGP atom carries a plain filter proof",
+                    ));
+                }
+                let sub = ap
+                    .range
+                    .as_ref()
+                    .ok_or_else(|| invalid("ranged layer BGP atom missing its range subproof"))?;
+                verify_ranged_atom(
+                    &spec,
+                    object_range,
+                    n,
+                    a,
+                    &com_s,
+                    &com_p,
+                    &com_o,
+                    layer,
+                    sub,
+                    &ap.kept_commitments,
+                    ap.m,
+                    &mut transcript,
+                )?;
+            }
+        }
         relations.push(RelationCommit {
             commitments: ap.kept_commitments.clone(),
             log_domain: a,
@@ -1606,6 +2104,7 @@ mod tests {
                     subject: AtomTerm::Variable,
                     predicate_term: KNOWS.to_vec(),
                     object: node_const("b"),
+                    object_range: None,
                 },
             ],
             joins: vec![JoinStep { acc_key: 0, rel_key: 0 }], // x = S(likes) == S(knows)
@@ -1662,6 +2161,7 @@ mod tests {
                     subject: AtomTerm::Variable,
                     predicate_term: NAME.to_vec(),
                     object: AtomTerm::ValueConstant(dt, lex),
+                    object_range: None,
                 },
                 LayerBgpAtom::all_variables(KNOWS.to_vec()),
             ],
@@ -1693,6 +2193,7 @@ mod tests {
                     subject: node_const("a"),
                     predicate_term: KNOWS.to_vec(),
                     object: AtomTerm::Variable,
+                    object_range: None,
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
@@ -1726,6 +2227,7 @@ mod tests {
                     subject: AtomTerm::Variable,
                     predicate_term: LIKES.to_vec(),
                     object: node_const("g"),
+                    object_range: None,
                 },
             ],
             joins: vec![JoinStep { acc_key: 1, rel_key: 0 }], // y = O(knows) == S(likes)
@@ -1776,6 +2278,7 @@ mod tests {
                     subject: AtomTerm::Variable,
                     predicate_term: LIKES.to_vec(),
                     object: node_const("absent"),
+                    object_range: None,
                 },
             ],
             joins: vec![JoinStep { acc_key: 1, rel_key: 0 }],
@@ -1796,6 +2299,7 @@ mod tests {
                     subject: node_const("a"),
                     predicate_term: KNOWS.to_vec(),
                     object: node_const("b"),
+                    object_range: None,
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
@@ -1809,11 +2313,297 @@ mod tests {
                     subject: AtomTerm::ValueConstant(CanonicalDatatype::String, b"x".to_vec()),
                     predicate_term: KNOWS.to_vec(),
                     object: AtomTerm::Variable,
+                    object_range: None,
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
             joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
         };
         assert!(prove_layer_bgp(&lc, &value_subject).is_err());
+    }
+
+    // ---- Q_k with a numeric object-value RANGE filter (CP-C) end-to-end ----
+
+    const AGE: &[u8] = b"http://ex/age";
+    const UINT32_TAG: u64 = CanonicalDatatype::UInt32 as u64;
+    const BOOLEAN_TAG: u64 = CanonicalDatatype::Boolean as u64;
+
+    fn fr(v: u64) -> ArkFr {
+        ArkFr::from_u64(v)
+    }
+
+    fn cmp_op(op: RangeOp, a: u64, b: u64) -> bool {
+        match op {
+            RangeOp::Lt => a < b,
+            RangeOp::Le => a <= b,
+            RangeOp::Gt => a > b,
+            RangeOp::Ge => a >= b,
+        }
+    }
+
+    // A base layer of `t(person, age, <UInt32>)` and `t(person, name, <node>)` triples.
+    // Ages are inserted OUT of numeric order; every person has exactly one name.
+    fn build_age_name_layer() -> std::sync::Arc<LayerCommitment> {
+        use tdb_succinct::TdbDataType;
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        let age = iri("age");
+        let name = iri("name");
+        for (person, a) in [
+            ("alice", 30u32),
+            ("bob", 15),
+            ("carol", 18),
+            ("dave", 40),
+            ("erin", 18),
+        ] {
+            builder
+                .add_value_triple(ValueTriple::new_value(&iri(person), &age, u32::make_entry(&a)))
+                .unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(person),
+                    &name,
+                    &iri(&format!("{person}_n")),
+                ))
+                .unwrap();
+        }
+        let (layer, _state) = builder.commit_with_proof().unwrap();
+        layer.proof_commitment().unwrap().unwrap()
+    }
+
+    // A layer with FEW triples but MANY distinct node/values: 3 people, each with a
+    // distinct age and a distinct name node. The node/value dictionary (9 entries -> 16
+    // rows) is LARGER than the table (6 triples -> 8 rows), so the common relocation
+    // domain D = 16 strictly EXCEEDS the table domain 2^a = 8 — exercising the up
+    // (object/dict -> D) and down (range_sel -> table) relocation branches end-to-end.
+    fn build_distinct_age_name_layer() -> std::sync::Arc<LayerCommitment> {
+        use tdb_succinct::TdbDataType;
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        let age = iri("age");
+        let name = iri("name");
+        for (person, a) in [("p1", 10u32), ("p2", 25), ("p3", 5)] {
+            builder
+                .add_value_triple(ValueTriple::new_value(&iri(person), &age, u32::make_entry(&a)))
+                .unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(person),
+                    &name,
+                    &iri(&format!("{person}_n")),
+                ))
+                .unwrap();
+        }
+        let (layer, _state) = builder.commit_with_proof().unwrap();
+        layer.proof_commitment().unwrap().unwrap()
+    }
+
+    // The UInt32 value behind a node/value dict id (its order-preserving encoding is the
+    // big-endian u32, so a BE read recovers the value), or None for a non-UInt32 object.
+    fn uint32_value_of(lc: &LayerCommitment, object_id: u64) -> Option<u64> {
+        use std::convert::TryInto;
+        lc.node_value_catalog
+            .iter()
+            .find(|r| r.object_id == object_id)
+            .and_then(|r| match &r.triple.object {
+                CanonicalObject::Value {
+                    datatype: CanonicalDatatype::UInt32,
+                    lexical,
+                } => Some(u32::from_be_bytes(lexical.as_slice().try_into().unwrap()) as u64),
+                _ => None,
+            })
+    }
+
+    fn age_range_plan(op: RangeOp, c: u64) -> LayerBgpPlan {
+        LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom::all_variables(AGE.to_vec()).with_object_range(ObjectRangeSpec {
+                    op,
+                    datatype: fr(UINT32_TAG),
+                    c: fr(c),
+                    b_bits: 64,
+                }),
+                LayerBgpAtom::all_variables(NAME.to_vec()),
+            ],
+            // x = S(age) == S(name).
+            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+        }
+    }
+
+    // Independently recompute the complete result of
+    // `t(?x, age, ?a) [?a op c], t(?x, name, ?n)`: the age relation is the range-filtered
+    // [S, O] pairs (in stored order), joined with the name [S, O] pairs on the shared x.
+    // Returns the result columns [a, x, n], the final join domain, and the row count.
+    fn expected_age_name_join(
+        lc: &LayerCommitment,
+        op: RangeOp,
+        c: u64,
+    ) -> (Vec<Vec<ArkFr>>, usize, usize) {
+        use crate::proof::join2::{binary_join_domain, compute_binary_join};
+        let age_id = resolve_predicate_id(lc, AGE).unwrap();
+        let name_id = resolve_predicate_id(lc, NAME).unwrap();
+        let (mut age_s, mut age_o) = (Vec::new(), Vec::new());
+        for rec in &lc.additions {
+            if rec.predicate_id == age_id {
+                if let Some(v) = uint32_value_of(lc, rec.object_id) {
+                    if cmp_op(op, v, c) {
+                        age_s.push(fr(rec.subject_id));
+                        age_o.push(fr(rec.object_id));
+                    }
+                }
+            }
+        }
+        let (mut name_s, mut name_o) = (Vec::new(), Vec::new());
+        for rec in &lc.additions {
+            if rec.predicate_id == name_id {
+                name_s.push(fr(rec.subject_id));
+                name_o.push(fr(rec.object_id));
+            }
+        }
+        let w = compute_binary_join(&age_s, &[age_o.as_slice()], &name_s, &[name_o.as_slice()]);
+        let domain = binary_join_domain(age_s.len(), name_s.len(), w.m_j, w.n_u).unwrap();
+        let mut cols = w.r_other_out.clone(); // [a]
+        cols.push(w.key.clone()); // x
+        cols.extend(w.s_other_out.clone()); // [n]
+        (cols, domain, w.m_j)
+    }
+
+    // Prove+verify an age-range BGP and assert the committed result equals the
+    // independently recomputed filtered+joined answer (count + committed columns).
+    fn check_age_range(lc: &LayerCommitment, op: RangeOp, c: u64, expected_m: usize) {
+        let plan = age_range_plan(op, c);
+        let (proof, coms, m, ids) = prove_layer_bgp(lc, &plan).unwrap();
+        verify_layer_bgp(lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+
+        let (exp_cols, domain, exp_m) = expected_age_name_join(lc, op, c);
+        assert_eq!(m, exp_m, "op {:?} c {}", op, c);
+        assert_eq!(m, expected_m, "op {:?} c {}", op, c);
+        assert_eq!(coms.len(), exp_cols.len());
+        for (i, col) in exp_cols.iter().enumerate() {
+            assert_eq!(
+                commit_column(&pad(col, domain)).unwrap(),
+                coms[i],
+                "op {:?} c {} col {}",
+                op,
+                c,
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn layer_bgp_object_range_all_ops_and_boundary_end_to_end() {
+        // ages: alice=30, bob=15, carol=18, dave=40, erin=18. c = 18 straddles them and
+        // hits the boundary (carol, erin == 18).
+        let lc = build_age_name_layer();
+        // Gt 18 -> {alice, dave}; Ge 18 -> {alice, carol, dave, erin}.
+        check_age_range(&lc, RangeOp::Gt, 18, 2);
+        check_age_range(&lc, RangeOp::Ge, 18, 4);
+        // Lt 18 -> {bob}; Le 18 -> {bob, carol, erin}.
+        check_age_range(&lc, RangeOp::Lt, 18, 1);
+        check_age_range(&lc, RangeOp::Le, 18, 3);
+    }
+
+    #[test]
+    fn layer_bgp_object_range_dict_domain_exceeds_table_end_to_end() {
+        // D = 16 (dict) strictly exceeds the table domain 8: the object column relocates
+        // UP to D, the dict columns stay at D, and range_sel relocates DOWN to the table.
+        let lc = build_distinct_age_name_layer();
+        // Sanity: the dict domain is larger than the table domain here.
+        let n = lc.additions.len();
+        assert!(dict_domain_len(lc.node_value_catalog.len()).unwrap() > padded_len(n).unwrap());
+        // ages p1=10, p2=25, p3=5. age >= 10 -> {p1, p2}.
+        check_age_range(&lc, RangeOp::Ge, 10, 2);
+    }
+
+    #[test]
+    fn layer_bgp_object_range_excludes_everything_m_zero() {
+        // Nothing satisfies age > 1000: the ranged relation is empty, so the join is too.
+        let lc = build_age_name_layer();
+        let plan = age_range_plan(RangeOp::Gt, 1000);
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        assert_eq!(m, 0);
+        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+        let (_cols, _domain, exp_m) = expected_age_name_join(&lc, RangeOp::Gt, 1000);
+        assert_eq!(exp_m, 0);
+    }
+
+    #[test]
+    fn layer_bgp_object_range_wrong_expected_root_is_rejected() {
+        let lc = build_age_name_layer();
+        let plan = age_range_plan(RangeOp::Gt, 18);
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        let mut wrong_root = lc.state.commitment_root;
+        wrong_root[0] ^= 0xff;
+        assert!(verify_layer_bgp(&lc, wrong_root, &plan, &ids, &coms, m, &proof).is_err());
+        // The correct external root still verifies.
+        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+    }
+
+    #[test]
+    fn layer_bgp_object_range_tampered_constant_or_datatype_is_rejected() {
+        let lc = build_age_name_layer();
+        let plan = age_range_plan(RangeOp::Gt, 18);
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+
+        // Verifying against a DIFFERENT range constant: the constant is bound into the
+        // statement AND the object-range sub-proof, so the transcript diverges -> REJECT.
+        let plan_wrong_c = age_range_plan(RangeOp::Gt, 19);
+        assert!(
+            verify_layer_bgp(&lc, lc.state.commitment_root, &plan_wrong_c, &ids, &coms, m, &proof)
+                .is_err()
+        );
+
+        // Verifying against a DIFFERENT datatype tag (Boolean instead of UInt32) -> REJECT.
+        let plan_wrong_dt = LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom::all_variables(AGE.to_vec()).with_object_range(ObjectRangeSpec {
+                    op: RangeOp::Gt,
+                    datatype: fr(BOOLEAN_TAG),
+                    c: fr(18),
+                    b_bits: 64,
+                }),
+                LayerBgpAtom::all_variables(NAME.to_vec()),
+            ],
+            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+        };
+        assert!(
+            verify_layer_bgp(&lc, lc.state.commitment_root, &plan_wrong_dt, &ids, &coms, m, &proof)
+                .is_err()
+        );
+
+        // A DIFFERENT operator (Ge instead of Gt) -> REJECT (and would also change m).
+        let plan_wrong_op = age_range_plan(RangeOp::Ge, 18);
+        assert!(
+            verify_layer_bgp(&lc, lc.state.commitment_root, &plan_wrong_op, &ids, &coms, m, &proof)
+                .is_err()
+        );
+
+        // Honest still verifies.
+        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+    }
+
+    #[test]
+    fn layer_bgp_object_range_rejects_range_on_a_constant_object() {
+        // A range on a CONSTANT object is out of v1 scope (validate_atom rejects it).
+        let lc = build_age_name_layer();
+        let plan = LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom {
+                    subject: AtomTerm::Variable,
+                    predicate_term: AGE.to_vec(),
+                    object: node_const("alice_n"),
+                    object_range: Some(ObjectRangeSpec {
+                        op: RangeOp::Gt,
+                        datatype: fr(UINT32_TAG),
+                        c: fr(18),
+                        b_bits: 64,
+                    }),
+                },
+                LayerBgpAtom::all_variables(NAME.to_vec()),
+            ],
+            joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+        };
+        assert!(prove_layer_bgp(&lc, &plan).is_err());
     }
 }
