@@ -1,6 +1,6 @@
 # terminusdb-store, a tokio-enabled data store for triple data
 
-## Parture asynchronous verified queries
+## Proof-of-WOQL store support
 
 This ParapluOU fork is the Store half of TerminusDB's Proof-of-WOQL capability.
 The current cross-repository design and status live in
@@ -8,25 +8,25 @@ The current cross-repository design and status live in
 authenticated-sidecar and guest-VM plans have been retired; this implementation
 uses native Dory column commitments, multilinear sumcheck, and LogUp arguments.
 
-The target request lifecycle is deliberately one-pass:
-
-```text
-ordinary request -> unchanged WOQL/Prolog execution
-
-proof request -> compile canonical proof plan
-              -> execute WOQL once in foreground SWI-Prolog
-              -> consume proof-aware native Store iterators while tracing
-              -> atomically seal rows, trace, commitments, and private evidence
-              -> return rows plus pending job metadata
-              -> asynchronously check/prove the sealed job
-                 (never rerun WOQL, Prolog search, or Store search)
-```
-
 Proof support is optional and disabled by default. A proof-enabled commit may
 build authenticated columns once; query proving is explicitly invoked by the
-caller and does not belong in Store mutation or the normal query path.
+caller and does not belong in Store mutation or the normal query path. Scheduling,
+persistence, and proof-generation lifecycle are deliberately left to the application
+or `terminusdb-rs` domain layer.
 Parture payment policy is intentionally outside this generic Store and prover
 framework.
+
+The active implementation commits materialized layer columns with Dory, proves
+constant filtering and object ranges, and composes connected single-key BGPs with
+sumcheck and LogUp arguments. It supports one or more atoms. Verification is anchored
+to an independently trusted `ProofHash`; a root supplied by the prover is not a trust
+anchor.
+
+### Retired sidecar design (historical context)
+
+The remainder of this Parture section describes the earlier Merkle-sidecar/protocol
+prototype. It is retained as historical context only and does not describe the active
+Dory query-proof implementation or its API.
 
 ### Why protocol v3 must remove full logical export
 
