@@ -540,13 +540,14 @@ pub struct ObjectRangeSpec {
 /// One atom of a layer BGP. v1 SCOPE: the PREDICATE is always a constant IRI
 /// (authenticated by the layer's predicate dictionary). The subject/object may each be a
 /// VARIABLE (a kept output column) or a CONSTANT (authenticated against the layer's
-/// node/value dictionary and folded into the atom filter). An optional `object_range`
+/// node/value dictionary and folded into the atom filter). A fully-ground atom is
+/// represented internally by the filter gadget's authenticated UNIT column and is
+/// accepted only as a single-atom plan. An optional `object_range`
 /// adds a numeric RANGE filter on the object — valid ONLY when the object is a
 /// `Variable` (a ranged object is a kept variable, never a constant). Constraints
 /// (enforced at prove AND verify): the subject may not be a `ValueConstant` (literals
-/// never occupy the subject position), at least one of subject/object must be a
-/// `Variable` (a fully-ground atom is an existence check, out of scope for v1), and an
-/// `object_range` requires a `Variable` object with a valid bit-width.
+/// never occupy the subject position), and an `object_range` requires a `Variable`
+/// object with a valid bit-width.
 #[derive(Clone, Debug)]
 pub struct LayerBgpAtom {
     pub subject: AtomTerm,
@@ -829,18 +830,13 @@ fn resolve_node_value_id(layer: &LayerCommitment, object: &CanonicalObject) -> i
         .ok_or_else(|| invalid("constant not in layer node/value dictionary"))
 }
 
-/// Enforce the v1 atom constraints: the subject is a variable or a node constant (never a
-/// value literal), and at least one of subject/object is a variable (fully-ground atoms
-/// are a later existence check).
+/// Enforce the atom constraints: the subject is a variable or a node constant (never a
+/// value literal). Fully-ground atoms are valid here; [`validate_bgp_plan`] restricts
+/// them to a single-atom existence query because the join chain has no zero-arity join.
 fn validate_atom(atom: &LayerBgpAtom) -> io::Result<()> {
     if matches!(atom.subject, AtomTerm::ValueConstant(..)) {
         return Err(invalid(
             "layer BGP subject may not be a value-literal constant",
-        ));
-    }
-    if !matches!(atom.subject, AtomTerm::Variable) && !matches!(atom.object, AtomTerm::Variable) {
-        return Err(invalid(
-            "layer BGP atom must have at least one variable (ground atoms unsupported in v1)",
         ));
     }
     if let Some(range) = &atom.object_range {
@@ -1024,7 +1020,25 @@ fn validate_bgp_plan(plan: &LayerBgpPlan) -> io::Result<usize> {
     if plan.joins.len() != k - 1 {
         return Err(invalid("layer BGP plan must have exactly k-1 join steps"));
     }
+    if k > 1
+        && plan.atoms.iter().any(|atom| {
+            !matches!(atom.subject, AtomTerm::Variable)
+                && !matches!(atom.object, AtomTerm::Variable)
+        })
+    {
+        return Err(invalid(
+            "ground atoms in a multi-atom BGP require authenticated boolean composition",
+        ));
+    }
     Ok(k)
+}
+
+/// Whether the plan's sole result column is the filter gadget's internal UNIT column.
+/// It authenticates a zero-arity relation's cardinality but is not a Store dictionary ID.
+pub(crate) fn has_ground_result_unit(plan: &LayerBgpPlan) -> bool {
+    matches!(plan.atoms.as_slice(), [atom]
+        if !matches!(atom.subject, AtomTerm::Variable)
+            && !matches!(atom.object, AtomTerm::Variable))
 }
 
 /// The padded power-of-two length of every committed node/value dictionary column,
@@ -3144,10 +3158,41 @@ mod tests {
     }
 
     #[test]
-    fn layer_bgp_ground_atom_and_value_subject_are_rejected() {
+    fn layer_bgp_single_ground_atom_proves_presence_and_absence() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
-        // A fully-ground atom (subject AND object constant) is out of v1 scope.
-        let ground = LayerBgpPlan {
+        let atom = |predicate: &[u8], object: &str| LayerBgpPlan {
+            atoms: vec![LayerBgpAtom {
+                subject: node_const("a"),
+                predicate_term: predicate.to_vec(),
+                object: node_const(object),
+                object_range: None,
+                subject_object_equal: false,
+            }],
+            joins: Vec::new(),
+        };
+
+        for (plan, expected_len) in [(atom(KNOWS, "b"), 1), (atom(LIKES, "c"), 0)] {
+            let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+            assert_eq!(result.result_len, expected_len);
+            assert_eq!(result.result_commitments.len(), 1);
+            assert_eq!(result.result_columns.len(), 1);
+            verify_layer_bgp(
+                &lc,
+                lc.state.commitment_root,
+                &plan,
+                &result.predicate_ids,
+                &result.result_commitments,
+                result.result_len,
+                &result.proof,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn layer_bgp_ground_atom_composition_and_value_subject_are_rejected() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
+        let ground_composition = LayerBgpPlan {
             atoms: vec![
                 LayerBgpAtom {
                     subject: node_const("a"),
@@ -3164,7 +3209,7 @@ mod tests {
                 additional_keys: Vec::new(),
             }],
         };
-        assert!(prove_layer_bgp(&lc, &ground).is_err());
+        assert!(prove_layer_bgp(&lc, &ground_composition).is_err());
         // A value literal in the SUBJECT position is rejected.
         let value_subject = LayerBgpPlan {
             atoms: vec![

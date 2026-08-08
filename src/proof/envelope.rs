@@ -19,9 +19,9 @@ use super::filter::{
 use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
 use super::query::{
-    resolve_result_objects, verify_layer_bgp, verify_result_columns, verify_result_objects,
-    AtomTerm, LayerBgpAtom, LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectRangeBound,
-    ObjectRangeSpec, RangeAtomSubproof, SecondRangeSubproof,
+    has_ground_result_unit, resolve_result_objects, verify_layer_bgp, verify_result_columns,
+    verify_result_objects, AtomTerm, LayerBgpAtom, LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof,
+    ObjectRangeBound, ObjectRangeSpec, RangeAtomSubproof, SecondRangeSubproof,
 };
 use super::range::{
     DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp, RangeSelectProof,
@@ -573,7 +573,16 @@ impl LayerBgpEnvelope {
             result_len,
             result_log_domain,
         )?;
-        let result_objects = resolve_result_objects(layer, expected_root, &result_columns)?;
+        let result_objects = if has_ground_result_unit(plan) {
+            if result_columns.len() != 1 || result_commitments.len() != 1 {
+                return Err(invalid(
+                    "ground result must carry exactly one internal UNIT column",
+                ));
+            }
+            Vec::new()
+        } else {
+            resolve_result_objects(layer, expected_root, &result_columns)?
+        };
         Ok(Self {
             layer_root: expected_root,
             plan_digest: plan_digest(plan)?,
@@ -619,12 +628,22 @@ impl LayerBgpEnvelope {
             self.result_len,
             self.result_log_domain,
         )?;
-        verify_result_objects(
-            layer,
-            expected_root,
-            &self.result_columns,
-            &self.result_objects,
-        )
+        if has_ground_result_unit(plan) {
+            if self.result_columns.len() != 1
+                || self.result_commitments.len() != 1
+                || !self.result_objects.is_empty()
+            {
+                return Err(invalid("invalid ground-result envelope shape"));
+            }
+            Ok(())
+        } else {
+            verify_result_objects(
+                layer,
+                expected_root,
+                &self.result_columns,
+                &self.result_objects,
+            )
+        }
     }
 
     pub fn encode(&self) -> io::Result<Vec<u8>> {
@@ -707,6 +726,42 @@ mod tests {
         let body_len = bytes.len() - CHECKSUM_BYTES;
         let checksum = Sha256::digest(&bytes[..body_len]);
         bytes[body_len..].copy_from_slice(&checksum);
+    }
+
+    #[test]
+    fn ground_result_unit_is_authenticated_but_not_dictionary_resolved() {
+        let (layer, _) = fixture();
+        let plan = LayerBgpPlan {
+            atoms: vec![LayerBgpAtom {
+                subject: AtomTerm::NodeConstant(iri("a").into_bytes()),
+                predicate_term: iri("knows").into_bytes(),
+                object: AtomTerm::NodeConstant(iri("b").into_bytes()),
+                object_range: None,
+                subject_object_equal: false,
+            }],
+            joins: Vec::new(),
+        };
+        let result = prove_layer_bgp_with_result(&layer, &plan).unwrap();
+        assert_eq!(result.result_len, 1);
+        let result_columns = result.real_columns();
+        let query_digest = plan_digest(&plan).unwrap();
+        let envelope = LayerBgpEnvelope::new_verified(
+            &layer,
+            layer.state.commitment_root,
+            &plan,
+            query_digest,
+            result.proof,
+            result.result_commitments,
+            result_columns,
+            result.result_log_domain,
+            result.result_len,
+            result.predicate_ids,
+        )
+        .unwrap();
+        assert!(envelope.result_objects.is_empty());
+        envelope
+            .verify(&layer, layer.state.commitment_root, &plan, query_digest)
+            .unwrap();
     }
 
     #[test]
