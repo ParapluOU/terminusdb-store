@@ -17,7 +17,7 @@ Parture payment policy is intentionally outside this generic Store and prover
 framework.
 
 The active implementation commits materialized layer columns with Dory, proves
-constant filtering and object ranges, and composes connected single-key BGPs with
+constant filtering and one- or two-sided object ranges, and composes connected single-key BGPs with
 sumcheck and LogUp arguments. It supports one or more atoms. Verification is anchored
 to an independently trusted `ProofHash`; a root supplied by the prover is not a trust
 anchor.
