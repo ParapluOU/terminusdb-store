@@ -97,29 +97,21 @@ fn main() -> io::Result<()> {
     let root = tempdir()?;
     let store = terminus_store::open_sync_directory_store(root.path());
 
-    let legacy_builder = store.create_base_layer()?;
-    add_rows(&legacy_builder, 0, base_rows);
+    let base_builder = store.create_base_layer()?;
+    add_rows(&base_builder, 0, base_rows);
     let started = Instant::now();
-    let legacy = legacy_builder.commit()?;
-    let legacy_commit = started.elapsed();
-    println!(
-        "legacy_base_commit: elapsed_ms={:.3}",
-        milliseconds(legacy_commit)
-    );
-
-    let started = Instant::now();
-    legacy.migrate_proof_chain()?;
-    let migration = started.elapsed();
-    let (native, proof) = proof_bytes(root.path(), &legacy)?;
-    print_measurement("large_base_migration", migration, native, proof);
+    let base = base_builder.commit()?;
+    let base_commit = started.elapsed();
+    let (native, proof) = proof_bytes(root.path(), &base)?;
+    print_measurement("large_base_commit", base_commit, native, proof);
 
     let proof_parent_builder = store.create_base_layer()?;
     add_rows(&proof_parent_builder, base_rows * 2, base_rows);
-    let (proof_parent, _) = proof_parent_builder.commit_with_proof()?;
+    let proof_parent = proof_parent_builder.commit()?;
     let proof_child_builder = proof_parent.open_write()?;
     add_rows(&proof_child_builder, base_rows * 4, child_rows);
     let started = Instant::now();
-    let (proof_child, _) = proof_child_builder.commit_with_proof()?;
+    let proof_child = proof_child_builder.commit()?;
     let proof_child_commit = started.elapsed();
     let (native, proof) = proof_bytes(root.path(), &proof_child)?;
     print_measurement(
@@ -129,15 +121,15 @@ fn main() -> io::Result<()> {
         proof,
     );
 
-    let legacy_parent_builder = store.create_base_layer()?;
-    add_rows(&legacy_parent_builder, base_rows * 6, base_rows);
-    let legacy_parent = legacy_parent_builder.commit()?;
-    let legacy_child_builder = legacy_parent.open_write()?;
-    add_rows(&legacy_child_builder, base_rows * 8, child_rows);
+    let second_parent_builder = store.create_base_layer()?;
+    add_rows(&second_parent_builder, base_rows * 6, base_rows);
+    let second_parent = second_parent_builder.commit()?;
+    let second_child_builder = second_parent.open_write()?;
+    add_rows(&second_child_builder, base_rows * 8, child_rows);
     let started = Instant::now();
-    let _legacy_child = legacy_child_builder.commit()?;
+    let _second_child = second_child_builder.commit()?;
     println!(
-        "small_legacy_child_commit: elapsed_ms={:.3}",
+        "second_small_child_commit: elapsed_ms={:.3}",
         milliseconds(started.elapsed())
     );
 
@@ -149,7 +141,7 @@ fn main() -> io::Result<()> {
 
     let second_builder = store.create_base_layer()?;
     add_rows(&second_builder, base_rows * 10, base_rows);
-    let (second, _) = second_builder.commit_with_proof()?;
+    let second = second_builder.commit()?;
     let merge_temp = tempdir()?;
     let started = Instant::now();
     let merged_id =
@@ -166,11 +158,11 @@ fn main() -> io::Result<()> {
         let deep_store = terminus_store::open_sync_directory_store(cold_root.path());
         let builder = deep_store.create_base_layer()?;
         add_rows(&builder, base_rows * 20, base_rows);
-        let (mut head, _) = builder.commit_with_proof()?;
+        let mut head = builder.commit()?;
         for layer_number in 0..deep_layers {
             let builder = head.open_write()?;
             add_rows(&builder, base_rows * 30 + layer_number, 1);
-            head = builder.commit_with_proof()?.0;
+            head = builder.commit()?;
         }
         head.name()
     };
@@ -180,18 +172,14 @@ fn main() -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "deep proof head not found"))?;
     let rss_before = resident_bytes();
     let started = Instant::now();
-    let commitment = cold_head
-        .proof_commitment()?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "deep proof commitment missing"))?;
+    let commitment = cold_head.proof_commitment()?;
     let cold_load = started.elapsed();
     let root_hash = commitment.state.commitment_root;
     drop(commitment);
     let rss_after = resident_bytes();
     let decoded_cache = cold_store.proof_cache_memory_bytes();
     let started = Instant::now();
-    let steady_commitment = cold_head
-        .proof_commitment()?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cached proof commitment missing"))?;
+    let steady_commitment = cold_head.proof_commitment()?;
     let steady_load = started.elapsed();
     let steady_cache = cold_store.proof_cache_memory_bytes();
     assert_eq!(steady_commitment.state.commitment_root, root_hash);

@@ -182,8 +182,9 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
 
     async fn abort_layer(&self, name: [u32; 5]) -> io::Result<()>;
 
-    /// Load and fully validate the optional authenticated logical delta for a layer.
-    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<LayerCommitment>>>;
+    /// Load and fully validate the intrinsic authenticated logical delta for a
+    /// layer. A missing sidecar is a legacy-format error, never a layer mode.
+    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Arc<LayerCommitment>>;
 
     /// Persist a validated proof layer before the physical layer is exposed.
     async fn write_proof_layer(&self, name: [u32; 5], proof: &LayerCommitment) -> io::Result<()>;
@@ -198,18 +199,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "layer not found"))?;
         let parent_state_root = match layer.parent_name() {
             None => None,
-            Some(parent) => Some(
-                self.proof_layer(parent)
-                    .await?
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "proof migration required for parent layer",
-                        )
-                    })?
-                    .state
-                    .commitment_root,
-            ),
+            Some(parent) => Some(self.proof_layer(parent).await?.state.commitment_root),
         };
         let mut budget = ProofConstructionBudget::new();
         let mut additions = Vec::new();
@@ -317,10 +307,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         &self,
         name: [u32; 5],
     ) -> io::Result<CommitmentState> {
-        let stored = self
-            .proof_layer(name)
-            .await?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "proof state not found"))?;
+        let stored = self.proof_layer(name).await?;
         // Decoding has already independently checked that every stored table
         // reconstructs the root committed by this state. Retain only that
         // commitment while rebuilding so admission never holds two maximum-
@@ -352,9 +339,12 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     async fn migrate_proof_chain(&self, name: [u32; 5]) -> io::Result<CommitmentState> {
         let mut top = None;
         for layer_name in self.retrieve_layer_stack_names(name).await? {
-            let state = match self.proof_layer(layer_name).await? {
-                Some(_) => self.validate_proof_layer_against_store(layer_name).await?,
-                None => self.prepare_proof_layer(layer_name).await?.state,
+            let state = match self.proof_layer(layer_name).await {
+                Ok(_) => self.validate_proof_layer_against_store(layer_name).await?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.prepare_proof_layer(layer_name).await?.state
+                }
+                Err(error) => return Err(error),
             };
             top = Some(state);
         }
@@ -2018,9 +2008,12 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         self.abort_directory(name).await
     }
 
-    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<LayerCommitment>>> {
+    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Arc<LayerCommitment>> {
         if !self.file_exists(name, FILENAMES.proof_state).await? {
-            return Ok(None);
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "legacy layer is missing intrinsic commitment data; run migrate_proof_chain once",
+            ));
         }
         let bytes = self.get_file(name, FILENAMES.proof_state).await?;
         if bytes.size().await? > crate::proof::MAX_PROOF_LAYER_BYTES {
@@ -2030,7 +2023,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             ));
         }
         let bytes = bytes.map().await?;
-        tokio::task::spawn_blocking(move || LayerCommitment::decode(&bytes).map(Arc::new).map(Some))
+        tokio::task::spawn_blocking(move || LayerCommitment::decode(&bytes).map(Arc::new))
             .await
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
     }
@@ -2191,12 +2184,15 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             return Ok(layer.name());
         }
 
+        self.validate_proof_chain_against_store(layer.name()).await?;
+
         // check if there's already an equivalent rollup
         if self.layer_has_rollup(layer.name()).await? {
             let rollup = self.read_rollup_file(layer.name()).await?;
             // the rollup is equivalent if it is a base layer
             if !self.layer_has_parent(rollup).await? {
                 // yup, equivalent. let's just return the rollup we know about.
+                self.validate_proof_chain_against_store(rollup).await?;
                 return Ok(rollup);
             }
         }
@@ -2205,6 +2201,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let result = async {
             let files = self.base_layer_files(dir_name).await?;
             delta_rollup(&layer, files).await?;
+            self.prepare_proof_layer(dir_name).await?;
             self.finalize(dir_name).await?;
             Ok(dir_name)
         }
@@ -2231,6 +2228,8 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             return Ok(layer.name());
         }
 
+        self.validate_proof_chain_against_store(layer.name()).await?;
+
         // check if there's already an equivalent rollup
         if self.layer_has_rollup(layer.name()).await? {
             let rollup = self.read_rollup_file(layer.name()).await?;
@@ -2238,6 +2237,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             // get rollup parent. if it is the same as upto, we're requesting something equivalent.
             if upto == self.read_parent_file(rollup).await? {
                 // yup, equivalent. Let's just return the rollup we know about.
+                self.validate_proof_chain_against_store(rollup).await?;
                 return Ok(rollup);
             }
         }
@@ -2247,6 +2247,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             .await?;
         let result = async {
             delta_rollup_upto(self, &layer, upto, child_layer_files).await?;
+            self.prepare_proof_layer(layer_dir).await?;
             self.finalize(layer_dir).await?;
             Ok(layer_dir)
         }
@@ -2273,6 +2274,8 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             return Ok(layer.name());
         }
 
+        self.validate_proof_chain_against_store(layer.name()).await?;
+
         // check if there's already an equivalent rollup
         if self.layer_has_rollup(layer.name()).await? {
             let rollup = self.read_rollup_file(layer.name()).await?;
@@ -2280,6 +2283,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             // get rollup parent. if it is the same as upto, we're requesting something equivalent.
             if upto == self.read_parent_file(rollup).await? {
                 // yup, equivalent. Let's just return the rollup we know about.
+                self.validate_proof_chain_against_store(rollup).await?;
                 return Ok(rollup);
             }
         }
@@ -2289,6 +2293,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             .await?;
         let result = async {
             imprecise_delta_rollup_upto(self, &layer, upto, child_layer_files).await?;
+            self.prepare_proof_layer(layer_dir).await?;
             self.finalize(layer_dir).await?;
             Ok(layer_dir)
         }
@@ -2316,11 +2321,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         // sort the mapped triples, insert them
         // finalize
 
-        let proof_enabled = self.proof_layer(layer.name()).await?.is_some();
-        if proof_enabled {
-            self.validate_proof_chain_against_store(layer.name())
-                .await?;
-        }
+        self.validate_proof_chain_against_store(layer.name()).await?;
         let stack = layer.immediate_layers();
         let node_count: usize = stack
             .iter()
@@ -2440,9 +2441,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
 
             builder.add_id_triples(triples.into_iter()).await?;
             builder.finalize().await?;
-            if proof_enabled {
-                self.prepare_proof_layer(layer_name).await?;
-            }
+            self.prepare_proof_layer(layer_name).await?;
             self.finalize_layer(layer_name).await?;
             Ok::<(), io::Error>(())
         }
@@ -2456,11 +2455,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
     }
 
     async fn squash_upto(&self, layer: Arc<InternalLayer>, upto: [u32; 5]) -> io::Result<[u32; 5]> {
-        let proof_enabled = self.proof_layer(layer.name()).await?.is_some();
-        if proof_enabled {
-            self.validate_proof_chain_against_store(layer.name())
-                .await?;
-        }
+        self.validate_proof_chain_against_store(layer.name()).await?;
         let mut base_node_count = 0;
         let mut base_pred_count = 0;
         let mut base_value_count = 0;
@@ -2683,9 +2678,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             }
             builder.finalize().await?;
             self.write_parent_file(layer_name, upto).await?;
-            if proof_enabled {
-                self.prepare_proof_layer(layer_name).await?;
-            }
+            self.prepare_proof_layer(layer_name).await?;
             self.finalize_layer(layer_name).await?;
             Ok::<(), io::Error>(())
         }
@@ -2703,17 +2696,8 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         layers: &[[u32; 5]],
         temp_path: &Path,
     ) -> io::Result<[u32; 5]> {
-        let mut proof_layers = 0usize;
         for layer in layers {
-            if self.proof_layer(*layer).await?.is_some() {
-                proof_layers += 1;
-            }
-        }
-        let proof_enabled = !layers.is_empty() && proof_layers == layers.len();
-        if proof_enabled {
-            for layer in layers {
-                self.validate_proof_chain_against_store(*layer).await?;
-            }
+            self.validate_proof_chain_against_store(*layer).await?;
         }
         let mut layer_files = Vec::with_capacity(layers.len());
         for layer in layers {
@@ -2733,9 +2717,7 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let finish = async {
             let output_layer_files = self.base_layer_files(output_name).await?;
             merge_base_layers(&layer_files, output_layer_files, temp_path).await?;
-            if proof_enabled {
-                self.prepare_proof_layer(output_name).await?;
-            }
+            self.prepare_proof_layer(output_name).await?;
             self.finalize(output_name).await?;
             Ok::<(), io::Error>(())
         }
@@ -4539,14 +4521,20 @@ mod tests {
         let base_name = base.name();
         base.add_value_triple(ValueTriple::new_node("base", "p", "value"));
         base.commit_boxed().await.unwrap();
+        store.prepare_proof_layer(base_name).await.unwrap();
+        store.finalize_layer(base_name).await.unwrap();
         let mut middle = store.create_child_layer(base_name).await.unwrap();
         let middle_name = middle.name();
         middle.add_value_triple(ValueTriple::new_node("middle", "p", "value"));
         middle.commit_boxed().await.unwrap();
+        store.prepare_proof_layer(middle_name).await.unwrap();
+        store.finalize_layer(middle_name).await.unwrap();
         let mut head = store.create_child_layer(middle_name).await.unwrap();
         let head_name = head.name();
         head.add_value_triple(ValueTriple::new_node("head", "p", "value"));
         head.commit_boxed().await.unwrap();
+        store.prepare_proof_layer(head_name).await.unwrap();
+        store.finalize_layer(head_name).await.unwrap();
         let base = store.get_layer(base_name).await.unwrap().unwrap();
         let head = store.get_layer(head_name).await.unwrap().unwrap();
         let mut original = store.directories().await.unwrap();
@@ -4558,6 +4546,33 @@ mod tests {
         let mut actual = store.directories().await.unwrap();
         actual.sort();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn physical_rollup_has_intrinsic_commitment() {
+        let (store, _, head, _) = fault_store_chain().await;
+        let rollup = store.perform_rollup(head).await.unwrap();
+        store.proof_layer(rollup).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_precise_rollup_has_intrinsic_commitment() {
+        let (store, base, head, _) = fault_store_chain().await;
+        let rollup = store
+            .perform_rollup_upto(head, base.name())
+            .await
+            .unwrap();
+        store.proof_layer(rollup).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_imprecise_rollup_has_intrinsic_commitment() {
+        let (store, base, head, _) = fault_store_chain().await;
+        let rollup = store
+            .perform_imprecise_rollup_upto(head, base.name())
+            .await
+            .unwrap();
+        store.proof_layer(rollup).await.unwrap();
     }
 
     #[tokio::test]

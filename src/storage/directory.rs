@@ -1326,7 +1326,7 @@ mod tests {
             second_store.prepare_proof_layer(name)
         );
         assert_ne!(first.is_ok(), second.is_ok());
-        let stored = store.proof_layer(name).await.unwrap().unwrap();
+        let stored = store.proof_layer(name).await.unwrap();
         store
             .validate_proof_layer_against_store(name)
             .await

@@ -68,7 +68,7 @@ pub trait Packable {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<Vec<u8>>;
 
-    /// Export a proof-capable pack under caller-negotiated limits. A pack
+    /// Export a layer pack under caller-negotiated limits. A pack
     /// emitted successfully with these limits is accepted by an importer using
     /// the same limits, subject to proof-root admission and the destination's
     /// separately bounded pre-existing ancestry fitting `max_ancestry_*` and
@@ -77,13 +77,6 @@ pub trait Packable {
         &self,
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         limits: PackImportLimits,
-    ) -> io::Result<Vec<u8>>;
-
-    /// Export a v1-compatible pack without authenticated proof sidecars.
-    /// This route exists only for legacy consumers and is not proof-capable.
-    async fn export_layers_legacy(
-        &self,
-        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<Vec<u8>>;
 
     /// Import the specified layers from the given pack, a byte slice that was previously generated with `export_layers`, on another store, and possibly even another machine).
@@ -96,8 +89,8 @@ pub trait Packable {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<()>;
 
-    /// Import proof-enabled layers while anchoring every admitted proof state
-    /// to a root obtained out of band from the pack producer.
+    /// Import layers while optionally anchoring admitted commitment roots to
+    /// roots obtained out of band from the pack producer.
     async fn import_layers_with_expected_roots(
         &self,
         pack: &[u8],
@@ -106,7 +99,8 @@ pub trait Packable {
     ) -> io::Result<()>;
 
     /// Import with explicit parser and staging budgets. Supplying an empty root
-    /// map keeps the operation legacy-only.
+    /// map performs intrinsic native-delta/commitment validation without an
+    /// additional producer-authenticity anchor.
     async fn import_layers_with_limits(
         &self,
         pack: &[u8],
@@ -122,7 +116,7 @@ impl<T: PersistentLayerStore> Packable for T {
         &self,
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<Vec<u8>> {
-        export_pack(self, layer_ids, true, PackImportLimits::default()).await
+        export_pack(self, layer_ids, PackImportLimits::default()).await
     }
 
     async fn export_layers_with_limits(
@@ -130,14 +124,7 @@ impl<T: PersistentLayerStore> Packable for T {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         limits: PackImportLimits,
     ) -> io::Result<Vec<u8>> {
-        export_pack(self, layer_ids, true, limits).await
-    }
-
-    async fn export_layers_legacy(
-        &self,
-        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<Vec<u8>> {
-        export_pack(self, layer_ids, false, PackImportLimits::default()).await
+        export_pack(self, layer_ids, limits).await
     }
 
     async fn import_layers(
@@ -353,7 +340,6 @@ impl PeakBudget {
 async fn export_pack<S: PersistentLayerStore>(
     store: &S,
     layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    proof_capable: bool,
     limits: PackImportLimits,
 ) -> io::Result<Vec<u8>> {
     let mtime = SystemTime::now()
@@ -378,21 +364,19 @@ async fn export_pack<S: PersistentLayerStore>(
     let mut enc = GzEncoder::new(writer, Compression::default());
     {
         let mut tar = tar::Builder::new(&mut enc);
-        if proof_capable {
-            budget.add_entry(PACK_MANIFEST.len())?;
-            let mut header = Header::new_gnu();
-            header.set_mode(0o644);
-            header.set_size(PACK_MANIFEST.len() as u64);
-            header.set_mtime(mtime);
-            header.set_cksum();
-            tar.append_data(
-                &mut header,
-                PACK_MANIFEST_PATH,
-                io::Cursor::new(PACK_MANIFEST),
-            )?;
-        }
+        budget.add_entry(PACK_MANIFEST.len())?;
+        let mut header = Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(PACK_MANIFEST.len() as u64);
+        header.set_mtime(mtime);
+        header.set_cksum();
+        tar.append_data(
+            &mut header,
+            PACK_MANIFEST_PATH,
+            io::Cursor::new(PACK_MANIFEST),
+        )?;
         for id in layer_ids {
-            tar_append_layer(&mut tar, store, id, mtime, proof_capable, &mut budget).await?;
+            tar_append_layer(&mut tar, store, id, mtime, &mut budget).await?;
         }
         tar.finish()?;
     }
@@ -1042,46 +1026,27 @@ async fn import_pack<S: PersistentLayerStore>(
         staged_ids.insert(parent);
     }
 
-    let mut saw_proof = false;
     for id in &layer_ids {
         load_staged_layer_without_panicking(&staging, *id).await?;
-        if staging.file_exists(*id, FILENAMES.proof_state).await? {
-            saw_proof = true;
-            if !v2 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "proof state requires a versioned proof-capable pack",
-                ));
-            }
-            let expected = expected_roots.get(id).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "proof import requires an out-of-band expected state root",
-                )
-            })?;
-            // Proof decoding has its own hard heap limit. Reserve that entire
-            // allowance against the aggregate pack peak before validation.
-            peak.set_transient(crate::proof::MAX_DECODED_PROOF_BYTES)?;
-            let validated = validate_staged_proof_without_panicking(&staging, *id).await?;
-            peak.set_transient(0)?;
+        if !v2 || !staging.file_exists(*id, FILENAMES.proof_state).await? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy pack has no intrinsic layer commitment; migrate and re-export it",
+            ));
+        }
+        // Proof decoding has its own hard heap limit. Reserve that entire
+        // allowance against the aggregate pack peak before validation.
+        peak.set_transient(crate::proof::MAX_DECODED_PROOF_BYTES)?;
+        let validated = validate_staged_proof_without_panicking(&staging, *id).await?;
+        peak.set_transient(0)?;
+        if let Some(expected) = expected_roots.get(id) {
             if &validated.commitment_root != expected {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "imported proof state does not match expected root",
                 ));
             }
-        } else if expected_roots.contains_key(id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "expected proof root supplied for a legacy layer",
-            ));
         }
-    }
-    if !saw_proof && !expected_roots.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "expected proof roots were not consumed",
-        ));
     }
 
     let mut imported = staging.into_layers()?;
@@ -1232,7 +1197,6 @@ async fn tar_append_layer<W: io::Write, S: PersistentLayerStore>(
     store: &S,
     layer: [u32; 5],
     mtime: u64,
-    include_proof_state: bool,
     budget: &mut PackBudget,
 ) -> io::Result<()> {
     budget.add_entry(0)?;
@@ -1250,12 +1214,20 @@ async fn tar_append_layer<W: io::Write, S: PersistentLayerStore>(
     for f in &SHARED_REQUIRED_FILES {
         tar_append_file(store, tar, layer, &path, f, mtime, budget).await?;
     }
+    tar_append_file(
+        store,
+        tar,
+        layer,
+        &path,
+        FILENAMES.proof_state,
+        mtime,
+        budget,
+    )
+    .await?;
     for f in &SHARED_OPTIONAL_FILES {
-        if f == &FILENAMES.rollup {
-            // skip the rollup file. It will not be resolvable remotely.
-            continue;
-        }
-        if f == &FILENAMES.proof_state && !include_proof_state {
+        if f == &FILENAMES.rollup || f == &FILENAMES.proof_state {
+            // Rollups are local aliases; the intrinsic commitment was emitted
+            // above as a required portable layer component.
             continue;
         }
         tar_append_file_if_exists(store, tar, layer, &path, f, mtime, budget).await?;
@@ -1387,13 +1359,6 @@ impl Packable for CachedLayerStore {
             .await
     }
 
-    async fn export_layers_legacy(
-        &self,
-        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<Vec<u8>> {
-        self.inner.export_layers_legacy(layer_ids).await
-    }
-
     async fn import_layers(
         &self,
         pack: &[u8],
@@ -1497,6 +1462,8 @@ mod tests {
         builder.add_value_triple(ValueTriple::new_node("duck", "hates", "cow"));
 
         builder.commit_boxed().await.unwrap();
+        store1.prepare_proof_layer(base_name).await.unwrap();
+        store1.finalize_layer(base_name).await.unwrap();
 
         let mut builder = store1.create_child_layer(base_name).await.unwrap();
         let child_name = builder.name();
@@ -1505,6 +1472,8 @@ mod tests {
         builder.add_value_triple(ValueTriple::new_node("duck", "likes", "cow"));
 
         builder.commit_boxed().await.unwrap();
+        store1.prepare_proof_layer(child_name).await.unwrap();
+        store1.finalize_layer(child_name).await.unwrap();
 
         let unrolled_layer = store1.get_layer(child_name).await.unwrap().unwrap();
 
@@ -1593,13 +1562,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn proof_pack_requires_matching_external_root_and_legacy_route_drops_proof() {
+    async fn pack_validates_intrinsically_and_rejects_legacy_format() {
         let source = open_memory_store();
         let builder = source.create_base_layer().await.unwrap();
         builder
             .add_value_triple(ValueTriple::new_node("a", "p", "b"))
             .unwrap();
-        let (layer, state) = builder.commit_with_proof().await.unwrap();
+        let layer = builder.commit().await.unwrap();
+        let state = layer.proof_commitment().await.unwrap().state.clone();
         let id = layer.name();
         let proof_pack = source
             .export_layers(Box::new(vec![id].into_iter()))
@@ -1632,32 +1602,22 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .proof_state()
+                .proof_commitment()
                 .await
                 .unwrap()
-                .unwrap()
+                .state
                 .commitment_root,
             state.commitment_root
         );
 
-        let legacy_pack = source
-            .export_layers_legacy(Box::new(vec![id].into_iter()))
-            .await
-            .unwrap();
+        let proof_path = format!("{}/{}", name_to_string(id), FILENAMES.proof_state);
+        let legacy_pack = remove_pack_entry(&proof_pack, &proof_path);
         let legacy = open_memory_store();
-        legacy
+        assert!(legacy
             .import_layers(&legacy_pack, Box::new(vec![id].into_iter()))
             .await
-            .unwrap();
-        assert!(legacy
-            .get_layer_from_id(id)
-            .await
-            .unwrap()
-            .unwrap()
-            .proof_state()
-            .await
-            .unwrap()
-            .is_none());
+            .is_err());
+        assert!(legacy.get_layer_from_id(id).await.unwrap().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1737,7 +1697,8 @@ mod tests {
         builder
             .add_value_triple(ValueTriple::new_node("a", "p", "b"))
             .unwrap();
-        let (layer, state) = builder.commit_with_proof().await.unwrap();
+        let layer = builder.commit().await.unwrap();
+        let state = layer.proof_commitment().await.unwrap().state.clone();
         let id = layer.name();
         let pack = source
             .export_layers(Box::new(vec![id].into_iter()))

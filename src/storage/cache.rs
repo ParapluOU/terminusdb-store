@@ -200,7 +200,7 @@ impl LayerCache for LockingHashMapLayerCache {
 }
 
 struct ProofLayerCache {
-    entries: lru::LruCache<[u32; 5], Arc<tokio::sync::OnceCell<Option<Arc<LayerCommitment>>>>>,
+    entries: lru::LruCache<[u32; 5], Arc<tokio::sync::OnceCell<Arc<LayerCommitment>>>>,
     bytes: usize,
     max_entries: usize,
     max_bytes: usize,
@@ -225,7 +225,7 @@ impl ProofLayerCache {
             self.bytes = self
                 .entries
                 .iter()
-                .filter_map(|(_, cell)| cell.get().and_then(|proof| proof.as_ref()))
+                .filter_map(|(_, cell)| cell.get().map(|proof| proof.as_ref()))
                 .map(|proof| proof_cache_weight(proof))
                 .fold(0usize, usize::saturating_add);
             let settled = self
@@ -253,7 +253,7 @@ impl ProofLayerCache {
     fn settle_loaded(
         &mut self,
         name: [u32; 5],
-        cell: &Arc<tokio::sync::OnceCell<Option<Arc<LayerCommitment>>>>,
+        cell: &Arc<tokio::sync::OnceCell<Arc<LayerCommitment>>>,
         load_succeeded: bool,
     ) {
         let resident = self
@@ -265,7 +265,6 @@ impl ProofLayerCache {
                 || self.max_entries == 0
                 || cell
                     .get()
-                    .and_then(|proof| proof.as_ref())
                     .map_or(false, |proof| proof_cache_weight(proof) > self.max_bytes);
             if exceeds_limit {
                 self.entries.pop(&name);
@@ -375,7 +374,7 @@ impl LayerStore for CachedLayerStore {
         self.inner.abort_layer(name).await
     }
 
-    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<LayerCommitment>>> {
+    async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Arc<LayerCommitment>> {
         let existing = {
             let mut cache = self.proof_cache.lock().unwrap();
             cache.entries.get(&name).cloned()
@@ -411,7 +410,7 @@ impl LayerStore for CachedLayerStore {
     async fn write_proof_layer(&self, name: [u32; 5], proof: &LayerCommitment) -> io::Result<()> {
         self.inner.write_proof_layer(name, proof).await?;
         let cell = Arc::new(tokio::sync::OnceCell::new());
-        cell.set(Some(Arc::new(proof.clone()))).map_err(|_| {
+        cell.set(Arc::new(proof.clone())).map_err(|_| {
             io::Error::new(io::ErrorKind::Other, "new proof cache cell was already set")
         })?;
         let mut cache = self.proof_cache.lock().unwrap();
@@ -1011,14 +1010,14 @@ pub mod tests {
         builder.commit_boxed().await.unwrap();
         store.prepare_proof_layer(name).await.unwrap();
 
-        let first = store.proof_layer(name).await.unwrap().unwrap();
-        let second = store.proof_layer(name).await.unwrap().unwrap();
+        let first = store.proof_layer(name).await.unwrap();
+        let second = store.proof_layer(name).await.unwrap();
         assert!(Arc::ptr_eq(&first, &second));
 
         LayerStore::invalidate(&store, name);
         let (reloaded, concurrent) = tokio::join!(store.proof_layer(name), store.proof_layer(name));
-        let reloaded = reloaded.unwrap().unwrap();
-        let concurrent = concurrent.unwrap().unwrap();
+        let reloaded = reloaded.unwrap();
+        let concurrent = concurrent.unwrap();
         assert!(Arc::ptr_eq(&reloaded, &concurrent));
         assert!(!Arc::ptr_eq(&first, &reloaded));
         assert_eq!(*first, *reloaded);
@@ -1185,8 +1184,8 @@ pub mod tests {
         }
         assert_eq!(slow.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
         slow.release.add_permits(1);
-        let first = first.await.unwrap().unwrap().unwrap();
-        let second = second.await.unwrap().unwrap().unwrap();
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
 
         let queued = SlowProofStore::new(inner);
@@ -1206,10 +1205,10 @@ pub mod tests {
         }
         assert_eq!(queued.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
         queued.release.add_permits(1);
-        first.await.unwrap().unwrap().unwrap();
+        first.await.unwrap().unwrap();
         queued.wait_for_loads(2).await;
         queued.release.add_permits(1);
-        second.await.unwrap().unwrap().unwrap();
+        second.await.unwrap().unwrap();
         assert_eq!(queued.loads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
@@ -1222,18 +1221,18 @@ pub mod tests {
             1,
             usize::MAX,
         );
-        let first = store.proof_layer(first_name).await.unwrap().unwrap();
-        store.proof_layer(second_name).await.unwrap().unwrap();
+        let first = store.proof_layer(first_name).await.unwrap();
+        store.proof_layer(second_name).await.unwrap();
         assert_eq!(store.proof_cache.lock().unwrap().entries.len(), 1);
-        let reloaded = store.proof_layer(first_name).await.unwrap().unwrap();
+        let reloaded = store.proof_layer(first_name).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &reloaded));
     }
 
     #[tokio::test]
     async fn proof_cache_evicts_by_bytes_and_reports_an_upper_bound() {
         let (inner, first_name, second_name) = memory_store_with_two_proof_layers().await;
-        let first_proof = inner.proof_layer(first_name).await.unwrap().unwrap();
-        let second_proof = inner.proof_layer(second_name).await.unwrap().unwrap();
+        let first_proof = inner.proof_layer(first_name).await.unwrap();
+        let second_proof = inner.proof_layer(second_name).await.unwrap();
         let first_bytes = proof_cache_weight(&first_proof);
         let second_bytes = proof_cache_weight(&second_proof);
         let limit = first_bytes.max(second_bytes);
@@ -1243,8 +1242,8 @@ pub mod tests {
             8,
             limit,
         );
-        store.proof_layer(first_name).await.unwrap().unwrap();
-        store.proof_layer(second_name).await.unwrap().unwrap();
+        store.proof_layer(first_name).await.unwrap();
+        store.proof_layer(second_name).await.unwrap();
         let cache = store.proof_cache.lock().unwrap();
         assert!(cache.entries.len() <= 1);
         assert!(cache.bytes <= limit);
@@ -1256,7 +1255,7 @@ pub mod tests {
     #[tokio::test]
     async fn oversized_proof_is_served_but_not_retained() {
         let (inner, first_name, _) = memory_store_with_two_proof_layers().await;
-        let proof = inner.proof_layer(first_name).await.unwrap().unwrap();
+        let proof = inner.proof_layer(first_name).await.unwrap();
         let store = CachedLayerStore::new_with_proof_cache_limits(
             inner,
             LockingHashMapLayerCache::new(),
@@ -1264,7 +1263,7 @@ pub mod tests {
             proof_cache_weight(&proof).saturating_sub(1),
         );
         assert_eq!(
-            store.proof_layer(first_name).await.unwrap().unwrap().state,
+            store.proof_layer(first_name).await.unwrap().state,
             proof.state
         );
         let cache = store.proof_cache.lock().unwrap();
@@ -1281,7 +1280,7 @@ pub mod tests {
             0,
             usize::MAX,
         );
-        assert!(store.proof_layer(first_name).await.unwrap().is_some());
+        store.proof_layer(first_name).await.unwrap();
         assert_eq!(store.proof_cache.lock().unwrap().entries.len(), 0);
     }
 
@@ -1333,7 +1332,7 @@ pub mod tests {
         tokio::fs::remove_file(proof_path).await.unwrap();
         inner.prepare_proof_layer(name).await.unwrap();
 
-        assert!(store.proof_layer(name).await.unwrap().is_some());
+        store.proof_layer(name).await.unwrap();
         assert_eq!(store.proof_cache.lock().unwrap().entries.len(), 1);
     }
 

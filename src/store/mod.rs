@@ -125,7 +125,8 @@ impl StoreLayerBuilder {
             .is_none()
     }
 
-    /// Commit the layer to storage without loading the resulting layer.
+    /// Commit the layer and its intrinsic authenticated commitment without
+    /// loading the resulting layer. Neither is published unless both succeed.
     pub async fn commit_no_load(&self) -> io::Result<()> {
         let mut builder = None;
         {
@@ -147,43 +148,17 @@ impl StoreLayerBuilder {
             }
             Some(builder) => {
                 let id = builder.name();
-                builder.commit_boxed().await?;
-                self.store.layer_store.finalize_layer(id).await
-            }
-        }
-    }
-
-    /// Commit a proof-enabled layer. The authenticated delta is built from the
-    /// just-written native delta before archive finalization/exposure.
-    pub async fn commit_no_load_with_proof(&self) -> io::Result<CommitmentState> {
-        let mut builder = None;
-        {
-            let mut guard = self
-                .builder
-                .write()
-                .expect("rwlock write should always succeed");
-            std::mem::swap(&mut builder, &mut guard);
-        }
-        match builder {
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "builder has already been committed",
-            )),
-            Some(builder) => {
-                let id = builder.name();
                 let result = async {
                     builder.commit_boxed().await.map_err(|error| {
                         io::Error::new(error.kind(), format!("write native layer: {error}"))
                     })?;
-                    let state = self
-                        .store
+                    self.store
                         .layer_store
                         .prepare_proof_layer(id)
                         .await
                         .map_err(|error| {
                             io::Error::new(error.kind(), format!("prepare proof layer: {error}"))
-                        })?
-                        .state;
+                        })?;
                     self.store
                         .layer_store
                         .finalize_layer(id)
@@ -191,7 +166,7 @@ impl StoreLayerBuilder {
                         .map_err(|error| {
                             io::Error::new(error.kind(), format!("finalize proof layer: {error}"))
                         })?;
-                    Ok::<_, io::Error>(state)
+                    Ok::<_, io::Error>(())
                 }
                 .await;
                 if result.is_err() {
@@ -200,6 +175,39 @@ impl StoreLayerBuilder {
                 result
             }
         }
+    }
+
+    /// Build a pre-commitment layer fixture for migration tests.
+    #[cfg(test)]
+    pub(crate) async fn commit_legacy_for_test(&self) -> io::Result<StoreLayer> {
+        let builder = self
+            .builder
+            .write()
+            .expect("rwlock write should always succeed")
+            .take()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "builder has already been committed",
+                )
+            })?;
+        let id = builder.name();
+        let result = async {
+            builder.commit_boxed().await?;
+            self.store.layer_store.finalize_layer(id).await?;
+            let layer = self
+                .store
+                .layer_store
+                .get_layer(id)
+                .await?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "layer not found"))?;
+            Ok(StoreLayer::wrap(layer, self.store.clone()))
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.store.layer_store.abort_layer(id).await;
+        }
+        result
     }
 
     /// Commit the layer to storage.
@@ -211,20 +219,6 @@ impl StoreLayerBuilder {
         Ok(StoreLayer::wrap(
             layer.expect("layer that was just created was not found in store"),
             self.store.clone(),
-        ))
-    }
-
-    /// Commit and load a proof-enabled layer.
-    pub async fn commit_with_proof(&self) -> io::Result<(StoreLayer, CommitmentState)> {
-        let name = self.name;
-        let state = self.commit_no_load_with_proof().await?;
-        let layer = self.store.layer_store.get_layer(name).await?;
-        Ok((
-            StoreLayer::wrap(
-                layer.expect("layer that was just created was not found in store"),
-                self.store.clone(),
-            ),
-            state,
         ))
     }
 
@@ -326,20 +320,10 @@ impl StoreLayer {
         Ok(StoreLayerBuilder::wrap(layer, self.store.clone()))
     }
 
-    /// Read the authenticated state root for this exact logical layer.
-    pub async fn proof_state(&self) -> io::Result<Option<CommitmentState>> {
-        Ok(self
-            .store
-            .layer_store
-            .proof_layer(self.layer.name())
-            .await?
-            .map(|proof| proof.state.clone()))
-    }
-
     /// Load the full authenticated commitment (column commitments + state) for
-    /// this exact logical layer, e.g. to prove/verify a query argument against
-    /// the layer's committed columns.
-    pub async fn proof_commitment(&self) -> io::Result<Option<Arc<LayerCommitment>>> {
+    /// this exact logical layer. Missing intrinsic commitment data is a legacy
+    /// format error; callers must explicitly migrate the layer chain first.
+    pub async fn proof_commitment(&self) -> io::Result<Arc<LayerCommitment>> {
         self.store.layer_store.proof_layer(self.layer.name()).await
     }
 
@@ -827,7 +811,7 @@ impl NamedGraph {
                 let layer = match new_label.layer {
                     None => None,
                     Some(layer) => {
-                        let layer = self.store.layer_store.get_layer(layer).await?;
+                        let layer = self.store.get_layer_from_id(layer).await?;
                         match layer {
                             None => {
                                 return Err(io::Error::new(
@@ -835,7 +819,7 @@ impl NamedGraph {
                                     "layer not found even though it is pointed at by a label",
                                 ))
                             }
-                            Some(layer) => Some(StoreLayer::wrap(layer, self.store.clone())),
+                            Some(layer) => Some(layer),
                         }
                     }
                 };
@@ -992,10 +976,18 @@ impl Store {
 
     /// Retrieve a layer with the given name from the layer store this Store was initialized with.
     pub async fn get_layer_from_id(&self, layer: [u32; 5]) -> io::Result<Option<StoreLayer>> {
-        let layer = self.layer_store.get_layer(layer).await?;
-        Ok(layer.map(|layer| StoreLayer::wrap(layer, self.clone())))
+        let stored = self.layer_store.get_layer(layer).await?;
+        match stored {
+            None => Ok(None),
+            Some(stored) => {
+                self.layer_store.proof_layer(layer).await?;
+                Ok(Some(StoreLayer::wrap(stored, self.clone())))
+            }
+        }
     }
 
+    /// Explicitly backfill intrinsic commitments for a legacy layer chain.
+    /// This is the only operation that admits layers without PF4 data.
     pub async fn migrate_proof_chain(&self, layer: [u32; 5]) -> io::Result<CommitmentState> {
         self.layer_store.migrate_proof_chain(layer).await
     }
@@ -1034,14 +1026,6 @@ impl Store {
             .await
     }
 
-    /// Export a legacy pack without authenticated proof state.
-    pub async fn export_layers_legacy(
-        &self,
-        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<Vec<u8>> {
-        self.layer_store.export_layers_legacy(layer_ids).await
-    }
-
     /// Import the specified layers from the given pack, a byte slice that was previously generated with `export_layers`, on another store, and possibly even another machine).
     ///
     /// On success every requested layer is retrievable. Missing layers reject
@@ -1054,7 +1038,7 @@ impl Store {
         self.layer_store.import_layers(pack, layer_ids).await
     }
 
-    /// Import proof-enabled layers anchored to independently supplied roots.
+    /// Import intrinsically committed layers, optionally anchored to supplied roots.
     pub async fn import_layers_with_expected_roots<'a>(
         &'a self,
         pack: &'a [u8],
@@ -1232,7 +1216,7 @@ mod tests {
         builder
             .add_value_triple(ValueTriple::new_string_value("a", "label", "alpha"))
             .unwrap();
-        let (base, _) = builder.commit_with_proof().await.unwrap();
+        let base = builder.commit().await.unwrap();
 
         let child = base.open_write().await.unwrap();
         child
@@ -1241,7 +1225,9 @@ mod tests {
         child
             .add_value_triple(ValueTriple::new_node("b", "p", "two"))
             .unwrap();
-        child.commit_with_proof().await.unwrap()
+        let head = child.commit().await.unwrap();
+        let state = head.proof_commitment().await.unwrap().state.clone();
+        (head, state)
     }
 
     #[tokio::test]
@@ -1251,12 +1237,12 @@ mod tests {
         base_builder
             .add_value_triple(ValueTriple::new_node("a", "p", "one"))
             .unwrap();
-        let (base, _) = base_builder.commit_with_proof().await.unwrap();
+        let base = base_builder.commit().await.unwrap();
         let middle_builder = base.open_write().await.unwrap();
         middle_builder
             .add_value_triple(ValueTriple::new_node("b", "p", "two"))
             .unwrap();
-        let (middle, _) = middle_builder.commit_with_proof().await.unwrap();
+        let middle = middle_builder.commit().await.unwrap();
         let head_builder = middle.open_write().await.unwrap();
         head_builder
             .remove_value_triple(ValueTriple::new_node("a", "p", "one"))
@@ -1264,14 +1250,20 @@ mod tests {
         head_builder
             .add_value_triple(ValueTriple::new_node("c", "p", "three"))
             .unwrap();
-        let (head, head_state) = head_builder.commit_with_proof().await.unwrap();
+        let head = head_builder.commit().await.unwrap();
+        let head_state = head.proof_commitment().await.unwrap().state.clone();
 
         let squashed = head.squash().await.unwrap();
-        let squashed_state = squashed.proof_state().await.unwrap().unwrap();
+        let squashed_state = squashed.proof_commitment().await.unwrap().state.clone();
         assert_ne!(head_state.commitment_root, squashed_state.commitment_root);
 
         let squashed_upto = head.squash_upto(&base).await.unwrap();
-        let upto_state = squashed_upto.proof_state().await.unwrap().unwrap();
+        let upto_state = squashed_upto
+            .proof_commitment()
+            .await
+            .unwrap()
+            .state
+            .clone();
         assert_ne!(head_state.commitment_root, upto_state.commitment_root);
         assert_eq!(
             squashed_upto.parent().await.unwrap().unwrap().name(),
@@ -1281,7 +1273,7 @@ mod tests {
         // Regenerated proof state must be present and self-consistent for both
         // squash variants (the query-time witness is stubbed out separately).
         for candidate in [&squashed, &squashed_upto] {
-            assert!(candidate.proof_state().await.unwrap().is_some());
+            candidate.proof_commitment().await.unwrap();
         }
     }
 
@@ -1290,52 +1282,39 @@ mod tests {
         let store = open_memory_store();
         let (head, before) = create_proof_stack(&store).await;
         head.rollup().await.unwrap();
-        let after = head.proof_state().await.unwrap().unwrap();
+        let after = head.proof_commitment().await.unwrap().state.clone();
         assert_eq!(before, after);
 
         store.invalidate_layer(head.name());
         let reloaded = store.get_layer_from_id(head.name()).await.unwrap().unwrap();
         let squashed = reloaded.squash().await.unwrap();
-        assert!(squashed.proof_state().await.unwrap().is_some());
+        squashed.proof_commitment().await.unwrap();
     }
 
     #[tokio::test]
-    async fn proof_merge_regenerates_only_when_every_base_is_proof_enabled() {
+    async fn merge_always_regenerates_valid_commitment() {
         let store = open_memory_store();
         let first_builder = store.create_base_layer().await.unwrap();
         first_builder
             .add_value_triple(ValueTriple::new_node("a", "p", "one"))
             .unwrap();
-        let (first, _) = first_builder.commit_with_proof().await.unwrap();
+        let first = first_builder.commit().await.unwrap();
         let second_builder = store.create_base_layer().await.unwrap();
         second_builder
             .add_value_triple(ValueTriple::new_node("b", "p", "two"))
             .unwrap();
-        let (second, _) = second_builder.commit_with_proof().await.unwrap();
+        let second = second_builder.commit().await.unwrap();
         let temp = tempdir().unwrap();
         let merged_id = store
             .merge_base_layers(&[first.name(), second.name()], temp.path())
             .await
             .unwrap();
         let merged = store.get_layer_from_id(merged_id).await.unwrap().unwrap();
-        assert!(merged.proof_state().await.unwrap().is_some());
-
-        let legacy_builder = store.create_base_layer().await.unwrap();
-        legacy_builder
-            .add_value_triple(ValueTriple::new_node("c", "p", "three"))
-            .unwrap();
-        let legacy = legacy_builder.commit().await.unwrap();
-        let mixed_temp = tempdir().unwrap();
-        let mixed_id = store
-            .merge_base_layers(&[first.name(), legacy.name()], mixed_temp.path())
-            .await
-            .unwrap();
-        let mixed = store.get_layer_from_id(mixed_id).await.unwrap().unwrap();
-        assert!(mixed.proof_state().await.unwrap().is_none());
+        merged.proof_commitment().await.unwrap();
     }
 
     #[tokio::test]
-    async fn proof_enabled_archive_survives_reopen() {
+    async fn intrinsic_commitment_archive_survives_reopen() {
         let dir = tempdir().unwrap();
         let store = open_raw_archive_store(dir.path());
         let (head, state) = create_proof_stack(&store).await;
@@ -1345,11 +1324,11 @@ mod tests {
 
         let reopened = open_raw_archive_store(dir.path());
         let head = reopened.get_layer_from_id(name).await.unwrap().unwrap();
-        assert_eq!(head.proof_state().await.unwrap().unwrap(), state);
+        assert_eq!(head.proof_commitment().await.unwrap().state, state);
     }
 
     #[tokio::test]
-    async fn proof_enabled_directory_survives_reopen() {
+    async fn intrinsic_commitment_directory_survives_reopen() {
         let dir = tempdir().unwrap();
         let store = open_directory_store(dir.path());
         let (head, state) = create_proof_stack(&store).await;
@@ -1359,7 +1338,7 @@ mod tests {
 
         let reopened = open_directory_store(dir.path());
         let head = reopened.get_layer_from_id(name).await.unwrap().unwrap();
-        assert_eq!(head.proof_state().await.unwrap().unwrap(), state);
+        assert_eq!(head.proof_commitment().await.unwrap().state, state);
     }
 
     #[tokio::test]
@@ -1369,14 +1348,17 @@ mod tests {
         builder
             .add_value_triple(ValueTriple::new_node("a", "p", "one"))
             .unwrap();
-        let legacy = builder.commit().await.unwrap();
-        assert!(legacy.proof_state().await.unwrap().is_none());
+        let legacy = builder.commit_legacy_for_test().await.unwrap();
+        assert_eq!(
+            legacy.proof_commitment().await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
         let child = legacy.open_write().await.unwrap();
         let child_name = child.name();
         child
             .add_value_triple(ValueTriple::new_node("b", "p", "two"))
             .unwrap();
-        assert!(child.commit_with_proof().await.is_err());
+        assert!(child.commit().await.is_err());
         assert!(store.get_layer_from_id(child_name).await.unwrap().is_none());
     }
 
@@ -1387,22 +1369,34 @@ mod tests {
         let base = store.create_base_layer().await.unwrap();
         base.add_value_triple(ValueTriple::new_node("z", "p", "one"))
             .unwrap();
-        let base = base.commit().await.unwrap();
+        let base = base.commit_legacy_for_test().await.unwrap();
         let child = base.open_write().await.unwrap();
         child
             .add_value_triple(ValueTriple::new_node("a", "p", "two"))
             .unwrap();
-        let head = child.commit().await.unwrap();
+        let head = child.commit_legacy_for_test().await.unwrap();
         let name = head.name();
-        assert!(head.proof_state().await.unwrap().is_none());
-        let migrated = head.migrate_proof_chain().await.unwrap();
-        assert_eq!(head.migrate_proof_chain().await.unwrap(), migrated);
+        assert_eq!(
+            head.proof_commitment().await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
         drop(head);
         drop(store);
 
         let reopened = open_raw_archive_store(dir.path());
+        assert_eq!(
+            reopened
+                .get_layer_from_id(name)
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let migrated = reopened.migrate_proof_chain(name).await.unwrap();
+        assert_eq!(reopened.migrate_proof_chain(name).await.unwrap(), migrated);
         let head = reopened.get_layer_from_id(name).await.unwrap().unwrap();
-        assert_eq!(head.proof_state().await.unwrap().unwrap(), migrated);
+        assert_eq!(head.proof_commitment().await.unwrap().state, migrated);
     }
 
     #[tokio::test]
@@ -1412,23 +1406,26 @@ mod tests {
         let base = store.create_base_layer().await.unwrap();
         base.add_value_triple(ValueTriple::new_node("z", "p", "one"))
             .unwrap();
-        let base = base.commit().await.unwrap();
+        let base = base.commit_legacy_for_test().await.unwrap();
         let child = base.open_write().await.unwrap();
         child
             .add_value_triple(ValueTriple::new_node("a", "p", "two"))
             .unwrap();
-        let head = child.commit().await.unwrap();
+        let head = child.commit_legacy_for_test().await.unwrap();
         let name = head.name();
 
         // Force both legacy archives through the LRU before the sidecar rewrite.
-        assert!(head.proof_state().await.unwrap().is_none());
+        assert_eq!(
+            head.proof_commitment().await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
         assert_eq!(head.triples().count(), 2);
         let migrated = head.migrate_proof_chain().await.unwrap();
 
         // No reopen/invalidation is allowed here: these reads must observe the
         // atomically replaced archive bytes rather than a stale LRU entry.
         let same_process = store.get_layer_from_id(name).await.unwrap().unwrap();
-        assert_eq!(same_process.proof_state().await.unwrap().unwrap(), migrated);
+        assert_eq!(same_process.proof_commitment().await.unwrap().state, migrated);
     }
 
     fn forge_proof_delta_in_pack(pack: &[u8], layer: [u32; 5]) -> Vec<u8> {
@@ -1474,21 +1471,28 @@ mod tests {
         let expected_roots = std::collections::HashMap::from([
             (
                 base.name(),
-                base.proof_state().await.unwrap().unwrap().commitment_root,
+                base.proof_commitment().await.unwrap().state.commitment_root,
             ),
             (head.name(), state.commitment_root),
         ]);
 
         let unanchored = open_memory_store();
-        assert!(unanchored
+        unanchored
             .import_layers(&pack, Box::new(ids.clone().into_iter()))
             .await
-            .is_err());
-        assert!(unanchored
-            .get_layer_from_id(head.name())
-            .await
-            .unwrap()
-            .is_none());
+            .unwrap();
+        assert_eq!(
+            unanchored
+                .get_layer_from_id(head.name())
+                .await
+                .unwrap()
+                .unwrap()
+                .proof_commitment()
+                .await
+                .unwrap()
+                .state,
+            state
+        );
 
         let target = open_memory_store();
         target
@@ -1504,7 +1508,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(imported.proof_state().await.unwrap().unwrap(), state);
+        assert_eq!(imported.proof_commitment().await.unwrap().state, state);
 
         let forged = forge_proof_delta_in_pack(&pack, head.name());
         let rejected = open_memory_store();

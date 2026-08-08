@@ -8,11 +8,10 @@ The current cross-repository design and status live in
 authenticated-sidecar and guest-VM plans have been retired; this implementation
 uses native Dory column commitments, multilinear sumcheck, and LogUp arguments.
 
-Proof support is optional and disabled by default. A proof-enabled commit may
-build authenticated columns once; query proving is explicitly invoked by the
-caller and does not belong in Store mutation or the normal query path. Scheduling,
-persistence, and proof-generation lifecycle are deliberately left to the application
-or `terminusdb-rs` domain layer.
+Every committed layer includes its intrinsic authenticated columns. Query proving
+is still explicitly invoked by the caller and does not belong in Store mutation or
+the normal query path. Scheduling, persistence, and proof-generation lifecycle are
+deliberately left to the application or `terminusdb-rs` domain layer.
 Parture payment policy is intentionally outside this generic Store and prover
 framework.
 
@@ -41,7 +40,7 @@ must not create, transfer, or trust a full logical export.
 
 ### Store v4 design: verified state
 
-The verified Store cycle implements an optional `proof_state.pf4` sidecar.
+The verified Store cycle implements a mandatory `proof_state.pf4` commitment file.
 It authenticates each native layer's complete additions, removals, and newly
 allocated dictionary interval. Each canonical leaf binds the native S/P/O IDs,
 canonical logical bytes, and its ordered position. The manifest commits exact
@@ -79,15 +78,15 @@ page-addressable and still reconstructs every projection on a cold proof read.
 
 ### Mutation, migration, and history semantics
 
-- Normal commits and untraced reads neither create nor read proof state.
-- `commit_with_proof` and explicit migration build authentication data from
-  native layer files; they do not generate query proofs.
-- Proof children require a proof-enabled parent and fail closed otherwise.
+- Every new base or child commit builds authentication data from native layer
+  files before the layer becomes visible; this does not generate a query proof.
+- Children require an intrinsically committed parent and fail closed otherwise.
 - Rollups are physical accelerators and retain the original unrolled proof
-  identity. They must never substitute remapped rollup IDs during admission.
+  identity. Each physical rollup also carries a commitment for its own native
+  representation and must never substitute remapped IDs during admission.
 - Squash and squash-up-to create new authenticated history and new roots.
-- Base merge regenerates proof state only when every input is proof-enabled;
-  mixed inputs remain explicitly legacy.
+- Base merge always regenerates authenticated state; legacy inputs must first be
+  migrated explicitly.
 - `pf3` was a development-only format and was never shipped. There is no v3
   archive decoder or migration tool. Directory data can be rebuilt explicitly
   from native files into v4; old archive `ProofState` payloads are unsupported
@@ -95,14 +94,13 @@ page-addressable and still reconstructs every projection on a cold proof read.
 
 ### Packs, roots, and publication visibility
 
-Pack v2 bounds parsing and aggregate peak memory, validates native layers and
-proof chains in shared-byte private staging, requires an independently supplied
-expected root for every requested proof layer, rejects collisions, and
-provides `export_layers_legacy` for explicit no-proof compatibility. The pack
-is transport, not a trust source: a root received from the same untrusted pack
-does not authenticate anything. The root must come from a trusted commit
-record, independently replicated node, signed deployment metadata, or the
-request/protocol context.
+Pack v2 bounds parsing and aggregate peak memory, requires intrinsic PF4 data for
+every requested layer, validates native layers and proof chains in shared-byte
+private staging, and rejects collisions. Independently supplied expected roots
+are optional authenticity anchors; intrinsic consistency is always checked. A
+legacy pack must be migrated and re-exported. The pack is transport, not a trust
+source: a root received from the same untrusted pack does not authenticate
+anything.
 
 Export streams compressed bytes through a bounded temporary file, and import
 gzip/tar parsing runs in a peak-charged blocking worker. Directory and archive

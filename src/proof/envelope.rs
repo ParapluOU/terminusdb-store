@@ -691,8 +691,8 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let (layer, _) = builder.commit_with_proof().unwrap();
-        let commitment = layer.proof_commitment().unwrap().unwrap();
+        let layer = builder.commit().unwrap();
+        let commitment = layer.proof_commitment().unwrap();
         let plan = LayerBgpPlan {
             atoms: vec![LayerBgpAtom::all_variables(iri("knows").into_bytes())],
             joins: Vec::new(),

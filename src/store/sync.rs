@@ -97,20 +97,11 @@ impl SyncStoreLayerBuilder {
         task_sync(self.inner.commit_no_load())
     }
 
-    pub fn commit_no_load_with_proof(&self) -> Result<CommitmentState, io::Error> {
-        task_sync(self.inner.commit_no_load_with_proof())
-    }
-
     /// Commit the layer to storage.
     pub fn commit(&self) -> Result<SyncStoreLayer, io::Error> {
         let inner = task_sync(self.inner.commit());
 
         inner.map(SyncStoreLayer::wrap)
-    }
-
-    pub fn commit_with_proof(&self) -> Result<(SyncStoreLayer, CommitmentState), io::Error> {
-        task_sync(self.inner.commit_with_proof())
-            .map(|(layer, state)| (SyncStoreLayer::wrap(layer), state))
     }
 
     /// Apply all triples added and removed by a layer to this builder.
@@ -149,11 +140,7 @@ impl SyncStoreLayer {
         Self { inner }
     }
 
-    pub fn proof_state(&self) -> io::Result<Option<CommitmentState>> {
-        task_sync(self.inner.proof_state())
-    }
-
-    pub fn proof_commitment(&self) -> io::Result<Option<Arc<LayerCommitment>>> {
+    pub fn proof_commitment(&self) -> io::Result<Arc<LayerCommitment>> {
         task_sync(self.inner.proof_commitment())
     }
 
@@ -629,6 +616,11 @@ impl SyncStore {
         Ok(inner)
     }
 
+    /// Explicitly backfill intrinsic commitments for a legacy layer chain.
+    pub fn migrate_proof_chain(&self, layer: [u32; 5]) -> io::Result<CommitmentState> {
+        task_sync(self.inner.migrate_proof_chain(layer))
+    }
+
     /// Export the given layers by creating a pack, a Vec<u8> that can later be used with `import_layers` on a different store.
     pub fn export_layers(
         &self,
@@ -650,14 +642,6 @@ impl SyncStore {
         )
     }
 
-    /// Export a legacy pack without authenticated proof state.
-    pub fn export_layers_legacy(
-        &self,
-        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<Vec<u8>> {
-        task_sync(self.inner.layer_store.export_layers_legacy(layer_ids))
-    }
-
     /// Import the specified layers from the given pack, a byte slice that was previously generated with `export_layers`, on another store, and possibly even another machine).
     ///
     /// On success every requested layer is retrievable. Missing layers reject
@@ -670,7 +654,7 @@ impl SyncStore {
         task_sync(self.inner.layer_store.import_layers(pack, layer_ids))
     }
 
-    /// Import proof-enabled layers anchored to independently supplied roots.
+    /// Import intrinsically committed layers, optionally anchored to supplied roots.
     pub fn import_layers_with_expected_roots(
         &self,
         pack: &[u8],

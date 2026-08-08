@@ -1538,8 +1538,8 @@ mod object_range_tests {
         builder
             .add_value_triple(ValueTriple::new_string_value(&iri("s8"), &p, "hello"))
             .unwrap();
-        let (layer, _state) = builder.commit_with_proof().unwrap();
-        let layer = layer.proof_commitment().unwrap().unwrap();
+        let layer = builder.commit().unwrap();
+        let layer = layer.proof_commitment().unwrap();
 
         let dict_id = layer.node_value_dictionary_columns().unwrap().1;
         let dict_value = layer.node_value_dictionary_value_column().unwrap();

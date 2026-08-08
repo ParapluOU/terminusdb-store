@@ -2651,8 +2651,8 @@ pub mod commitment {
             builder
                 .add_value_triple(ValueTriple::new_string_value(&iri("s6"), &p, "hello"))
                 .unwrap();
-            let (layer, _state) = builder.commit_with_proof().unwrap();
-            let layer = layer.proof_commitment().unwrap().unwrap();
+            let layer = builder.commit().unwrap();
+            let layer = layer.proof_commitment().unwrap();
 
             let values = layer.node_value_dictionary_value_column().unwrap();
             let datatypes = layer.node_value_dictionary_datatype_column().unwrap();

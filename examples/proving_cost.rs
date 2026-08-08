@@ -14,13 +14,10 @@
 //!     t(?x, knows, ?y), t(?x, age, ?a) [?a > 18]   (join on ?x)
 //!
 //! the following phases:
-//!   * setup          -- the ONE-TIME global deterministic Dory transparent setup
-//!                        (isolated via a cold-minus-warm commit_with_proof; this
-//!                        is the OnceLock `deterministic_prover_setup` cost).
-//!   * commit-native  -- building the native store base layer (no proof).
-//!   * commit-Dory    -- the EXTRA cost of `commit_with_proof` over `commit`,
-//!                        i.e. the commit-time Dory column-commitment MSMs
-//!                        (6 triple columns + the dict/value columns).
+//!   * setup          -- the ONE-TIME global deterministic Dory transparent setup,
+//!                        estimated from cold-minus-warm intrinsic commits.
+//!   * commit         -- building the native store layer and its mandatory
+//!                        authenticated column commitments.
 //!   * prove          -- `prove_layer_bgp` (sumcheck + Dory openings + the range
 //!                        bit-decomposition/lookup + the binary join).
 //!   * prove(plain)   -- the same 2-atom join WITHOUT the range filter, so
@@ -315,24 +312,14 @@ fn populate(builder: &terminus_store::store::sync::SyncStoreLayerBuilder, person
     }
 }
 
-/// Build a native-only base layer (no proof), returning the wall time.
-fn build_native(persons: usize) -> Duration {
+/// Build a base layer and its intrinsic commitment.
+fn build_committed(persons: usize) -> (Duration, std::sync::Arc<LayerCommitment>) {
     let store = open_sync_memory_store();
     let builder = store.create_base_layer().unwrap();
     populate(&builder, persons);
     let t = Instant::now();
-    let _layer = builder.commit().unwrap();
-    t.elapsed()
-}
-
-/// Build a base layer WITH proof commitments, returning (wall time, LayerCommitment).
-fn build_proof(persons: usize) -> (Duration, std::sync::Arc<LayerCommitment>) {
-    let store = open_sync_memory_store();
-    let builder = store.create_base_layer().unwrap();
-    populate(&builder, persons);
-    let t = Instant::now();
-    let (layer, _state) = builder.commit_with_proof().unwrap();
-    let lc = layer.proof_commitment().unwrap().unwrap();
+    let layer = builder.commit().unwrap();
+    let lc = layer.proof_commitment().unwrap();
     (t.elapsed(), lc)
 }
 
@@ -375,8 +362,7 @@ struct Row {
     n_triples: usize,
     persons: usize,
     log_domain: u32,
-    commit_native: Duration,
-    commit_dory: Duration,
+    commit: Duration,
     prove: Duration,
     prove_plain: Duration,
     verify: Duration,
@@ -388,10 +374,8 @@ fn bench_size(n_triples: usize, prove_runs: usize) -> Row {
     let persons = (n_triples / 2).max(1);
     let real_triples = persons * 2;
 
-    // (1) commit-native (no proof) and commit-with-proof, on separate identical stores.
-    let commit_native = build_native(persons);
-    let (commit_proof, lc) = build_proof(persons);
-    let commit_dory = commit_proof.saturating_sub(commit_native);
+    // (1) Commit the native layer and its mandatory authenticated commitment.
+    let (commit, lc) = build_committed(persons);
     let log_domain = (real_triples.next_power_of_two()).trailing_zeros();
 
     // (2) representative ranged BGP: prove (median) + verify (warm) + proof size.
@@ -432,8 +416,7 @@ fn bench_size(n_triples: usize, prove_runs: usize) -> Row {
         n_triples: real_triples,
         persons,
         log_domain,
-        commit_native,
-        commit_dory,
+        commit,
         prove,
         prove_plain,
         verify,
@@ -454,14 +437,10 @@ fn main() {
     }
 
     // --- One-time setup isolation --------------------------------------------
-    // Warm the store/tokio/allocator with a NATIVE-only tiny build (does NOT
-    // trigger the Dory setup OnceLock). Then the first commit_with_proof pays the
-    // one-time deterministic Dory prover setup; the second does not. The
-    // difference isolates the global setup cost. Likewise the first verify pays
-    // the one-time verifier setup.
-    let _warm = build_native(1);
-    let (cold_commit, _lc0) = build_proof(4);
-    let (warm_commit, lc_tiny) = build_proof(4);
+    // The first intrinsic commit pays deterministic prover setup; the second
+    // reuses it. Likewise the first verification pays verifier setup.
+    let (cold_commit, _lc0) = build_committed(4);
+    let (warm_commit, lc_tiny) = build_committed(4);
     let setup_prover = cold_commit.saturating_sub(warm_commit);
 
     let tiny_plan = ranged_plan();
@@ -516,12 +495,11 @@ fn main() {
     // --- Table ----------------------------------------------------------------
     println!("\n================================ RESULTS (RELEASE) ================================");
     println!(
-        "{:>9} {:>7} {:>6} | {:>10} {:>10} | {:>11} {:>11} {:>9} | {:>10} {:>8}",
+        "{:>9} {:>7} {:>6} | {:>10} | {:>11} {:>11} {:>9} | {:>10} {:>8}",
         "triples",
         "persons",
         "domain",
-        "cmt-native",
-        "cmt-Dory",
+        "commit",
         "prove",
         "prove-plain",
         "verify",
@@ -529,18 +507,17 @@ fn main() {
         "rows",
     );
     println!(
-        "{:>9} {:>7} {:>6} | {:>10} {:>10} | {:>11} {:>11} {:>9} | {:>10} {:>8}",
-        "", "", "", "(ms)", "(ms)", "(ms)", "(ms)", "(ms)", "(bytes)", "",
+        "{:>9} {:>7} {:>6} | {:>10} | {:>11} {:>11} {:>9} | {:>10} {:>8}",
+        "", "", "", "(ms)", "(ms)", "(ms)", "(ms)", "(bytes)", "",
     );
     println!("{}", "-".repeat(98));
     for r in &rows {
         println!(
-            "{:>9} {:>7} {:>6} | {:>10.1} {:>10.1} | {:>11.1} {:>11.1} {:>9.1} | {:>10} {:>8}",
+            "{:>9} {:>7} {:>6} | {:>10.1} | {:>11.1} {:>11.1} {:>9.1} | {:>10} {:>8}",
             r.n_triples,
             r.persons,
             format!("2^{}", r.log_domain),
-            ms(r.commit_native),
-            ms(r.commit_dory),
+            ms(r.commit),
             ms(r.prove),
             ms(r.prove_plain),
             ms(r.verify),
@@ -550,8 +527,8 @@ fn main() {
     }
     println!("{}", "=".repeat(98));
     println!(
-        "\nNote: 'cmt-Dory' = commit_with_proof MINUS commit (native) = commit-time Dory\n\
-         column-commitment MSMs. 'prove-plain' = same 2-atom join without the range\n\
+        "\nNote: 'commit' includes native storage and intrinsic Dory column commitments.\n\
+         'prove-plain' = same 2-atom join without the range\n\
          filter, so (prove - prove-plain) isolates the range gadget's prove cost.\n\
          'setup' above is process-global and paid ONCE, not per proof."
     );

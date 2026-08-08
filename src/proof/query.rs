@@ -2071,8 +2071,8 @@ mod tests {
                 .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
                 .unwrap();
         }
-        let (layer, _state) = builder.commit_with_proof().unwrap();
-        layer.proof_commitment().unwrap().unwrap()
+        let layer = builder.commit().unwrap();
+        layer.proof_commitment().unwrap()
     }
 
     // Independently recompute the expected dense result for a predicate id.
@@ -2224,13 +2224,13 @@ mod tests {
                 .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
                 .unwrap();
         }
-        let (base, _) = builder.commit_with_proof().unwrap();
+        let base = builder.commit().unwrap();
         let child = base.open_write().unwrap();
         child
             .remove_value_triple(ValueTriple::new_node(&iri("a1"), &iri("p1"), &iri("b1")))
             .unwrap();
-        let (head, _) = child.commit_with_proof().unwrap();
-        let lc = head.proof_commitment().unwrap().unwrap();
+        let head = child.commit().unwrap();
+        let lc = head.proof_commitment().unwrap();
         assert!(prove_layer_filter(&lc, P1).is_err());
     }
 
@@ -2247,7 +2247,7 @@ mod tests {
                 .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
                 .unwrap();
         }
-        let (base, _) = builder.commit_with_proof().unwrap();
+        let base = builder.commit().unwrap();
         // Add >= 2 triples under a NEW predicate so the delta proof is well-formed (>= 2
         // rows) and the predicate resolves in the child's own (delta) dictionary.
         let child = base.open_write().unwrap();
@@ -2256,8 +2256,8 @@ mod tests {
                 .add_value_triple(ValueTriple::new_node(&iri(s), &iri("pn"), &iri(o)))
                 .unwrap();
         }
-        let (head, _) = child.commit_with_proof().unwrap();
-        let lc = head.proof_commitment().unwrap().unwrap();
+        let head = child.commit().unwrap();
+        let lc = head.proof_commitment().unwrap();
         // Precondition: the old gate (removals only) would NOT have caught this.
         assert_eq!(lc.state.removal_count, 0);
         assert!(lc.state.parent_state_root.is_some());
@@ -2827,8 +2827,8 @@ mod tests {
         for t in triples {
             builder.add_value_triple(t).unwrap();
         }
-        let (layer, _state) = builder.commit_with_proof().unwrap();
-        layer.proof_commitment().unwrap().unwrap()
+        let layer = builder.commit().unwrap();
+        layer.proof_commitment().unwrap()
     }
 
     fn node_const(suffix: &str) -> AtomTerm {
@@ -3290,8 +3290,8 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let (layer, _state) = builder.commit_with_proof().unwrap();
-        layer.proof_commitment().unwrap().unwrap()
+        let layer = builder.commit().unwrap();
+        layer.proof_commitment().unwrap()
     }
 
     // A layer with FEW triples but MANY distinct node/values: 3 people, each with a
@@ -3321,8 +3321,8 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let (layer, _state) = builder.commit_with_proof().unwrap();
-        layer.proof_commitment().unwrap().unwrap()
+        let layer = builder.commit().unwrap();
+        layer.proof_commitment().unwrap()
     }
 
     // The UInt32 value behind a node/value dict id (its order-preserving encoding is the
