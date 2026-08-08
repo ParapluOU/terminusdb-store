@@ -13,6 +13,7 @@ use crate::storage::directory::{DirectoryLabelStore, DirectoryLayerStore};
 use crate::storage::memory::{MemoryLabelStore, MemoryLayerStore};
 use crate::storage::{
     CachedLayerStore, LabelStore, LayerStore, LockingHashMapLayerCache, PackImportLimits,
+    ProofMigrationOutcome,
 };
 use tdb_succinct::TypedDictEntry;
 
@@ -980,6 +981,17 @@ impl Store {
     /// This is the only operation that admits layers without PF4 data.
     pub async fn migrate_proof_chain(&self, layer: [u32; 5]) -> io::Result<CommitmentState> {
         self.layer_store.migrate_proof_chain(layer).await
+    }
+
+    /// Explicitly backfill a legacy proof chain and report whether this
+    /// invocation performed migration work.
+    pub async fn migrate_proof_chain_with_status(
+        &self,
+        layer: [u32; 5],
+    ) -> io::Result<ProofMigrationOutcome> {
+        self.layer_store
+            .migrate_proof_chain_with_status(layer)
+            .await
     }
 
     /// Create a base layer builder, unattached to any database label.

@@ -15,7 +15,7 @@ use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, Value
 use std::sync::Arc;
 
 use crate::proof::{CommitmentState, LayerCommitment, ProofHash};
-use crate::storage::PackImportLimits;
+use crate::storage::{PackImportLimits, ProofMigrationOutcome};
 use crate::store::{
     open_directory_store, open_memory_store, NamedGraph, Store, StoreLayer, StoreLayerBuilder,
 };
@@ -615,6 +615,15 @@ impl SyncStore {
     /// Explicitly backfill intrinsic commitments for a legacy layer chain.
     pub fn migrate_proof_chain(&self, layer: [u32; 5]) -> io::Result<CommitmentState> {
         task_sync(self.inner.migrate_proof_chain(layer))
+    }
+
+    /// Explicitly backfill a legacy proof chain and report whether this
+    /// invocation performed migration work.
+    pub fn migrate_proof_chain_with_status(
+        &self,
+        layer: [u32; 5],
+    ) -> io::Result<ProofMigrationOutcome> {
+        task_sync(self.inner.migrate_proof_chain_with_status(layer))
     }
 
     /// Export the given layers by creating a pack, a Vec<u8> that can later be used with `import_layers` on a different store.

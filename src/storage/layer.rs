@@ -40,6 +40,16 @@ use async_trait::async_trait;
 
 pub const MAX_LAYER_CHAIN_DEPTH: usize = 1024;
 
+/// Result of an explicit proof-chain migration.
+///
+/// `migrated` is derived inside the migration operation, so callers do not
+/// need a racy before/after probe to distinguish an idempotent invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofMigrationOutcome {
+    pub state: CommitmentState,
+    pub migrated: bool,
+}
+
 /// Publication crossed its logical visibility point, but the final directory
 /// durability barrier failed. The caller must treat the transaction as
 /// indeterminate, inspect/recover the store, and must not blindly retry it.
@@ -362,9 +372,13 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     }
 
     /// Explicit one-time legacy migration. No query path calls this method.
-    async fn migrate_proof_chain(&self, name: [u32; 5]) -> io::Result<CommitmentState> {
+    async fn migrate_proof_chain_with_status(
+        &self,
+        name: [u32; 5],
+    ) -> io::Result<ProofMigrationOutcome> {
         let mut top = None;
         let mut legacy_parent_root = None;
+        let mut migrated = false;
         for layer_name in self.retrieve_layer_stack_names(name).await? {
             let state = match self.proof_layer(layer_name).await {
                 Ok(current) => {
@@ -374,6 +388,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     let current = self.prepare_proof_layer(layer_name).await?;
+                    migrated = true;
                     legacy_parent_root = Some(current.legacy_v3_root(legacy_parent_root)?);
                     current.state
                 }
@@ -408,6 +423,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
                     .map_err(io::Error::other)??;
                     self.replace_proof_state_bytes_if_matches(layer_name, &old_bytes, &replacement)
                         .await?;
+                    migrated = true;
                     legacy_parent_root = Some(legacy.commitment_root);
                     current.state
                 }
@@ -415,7 +431,13 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
             };
             top = Some(state);
         }
-        top.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty migration chain"))
+        let state =
+            top.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty migration chain"))?;
+        Ok(ProofMigrationOutcome { state, migrated })
+    }
+
+    async fn migrate_proof_chain(&self, name: [u32; 5]) -> io::Result<CommitmentState> {
+        Ok(self.migrate_proof_chain_with_status(name).await?.state)
     }
 
     async fn get_layer_parent_name(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
@@ -4755,17 +4777,25 @@ mod tests {
 
         // Simulate interruption after the base CAS: the child remains v3. The
         // retry reconstructs the base's legacy root from its validated v4 state.
-        store.migrate_proof_chain(names[0]).await.unwrap();
+        assert!(
+            store
+                .migrate_proof_chain_with_status(names[0])
+                .await
+                .unwrap()
+                .migrated
+        );
         assert!(store.proof_layer(names[0]).await.is_ok());
         assert_eq!(
             store.proof_layer(head).await.unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
-        let first = store.migrate_proof_chain(head).await.unwrap();
-        let second = store.migrate_proof_chain(head).await.unwrap();
-        assert_eq!(first, second);
+        let first = store.migrate_proof_chain_with_status(head).await.unwrap();
+        let second = store.migrate_proof_chain_with_status(head).await.unwrap();
+        assert!(first.migrated);
+        assert!(!second.migrated);
+        assert_eq!(first.state, second.state);
         assert_eq!(
-            first,
+            first.state,
             store
                 .validate_proof_chain_against_store(head)
                 .await
