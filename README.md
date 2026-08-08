@@ -2,13 +2,11 @@
 
 ## Parture asynchronous verified queries
 
-This ParapluOU fork is the Store half of TerminusDB's asynchronous WOQL
-query-proof capability. The authoritative cross-repository plan is
-[`PARTURE_ASYNC_QUERY_PROOF_PLAN.md`](../terminusdb/docs/PARTURE_ASYNC_QUERY_PROOF_PLAN.md).
-The Store format is described in
-[`docs/AUTHENTICATED_PROOF_FORMAT.md`](docs/AUTHENTICATED_PROOF_FORMAT.md), and
-the dependency-ordered implementation handoff is
-[`docs/AUTHENTICATED_PROOF_TODO.md`](docs/AUTHENTICATED_PROOF_TODO.md).
+This ParapluOU fork is the Store half of TerminusDB's Proof-of-WOQL capability.
+The current cross-repository design and status live in
+[`doc/proof-of-woql/overview.md`](../../doc/proof-of-woql/overview.md). The older
+authenticated-sidecar and guest-VM plans have been retired; this implementation
+uses native Dory column commitments, multilinear sumcheck, and LogUp arguments.
 
 The target request lifecycle is deliberately one-pass:
 
@@ -24,10 +22,9 @@ proof request -> compile canonical proof plan
                  (never rerun WOQL, Prolog search, or Store search)
 ```
 
-Proof support is optional and disabled by default. No RISC Zero, OpenVM, Jolt,
-or other ZK work belongs in Store mutation or in the normal query path. A
-proof-enabled commit may build authenticated native indexes once; cryptographic
-proving begins only after the one foreground query has sealed a durable job.
+Proof support is optional and disabled by default. A proof-enabled commit may
+build authenticated columns once; query proving is explicitly invoked by the
+caller and does not belong in Store mutation or the normal query path.
 Parture payment policy is intentionally outside this generic Store and prover
 framework.
 
@@ -84,7 +81,7 @@ page-addressable and still reconstructs every projection on a cold proof read.
 
 - Normal commits and untraced reads neither create nor read proof state.
 - `commit_with_proof` and explicit migration build authentication data from
-  native layer files; they do no ZK proving.
+  native layer files; they do not generate query proofs.
 - Proof children require a proof-enabled parent and fail closed otherwise.
 - Rollups are physical accelerators and retain the original unrolled proof
   identity. They must never substitute remapped rollup IDs during admission.
@@ -139,8 +136,8 @@ is a separate version. Before compiling TerminusDB against this checkout:
 6. bind the canonical query, proof plan, options, executor/checker contract,
    request nonce, state root, ordered result root, deterministic cost, and
    backend image/program identity in the public statement;
-7. have the independent native checker and each RISC Zero/OpenVM/Jolt guest
-   verify the same sealed private trace/evidence without calling Prolog or Store;
+7. expose the same native verifier through the Rust and TerminusDB integration
+   boundaries without rerunning Prolog or Store search;
 8. preserve the existing atomic sealed/aborted job lifecycle and keep all
    unsupported WOQL/control states fail-closed before execution.
 

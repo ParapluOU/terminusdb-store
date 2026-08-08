@@ -1,6 +1,6 @@
 //! Stable-toolchain authenticated Store mutation benchmark.
 //!
-//! This measures Store index construction only. It never invokes a ZK prover.
+//! This measures Store index construction only. It never generates a query proof.
 
 use std::env;
 use std::fs;
