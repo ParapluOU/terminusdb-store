@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 use terminus_store::layer::ValueTriple;
-use terminus_store::proof::{verify_layer_chain, TriplePattern};
 use terminus_store::storage::name_to_string;
 use terminus_store::store::sync::SyncStoreLayer;
 use terminus_store::Layer;
@@ -179,40 +178,39 @@ fn main() -> io::Result<()> {
     let cold_head = cold_store
         .get_layer_from_id(deep_head)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "deep proof head not found"))?;
-    let pattern = TriplePattern::default();
     let rss_before = resident_bytes();
     let started = Instant::now();
-    let (root_hash, witness) = cold_head.proof_range_witness(&pattern)?;
-    let cold_scan = started.elapsed();
-    let result_count = verify_layer_chain(root_hash, &pattern, &witness)?.len();
-    drop(witness);
+    let commitment = cold_head
+        .proof_commitment()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "deep proof commitment missing"))?;
+    let cold_load = started.elapsed();
+    let root_hash = commitment.state.commitment_root;
+    drop(commitment);
     let rss_after = resident_bytes();
     let decoded_cache = cold_store.proof_cache_memory_bytes();
     let started = Instant::now();
-    let (steady_root, steady_witness) = cold_head.proof_range_witness(&pattern)?;
-    let steady_scan = started.elapsed();
-    let steady_count = verify_layer_chain(steady_root, &pattern, &steady_witness)?.len();
+    let steady_commitment = cold_head
+        .proof_commitment()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cached proof commitment missing"))?;
+    let steady_load = started.elapsed();
     let steady_cache = cold_store.proof_cache_memory_bytes();
-    assert_eq!(result_count, base_rows + deep_layers);
-    assert_eq!(steady_count, result_count);
+    assert_eq!(steady_commitment.state.commitment_root, root_hash);
     assert_eq!(
         steady_cache, decoded_cache,
-        "steady scan rebuilt cached indexes"
+        "steady load rebuilt cached commitments"
     );
     println!(
-        "cold_deep_scan: layers={} elapsed_ms={:.3} rss_delta_bytes={} decoded_cache_bytes={} rows={}",
+        "cold_deep_commitment_load: layers={} elapsed_ms={:.3} rss_delta_bytes={} decoded_cache_bytes={}",
         deep_layers + 1,
-        milliseconds(cold_scan),
+        milliseconds(cold_load),
         rss_after.unwrap_or(0).saturating_sub(rss_before.unwrap_or(0)),
         decoded_cache,
-        result_count
     );
     println!(
-        "steady_deep_scan: layers={} elapsed_ms={:.3} decoded_cache_bytes={} rows={}",
+        "steady_deep_commitment_load: layers={} elapsed_ms={:.3} decoded_cache_bytes={}",
         deep_layers + 1,
-        milliseconds(steady_scan),
+        milliseconds(steady_load),
         steady_cache,
-        steady_count
     );
 
     Ok(())

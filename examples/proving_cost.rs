@@ -282,7 +282,7 @@ fn atom_proof_bytes(a: &LayerBgpAtomProof) -> usize {
 
 fn proof_bytes(proof: &LayerBgpProof, result_coms: &[ArkGT]) -> usize {
     proof.atoms.iter().map(atom_proof_bytes).sum::<usize>()
-        + bgp_chain_bytes(&proof.chain)
+        + proof.chain.as_ref().map(bgp_chain_bytes).unwrap_or(0)
         + gts(result_coms)
 }
 
@@ -344,6 +344,7 @@ fn ranged_plan() -> LayerBgpPlan {
                 datatype: ArkFr::from_u64(CanonicalDatatype::UInt32 as u64),
                 c: ArkFr::from_u64(18),
                 b_bits: 64,
+                second: None,
             }),
             LayerBgpAtom::all_variables(KNOWS.to_vec()),
         ],
