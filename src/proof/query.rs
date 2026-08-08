@@ -25,7 +25,8 @@ use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{commit_column, Transcript254};
 use super::bgp::{
-    prove_bgp_chain, verify_bgp_chain, BgpChainProof, JoinStep, RelationCommit, RelationWitness,
+    prove_bgp_chain_with_result, verify_bgp_chain, BgpChainProof, JoinStep, RelationCommit,
+    RelationWitness,
 };
 use super::commitment::LayerCommitment;
 use super::dict::{
@@ -736,6 +737,57 @@ pub struct LayerBgpAtomProof {
 pub struct LayerBgpProof {
     pub atoms: Vec<LayerBgpAtomProof>,
     pub chain: Option<BgpChainProof>,
+}
+
+/// Prover-side BGP output including the values bound by the result commitments. Columns
+/// are padded to `2^result_log_domain`; query rows occupy `[0, result_len)`.
+pub struct LayerBgpResult {
+    pub proof: LayerBgpProof,
+    pub result_commitments: Vec<ArkGT>,
+    pub result_columns: Vec<Vec<ArkFr>>,
+    pub result_log_domain: usize,
+    pub result_len: usize,
+    pub predicate_ids: Vec<u64>,
+}
+
+impl LayerBgpResult {
+    /// Copy the real result prefix, omitting commitment-domain padding.
+    pub fn real_columns(&self) -> Vec<Vec<ArkFr>> {
+        self.result_columns
+            .iter()
+            .map(|column| column[..self.result_len].to_vec())
+            .collect()
+    }
+}
+
+/// Bind caller-delivered result ID columns to the commitments authenticated by a query
+/// proof. This is intentionally deterministic: pad each real column to the proven domain
+/// and recompute its Dory commitment. It adds work linear in the delivered result size,
+/// but no new proof-generation lifecycle or trusted component.
+pub fn verify_result_columns(
+    commitments: &[ArkGT],
+    columns: &[Vec<ArkFr>],
+    result_len: usize,
+    result_log_domain: usize,
+) -> io::Result<()> {
+    if result_log_domain == 0 || result_log_domain >= usize::BITS as usize {
+        return Err(invalid("result column log-domain out of range"));
+    }
+    let domain = 1usize << result_log_domain;
+    if result_len > domain || commitments.len() != columns.len() {
+        return Err(invalid("result column shape does not match its commitments"));
+    }
+    for (commitment, column) in commitments.iter().zip(columns) {
+        if column.len() != result_len {
+            return Err(invalid("result column length does not match the proven length"));
+        }
+        let mut padded = column.clone();
+        padded.resize(domain, ArkFr::zero());
+        if commit_column(&padded)? != *commitment {
+            return Err(invalid("delivered result column does not match its commitment"));
+        }
+    }
+    Ok(())
 }
 
 /// The resolved dictionary ids for one atom's constants: the predicate is always a
@@ -1524,6 +1576,22 @@ pub fn prove_layer_bgp(
     layer: &LayerCommitment,
     plan: &LayerBgpPlan,
 ) -> io::Result<(LayerBgpProof, Vec<ArkGT>, usize, Vec<u64>)> {
+    let result = prove_layer_bgp_with_result(layer, plan)?;
+    Ok((
+        result.proof,
+        result.result_commitments,
+        result.result_len,
+        result.predicate_ids,
+    ))
+}
+
+/// Prove the complete BGP and retain the authenticated result values for delivery by an
+/// explicitly invoking caller. The commitment-only [`prove_layer_bgp`] API remains
+/// available for compatibility.
+pub fn prove_layer_bgp_with_result(
+    layer: &LayerCommitment,
+    plan: &LayerBgpPlan,
+) -> io::Result<LayerBgpResult> {
     let k = validate_bgp_plan(plan)?;
     let (s, p, o, n) = base_layer_columns(layer)?;
 
@@ -1670,24 +1738,37 @@ pub fn prove_layer_bgp(
 
     // (5) The left-deep chain over the filtered relations, when there is something to
     // join. For k=1 the complete atom filter result is already the query result.
-    let (chain, result_coms, result_m) = if k == 1 {
+    let (chain, result_coms, result_columns, result_log_domain, result_m) = if k == 1 {
         let relation = &relations[0];
-        (None, relation.commitments.clone(), relation.n)
+        (
+            None,
+            relation.commitments.clone(),
+            relation.columns.clone(),
+            relation.log_domain,
+            relation.n,
+        )
     } else {
-        let (chain, result_coms, result_m) =
-            prove_bgp_chain(&relations, &plan.joins, &mut transcript)?;
-        (Some(chain), result_coms, result_m)
+        let result = prove_bgp_chain_with_result(&relations, &plan.joins, &mut transcript)?;
+        (
+            Some(result.proof),
+            result.commitments,
+            result.columns,
+            result.log_domain,
+            result.n,
+        )
     };
 
-    Ok((
-        LayerBgpProof {
+    Ok(LayerBgpResult {
+        proof: LayerBgpProof {
             atoms: atom_proofs,
             chain,
         },
-        result_coms,
-        result_m,
+        result_commitments: result_coms,
+        result_columns,
+        result_log_domain,
+        result_len: result_m,
         predicate_ids,
-    ))
+    })
 }
 
 /// Verify a k-atom layer BGP proof. Anchors to `commitment_root` FIRST (exactly like
@@ -2362,6 +2443,49 @@ mod tests {
             }
         }
         vec![s, o]
+    }
+
+    #[test]
+    fn delivered_result_columns_are_bound_to_the_proven_commitments() {
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("x", "likes", "y"),
+        ]);
+        let plan = LayerBgpPlan {
+            atoms: vec![atom(KNOWS)],
+            joins: Vec::new(),
+        };
+        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
+
+        let columns = result.real_columns();
+        verify_result_columns(
+            &result.result_commitments,
+            &columns,
+            result.result_len,
+            result.result_log_domain,
+        )
+        .unwrap();
+
+        let mut tampered = columns;
+        tampered[0][0] = tampered[0][0] + ArkFr::one();
+        assert!(verify_result_columns(
+            &result.result_commitments,
+            &tampered,
+            result.result_len,
+            result.result_log_domain,
+        )
+        .is_err());
     }
 
     // Independently recompute the complete BGP result columns (real length) and the final

@@ -200,6 +200,16 @@ pub struct BgpChainProof {
     pub stages: Vec<BgpStageProof>,
 }
 
+/// Prover-side output of a BGP chain, including the authenticated result column values.
+/// `columns` are padded to `2^log_domain`; only the prefix `[0, n)` is query output.
+pub struct BgpChainResult {
+    pub proof: BgpChainProof,
+    pub commitments: Vec<ArkGT>,
+    pub columns: Vec<Vec<ArkFr>>,
+    pub log_domain: usize,
+    pub n: usize,
+}
+
 /// Shared shape validation over the verifier-facing view.
 fn validate_shape(relations: &[RelationCommit], plan: &[JoinStep]) -> io::Result<()> {
     if relations.len() < 2 {
@@ -357,19 +367,42 @@ pub fn prove_bgp_chain(
     plan: &[JoinStep],
     transcript: &mut Transcript254,
 ) -> io::Result<(BgpChainProof, Vec<ArkGT>, usize)> {
+    let result = prove_bgp_chain_with_result(relations, plan, transcript)?;
+    Ok((result.proof, result.commitments, result.n))
+}
+
+/// Prove the chain and retain the authenticated result values for explicit delivery to
+/// a caller. This does not schedule, persist, or otherwise manage proof generation.
+pub fn prove_bgp_chain_with_result(
+    relations: &[RelationWitness],
+    plan: &[JoinStep],
+    transcript: &mut Transcript254,
+) -> io::Result<BgpChainResult> {
     let overrides = vec![None; plan.len()];
-    prove_bgp_chain_inner(relations, plan, &overrides, transcript)
+    prove_bgp_chain_inner_with_result(relations, plan, &overrides, transcript)
 }
 
 /// Prove the chain from EXPLICIT per-stage accumulator lengths (the honest entry passes
 /// all `None`, so each stage uses the prior stage's proven `m_j`). Tests use the
 /// override to inject a real-length-continuity attack (an inflated intermediate length).
+#[allow(dead_code)]
 pub(crate) fn prove_bgp_chain_inner(
     relations: &[RelationWitness],
     plan: &[JoinStep],
     r_len_overrides: &[Option<usize>],
     transcript: &mut Transcript254,
 ) -> io::Result<(BgpChainProof, Vec<ArkGT>, usize)> {
+    let result =
+        prove_bgp_chain_inner_with_result(relations, plan, r_len_overrides, transcript)?;
+    Ok((result.proof, result.commitments, result.n))
+}
+
+fn prove_bgp_chain_inner_with_result(
+    relations: &[RelationWitness],
+    plan: &[JoinStep],
+    r_len_overrides: &[Option<usize>],
+    transcript: &mut Transcript254,
+) -> io::Result<BgpChainResult> {
     let views: Vec<RelationCommit> = relations.iter().map(|r| r.view()).collect();
     validate_shape(&views, plan)?;
     if r_len_overrides.len() != plan.len() {
@@ -539,7 +572,13 @@ pub(crate) fn prove_bgp_chain_inner(
         });
     }
 
-    Ok((BgpChainProof { stages }, acc_coms, acc_len))
+    Ok(BgpChainResult {
+        proof: BgpChainProof { stages },
+        commitments: acc_coms,
+        columns: acc_cols,
+        log_domain: acc_domain_log,
+        n: acc_len,
+    })
 }
 
 /// Verify a left-deep chain proof against the committed input relations. Returns the
