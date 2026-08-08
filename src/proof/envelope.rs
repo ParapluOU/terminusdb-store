@@ -157,7 +157,10 @@ impl<T: Wire> Wire for Vec<T> {
         if len > MAX_ITEMS {
             return Err(invalid("too many envelope items"));
         }
-        let mut values = Vec::with_capacity(len);
+        // `len` is attacker-controlled. Even though it is capped, reserving it up
+        // front can allocate far more than the bounded input for a large `T` before
+        // the first truncated element is noticed. Grow only after elements decode.
+        let mut values = Vec::new();
         for _ in 0..len {
             values.push(T::get(reader)?);
         }
@@ -765,6 +768,17 @@ mod tests {
             .copy_from_slice(&((MAX_ITEMS as u64) + 1).to_le_bytes());
         refresh_checksum(&mut oversized_count);
         assert!(LayerBgpEnvelope::decode(&oversized_count).is_err());
+
+        // Exactly-at-cap counts pass the numeric guard. A truncated vector of the
+        // materially large LayerBgpAtomProof type must fail before reserving space for
+        // MAX_ITEMS elements (which would dwarf the entire input-size limit).
+        let mut truncated_at_cap = encoded[..atom_count_offset + 8].to_vec();
+        truncated_at_cap[atom_count_offset..atom_count_offset + 8]
+            .copy_from_slice(&(MAX_ITEMS as u64).to_le_bytes());
+        let checksum = Sha256::digest(&truncated_at_cap);
+        truncated_at_cap.extend_from_slice(&checksum);
+        let error = LayerBgpEnvelope::decode(&truncated_at_cap).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let mut forged_objects = decoded.clone();
         forged_objects.result_objects[0][0] = CanonicalObject::Node(iri("forged").into_bytes());
