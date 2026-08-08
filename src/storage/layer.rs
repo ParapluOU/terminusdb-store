@@ -16,8 +16,8 @@ use crate::layer::{
     SimpleLayerBuilder,
 };
 use crate::proof::{
-    CanonicalObject, CanonicalTriple, CommitmentState, LayerCommitment, ProofConstructionBudget,
-    ProofRecord,
+    decode_legacy_v3, CanonicalObject, CanonicalTriple, CommitmentState, LayerCommitment,
+    ProofConstructionBudget, ProofRecord,
 };
 use crate::Layer;
 use tdb_succinct::bitarray::bitarray_len_from_file;
@@ -189,6 +189,17 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     /// Persist a validated proof layer before the physical layer is exposed.
     async fn write_proof_layer(&self, name: [u32; 5], proof: &LayerCommitment) -> io::Result<()>;
 
+    /// Raw sidecar access and exact-byte CAS replacement are exposed solely for
+    /// the explicit legacy migration boundary. Normal commit/read paths remain
+    /// single-assignment and fail closed on unknown versions.
+    async fn proof_state_bytes(&self, name: [u32; 5]) -> io::Result<bytes::Bytes>;
+    async fn replace_proof_state_bytes_if_matches(
+        &self,
+        name: [u32; 5],
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> io::Result<()>;
+
     /// Rebuild proof state from the complete native delta and the complete set of
     /// dictionary mappings introduced by this layer. This is an admission-time
     /// operation, never a proof-query operation.
@@ -238,9 +249,26 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
             removals.try_reserve(1).map_err(io::Error::other)?;
             removals.push(record);
         }
+        let mut materialized = Vec::new();
+        for triple in layer.triples() {
+            let value = layer.id_triple_to_string(&triple).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot resolve logical triple into canonical proof bytes",
+                )
+            })?;
+            let record = ProofRecord {
+                subject_id: triple.subject,
+                predicate_id: triple.predicate,
+                object_id: triple.object,
+                triple: CanonicalTriple::from_value_triple(&value),
+            };
+            budget.record(&record)?;
+            materialized.try_reserve(1).map_err(io::Error::other)?;
+            materialized.push(record);
+        }
         let mut node_value_mappings = Vec::new();
-        for id in (layer.parent_node_value_count() as u64 + 1)..=layer.node_and_value_count() as u64
-        {
+        for id in 1..=layer.node_and_value_count() as u64 {
             let object = layer.id_object(id).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -255,7 +283,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
             node_value_mappings.push((object, id));
         }
         let mut predicate_mappings = Vec::new();
-        for id in (layer.parent_predicate_count() as u64 + 1)..=layer.predicate_count() as u64 {
+        for id in 1..=layer.predicate_count() as u64 {
             let predicate = layer.id_predicate(id).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -278,6 +306,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
                 parent_state_root,
                 additions,
                 removals,
+                materialized,
                 parent_node_value_count,
                 parent_predicate_count,
                 node_value_count,
@@ -335,11 +364,52 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     /// Explicit one-time legacy migration. No query path calls this method.
     async fn migrate_proof_chain(&self, name: [u32; 5]) -> io::Result<CommitmentState> {
         let mut top = None;
+        let mut legacy_parent_root = None;
         for layer_name in self.retrieve_layer_stack_names(name).await? {
             let state = match self.proof_layer(layer_name).await {
-                Ok(_) => self.validate_proof_layer_against_store(layer_name).await?,
+                Ok(current) => {
+                    let state = self.validate_proof_layer_against_store(layer_name).await?;
+                    legacy_parent_root = Some(current.legacy_v3_root(legacy_parent_root)?);
+                    state
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    self.prepare_proof_layer(layer_name).await?.state
+                    let current = self.prepare_proof_layer(layer_name).await?;
+                    legacy_parent_root = Some(current.legacy_v3_root(legacy_parent_root)?);
+                    current.state
+                }
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    let old_bytes = self.proof_state_bytes(layer_name).await?;
+                    let legacy = tokio::task::spawn_blocking({
+                        let old_bytes = old_bytes.clone();
+                        move || decode_legacy_v3(&old_bytes)
+                    })
+                    .await
+                    .map_err(io::Error::other)??;
+                    if legacy.parent_state_root != legacy_parent_root {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "legacy v3 proof parent root is discontinuous",
+                        ));
+                    }
+                    let current = self.rebuild_proof_layer(layer_name).await?;
+                    legacy.validate_against_v4(&current)?;
+                    let reconstructed = current.legacy_v3_root(legacy_parent_root)?;
+                    if reconstructed != legacy.commitment_root {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "legacy v3 root differs from reconstructed native state",
+                        ));
+                    }
+                    let replacement = tokio::task::spawn_blocking({
+                        let current = current.clone();
+                        move || current.encode()
+                    })
+                    .await
+                    .map_err(io::Error::other)??;
+                    self.replace_proof_state_bytes_if_matches(layer_name, &old_bytes, &replacement)
+                        .await?;
+                    legacy_parent_root = Some(legacy.commitment_root);
+                    current.state
                 }
                 Err(error) => return Err(error),
             };
@@ -695,6 +765,20 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
     /// Publish proof bytes with single-assignment semantics. Implementations
     /// must never inherit an overwrite-capable generic file writer here.
     async fn write_proof_state_bytes(&self, directory: [u32; 5], bytes: &[u8]) -> io::Result<()>;
+
+    /// Migration-only exact-byte compare-and-swap. Implementations that support
+    /// persistent proof migration override this with an atomic replacement.
+    async fn replace_proof_state_bytes_if_matches(
+        &self,
+        _directory: [u32; 5],
+        _expected: &[u8],
+        _replacement: &[u8],
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic proof-state migration is unsupported by this backend",
+        ))
+    }
 
     async fn finalize(&self, _directory: [u32; 5]) -> io::Result<()> {
         Ok(())
@@ -2016,6 +2100,26 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         self.write_proof_state_bytes(name, &bytes).await
     }
 
+    async fn proof_state_bytes(&self, name: [u32; 5]) -> io::Result<bytes::Bytes> {
+        let file = self.get_file(name, FILENAMES.proof_state).await?;
+        file.map().await
+    }
+
+    async fn replace_proof_state_bytes_if_matches(
+        &self,
+        name: [u32; 5],
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> io::Result<()> {
+        PersistentLayerStore::replace_proof_state_bytes_if_matches(
+            self,
+            name,
+            expected,
+            replacement,
+        )
+        .await
+    }
+
     async fn get_layer_parent_name(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
         self.layer_parent(name).await
     }
@@ -2164,7 +2268,8 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             return Ok(layer.name());
         }
 
-        self.validate_proof_chain_against_store(layer.name()).await?;
+        self.validate_proof_chain_against_store(layer.name())
+            .await?;
 
         // check if there's already an equivalent rollup
         if self.layer_has_rollup(layer.name()).await? {
@@ -2208,7 +2313,8 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             return Ok(layer.name());
         }
 
-        self.validate_proof_chain_against_store(layer.name()).await?;
+        self.validate_proof_chain_against_store(layer.name())
+            .await?;
 
         // check if there's already an equivalent rollup
         if self.layer_has_rollup(layer.name()).await? {
@@ -2254,7 +2360,8 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             return Ok(layer.name());
         }
 
-        self.validate_proof_chain_against_store(layer.name()).await?;
+        self.validate_proof_chain_against_store(layer.name())
+            .await?;
 
         // check if there's already an equivalent rollup
         if self.layer_has_rollup(layer.name()).await? {
@@ -2301,7 +2408,8 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         // sort the mapped triples, insert them
         // finalize
 
-        self.validate_proof_chain_against_store(layer.name()).await?;
+        self.validate_proof_chain_against_store(layer.name())
+            .await?;
         let stack = layer.immediate_layers();
         let node_count: usize = stack
             .iter()
@@ -2435,7 +2543,8 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
     }
 
     async fn squash_upto(&self, layer: Arc<InternalLayer>, upto: [u32; 5]) -> io::Result<[u32; 5]> {
-        self.validate_proof_chain_against_store(layer.name()).await?;
+        self.validate_proof_chain_against_store(layer.name())
+            .await?;
         let mut base_node_count = 0;
         let mut base_pred_count = 0;
         let mut base_value_count = 0;
@@ -3197,6 +3306,7 @@ pub(crate) async fn file_triple_layer_count<F: FileLoad + FileStore>(
 mod tests {
     use super::*;
     use crate::layer::{ObjectType, ValueTriple};
+    use crate::storage::archive::{ArchiveLayerStore, DirectoryArchiveBackend};
     use crate::storage::directory::DirectoryLayerStore;
     use crate::storage::memory::{MemoryBackedStore, MemoryLayerStore};
     use std::collections::HashMap;
@@ -4538,10 +4648,7 @@ mod tests {
     #[tokio::test]
     async fn physical_precise_rollup_has_intrinsic_commitment() {
         let (store, base, head, _) = fault_store_chain().await;
-        let rollup = store
-            .perform_rollup_upto(head, base.name())
-            .await
-            .unwrap();
+        let rollup = store.perform_rollup_upto(head, base.name()).await.unwrap();
         store.proof_layer(rollup).await.unwrap();
     }
 
@@ -4613,5 +4720,112 @@ mod tests {
                 .is_err());
             assert_fault_store_unchanged(&store, &original).await;
         }
+    }
+
+    async fn install_v3_chain<S: LayerStore>(store: &S, head: [u32; 5]) -> Vec<[u32; 5]> {
+        // Low-level test builders do not pass through Store's publication wrapper.
+        store.migrate_proof_chain(head).await.unwrap();
+        let names = store.retrieve_layer_stack_names(head).await.unwrap();
+        for name in &names {
+            store.finalize_layer(*name).await.unwrap();
+        }
+        let mut legacy_parent = None;
+        for name in &names {
+            let current = store.proof_layer(*name).await.unwrap();
+            let old = store.proof_state_bytes(*name).await.unwrap();
+            let legacy = current.encode_legacy_v3_for_test(legacy_parent).unwrap();
+            store
+                .replace_proof_state_bytes_if_matches(*name, &old, &legacy)
+                .await
+                .unwrap();
+            legacy_parent = Some(current.legacy_v3_root(legacy_parent).unwrap());
+        }
+        names
+    }
+
+    #[tokio::test]
+    async fn v3_migration_retries_after_partial_chain_and_is_idempotent() {
+        let store = MemoryLayerStore::new();
+        let (head, _, _, _) = example_child_layer(&store, false).await.unwrap();
+        let names = install_v3_chain(&store, head).await;
+        assert_eq!(
+            store.proof_layer(names[0]).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // Simulate interruption after the base CAS: the child remains v3. The
+        // retry reconstructs the base's legacy root from its validated v4 state.
+        store.migrate_proof_chain(names[0]).await.unwrap();
+        assert!(store.proof_layer(names[0]).await.is_ok());
+        assert_eq!(
+            store.proof_layer(head).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let first = store.migrate_proof_chain(head).await.unwrap();
+        let second = store.migrate_proof_chain(head).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            store
+                .validate_proof_chain_against_store(head)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_migration_rejects_corruption_and_cas_mismatch_without_overwrite() {
+        let store = MemoryLayerStore::new();
+        let (name, _, _) = example_base_layer(&store, false).await.unwrap();
+        install_v3_chain(&store, name).await;
+        let legacy = store.proof_state_bytes(name).await.unwrap();
+
+        let mismatch = vec![0x55; legacy.len()];
+        assert_eq!(
+            LayerStore::replace_proof_state_bytes_if_matches(
+                &store,
+                name,
+                &mismatch,
+                b"replacement",
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(store.proof_state_bytes(name).await.unwrap(), legacy);
+
+        let mut corrupt = legacy.to_vec();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        LayerStore::replace_proof_state_bytes_if_matches(&store, name, &legacy, &corrupt)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.migrate_proof_chain(name).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            store.proof_state_bytes(name).await.unwrap().as_ref(),
+            corrupt
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_v3_migration_survives_reopen() {
+        let directory = tempdir().unwrap();
+        let backend = DirectoryArchiveBackend::new(directory.path().to_path_buf());
+        let store = ArchiveLayerStore::new(backend.clone(), backend);
+        let (head, _, _, _) = example_child_layer(&store, false).await.unwrap();
+        install_v3_chain(&store, head).await;
+        store.migrate_proof_chain(head).await.unwrap();
+        drop(store);
+
+        let backend = DirectoryArchiveBackend::new(directory.path().to_path_buf());
+        let reopened = ArchiveLayerStore::new(backend.clone(), backend);
+        reopened
+            .validate_proof_chain_against_store(head)
+            .await
+            .unwrap();
     }
 }

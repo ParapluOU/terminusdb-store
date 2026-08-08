@@ -192,18 +192,17 @@ impl StoreLayerBuilder {
                 )
             })?;
         let id = builder.name();
-        let result = async {
-            builder.commit_boxed().await?;
-            self.store.layer_store.finalize_layer(id).await?;
-            let layer = self
-                .store
-                .layer_store
-                .get_layer(id)
-                .await?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "layer not found"))?;
-            Ok(StoreLayer::wrap(layer, self.store.clone()))
-        }
-        .await;
+        let result =
+            async {
+                builder.commit_boxed().await?;
+                self.store.layer_store.finalize_layer(id).await?;
+                let layer =
+                    self.store.layer_store.get_layer(id).await?.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "layer not found")
+                    })?;
+                Ok(StoreLayer::wrap(layer, self.store.clone()))
+            }
+            .await;
         if result.is_err() {
             let _ = self.store.layer_store.abort_layer(id).await;
         }
@@ -1272,9 +1271,11 @@ mod tests {
     async fn proof_rollup_keeps_original_proof_identity() {
         let store = open_memory_store();
         let (head, before) = create_proof_stack(&store).await;
+        let before_view = head.proof_commitment().await.unwrap().materialized.clone();
         head.rollup().await.unwrap();
-        let after = head.proof_commitment().await.unwrap().state.clone();
-        assert_eq!(before, after);
+        let after = head.proof_commitment().await.unwrap();
+        assert_eq!(before, after.state);
+        assert_eq!(before_view, after.materialized);
 
         store.invalidate_layer(head.name());
         let reloaded = store.get_layer_from_id(head.name()).await.unwrap().unwrap();
@@ -1376,12 +1377,7 @@ mod tests {
 
         let reopened = open_raw_archive_store(dir.path());
         assert_eq!(
-            reopened
-                .get_layer_from_id(name)
-                .await
-                .err()
-                .unwrap()
-                .kind(),
+            reopened.get_layer_from_id(name).await.err().unwrap().kind(),
             io::ErrorKind::NotFound
         );
         let migrated = reopened.migrate_proof_chain(name).await.unwrap();
@@ -1416,7 +1412,10 @@ mod tests {
         // No reopen/invalidation is allowed here: these reads must observe the
         // atomically replaced archive bytes rather than a stale LRU entry.
         let same_process = store.get_layer_from_id(name).await.unwrap().unwrap();
-        assert_eq!(same_process.proof_commitment().await.unwrap().state, migrated);
+        assert_eq!(
+            same_process.proof_commitment().await.unwrap().state,
+            migrated
+        );
     }
 
     fn forge_proof_delta_in_pack(pack: &[u8], layer: [u32; 5]) -> Vec<u8> {

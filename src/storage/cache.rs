@@ -431,6 +431,25 @@ impl LayerStore for CachedLayerStore {
         Ok(())
     }
 
+    async fn proof_state_bytes(&self, name: [u32; 5]) -> io::Result<bytes::Bytes> {
+        self.inner.proof_state_bytes(name).await
+    }
+
+    async fn replace_proof_state_bytes_if_matches(
+        &self,
+        name: [u32; 5],
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> io::Result<()> {
+        self.inner
+            .replace_proof_state_bytes_if_matches(name, expected, replacement)
+            .await?;
+        let mut cache = self.proof_cache.lock().unwrap();
+        cache.entries.pop(&name);
+        cache.recompute_and_evict();
+        Ok(())
+    }
+
     async fn get_layer_parent_name(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
         // is layer in cache? if so, we can use the cached version
         if let Some(layer) = self.cache.get_layer_from_cache(name) {

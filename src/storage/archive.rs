@@ -2427,6 +2427,51 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
             .await
     }
 
+    async fn replace_proof_state_bytes_if_matches(
+        &self,
+        directory: [u32; 5],
+        expected_proof: &[u8],
+        replacement_proof: &[u8],
+    ) -> io::Result<()> {
+        if self.construction.read().unwrap().contains_key(&directory) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot migrate an archive layer under construction",
+            ));
+        }
+        let expected_archive = self.data_backend.get_layer_bytes(directory).await?;
+        let archive = Archive::parse(expected_archive.clone());
+        let current = archive
+            .slice_for(LayerFileEnum::ProofState)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "proof state not found"))?;
+        if current.as_ref() != expected_proof {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "proof state changed during migration",
+            ));
+        }
+        let mut structures = HashMap::new();
+        for raw in 0..=LayerFileEnum::ProofState as u64 {
+            let kind = LayerFileEnum::from_u64(raw).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "unknown archive file bit")
+            })?;
+            if kind == LayerFileEnum::Rollup || kind == LayerFileEnum::ProofState {
+                continue;
+            }
+            if let Some(contents) = archive.slice_for(kind) {
+                structures.insert(kind, contents);
+            }
+        }
+        structures.insert(
+            LayerFileEnum::ProofState,
+            Bytes::copy_from_slice(replacement_proof),
+        );
+        let replacement_archive = encode_archive_layer(structures)?;
+        self.data_backend
+            .replace_layer_file_if_matches(directory, expected_archive, replacement_archive)
+            .await
+    }
+
     async fn finalize(&self, directory: [u32; 5]) -> io::Result<()> {
         let files = {
             let mut guard = self.construction.write().unwrap();

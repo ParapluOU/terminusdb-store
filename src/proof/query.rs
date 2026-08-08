@@ -68,8 +68,8 @@ pub struct CombinedFilterProof {
     pub filter: FullFilterProof,
 }
 
-/// The padded hypercube size for a materialized base layer's columns, matching
-/// `commit_id_column`'s `next_power_of_two(additions.len())`. Requires `>= 2` (a
+/// The padded hypercube size for a materialized head view's columns, matching
+/// `commit_id_column`'s `next_power_of_two(materialized.len())`. Requires `>= 2` (a
 /// one-row layer has `k = 0`, below the sumcheck's minimum of one variable).
 fn padded_len(real_rows: usize) -> io::Result<usize> {
     let padded = real_rows
@@ -84,66 +84,22 @@ fn padded_len(real_rows: usize) -> io::Result<usize> {
 }
 
 /// Extract the `(S, P, O)` `ArkFr` columns and real-row count `n` from a
-/// materialized base layer, in the exact stored (SPO-sorted) order and padding
-/// that produced `column_commitments[0..3]`.
-fn base_layer_columns(
+/// complete logical view, in the exact deterministic order and padding that
+/// produced `materialized_column_commitments`.
+fn materialized_layer_columns(
     layer: &LayerCommitment,
 ) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>, Vec<ArkFr>, usize)> {
-    if !layer.removals.is_empty() {
-        return Err(invalid(
-            "layer filter requires a materialized base layer (no removals)",
-        ));
-    }
-    let n = layer.additions.len();
+    let n = layer.materialized.len();
     let padded = padded_len(n)?;
     let mut s = vec![f0(); padded];
     let mut p = vec![f0(); padded];
     let mut o = vec![f0(); padded];
-    for (i, record) in layer.additions.iter().enumerate() {
+    for (i, record) in layer.materialized.iter().enumerate() {
         s[i] = ArkFr::from_u64(record.subject_id);
         p[i] = ArkFr::from_u64(record.predicate_id);
         o[i] = ArkFr::from_u64(record.object_id);
     }
     Ok((s, p, o, n))
-}
-
-/// Guard the query proof paths against a NON-materialized (delta-only) layer.
-///
-/// Every query proof path commits and ranges over `layer.additions` as if it were the
-/// COMPLETE current triple set (see [`base_layer_columns`]). That equivalence holds ONLY
-/// for a materialized BASE layer. `LayerStore::rebuild_proof_layer` builds proof state from
-/// the ORIGINAL, UNROLLED layer chain (`get_unrolled_layer`, following the physical
-/// parent-file chain — NOT any rollup substitution), taking `additions` from
-/// `triple_additions(name)`. For a layer WITH a parent that is just the layer's DELTA
-/// additions, not the inherited triples, so a "complete result" over it would be complete
-/// over the delta only — an incomplete answer over the whole database (a completeness gap,
-/// not a soundness hole). A genuine base layer (`parent_state_root.is_none()`) has no
-/// parent: its `additions` ARE the whole triple set, its `removals` are empty, and its
-/// dictionary is fully self-contained (`CommitmentState::validate` forces the parent
-/// dictionary counts to 0 when `parent_state_root.is_none()`).
-///
-/// We therefore require `parent_state_root.is_none()` in addition to the caller's existing
-/// `removal_count == 0` check. This is CONSERVATIVE-but-SOUND: it never accepts a layer
-/// whose committed `additions` are incomplete. Rollups do not make it over-restrictive —
-/// a rollup is a PHYSICAL read optimization, and the proof pipeline always rebuilds from
-/// the original delta chain, so no rollup currently produces a parent-ful layer whose
-/// committed `additions` are the full materialized set. Hence this guard rejects no valid
-/// materialized result today.
-///
-/// TODO: relax for materialized rollups once the proof pipeline can admit a squashed layer
-/// whose committed `additions` are the FULL materialized triple set while it still carries a
-/// parent (`parent_state_root.is_some()`) — e.g. a root-bound per-layer "fully materialized"
-/// flag set by `rebuild_proof_layer` when it commits over the rolled-up (not delta) triple
-/// set. Until such a flag exists and is bound by `commitment_root`, a parent-ful layer
-/// cannot be trusted to commit the complete set, so it must be rejected here.
-fn require_materialized_base_layer(layer: &LayerCommitment) -> io::Result<()> {
-    if layer.state.parent_state_root.is_some() {
-        return Err(invalid(
-            "query proof requires a fully-materialized base layer: this layer commits only a \
-             delta over a parent, so its committed additions are not the complete triple set",
-        ));
-    }
-    Ok(())
 }
 
 /// Resolve a predicate IRI (term bytes) to its dictionary id in this layer, or
@@ -171,7 +127,7 @@ fn bind_statement(
     transcript.append_bytes(b"pow/q1-iri/predicate-id", &predicate_id.to_le_bytes());
 }
 
-/// Prove `t(?s, <predicate_term>, ?o)` against a materialized base layer. Resolves
+/// Prove `t(?s, <predicate_term>, ?o)` against a complete materialized head view. Resolves
 /// the predicate IRI to its committed dictionary id, proves that binding (Q3
 /// membership), then proves the filtered result for that id (Q1). Returns the
 /// combined proof, the output commitments, the result length `m`, and the REVEALED
@@ -180,7 +136,7 @@ pub fn prove_layer_filter(
     layer: &LayerCommitment,
     predicate_term: &[u8],
 ) -> io::Result<(CombinedFilterProof, ArkGT, ArkGT, usize, u64)> {
-    let (s, p, o, n) = base_layer_columns(layer)?;
+    let (s, p, o, n) = materialized_layer_columns(layer)?;
     let predicate_id = resolve_predicate_id(layer, predicate_term)?;
 
     let (dict_hash, dict_id) = layer.predicate_dictionary_columns()?;
@@ -204,9 +160,7 @@ pub fn prove_layer_filter(
     )?;
 
     // Q1 filter: the result for that id.
-    let com_s = layer.column_commitments[0];
-    let com_p = layer.column_commitments[1];
-    let com_o = layer.column_commitments[2];
+    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
     let pred = ArkFr::from_u64(predicate_id);
     let (filter, com_sout, com_oout, m) =
         prove_filter(&s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript)?;
@@ -249,14 +203,7 @@ pub fn verify_layer_filter(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
-    // The committed additions must be the COMPLETE materialized triple set, not a delta.
-    require_materialized_base_layer(layer)?;
-    if layer.state.removal_count != 0 {
-        return Err(invalid(
-            "layer filter requires a materialized base layer (no removals)",
-        ));
-    }
-    let n = layer.state.addition_count as usize;
+    let n = layer.state.materialized_count as usize;
     let padded = padded_len(n)?;
     let expected_k = padded.trailing_zeros() as usize;
     if proof.filter.sumcheck.round_polys.len() != expected_k {
@@ -281,9 +228,7 @@ pub fn verify_layer_filter(
     )?;
 
     // Filter: the result for that id.
-    let com_s = layer.column_commitments[0];
-    let com_p = layer.column_commitments[1];
-    let com_o = layer.column_commitments[2];
+    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
     let pred = ArkFr::from_u64(predicate_id);
     verify_filter(
         &com_s,
@@ -349,7 +294,7 @@ pub fn prove_layer_graph_pattern2(
     layer: &LayerCommitment,
     predicate_term: &[u8],
 ) -> io::Result<(GraphPattern2Proof, ArkGT, ArkGT, ArkGT, usize, u64)> {
-    let (s, p, o, n) = base_layer_columns(layer)?;
+    let (s, p, o, n) = materialized_layer_columns(layer)?;
     let predicate_id = resolve_predicate_id(layer, predicate_term)?;
 
     let (dict_hash, dict_id) = layer.predicate_dictionary_columns()?;
@@ -373,9 +318,7 @@ pub fn prove_layer_graph_pattern2(
     )?;
 
     // (2) Q1 complete filter: F = (Sf, Of) = the predicate-P (subject, object) pairs.
-    let com_s = layer.column_commitments[0];
-    let com_p = layer.column_commitments[1];
-    let com_o = layer.column_commitments[2];
+    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
     let pred = ArkFr::from_u64(predicate_id);
     let (filter, com_sout, com_oout, m) =
         prove_filter(&s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript)?;
@@ -463,14 +406,7 @@ pub fn verify_layer_graph_pattern2(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
-    // The committed additions must be the COMPLETE materialized triple set, not a delta.
-    require_materialized_base_layer(layer)?;
-    if layer.state.removal_count != 0 {
-        return Err(invalid(
-            "layer graph-pattern query requires a materialized base layer (no removals)",
-        ));
-    }
-    let n = layer.state.addition_count as usize;
+    let n = layer.state.materialized_count as usize;
     let padded = padded_len(n)?;
     let a = padded.trailing_zeros() as usize;
     if proof.filter.sumcheck.round_polys.len() != a {
@@ -514,9 +450,7 @@ pub fn verify_layer_graph_pattern2(
     )?;
 
     // (2) Filter: F = (S_out, O_out) is the complete predicate-P result (length n_F).
-    let com_s = layer.column_commitments[0];
-    let com_p = layer.column_commitments[1];
-    let com_o = layer.column_commitments[2];
+    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
     let pred = ArkFr::from_u64(predicate_id);
     verify_filter(
         &com_s,
@@ -775,16 +709,22 @@ pub fn verify_result_columns(
     }
     let domain = 1usize << result_log_domain;
     if result_len > domain || commitments.len() != columns.len() {
-        return Err(invalid("result column shape does not match its commitments"));
+        return Err(invalid(
+            "result column shape does not match its commitments",
+        ));
     }
     for (commitment, column) in commitments.iter().zip(columns) {
         if column.len() != result_len {
-            return Err(invalid("result column length does not match the proven length"));
+            return Err(invalid(
+                "result column length does not match the proven length",
+            ));
         }
         let mut padded = column.clone();
         padded.resize(domain, ArkFr::zero());
         if commit_column(&padded)? != *commitment {
-            return Err(invalid("delivered result column does not match its commitment"));
+            return Err(invalid(
+                "delivered result column does not match its commitment",
+            ));
         }
     }
     Ok(())
@@ -1132,24 +1072,10 @@ fn range_common_domain(a: usize, n_dict: usize) -> io::Result<(usize, usize)> {
     Ok((a.max(dict_log), dict_log))
 }
 
-/// The root-bound count of node/value dictionary rows THIS layer commits in its
-/// `node_value_catalog` columns. Taken from the root-bound state scalars
-/// (`node_value_count − parent_node_value_count`) rather than
-/// `node_value_catalog.len()`, for parity with how the table length `n` is taken from
-/// the root-bound `state.addition_count` rather than `additions.len()`. The two are
-/// pinned equal by `validate_complete_catalog` (which enforces
-/// `node_value_catalog.len() == node_value_count − parent_node_value_count`) and both
-/// are bound by `commitment_root`, so we also assert equality as defense-in-depth. For
-/// a MATERIALIZED BASE layer `parent_node_value_count == 0`, so this equals
-/// `node_value_count` — the whole authenticated dictionary — which is exactly what the
-/// object-range gadget must range over.
+/// The root-bound count of rows in the complete node/value dictionary committed at
+/// this head. The count and the full catalog are both authenticated by the head root.
 fn root_bound_n_dict(layer: &LayerCommitment) -> io::Result<usize> {
-    let n_dict = layer
-        .state
-        .node_value_count
-        .checked_sub(layer.state.parent_node_value_count)
-        .ok_or_else(|| invalid("node/value dictionary count decreased below its parent"))?
-        as usize;
+    let n_dict = layer.state.node_value_count as usize;
     if n_dict != layer.node_value_catalog.len() {
         return Err(invalid(
             "root-bound node/value dictionary count does not match the committed catalog length",
@@ -1625,7 +1551,7 @@ fn verify_ranged_atom(
     )
 }
 
-/// Prove the COMPLETE result of a k-atom conjunctive BGP against a materialized base
+/// Prove the COMPLETE result of a k-atom conjunctive BGP against a materialized head
 /// layer. Each atom is filtered by its (dictionary-authenticated) constant PREDICATE and
 /// any (dictionary-authenticated) subject/object CONSTANTS into its dense KEPT (variable)
 /// columns; the resulting `k` relations (one column per variable, in S,O order) are joined
@@ -1655,7 +1581,7 @@ pub fn prove_layer_bgp_with_result(
     plan: &LayerBgpPlan,
 ) -> io::Result<LayerBgpResult> {
     let k = validate_bgp_plan(plan)?;
-    let (s, p, o, n) = base_layer_columns(layer)?;
+    let (s, p, o, n) = materialized_layer_columns(layer)?;
 
     // Resolve every atom's constant ids up front (fail closed if any is absent): the
     // predicate IRI via the predicate dictionary, each subject/object constant via the
@@ -1686,9 +1612,7 @@ pub fn prove_layer_bgp_with_result(
     let (nv_dict_hash, nv_dict_id) = layer.node_value_dictionary_columns()?;
     let com_nv_hash = layer.node_value_dict_commitments.0;
     let com_nv_id = layer.node_value_dict_commitments.1;
-    let com_s = layer.column_commitments[0];
-    let com_p = layer.column_commitments[1];
-    let com_o = layer.column_commitments[2];
+    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
     let a = padded_len(n)?.trailing_zeros() as usize;
 
     let mut transcript = Transcript254::new(LAYER_BGP_DOMAIN);
@@ -1859,18 +1783,11 @@ pub fn verify_layer_bgp(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
-    // The committed additions must be the COMPLETE materialized triple set, not a delta.
-    require_materialized_base_layer(layer)?;
-    if layer.state.removal_count != 0 {
-        return Err(invalid(
-            "layer BGP query requires a materialized base layer (no removals)",
-        ));
-    }
     let k = validate_bgp_plan(plan)?;
     if proof.atoms.len() != k || predicate_ids.len() != k {
         return Err(invalid("layer BGP proof/atom/id count mismatch"));
     }
-    let n = layer.state.addition_count as usize;
+    let n = layer.state.materialized_count as usize;
     let a = padded_len(n)?.trailing_zeros() as usize;
 
     // Reconstruct each atom's resolved ids from the public predicate ids + the
@@ -1903,9 +1820,7 @@ pub fn verify_layer_bgp(
     let com_pred_id = layer.predicate_dict_commitments.1;
     let com_nv_hash = layer.node_value_dict_commitments.0;
     let com_nv_id = layer.node_value_dict_commitments.1;
-    let com_s = layer.column_commitments[0];
-    let com_p = layer.column_commitments[1];
-    let com_o = layer.column_commitments[2];
+    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
 
     let mut relations: Vec<RelationCommit> = Vec::with_capacity(k);
     for ((atom, ap), ids) in plan
@@ -2077,11 +1992,11 @@ mod tests {
 
     // Independently recompute the expected dense result for a predicate id.
     fn expected_result(layer: &LayerCommitment, pred_id: u64) -> (Vec<ArkFr>, Vec<ArkFr>, usize) {
-        let padded = padded_len(layer.additions.len()).unwrap();
+        let padded = padded_len(layer.materialized.len()).unwrap();
         let mut s_out = vec![f0(); padded];
         let mut o_out = vec![f0(); padded];
         let mut m = 0usize;
-        for record in &layer.additions {
+        for record in &layer.materialized {
             if record.predicate_id == pred_id {
                 s_out[m] = ArkFr::from_u64(record.subject_id);
                 o_out[m] = ArkFr::from_u64(record.object_id);
@@ -2105,10 +2020,19 @@ mod tests {
     #[test]
     fn query_commitment_convention_matches_layer_commitment_columns() {
         let lc = build_layer(&[("a1", "p1", "b1"), ("a2", "p1", "b2"), ("c1", "p2", "d1")]);
-        let (s, p, o, _n) = base_layer_columns(&lc).unwrap();
-        assert_eq!(commit_column(&s).unwrap(), lc.column_commitments[0]);
-        assert_eq!(commit_column(&p).unwrap(), lc.column_commitments[1]);
-        assert_eq!(commit_column(&o).unwrap(), lc.column_commitments[2]);
+        let (s, p, o, _n) = materialized_layer_columns(&lc).unwrap();
+        assert_eq!(
+            commit_column(&s).unwrap(),
+            lc.materialized_column_commitments[0]
+        );
+        assert_eq!(
+            commit_column(&p).unwrap(),
+            lc.materialized_column_commitments[1]
+        );
+        assert_eq!(
+            commit_column(&o).unwrap(),
+            lc.materialized_column_commitments[2]
+        );
     }
 
     #[test]
@@ -2216,10 +2140,10 @@ mod tests {
     }
 
     #[test]
-    fn non_materialized_layer_fails_closed() {
+    fn child_add_and_remove_proves_against_complete_head_view() {
         let store = open_sync_memory_store();
         let builder = store.create_base_layer().unwrap();
-        for (s, p, o) in [("a1", "p1", "b1"), ("a2", "p1", "b2")] {
+        for (s, p, o) in [("a1", "p1", "b1"), ("a2", "p1", "b2"), ("a3", "p1", "b3")] {
             builder
                 .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
                 .unwrap();
@@ -2229,17 +2153,41 @@ mod tests {
         child
             .remove_value_triple(ValueTriple::new_node(&iri("a1"), &iri("p1"), &iri("b1")))
             .unwrap();
+        child
+            .add_value_triple(ValueTriple::new_node(&iri("a4"), &iri("p1"), &iri("b4")))
+            .unwrap();
         let head = child.commit().unwrap();
         let lc = head.proof_commitment().unwrap();
-        assert!(prove_layer_filter(&lc, P1).is_err());
+        assert_eq!(lc.state.addition_count, 1);
+        assert_eq!(lc.state.removal_count, 1);
+        assert_eq!(lc.state.materialized_count, 3);
+        let subjects: Vec<_> = lc
+            .materialized
+            .iter()
+            .map(|record| record.triple.subject.as_slice())
+            .collect();
+        assert!(!subjects.contains(&iri("a1").as_bytes()));
+        assert!(subjects.contains(&iri("a2").as_bytes()));
+        assert!(subjects.contains(&iri("a3").as_bytes()));
+        assert!(subjects.contains(&iri("a4").as_bytes()));
+
+        let (proof, com_s, com_o, m, id) = prove_layer_filter(&lc, P1).unwrap();
+        verify_layer_filter(
+            &lc,
+            lc.state.commitment_root,
+            P1,
+            id,
+            &com_s,
+            &com_o,
+            m,
+            &proof,
+        )
+        .unwrap();
+        assert_eq!(m, 3);
     }
 
     #[test]
-    fn delta_only_child_layer_is_rejected_by_the_completeness_guard() {
-        // A child that ONLY adds triples has removal_count == 0 (so the pre-existing
-        // "no removals" gate passed), yet its committed `additions` are just the DELTA,
-        // not the whole triple set. Verification must reject such a non-materialized
-        // layer even though the prover can build a (delta-scoped) proof for it.
+    fn child_additions_prove_with_inherited_parent_rows() {
         let store = open_sync_memory_store();
         let builder = store.create_base_layer().unwrap();
         for (s, p, o) in [("a1", "p1", "b1"), ("a2", "p1", "b2")] {
@@ -2248,8 +2196,6 @@ mod tests {
                 .unwrap();
         }
         let base = builder.commit().unwrap();
-        // Add >= 2 triples under a NEW predicate so the delta proof is well-formed (>= 2
-        // rows) and the predicate resolves in the child's own (delta) dictionary.
         let child = base.open_write().unwrap();
         for (s, o) in [("a3", "b3"), ("a4", "b4")] {
             child
@@ -2258,13 +2204,14 @@ mod tests {
         }
         let head = child.commit().unwrap();
         let lc = head.proof_commitment().unwrap();
-        // Precondition: the old gate (removals only) would NOT have caught this.
         assert_eq!(lc.state.removal_count, 0);
         assert!(lc.state.parent_state_root.is_some());
+        assert_eq!(lc.state.addition_count, 2);
+        assert_eq!(lc.state.materialized_count, 4);
 
         let pn: &[u8] = b"http://ex/pn";
         let (proof, com_sout, com_oout, m, id) = prove_layer_filter(&lc, pn).unwrap();
-        assert!(verify_layer_filter(
+        verify_layer_filter(
             &lc,
             lc.state.commitment_root,
             pn,
@@ -2274,7 +2221,8 @@ mod tests {
             m,
             &proof,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(m, 2);
     }
 
     // ---- Q2: 2-atom graph-pattern (self-join) end-to-end ----
@@ -2289,7 +2237,7 @@ mod tests {
     ) -> (Vec<ArkFr>, Vec<ArkFr>, Vec<ArkFr>, usize, usize) {
         let mut sf = Vec::new();
         let mut of = Vec::new();
-        for record in &lc.additions {
+        for record in &lc.materialized {
             if record.predicate_id == pred_id {
                 sf.push(ArkFr::from_u64(record.subject_id));
                 of.push(ArkFr::from_u64(record.object_id));
@@ -2498,7 +2446,7 @@ mod tests {
     fn atom_relation(lc: &LayerCommitment, pred_id: u64) -> Vec<Vec<ArkFr>> {
         let mut s = Vec::new();
         let mut o = Vec::new();
-        for rec in &lc.additions {
+        for rec in &lc.materialized {
             if rec.predicate_id == pred_id {
                 s.push(ArkFr::from_u64(rec.subject_id));
                 o.push(ArkFr::from_u64(rec.object_id));
@@ -2581,12 +2529,9 @@ mod tests {
         let mut tampered_catalog = (*lc).clone();
         tampered_catalog.node_value_catalog[0].triple.object =
             CanonicalObject::Node(iri("forged").into_bytes());
-        assert!(resolve_result_objects(
-            &tampered_catalog,
-            lc.state.commitment_root,
-            &columns,
-        )
-        .is_err());
+        assert!(
+            resolve_result_objects(&tampered_catalog, lc.state.commitment_root, &columns,).is_err()
+        );
     }
 
     // Independently recompute the complete BGP result columns (real length) and the final
@@ -2609,7 +2554,7 @@ mod tests {
         };
         let mut acc = atom_relation(lc, ids[0]);
         let mut acc_len = acc[0].len();
-        let mut domain = padded_len(lc.additions.len()).unwrap();
+        let mut domain = padded_len(lc.materialized.len()).unwrap();
         for (j, step) in joins.iter().enumerate() {
             let rel = atom_relation(lc, ids[j + 1]);
             let rel_len = rel[0].len();
@@ -2740,7 +2685,7 @@ mod tests {
         assert_eq!(m, 2);
         assert!(proof.chain.is_none());
         let expected = atom_relation(&lc, ids[0]);
-        let domain = padded_len(lc.additions.len()).unwrap();
+        let domain = padded_len(lc.materialized.len()).unwrap();
         assert_eq!(coms.len(), 2);
         for (commitment, column) in coms.iter().zip(expected.iter()) {
             assert_eq!(*commitment, commit_column(&pad(column, domain)).unwrap());
@@ -2854,7 +2799,7 @@ mod tests {
         if keep_o {
             cols.push(Vec::new());
         }
-        for rec in &lc.additions {
+        for rec in &lc.materialized {
             if rec.predicate_id == predicate_id
                 && subject_id.map_or(true, |s| rec.subject_id == s)
                 && object_id.map_or(true, |o| rec.object_id == o)
@@ -2905,7 +2850,7 @@ mod tests {
         };
         let mut acc = rel(0);
         let mut acc_len = acc[0].len();
-        let mut domain = padded_len(lc.additions.len()).unwrap();
+        let mut domain = padded_len(lc.materialized.len()).unwrap();
         for (j, step) in joins.iter().enumerate() {
             let r = rel(j + 1);
             let rel_len = r[0].len();
@@ -3014,7 +2959,7 @@ mod tests {
         let a_id =
             resolve_node_value_id(&lc, &CanonicalObject::Node(iri("a").into_bytes())).unwrap();
         let hi_id = lc
-            .additions
+            .materialized
             .iter()
             .find(|r| r.subject_id == a_id && r.predicate_id == name_id)
             .unwrap()
@@ -3375,7 +3320,7 @@ mod tests {
         let age_id = resolve_predicate_id(lc, AGE).unwrap();
         let name_id = resolve_predicate_id(lc, NAME).unwrap();
         let (mut age_s, mut age_o) = (Vec::new(), Vec::new());
-        for rec in &lc.additions {
+        for rec in &lc.materialized {
             if rec.predicate_id == age_id {
                 if let Some(v) = uint32_value_of(lc, rec.object_id) {
                     if cmp_op(op, v, c) {
@@ -3386,7 +3331,7 @@ mod tests {
             }
         }
         let (mut name_s, mut name_o) = (Vec::new(), Vec::new());
-        for rec in &lc.additions {
+        for rec in &lc.materialized {
             if rec.predicate_id == name_id {
                 name_s.push(fr(rec.subject_id));
                 name_o.push(fr(rec.object_id));
@@ -3442,7 +3387,7 @@ mod tests {
         // UP to D, the dict columns stay at D, and range_sel relocates DOWN to the table.
         let lc = build_distinct_age_name_layer();
         // Sanity: the dict domain is larger than the table domain here.
-        let n = lc.additions.len();
+        let n = lc.materialized.len();
         assert!(dict_domain_len(lc.node_value_catalog.len()).unwrap() > padded_len(n).unwrap());
         // ages p1=10, p2=25, p3=5. age >= 10 -> {p1, p2}.
         check_age_range(&lc, RangeOp::Ge, 10, 2);
@@ -3554,12 +3499,12 @@ mod tests {
 
         let predicate_id = ids[0];
         let mut expected: Vec<ArkFr> = lc
-            .additions
+            .materialized
             .iter()
             .filter(|row| row.predicate_id == predicate_id && row.subject_id == row.object_id)
             .map(|row| fr(row.subject_id))
             .collect();
-        expected.resize(padded_len(lc.additions.len()).unwrap(), f0());
+        expected.resize(padded_len(lc.materialized.len()).unwrap(), f0());
         assert_eq!(commitments[0], commit_column(&expected).unwrap());
     }
 

@@ -641,14 +641,15 @@ fn index_projection_heap(records: usize) -> io::Result<usize> {
 fn validate_decoded_heap_budget(
     additions: &[ProofRecord],
     removals: &[ProofRecord],
+    materialized: &[ProofRecord],
     predicates: &[ProofRecord],
     objects: &[ProofRecord],
 ) -> io::Result<()> {
     let mut total = 0usize;
-    for records in [additions, removals, predicates, objects] {
+    for records in [additions, removals, materialized, predicates, objects] {
         checked_heap_add(&mut total, record_table_heap(records)?)?;
     }
-    for records in [additions, removals] {
+    for records in [additions, removals, materialized] {
         let projection = index_projection_heap(records.len())?;
         checked_heap_add(
             &mut total,
@@ -697,11 +698,12 @@ fn validate_decoded_heap_budget(
 fn validate_construction_heap_budget(
     additions: &[ProofRecord],
     removals: &[ProofRecord],
+    materialized: &[ProofRecord],
     node_values: &[(CanonicalObject, u64)],
     predicates: &[(Vec<u8>, u64)],
 ) -> io::Result<()> {
     let mut total = 0usize;
-    for records in [additions, removals] {
+    for records in [additions, removals, materialized] {
         checked_heap_add(&mut total, record_table_heap(records)?)?;
         checked_heap_add(
             &mut total,
@@ -773,6 +775,7 @@ fn validate_construction_heap_budget(
     )
 }
 
+pub(crate) use commitment::decode_legacy_v3;
 pub use commitment::{CommitmentState, LayerCommitment};
 
 pub mod argument;
@@ -822,11 +825,12 @@ pub mod commitment {
     use rand_chacha::ChaCha20Rng;
 
     const COMMITMENT_MAGIC: &[u8; 8] = b"TSPCW0\0\0";
-    pub const COMMITMENT_FORMAT_VERSION: u32 = 3;
+    pub const COMMITMENT_FORMAT_VERSION: u32 = 4;
 
     /// Number of committed columns per layer: additions (S,P,O) then removals
     /// (S,P,O), in that fixed order.
     pub const COLUMN_COUNT: usize = 6;
+    pub const MATERIALIZED_COLUMN_COUNT: usize = 3;
 
     /// Fixed size of the global transparent Dory setup. `max_log_n = 20` supports
     /// polynomials of up to `2^20` coefficients, i.e. a padded per-column length of
@@ -859,8 +863,12 @@ pub mod commitment {
         use ark_ff::UniformRand;
         let mut rng = ChaCha20Rng::from_seed(setup_seed());
         let n = 1usize << max_log_n.div_ceil(2);
-        let g1_vec: Vec<ArkG1> = (0..n).map(|_| ArkG1(G1Projective::rand(&mut rng))).collect();
-        let g2_vec: Vec<ArkG2> = (0..n).map(|_| ArkG2(G2Projective::rand(&mut rng))).collect();
+        let g1_vec: Vec<ArkG1> = (0..n)
+            .map(|_| ArkG1(G1Projective::rand(&mut rng)))
+            .collect();
+        let g2_vec: Vec<ArkG2> = (0..n)
+            .map(|_| ArkG2(G2Projective::rand(&mut rng)))
+            .collect();
         let h1 = ArkG1(G1Projective::rand(&mut rng));
         let h2 = ArkG2(G2Projective::rand(&mut rng));
         let ht = <BN254 as PairingCurve>::pair(&h1, &h2);
@@ -949,7 +957,8 @@ pub mod commitment {
         additions: &[ProofRecord],
         removals: &[ProofRecord],
     ) -> io::Result<[ArkGT; COLUMN_COUNT]> {
-        let subjects = |table: &[ProofRecord]| table.iter().map(|r| r.subject_id).collect::<Vec<_>>();
+        let subjects =
+            |table: &[ProofRecord]| table.iter().map(|r| r.subject_id).collect::<Vec<_>>();
         let predicates =
             |table: &[ProofRecord]| table.iter().map(|r| r.predicate_id).collect::<Vec<_>>();
         let objects = |table: &[ProofRecord]| table.iter().map(|r| r.object_id).collect::<Vec<_>>();
@@ -960,6 +969,18 @@ pub mod commitment {
             commit_id_column(&subjects(removals))?,
             commit_id_column(&predicates(removals))?,
             commit_id_column(&objects(removals))?,
+        ])
+    }
+
+    fn commit_materialized_columns(
+        records: &[ProofRecord],
+    ) -> io::Result<[ArkGT; MATERIALIZED_COLUMN_COUNT]> {
+        let column =
+            |select: fn(&ProofRecord) -> u64| records.iter().map(select).collect::<Vec<_>>();
+        Ok([
+            commit_id_column(&column(|record| record.subject_id))?,
+            commit_id_column(&column(|record| record.predicate_id))?,
+            commit_id_column(&column(|record| record.object_id))?,
         ])
     }
 
@@ -999,7 +1020,9 @@ pub mod commitment {
     /// Commit the two predicate-dictionary columns via the SAME shared query-side
     /// `commit_column` the Q3 gadget opens, so the committed columns align with
     /// what a membership proof opens. An empty dictionary gets identity commitments.
-    fn commit_predicate_dictionary(predicate_catalog: &[ProofRecord]) -> io::Result<(ArkGT, ArkGT)> {
+    fn commit_predicate_dictionary(
+        predicate_catalog: &[ProofRecord],
+    ) -> io::Result<(ArkGT, ArkGT)> {
         let (hashes, ids) = predicate_dict_columns_from_catalog(predicate_catalog)?;
         if hashes.is_empty() {
             let identity = <ArkGT as Group>::identity();
@@ -1161,7 +1184,9 @@ pub mod commitment {
     /// rows carry `0` (mirrors `hash`/`id`); tag `0` is `String`, which is not a
     /// range-supported type, and padding rows have `id = 0`, so padding never
     /// false-matches a numeric range query. Single source of truth for COMMIT/OPEN.
-    fn node_value_dict_datatype_column(node_value_catalog: &[ProofRecord]) -> io::Result<Vec<ArkFr>> {
+    fn node_value_dict_datatype_column(
+        node_value_catalog: &[ProofRecord],
+    ) -> io::Result<Vec<ArkFr>> {
         let padded = node_value_dict_padded_len(node_value_catalog.len())?;
         let mut datatypes = vec![<ArkFr as DoryField>::zero(); padded];
         for (k, record) in node_value_catalog.iter().enumerate() {
@@ -1217,6 +1242,7 @@ pub mod commitment {
         pub parent_state_root: Option<ProofHash>,
         pub addition_count: u64,
         pub removal_count: u64,
+        pub materialized_count: u64,
         pub parent_node_value_count: u64,
         pub parent_predicate_count: u64,
         pub node_value_count: u64,
@@ -1246,12 +1272,16 @@ pub mod commitment {
         // dictionary order for catalogs) so commitments are deterministic.
         pub additions: Vec<ProofRecord>,
         pub removals: Vec<ProofRecord>,
+        /// Complete logical triple set visible at this immutable layer head.
+        pub materialized: Vec<ProofRecord>,
         pub predicate_catalog: Vec<ProofRecord>,
         pub node_value_catalog: Vec<ProofRecord>,
         /// Per-column Dory (tier-2 GT) commitments over the id columns, in fixed
         /// order: additions (S,P,O) then removals (S,P,O). `commitment_root`
         /// binds these. Phase 1b commits each column standalone at offset 0.
         pub column_commitments: [ArkGT; COLUMN_COUNT],
+        /// Dory commitments over the complete logical S/P/O columns.
+        pub materialized_column_commitments: [ArkGT; MATERIALIZED_COLUMN_COUNT],
         /// Dory commitments of the layer's PREDICATE dictionary as two columns
         /// `(Com(pred_dict_hash), Com(pred_dict_id))`, where `pred_dict_hash[k] =
         /// hash_term(predicate_bytes_k)` and `pred_dict_id[k] = predicate_id_k`
@@ -1308,6 +1338,7 @@ pub mod commitment {
             parent_state_root: Option<ProofHash>,
             mut additions: Vec<ProofRecord>,
             mut removals: Vec<ProofRecord>,
+            mut materialized: Vec<ProofRecord>,
             parent_node_value_count: u64,
             parent_predicate_count: u64,
             node_value_count: u64,
@@ -1318,10 +1349,14 @@ pub mod commitment {
             validate_construction_heap_budget(
                 &additions,
                 &removals,
+                &materialized,
                 &node_value_mappings,
                 &predicate_mappings,
             )?;
-            if additions.len() > MAX_RECORDS || removals.len() > MAX_RECORDS {
+            if additions.len() > MAX_RECORDS
+                || removals.len() > MAX_RECORDS
+                || materialized.len() > MAX_RECORDS
+            {
                 return Err(invalid("proof delta exceeds storage limit"));
             }
             let [subject_catalog, predicate_catalog, node_value_catalog] =
@@ -1350,22 +1385,23 @@ pub mod commitment {
             validate_complete_catalog(
                 &additions,
                 &removals,
+                &materialized,
                 &[
                     subject_catalog,
                     predicate_catalog.clone(),
                     node_value_catalog.clone(),
                 ],
-                parent_node_value_count,
-                parent_predicate_count,
                 node_value_count,
                 predicate_count,
             )?;
 
             additions.sort_by(|a, b| triple_cmp(a, b, ProofIndex::Spo));
             removals.sort_by(|a, b| triple_cmp(a, b, ProofIndex::Spo));
+            materialized.sort_by(|a, b| triple_cmp(a, b, ProofIndex::Spo));
 
             // Real per-column Dory commitments over the sorted id columns.
             let column_commitments = commit_delta_columns(&additions, &removals)?;
+            let materialized_column_commitments = commit_materialized_columns(&materialized)?;
             // Predicate-dictionary commitments (IRI->id binding, authenticated by
             // the root so Q3 membership proofs can trust it).
             let predicate_dict_commitments = commit_predicate_dictionary(&predicate_catalog)?;
@@ -1381,6 +1417,7 @@ pub mod commitment {
                 parent_state_root,
                 addition_count: additions.len() as u64,
                 removal_count: removals.len() as u64,
+                materialized_count: materialized.len() as u64,
                 parent_node_value_count,
                 parent_predicate_count,
                 node_value_count,
@@ -1391,9 +1428,11 @@ pub mod commitment {
                 state,
                 additions,
                 removals,
+                materialized,
                 predicate_catalog,
                 node_value_catalog,
                 column_commitments,
+                materialized_column_commitments,
                 predicate_dict_commitments,
                 node_value_dict_commitments,
                 node_value_dict_range_commitments,
@@ -1433,21 +1472,26 @@ pub mod commitment {
             std::mem::size_of::<LayerCommitment>()
                 .saturating_add(table_bytes(&self.additions))
                 .saturating_add(table_bytes(&self.removals))
+                .saturating_add(table_bytes(&self.materialized))
                 .saturating_add(table_bytes(&self.predicate_catalog))
                 .saturating_add(table_bytes(&self.node_value_catalog))
         }
 
         pub fn validate(&self) -> io::Result<()> {
             self.state.validate()?;
-            if self.additions.len() > MAX_RECORDS || self.removals.len() > MAX_RECORDS {
+            if self.additions.len() > MAX_RECORDS
+                || self.removals.len() > MAX_RECORDS
+                || self.materialized.len() > MAX_RECORDS
+            {
                 return Err(invalid("proof delta exceeds storage limit"));
             }
             if self.additions.len() as u64 != self.state.addition_count
                 || self.removals.len() as u64 != self.state.removal_count
+                || self.materialized.len() as u64 != self.state.materialized_count
             {
                 return Err(invalid("commitment delta count mismatch"));
             }
-            for table in [&self.additions, &self.removals] {
+            for table in [&self.additions, &self.removals, &self.materialized] {
                 if table
                     .windows(2)
                     .any(|pair| triple_cmp(&pair[0], &pair[1], ProofIndex::Spo) != Ordering::Less)
@@ -1475,20 +1519,50 @@ pub mod commitment {
             {
                 return Err(invalid("duplicate or conflicting native delta records"));
             }
+            let materialized_set: BTreeSet<_> = self
+                .materialized
+                .iter()
+                .map(|record| &record.triple)
+                .collect();
+            if materialized_set.len() != self.materialized.len() {
+                return Err(invalid("duplicate materialized logical records"));
+            }
             let subject_catalog = subject_catalog_from_objects(&self.node_value_catalog)?;
             validate_complete_catalog(
                 &self.additions,
                 &self.removals,
+                &self.materialized,
                 &[
                     subject_catalog,
                     self.predicate_catalog.clone(),
                     self.node_value_catalog.clone(),
                 ],
-                self.state.parent_node_value_count,
-                self.state.parent_predicate_count,
                 self.state.node_value_count,
                 self.state.predicate_count,
             )?;
+            if commit_delta_columns(&self.additions, &self.removals)? != self.column_commitments {
+                return Err(invalid("native delta column commitment mismatch"));
+            }
+            if commit_materialized_columns(&self.materialized)?
+                != self.materialized_column_commitments
+            {
+                return Err(invalid("materialized column commitment mismatch"));
+            }
+            if commit_predicate_dictionary(&self.predicate_catalog)?
+                != self.predicate_dict_commitments
+            {
+                return Err(invalid("predicate dictionary commitment mismatch"));
+            }
+            if commit_node_value_dictionary(&self.node_value_catalog)?
+                != self.node_value_dict_commitments
+            {
+                return Err(invalid("node/value dictionary commitment mismatch"));
+            }
+            if commit_node_value_dict_range(&self.node_value_catalog)?
+                != self.node_value_dict_range_commitments
+            {
+                return Err(invalid("node/value range commitment mismatch"));
+            }
             if self.compute_commitment_root()? != self.state.commitment_root {
                 return Err(invalid("commitment root mismatch"));
             }
@@ -1535,12 +1609,14 @@ pub mod commitment {
             };
             let addition_count = r.u64()?;
             let removal_count = r.u64()?;
+            let materialized_count = r.u64()?;
             let parent_node_value_count = r.u64()?;
             let parent_predicate_count = r.u64()?;
             let node_value_count = r.u64()?;
             let predicate_count = r.u64()?;
             let additions = read_records(&mut r, PersistedTableKind::Delta)?;
             let removals = read_records(&mut r, PersistedTableKind::Delta)?;
+            let materialized = read_records(&mut r, PersistedTableKind::Delta)?;
             let predicate_records = read_records(&mut r, PersistedTableKind::PredicateCatalog)?;
             let object_records = read_records(&mut r, PersistedTableKind::ObjectCatalog)?;
             let mut column_commitments: [ArkGT; COLUMN_COUNT] =
@@ -1548,6 +1624,11 @@ pub mod commitment {
             for slot in column_commitments.iter_mut() {
                 let bytes = r.bytes()?;
                 *slot = deserialize_commitment(&bytes)?;
+            }
+            let mut materialized_column_commitments: [ArkGT; MATERIALIZED_COLUMN_COUNT] =
+                [<ArkGT as Group>::identity(); MATERIALIZED_COLUMN_COUNT];
+            for slot in materialized_column_commitments.iter_mut() {
+                *slot = deserialize_commitment(&r.bytes()?)?;
             }
             let predicate_dict_commitments = {
                 let hash = deserialize_commitment(&r.bytes()?)?;
@@ -1569,7 +1650,13 @@ pub mod commitment {
             if !r.done() {
                 return Err(invalid("trailing commitment file bytes"));
             }
-            validate_decoded_heap_budget(&additions, &removals, &predicate_records, &object_records)?;
+            validate_decoded_heap_budget(
+                &additions,
+                &removals,
+                &materialized,
+                &predicate_records,
+                &object_records,
+            )?;
             let predicate_mappings = predicate_records
                 .into_iter()
                 .map(|record| {
@@ -1605,6 +1692,7 @@ pub mod commitment {
                 parent_state_root,
                 addition_count,
                 removal_count,
+                materialized_count,
                 parent_node_value_count,
                 parent_predicate_count,
                 node_value_count,
@@ -1615,9 +1703,11 @@ pub mod commitment {
                 state,
                 additions,
                 removals,
+                materialized,
                 predicate_catalog,
                 node_value_catalog,
                 column_commitments,
+                materialized_column_commitments,
                 predicate_dict_commitments,
                 node_value_dict_commitments,
                 node_value_dict_range_commitments,
@@ -1627,12 +1717,109 @@ pub mod commitment {
         }
 
         /// Recompute the `commitment_root` binding purely from the state counts,
-        /// parent root, the six column commitments, and the six dictionary
+        /// parent root, the nine triple-column commitments, and the six dictionary
         /// commitments (independent of the raw tables). A query verifier trusts a
         /// layer's `commitment_root`, and calls this to confirm the commitments it
         /// is about to open are exactly the ones that root authenticates.
         pub fn recomputed_commitment_root(&self) -> io::Result<ProofHash> {
             self.compute_commitment_root()
+        }
+
+        /// Reconstruct the root this same native delta would have had in PF4 v3.
+        /// This is migration-only: it lets an interrupted v3→v4 chain upgrade
+        /// authenticate the next legacy child's parent pointer without retaining
+        /// legacy metadata in the v4 format.
+        pub(crate) fn legacy_v3_root(
+            &self,
+            legacy_parent_root: Option<ProofHash>,
+        ) -> io::Result<ProofHash> {
+            let predicate_catalog: Vec<_> = self
+                .predicate_catalog
+                .iter()
+                .filter(|record| record.predicate_id > self.state.parent_predicate_count)
+                .cloned()
+                .collect();
+            let node_value_catalog: Vec<_> = self
+                .node_value_catalog
+                .iter()
+                .filter(|record| record.object_id > self.state.parent_node_value_count)
+                .cloned()
+                .collect();
+            legacy_v3_root_from_parts(
+                legacy_parent_root,
+                self.state.addition_count,
+                self.state.removal_count,
+                self.state.parent_node_value_count,
+                self.state.parent_predicate_count,
+                self.state.node_value_count,
+                self.state.predicate_count,
+                &self.column_commitments,
+                &commit_predicate_dictionary(&predicate_catalog)?,
+                &commit_node_value_dictionary(&node_value_catalog)?,
+                &commit_node_value_dict_range(&node_value_catalog)?,
+            )
+        }
+
+        #[cfg(test)]
+        pub(crate) fn encode_legacy_v3_for_test(
+            &self,
+            legacy_parent_root: Option<ProofHash>,
+        ) -> io::Result<Vec<u8>> {
+            let predicate_catalog: Vec<_> = self
+                .predicate_catalog
+                .iter()
+                .filter(|record| record.predicate_id > self.state.parent_predicate_count)
+                .cloned()
+                .collect();
+            let node_value_catalog: Vec<_> = self
+                .node_value_catalog
+                .iter()
+                .filter(|record| record.object_id > self.state.parent_node_value_count)
+                .cloned()
+                .collect();
+            let predicate_commitments = commit_predicate_dictionary(&predicate_catalog)?;
+            let object_commitments = commit_node_value_dictionary(&node_value_catalog)?;
+            let range_commitments = commit_node_value_dict_range(&node_value_catalog)?;
+            let root = self.legacy_v3_root(legacy_parent_root)?;
+            let mut out = Vec::new();
+            out.extend_from_slice(COMMITMENT_MAGIC);
+            put_u32(&mut out, 3);
+            out.push(legacy_parent_root.is_some() as u8);
+            if let Some(parent) = legacy_parent_root {
+                put_hash(&mut out, &parent);
+            }
+            for count in [
+                self.state.addition_count,
+                self.state.removal_count,
+                self.state.parent_node_value_count,
+                self.state.parent_predicate_count,
+                self.state.node_value_count,
+                self.state.predicate_count,
+            ] {
+                put_u64(&mut out, count);
+            }
+            for table in [
+                &self.additions,
+                &self.removals,
+                &predicate_catalog,
+                &node_value_catalog,
+            ] {
+                put_records(&mut out, table);
+            }
+            for commitment in self.column_commitments.iter().chain([
+                &predicate_commitments.0,
+                &predicate_commitments.1,
+                &object_commitments.0,
+                &object_commitments.1,
+                &range_commitments.0,
+                &range_commitments.1,
+            ]) {
+                put_bytes(&mut out, &serialize_commitment(commitment)?);
+            }
+            put_hash(&mut out, &root);
+            let checksum = file_checksum(&out);
+            out.extend_from_slice(&checksum);
+            Ok(out)
         }
 
         /// Rebuild the padded predicate-dictionary columns `(hash, id)` that
@@ -1680,8 +1867,9 @@ pub mod commitment {
             ]
         }
 
-        /// The commitment root binds the parent root, the six counts, the six
-        /// per-column Dory commitments, and the SIX dictionary commitments (the
+        /// The commitment root binds the parent root, the seven counts, the six
+        /// native-delta and three materialized-view column commitments, and the
+        /// six dictionary commitments (the
         /// predicate hash/id pair, the node/value hash/id pair, then the node/value
         /// order-preserving VALUE + DATATYPE pair) — NOT the raw tables, which are
         /// separately bound by the file checksum and revalidated on decode. The
@@ -1690,7 +1878,7 @@ pub mod commitment {
         /// encodings.
         fn compute_commitment_root(&self) -> io::Result<ProofHash> {
             let mut hasher = Sha256::new();
-            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v3");
+            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v4");
             match self.state.parent_state_root {
                 Some(root) => {
                     hasher.update([1u8]);
@@ -1700,6 +1888,7 @@ pub mod commitment {
             }
             hasher.update(self.state.addition_count.to_be_bytes());
             hasher.update(self.state.removal_count.to_be_bytes());
+            hasher.update(self.state.materialized_count.to_be_bytes());
             hasher.update(self.state.parent_node_value_count.to_be_bytes());
             hasher.update(self.state.parent_predicate_count.to_be_bytes());
             hasher.update(self.state.node_value_count.to_be_bytes());
@@ -1707,6 +1896,7 @@ pub mod commitment {
             for commitment in self
                 .column_commitments
                 .iter()
+                .chain(self.materialized_column_commitments.iter())
                 .chain(self.dictionary_commitments())
             {
                 let bytes = serialize_commitment(commitment)?;
@@ -1726,6 +1916,7 @@ pub mod commitment {
             }
             put_u64(&mut out, self.state.addition_count);
             put_u64(&mut out, self.state.removal_count);
+            put_u64(&mut out, self.state.materialized_count);
             put_u64(&mut out, self.state.parent_node_value_count);
             put_u64(&mut out, self.state.parent_predicate_count);
             put_u64(&mut out, self.state.node_value_count);
@@ -1733,6 +1924,7 @@ pub mod commitment {
             for table in [
                 &self.additions,
                 &self.removals,
+                &self.materialized,
                 &self.predicate_catalog,
                 &self.node_value_catalog,
             ] {
@@ -1741,6 +1933,7 @@ pub mod commitment {
             for commitment in self
                 .column_commitments
                 .iter()
+                .chain(self.materialized_column_commitments.iter())
                 .chain(self.dictionary_commitments())
             {
                 let bytes = serialize_commitment(commitment)?;
@@ -1756,7 +1949,7 @@ pub mod commitment {
                 } else {
                     0
                 })
-                .and_then(|value| value.checked_add(6 * 8))
+                .and_then(|value| value.checked_add(7 * 8))
                 .ok_or_else(|| invalid("commitment manifest encoded length overflow"))?;
             let mut total = COMMITMENT_MAGIC
                 .len()
@@ -1766,6 +1959,7 @@ pub mod commitment {
             for table in [
                 &self.additions,
                 &self.removals,
+                &self.materialized,
                 &self.predicate_catalog,
                 &self.node_value_catalog,
             ] {
@@ -1780,6 +1974,7 @@ pub mod commitment {
             for commitment in self
                 .column_commitments
                 .iter()
+                .chain(self.materialized_column_commitments.iter())
                 .chain(self.dictionary_commitments())
             {
                 let commitment_len = 8usize
@@ -1791,6 +1986,225 @@ pub mod commitment {
             total = checked_proof_encoded_growth(total, 32)?;
             checked_proof_encoded_growth(total, 32)
         }
+    }
+
+    /// Fully validated migration-only representation of the immediately preceding
+    /// PF4 v3 sidecar format. Normal reads and pack admission never call this decoder.
+    pub(crate) struct LegacyV3Commitment {
+        pub parent_state_root: Option<ProofHash>,
+        pub commitment_root: ProofHash,
+        addition_count: u64,
+        removal_count: u64,
+        parent_node_value_count: u64,
+        parent_predicate_count: u64,
+        node_value_count: u64,
+        predicate_count: u64,
+        additions: Vec<ProofRecord>,
+        removals: Vec<ProofRecord>,
+        predicate_catalog: Vec<ProofRecord>,
+        node_value_catalog: Vec<ProofRecord>,
+    }
+
+    impl LegacyV3Commitment {
+        pub(crate) fn validate_against_v4(&self, current: &LayerCommitment) -> io::Result<()> {
+            let legacy_predicates: Vec<_> = current
+                .predicate_catalog
+                .iter()
+                .filter(|record| record.predicate_id > current.state.parent_predicate_count)
+                .cloned()
+                .collect();
+            let legacy_objects: Vec<_> = current
+                .node_value_catalog
+                .iter()
+                .filter(|record| record.object_id > current.state.parent_node_value_count)
+                .cloned()
+                .collect();
+            if self.addition_count != current.state.addition_count
+                || self.removal_count != current.state.removal_count
+                || self.parent_node_value_count != current.state.parent_node_value_count
+                || self.parent_predicate_count != current.state.parent_predicate_count
+                || self.node_value_count != current.state.node_value_count
+                || self.predicate_count != current.state.predicate_count
+                || self.additions != current.additions
+                || self.removals != current.removals
+                || self.predicate_catalog != legacy_predicates
+                || self.node_value_catalog != legacy_objects
+            {
+                return Err(invalid(
+                    "legacy v3 proof state differs from native layer delta",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_v3_root_from_parts(
+        parent_state_root: Option<ProofHash>,
+        addition_count: u64,
+        removal_count: u64,
+        parent_node_value_count: u64,
+        parent_predicate_count: u64,
+        node_value_count: u64,
+        predicate_count: u64,
+        column_commitments: &[ArkGT; COLUMN_COUNT],
+        predicate_dict_commitments: &(ArkGT, ArkGT),
+        node_value_dict_commitments: &(ArkGT, ArkGT),
+        node_value_dict_range_commitments: &(ArkGT, ArkGT),
+    ) -> io::Result<ProofHash> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"terminus-store/proof-of-woql/commitment-root/v3");
+        match parent_state_root {
+            Some(root) => {
+                hasher.update([1u8]);
+                hasher.update(root);
+            }
+            None => hasher.update([0u8]),
+        }
+        for count in [
+            addition_count,
+            removal_count,
+            parent_node_value_count,
+            parent_predicate_count,
+            node_value_count,
+            predicate_count,
+        ] {
+            hasher.update(count.to_be_bytes());
+        }
+        for commitment in column_commitments.iter().chain([
+            &predicate_dict_commitments.0,
+            &predicate_dict_commitments.1,
+            &node_value_dict_commitments.0,
+            &node_value_dict_commitments.1,
+            &node_value_dict_range_commitments.0,
+            &node_value_dict_range_commitments.1,
+        ]) {
+            let bytes = serialize_commitment(commitment)?;
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        Ok(hasher.finalize().into())
+    }
+
+    pub(crate) fn decode_legacy_v3(bytes: &[u8]) -> io::Result<LegacyV3Commitment> {
+        if bytes.len() < COMMITMENT_MAGIC.len() + 4 + 64 || bytes.len() > MAX_PROOF_LAYER_BYTES {
+            return Err(invalid("truncated legacy v3 proof commitment"));
+        }
+        let (payload, checksum) = bytes.split_at(bytes.len() - 32);
+        if file_checksum(payload).as_slice() != checksum {
+            return Err(invalid("legacy v3 commitment file checksum mismatch"));
+        }
+        let (body, root_bytes) = payload.split_at(payload.len() - 32);
+        let commitment_root: ProofHash = root_bytes.try_into().unwrap();
+        let mut r = Reader::new(body);
+        if r.take(COMMITMENT_MAGIC.len())? != COMMITMENT_MAGIC || r.u32()? != 3 {
+            return Err(invalid("not a PF4 v3 commitment file"));
+        }
+        let parent_state_root = match r.u8()? {
+            0 => None,
+            1 => Some(r.hash()?),
+            _ => return Err(invalid("bad legacy v3 parent root tag")),
+        };
+        let addition_count = r.u64()?;
+        let removal_count = r.u64()?;
+        let parent_node_value_count = r.u64()?;
+        let parent_predicate_count = r.u64()?;
+        let node_value_count = r.u64()?;
+        let predicate_count = r.u64()?;
+        let additions = read_records(&mut r, PersistedTableKind::Delta)?;
+        let removals = read_records(&mut r, PersistedTableKind::Delta)?;
+        let predicate_records = read_records(&mut r, PersistedTableKind::PredicateCatalog)?;
+        let object_records = read_records(&mut r, PersistedTableKind::ObjectCatalog)?;
+        let mut column_commitments = [<ArkGT as Group>::identity(); COLUMN_COUNT];
+        for commitment in &mut column_commitments {
+            *commitment = deserialize_commitment(&r.bytes()?)?;
+        }
+        let predicate_dict_commitments = (
+            deserialize_commitment(&r.bytes()?)?,
+            deserialize_commitment(&r.bytes()?)?,
+        );
+        let node_value_dict_commitments = (
+            deserialize_commitment(&r.bytes()?)?,
+            deserialize_commitment(&r.bytes()?)?,
+        );
+        let node_value_dict_range_commitments = (
+            deserialize_commitment(&r.bytes()?)?,
+            deserialize_commitment(&r.bytes()?)?,
+        );
+        if !r.done() {
+            return Err(invalid("trailing legacy v3 commitment bytes"));
+        }
+        let predicate_mappings = predicate_records
+            .into_iter()
+            .map(|record| {
+                if record.subject_id != 0
+                    || record.predicate_id == 0
+                    || record.object_id != 0
+                    || !record.triple.subject.is_empty()
+                    || record.triple.object != CanonicalObject::Node(Vec::new())
+                {
+                    return Err(invalid("malformed legacy v3 predicate catalog"));
+                }
+                Ok((record.triple.predicate, record.predicate_id))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let node_value_mappings = object_records
+            .into_iter()
+            .map(|record| {
+                if record.subject_id != 0
+                    || record.predicate_id != 0
+                    || record.object_id == 0
+                    || !record.triple.subject.is_empty()
+                    || !record.triple.predicate.is_empty()
+                {
+                    return Err(invalid("malformed legacy v3 node/value catalog"));
+                }
+                Ok((record.triple.object, record.object_id))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let [_, predicate_catalog, node_value_catalog] =
+            build_dictionary_catalogs_from_maps(node_value_mappings, predicate_mappings)?;
+        if additions.len() as u64 != addition_count || removals.len() as u64 != removal_count {
+            return Err(invalid("legacy v3 delta count mismatch"));
+        }
+        if commit_delta_columns(&additions, &removals)? != column_commitments
+            || commit_predicate_dictionary(&predicate_catalog)? != predicate_dict_commitments
+            || commit_node_value_dictionary(&node_value_catalog)? != node_value_dict_commitments
+            || commit_node_value_dict_range(&node_value_catalog)?
+                != node_value_dict_range_commitments
+        {
+            return Err(invalid("legacy v3 raw table commitment mismatch"));
+        }
+        let recomputed = legacy_v3_root_from_parts(
+            parent_state_root,
+            addition_count,
+            removal_count,
+            parent_node_value_count,
+            parent_predicate_count,
+            node_value_count,
+            predicate_count,
+            &column_commitments,
+            &predicate_dict_commitments,
+            &node_value_dict_commitments,
+            &node_value_dict_range_commitments,
+        )?;
+        if recomputed != commitment_root {
+            return Err(invalid("legacy v3 commitment root mismatch"));
+        }
+        Ok(LegacyV3Commitment {
+            parent_state_root,
+            commitment_root,
+            addition_count,
+            removal_count,
+            parent_node_value_count,
+            parent_predicate_count,
+            node_value_count,
+            predicate_count,
+            additions,
+            removals,
+            predicate_catalog,
+            node_value_catalog,
+        })
     }
 
     fn put_records(out: &mut Vec<u8>, records: &[ProofRecord]) {
@@ -1988,39 +2402,25 @@ pub mod commitment {
     fn validate_complete_catalog(
         additions: &[ProofRecord],
         removals: &[ProofRecord],
+        materialized: &[ProofRecord],
         indexes: &[Vec<ProofRecord>; 3],
-        parent_node_value_count: u64,
-        parent_predicate_count: u64,
         node_value_count: u64,
         predicate_count: u64,
     ) -> io::Result<()> {
         validate_dictionary_catalogs(indexes, node_value_count, predicate_count)?;
-        let expected_node_values = node_value_count
-            .checked_sub(parent_node_value_count)
-            .ok_or_else(|| invalid("node/value dictionary count decreased"))?;
-        let expected_predicates = predicate_count
-            .checked_sub(parent_predicate_count)
-            .ok_or_else(|| invalid("predicate dictionary count decreased"))?;
-        if indexes[2].len() as u64 != expected_node_values
-            || indexes[1].len() as u64 != expected_predicates
+        if indexes[2].len() as u64 != node_value_count || indexes[1].len() as u64 != predicate_count
         {
             return Err(invalid(
-                "dictionary catalog does not exactly cover the layer id interval",
+                "dictionary catalog does not exactly cover the full id interval",
             ));
         }
 
         let mut objects_by_id = BTreeMap::new();
         for record in indexes[2].iter() {
-            if record.object_id <= parent_node_value_count {
-                return Err(invalid("layer catalog repeats an inherited node/value id"));
-            }
             objects_by_id.insert(record.object_id, record.triple.object.clone());
         }
         let mut predicates_by_id = BTreeMap::new();
         for record in indexes[1].iter() {
-            if record.predicate_id <= parent_predicate_count {
-                return Err(invalid("layer catalog repeats an inherited predicate id"));
-            }
             predicates_by_id.insert(record.predicate_id, record.triple.predicate.clone());
         }
         let subjects_by_id: BTreeMap<_, _> = indexes[0]
@@ -2028,29 +2428,22 @@ pub mod commitment {
             .map(|record| (record.subject_id, record.triple.subject.clone()))
             .collect();
 
-        for record in additions.iter().chain(removals.iter()) {
-            if record.subject_id > parent_node_value_count
-                && (subjects_by_id.get(&record.subject_id) != Some(&record.triple.subject)
-                    || objects_by_id.get(&record.subject_id)
-                        != Some(&CanonicalObject::Node(record.triple.subject.clone())))
+        for record in additions
+            .iter()
+            .chain(removals.iter())
+            .chain(materialized.iter())
+        {
+            if subjects_by_id.get(&record.subject_id) != Some(&record.triple.subject)
+                || objects_by_id.get(&record.subject_id)
+                    != Some(&CanonicalObject::Node(record.triple.subject.clone()))
             {
-                return Err(invalid(
-                    "new subject id is not bound to delta canonical bytes",
-                ));
+                return Err(invalid("subject id is not bound to canonical bytes"));
             }
-            if record.predicate_id > parent_predicate_count
-                && predicates_by_id.get(&record.predicate_id) != Some(&record.triple.predicate)
-            {
-                return Err(invalid(
-                    "new predicate id is not bound to delta canonical bytes",
-                ));
+            if predicates_by_id.get(&record.predicate_id) != Some(&record.triple.predicate) {
+                return Err(invalid("predicate id is not bound to canonical bytes"));
             }
-            if record.object_id > parent_node_value_count
-                && objects_by_id.get(&record.object_id) != Some(&record.triple.object)
-            {
-                return Err(invalid(
-                    "new object id is not bound to delta canonical bytes",
-                ));
+            if objects_by_id.get(&record.object_id) != Some(&record.triple.object) {
+                return Err(invalid("object id is not bound to canonical bytes"));
             }
         }
         Ok(())
@@ -2070,10 +2463,12 @@ pub mod commitment {
         }
 
         fn sample() -> LayerCommitment {
+            let additions = vec![record(1, 1, 2, "a", "p", "b")];
             LayerCommitment::from_native_delta(
                 None,
-                vec![record(1, 1, 2, "a", "p", "b")],
+                additions.clone(),
                 vec![],
+                additions,
                 0,
                 0,
                 2,
@@ -2089,14 +2484,13 @@ pub mod commitment {
 
         // Same two-node/one-predicate dictionary {a:1, b:2}, {p:1}, but the caller
         // chooses whether the triple lands in additions and/or removals.
-        fn delta(
-            additions: Vec<ProofRecord>,
-            removals: Vec<ProofRecord>,
-        ) -> LayerCommitment {
+        fn delta(additions: Vec<ProofRecord>, removals: Vec<ProofRecord>) -> LayerCommitment {
+            let materialized = additions.clone();
             LayerCommitment::from_native_delta(
                 None,
                 additions,
                 removals,
+                materialized,
                 0,
                 0,
                 2,
@@ -2132,20 +2526,25 @@ pub mod commitment {
                 decoded.node_value_dict_range_commitments,
                 commitment.node_value_dict_range_commitments
             );
-            assert_eq!(decoded.state.commitment_root, commitment.state.commitment_root);
+            assert_eq!(
+                decoded.state.commitment_root,
+                commitment.state.commitment_root
+            );
         }
 
         // A base layer with three predicates p1<p2<p3 (dict of size 3, padded to 4)
         // over distinct subjects/objects.
         fn multi_predicate_layer() -> LayerCommitment {
+            let additions = vec![
+                record(1, 1, 2, "a", "p1", "b"),
+                record(3, 2, 4, "c", "p2", "d"),
+                record(5, 3, 6, "e", "p3", "f"),
+            ];
             LayerCommitment::from_native_delta(
                 None,
-                vec![
-                    record(1, 1, 2, "a", "p1", "b"),
-                    record(3, 2, 4, "c", "p2", "d"),
-                    record(5, 3, 6, "e", "p3", "f"),
-                ],
+                additions.clone(),
                 vec![],
+                additions,
                 0,
                 0,
                 6,
@@ -2158,7 +2557,11 @@ pub mod commitment {
                     (CanonicalObject::Node(b"e".to_vec()), 5),
                     (CanonicalObject::Node(b"f".to_vec()), 6),
                 ],
-                vec![(b"p1".to_vec(), 1), (b"p2".to_vec(), 2), (b"p3".to_vec(), 3)],
+                vec![
+                    (b"p1".to_vec(), 1),
+                    (b"p2".to_vec(), 2),
+                    (b"p3".to_vec(), 3),
+                ],
             )
             .unwrap()
         }
@@ -2183,7 +2586,10 @@ pub mod commitment {
                 commit_column(&hashes).unwrap(),
                 layer.predicate_dict_commitments.0
             );
-            assert_eq!(commit_column(&ids).unwrap(), layer.predicate_dict_commitments.1);
+            assert_eq!(
+                commit_column(&ids).unwrap(),
+                layer.predicate_dict_commitments.1
+            );
         }
 
         #[test]
@@ -2196,14 +2602,16 @@ pub mod commitment {
             );
             // Changing a predicate TERM (same ids) changes the dict-hash commitment,
             // hence the root.
+            let changed_additions = vec![
+                record(1, 1, 2, "a", "pX", "b"),
+                record(3, 2, 4, "c", "p2", "d"),
+                record(5, 3, 6, "e", "p3", "f"),
+            ];
             let changed = LayerCommitment::from_native_delta(
                 None,
-                vec![
-                    record(1, 1, 2, "a", "pX", "b"),
-                    record(3, 2, 4, "c", "p2", "d"),
-                    record(5, 3, 6, "e", "p3", "f"),
-                ],
+                changed_additions.clone(),
                 vec![],
+                changed_additions,
                 0,
                 0,
                 6,
@@ -2216,7 +2624,11 @@ pub mod commitment {
                     (CanonicalObject::Node(b"e".to_vec()), 5),
                     (CanonicalObject::Node(b"f".to_vec()), 6),
                 ],
-                vec![(b"pX".to_vec(), 1), (b"p2".to_vec(), 2), (b"p3".to_vec(), 3)],
+                vec![
+                    (b"pX".to_vec(), 1),
+                    (b"p2".to_vec(), 2),
+                    (b"p3".to_vec(), 3),
+                ],
             )
             .unwrap();
             assert_ne!(
@@ -2242,10 +2654,12 @@ pub mod commitment {
                     },
                 },
             };
+            let additions = vec![record(1, 1, 2, "a", "p", "b"), value_triple];
             LayerCommitment::from_native_delta(
                 None,
-                vec![record(1, 1, 2, "a", "p", "b"), value_triple],
+                additions.clone(),
                 vec![],
+                additions,
                 0,
                 0,
                 3,
@@ -2267,8 +2681,8 @@ pub mod commitment {
         }
 
         #[test]
-        fn commitment_format_version_is_three() {
-            assert_eq!(COMMITMENT_FORMAT_VERSION, 3);
+        fn commitment_format_version_is_four() {
+            assert_eq!(COMMITMENT_FORMAT_VERSION, 4);
         }
 
         #[test]
@@ -2443,16 +2857,32 @@ pub mod commitment {
             // Three UInt32 values (inserted OUT of numeric order) + a Boolean + a
             // Node object + a String value.
             builder
-                .add_value_triple(ValueTriple::new_value(&iri("s1"), &p, u32::make_entry(&300u32)))
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("s1"),
+                    &p,
+                    u32::make_entry(&300u32),
+                ))
                 .unwrap();
             builder
-                .add_value_triple(ValueTriple::new_value(&iri("s2"), &p, u32::make_entry(&5u32)))
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("s2"),
+                    &p,
+                    u32::make_entry(&5u32),
+                ))
                 .unwrap();
             builder
-                .add_value_triple(ValueTriple::new_value(&iri("s3"), &p, u32::make_entry(&7u32)))
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("s3"),
+                    &p,
+                    u32::make_entry(&7u32),
+                ))
                 .unwrap();
             builder
-                .add_value_triple(ValueTriple::new_value(&iri("s4"), &p, bool::make_entry(&true)))
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("s4"),
+                    &p,
+                    bool::make_entry(&true),
+                ))
                 .unwrap();
             builder
                 .add_value_triple(ValueTriple::new_node(&iri("s5"), &p, &iri("target")))
@@ -2516,7 +2946,10 @@ pub mod commitment {
                         saw_node = true;
                         // Nodes (subjects and the node object): 0 sentinel, reserved tag.
                         assert_eq!(values[k], <ArkFr as DoryField>::zero());
-                        assert_eq!(datatypes[k], <ArkFr as DoryField>::from_u64(NODE_DATATYPE_TAG));
+                        assert_eq!(
+                            datatypes[k],
+                            <ArkFr as DoryField>::from_u64(NODE_DATATYPE_TAG)
+                        );
                     }
                     other => panic!("unexpected catalog object {:?}", other),
                 }
@@ -2562,8 +2995,9 @@ pub mod commitment {
             // A prove+verify round for one `(hash_object(term), id)` pair.
             let open = |q_hash: ArkFr, id: ArkFr| -> io::Result<()> {
                 let mut pt = Transcript254::new(b"nv-dict-open");
-                let proof =
-                    prove_dict_membership(&dict_hash, &dict_id, &com_h, &com_i, q_hash, id, &mut pt)?;
+                let proof = prove_dict_membership(
+                    &dict_hash, &dict_id, &com_h, &com_i, q_hash, id, &mut pt,
+                )?;
                 let mut vt = Transcript254::new(b"nv-dict-open");
                 verify_dict_membership(&com_h, &com_i, q_hash, id, &proof, &mut vt)
             };
@@ -2607,8 +3041,7 @@ pub mod commitment {
             assert_eq!(setup_a.g1_vec, setup_b.g1_vec);
             assert_eq!(setup_a.g2_vec, setup_b.g2_vec);
 
-            let coefficients: Vec<ArkFr> =
-                (1..=4u64).map(<ArkFr as DoryField>::from_u64).collect();
+            let coefficients: Vec<ArkFr> = (1..=4u64).map(<ArkFr as DoryField>::from_u64).collect();
             let poly = ArkworksPolynomial::new(coefficients);
             let (commitment_a, _, _) = poly
                 .commit::<BN254, Transparent, G1Routines>(1, 1, &setup_a)
@@ -2622,7 +3055,10 @@ pub mod commitment {
         #[test]
         fn commitment_root_is_stable_across_independent_calls() {
             // End-to-end determinism: the same delta yields the same root.
-            assert_eq!(sample().state.commitment_root, sample().state.commitment_root);
+            assert_eq!(
+                sample().state.commitment_root,
+                sample().state.commitment_root
+            );
             assert_ne!(sample().state.commitment_root, [0u8; 32]);
         }
 
@@ -2639,7 +3075,16 @@ pub mod commitment {
         #[test]
         fn empty_adds_only_removes_only_are_valid_and_distinct() {
             let empty = LayerCommitment::from_native_delta(
-                None, vec![], vec![], 0, 0, 0, 0, vec![], vec![],
+                None,
+                vec![],
+                vec![],
+                vec![],
+                0,
+                0,
+                0,
+                0,
+                vec![],
+                vec![],
             )
             .unwrap();
             let adds_only = delta(vec![record(1, 1, 2, "a", "p", "b")], vec![]);
@@ -2649,8 +3094,12 @@ pub mod commitment {
             let identity = <ArkGT as Group>::identity();
             assert!(empty.column_commitments.iter().all(|c| *c == identity));
             // Adds-only: remove columns are empty; removes-only: add columns empty.
-            assert!(adds_only.column_commitments[3..].iter().all(|c| *c == identity));
-            assert!(removes_only.column_commitments[..3].iter().all(|c| *c == identity));
+            assert!(adds_only.column_commitments[3..]
+                .iter()
+                .all(|c| *c == identity));
+            assert!(removes_only.column_commitments[..3]
+                .iter()
+                .all(|c| *c == identity));
 
             let roots = [
                 empty.state.commitment_root,
@@ -2669,6 +3118,22 @@ pub mod commitment {
             let mid = bytes.len() / 2;
             bytes[mid] ^= 1;
             assert!(LayerCommitment::decode(&bytes).is_err());
+        }
+
+        #[test]
+        fn tampered_materialized_view_is_rejected() {
+            let mut commitment = sample();
+            commitment.materialized[0].object_id = 1;
+            commitment.materialized[0].triple.object = CanonicalObject::Node(b"a".to_vec());
+            assert!(commitment.validate().is_err());
+        }
+
+        #[test]
+        fn tampered_full_catalog_is_rejected() {
+            let mut commitment = sample();
+            commitment.node_value_catalog[1].triple.object =
+                CanonicalObject::Node(b"tampered".to_vec());
+            assert!(commitment.validate().is_err());
         }
 
         #[test]
@@ -2691,6 +3156,7 @@ pub mod commitment {
         fn catalog_gap_fails_closed() {
             assert!(LayerCommitment::from_native_delta(
                 None,
+                vec![],
                 vec![],
                 vec![],
                 0,

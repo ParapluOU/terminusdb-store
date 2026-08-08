@@ -144,6 +144,34 @@ impl PersistentLayerStore for MemoryLayerStore {
         files.insert(FILENAMES.proof_state.to_string(), file);
         Ok(())
     }
+
+    async fn replace_proof_state_bytes_if_matches(
+        &self,
+        directory: [u32; 5],
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> io::Result<()> {
+        let file = MemoryBackedStore::new();
+        let mut writer = file.open_write().await?;
+        tokio::io::AsyncWriteExt::write_all(&mut writer, replacement).await?;
+        tokio::io::AsyncWriteExt::flush(&mut writer).await?;
+        writer.sync_all().await?;
+        let mut guard = self.layers.write().await;
+        let files = guard
+            .get_mut(&directory)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "layer not found"))?;
+        let current = files
+            .get(FILENAMES.proof_state)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "proof state not found"))?;
+        if current.map().await?.as_ref() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "proof state changed during migration",
+            ));
+        }
+        files.insert(FILENAMES.proof_state.to_string(), file);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Default)]

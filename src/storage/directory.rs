@@ -566,6 +566,51 @@ impl PersistentLayerStore for DirectoryLayerStore {
         result
     }
 
+    async fn replace_proof_state_bytes_if_matches(
+        &self,
+        directory: [u32; 5],
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> io::Result<()> {
+        let _lock = self.acquire_import_lock().await?;
+        self.recover_uncommitted_imports_locked().await?;
+        let name = name_to_string(directory);
+        let directory_path = self.path.join(&name[..PREFIX_DIR_SIZE]).join(name);
+        let target = directory_path.join(FILENAMES.proof_state);
+        if fs::read(&target).await?.as_slice() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "proof state changed during migration",
+            ));
+        }
+        let temporary = directory_path.join(format!(
+            ".{}.migrate-{:016x}",
+            FILENAMES.proof_state,
+            rand::random::<u64>()
+        ));
+        let result = async {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .await?;
+            file.write_all(replacement).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            fs::rename(&temporary, &target).await?;
+            let directory_file = fs::OpenOptions::new()
+                .read(true)
+                .open(&directory_path)
+                .await?;
+            directory_file.sync_all().await
+        }
+        .await;
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary).await;
+        }
+        result
+    }
+
     async fn finalize(&self, directory: [u32; 5]) -> io::Result<()> {
         if cfg!(unix) {
             // ensure the underlying directory record is properly synchronized
