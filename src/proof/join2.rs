@@ -44,7 +44,10 @@ use super::logup::{masked_multiset_link_claim, reciprocal_witness, rlc_fold};
 use super::membership::{
     prove_membership_with_mult_with_witness, verify_membership_with_mult, MembershipProof,
 };
-use super::sort::{prove_strictly_sorted, verify_strictly_sorted, SortedProof};
+use super::sort::{
+    prove_strictly_sorted, prove_strictly_sorted_bits, verify_strictly_sorted,
+    verify_strictly_sorted_bits, SortedProof,
+};
 
 #[inline]
 fn f0() -> ArkFr {
@@ -136,12 +139,7 @@ impl Layout {
 /// Exposed `pub` alongside [`compute_binary_join`] so external consumers (the
 /// `woql-proof` compiler's end-to-end tests) can reproduce the exact per-column
 /// padding a BGP proof uses when recomputing an independent natural join.
-pub fn binary_join_domain(
-    n_r: usize,
-    n_s: usize,
-    m_j: usize,
-    n_u: usize,
-) -> io::Result<usize> {
+pub fn binary_join_domain(n_r: usize, n_s: usize, m_j: usize, n_u: usize) -> io::Result<usize> {
     n_r.max(n_s)
         .max(m_j)
         .max(n_u)
@@ -208,12 +206,14 @@ fn binary_pairs_shape(
 ) -> SumcheckShape {
     // LEFT fold order: [r_other_0.., r_key, idx] for the source; the candidate uses
     // [r_other_out_0.., key, rho_l] with the SAME powers.
-    let mut left_src_ops: Vec<Operand> =
-        (0..layout.p).map(|d| Operand::Column(layout.r_other(d))).collect();
+    let mut left_src_ops: Vec<Operand> = (0..layout.p)
+        .map(|d| Operand::Column(layout.r_other(d)))
+        .collect();
     left_src_ops.push(Operand::Column(layout.r_key()));
     left_src_ops.push(Operand::Idx);
-    let mut left_cand_ops: Vec<Operand> =
-        (0..layout.p).map(|d| Operand::Column(layout.r_other_out(d))).collect();
+    let mut left_cand_ops: Vec<Operand> = (0..layout.p)
+        .map(|d| Operand::Column(layout.r_other_out(d)))
+        .collect();
     left_cand_ops.push(Operand::Column(layout.key()));
     left_cand_ops.push(Operand::Column(layout.rho_l()));
 
@@ -225,9 +225,16 @@ fn binary_pairs_shape(
     right_cand_ops.extend((0..layout.q).map(|d| Operand::Column(layout.s_other_out(d))));
     right_cand_ops.push(Operand::Column(layout.rho_r()));
 
-    let src_l = reciprocal_fold_claim(layout.rec_src_l(), &power_fold(beta_l, &left_src_ops), alpha_l);
-    let cand_l =
-        reciprocal_fold_claim(layout.rec_cand_l(), &power_fold(beta_l, &left_cand_ops), alpha_l);
+    let src_l = reciprocal_fold_claim(
+        layout.rec_src_l(),
+        &power_fold(beta_l, &left_src_ops),
+        alpha_l,
+    );
+    let cand_l = reciprocal_fold_claim(
+        layout.rec_cand_l(),
+        &power_fold(beta_l, &left_cand_ops),
+        alpha_l,
+    );
     // Source side masked by chi_{n_R} (audit fix: don't regress source masking).
     let link_l = masked_multiset_link_claim(
         &[Operand::Chi(CHI_MJ)],
@@ -236,9 +243,16 @@ fn binary_pairs_shape(
         layout.rec_src_l(),
     );
 
-    let src_r = reciprocal_fold_claim(layout.rec_src_r(), &power_fold(beta_r, &right_src_ops), alpha_r);
-    let cand_r =
-        reciprocal_fold_claim(layout.rec_cand_r(), &power_fold(beta_r, &right_cand_ops), alpha_r);
+    let src_r = reciprocal_fold_claim(
+        layout.rec_src_r(),
+        &power_fold(beta_r, &right_src_ops),
+        alpha_r,
+    );
+    let cand_r = reciprocal_fold_claim(
+        layout.rec_cand_r(),
+        &power_fold(beta_r, &right_cand_ops),
+        alpha_r,
+    );
     let link_r = masked_multiset_link_claim(
         &[Operand::Chi(CHI_MJ)],
         layout.rec_cand_r(),
@@ -393,7 +407,9 @@ fn prove_binary_pairs(
     transcript.append_group(b"pow/join2/com-rec-src-r", &rec_src_r_commitment);
     transcript.append_group(b"pow/join2/com-rec-cand-r", &rec_cand_r_commitment);
 
-    let shape = binary_pairs_shape(&layout, num_vars, m_j, n_r, n_s, alpha_l, beta_l, alpha_r, beta_r);
+    let shape = binary_pairs_shape(
+        &layout, num_vars, m_j, n_r, n_s, alpha_l, beta_l, alpha_r, beta_r,
+    );
     let mut columns = vec![cols.r_key.clone()];
     columns.extend(cols.r_other.iter().cloned());
     columns.push(cols.s_key.clone());
@@ -445,7 +461,9 @@ fn verify_binary_pairs(
 ) -> io::Result<()> {
     let num_vars = proof.membership_sumcheck.round_polys.len();
     if num_vars == 0 || num_vars >= usize::BITS as usize {
-        return Err(invalid("binary pairs proof has an implausible variable count"));
+        return Err(invalid(
+            "binary pairs proof has an implausible variable count",
+        ));
     }
     let n = 1usize << num_vars;
     if n_r > n || n_s > n || m_j > n {
@@ -471,7 +489,9 @@ fn verify_binary_pairs(
     transcript.append_group(b"pow/join2/com-rec-src-r", &proof.rec_src_r_commitment);
     transcript.append_group(b"pow/join2/com-rec-cand-r", &proof.rec_cand_r_commitment);
 
-    let shape = binary_pairs_shape(&layout, num_vars, m_j, n_r, n_s, alpha_l, beta_l, alpha_r, beta_r);
+    let shape = binary_pairs_shape(
+        &layout, num_vars, m_j, n_r, n_s, alpha_l, beta_l, alpha_r, beta_r,
+    );
     let (r, evals) = verify_sumcheck(&shape, &proof.membership_sumcheck, transcript)?;
 
     let mut coms = vec![com.r_key];
@@ -641,11 +661,13 @@ fn bind_instance(
     n_s: usize,
     n_u: usize,
     m_j: usize,
+    key_bits: usize,
 ) {
     transcript.append_bytes(LABEL_DOMAIN, b"parture/proof-of-woql/binary-join/v0");
     for v in [n_r, n_s, n_u, m_j] {
         transcript.append_bytes(LABEL_LEN, &(v as u64).to_le_bytes());
     }
+    transcript.append_bytes(b"pow/join2/key-bits", &(key_bits as u64).to_le_bytes());
     bind_pairs_data(transcript, com);
     transcript.append_group(b"pow/join2/com-u", &com.u);
     transcript.append_group(b"pow/join2/com-w-l", &com.w_l);
@@ -663,10 +685,23 @@ pub fn prove_binary_join(
     com: &BinaryJoinCommitments,
     transcript: &mut Transcript254,
 ) -> io::Result<(BinaryJoinProof, Vec<ArkGT>, usize)> {
+    prove_binary_join_with_key_bits(r_key, r_other, s_key, s_other, 64, com, transcript)
+}
+
+/// Prove a join whose canonical integer key representation has the given bit width.
+pub fn prove_binary_join_with_key_bits(
+    r_key: &[ArkFr],
+    r_other: &[&[ArkFr]],
+    s_key: &[ArkFr],
+    s_other: &[&[ArkFr]],
+    key_bits: usize,
+    com: &BinaryJoinCommitments,
+    transcript: &mut Transcript254,
+) -> io::Result<(BinaryJoinProof, Vec<ArkGT>, usize)> {
     let witness = compute_binary_join(r_key, r_other, s_key, s_other);
     let radix = combined_index_radix(r_key.len(), s_key.len())?;
-    let proof = prove_binary_join_with_witness(
-        r_key, r_other, s_key, s_other, &witness, radix, com, transcript,
+    let proof = prove_binary_join_with_witness_and_key_bits(
+        r_key, r_other, s_key, s_other, &witness, radix, key_bits, com, transcript,
     )?;
     let mut out = com.r_other_out.clone();
     out.push(com.key);
@@ -678,6 +713,7 @@ pub fn prove_binary_join(
 /// them; tests inject malicious output / U / w / a wrong radix). `witness.u`/`w_l`/`w_r`
 /// may carry a padding-tail stash; `witness.rho_*`/output may be fabricated.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn prove_binary_join_with_witness(
     r_key: &[ArkFr],
     r_other: &[&[ArkFr]],
@@ -688,12 +724,29 @@ pub(crate) fn prove_binary_join_with_witness(
     com: &BinaryJoinCommitments,
     transcript: &mut Transcript254,
 ) -> io::Result<BinaryJoinProof> {
+    prove_binary_join_with_witness_and_key_bits(
+        r_key, r_other, s_key, s_other, witness, radix, 64, com, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_binary_join_with_witness_and_key_bits(
+    r_key: &[ArkFr],
+    r_other: &[&[ArkFr]],
+    s_key: &[ArkFr],
+    s_other: &[&[ArkFr]],
+    witness: &BinaryJoinWitness,
+    radix: usize,
+    key_bits: usize,
+    com: &BinaryJoinCommitments,
+    transcript: &mut Transcript254,
+) -> io::Result<BinaryJoinProof> {
     let (n_r, n_s) = (r_key.len(), s_key.len());
     let n_u = witness.n_u;
     let m_j = witness.m_j;
     let n = binary_join_domain(n_r, n_s, m_j, n_u)?;
 
-    bind_instance(transcript, com, n_r, n_s, n_u, m_j);
+    bind_instance(transcript, com, n_r, n_s, n_u, m_j, key_bits);
 
     let cols = JoinColumns {
         r_key: padded(r_key, n),
@@ -709,22 +762,42 @@ pub(crate) fn prove_binary_join_with_witness(
     let mult_l = source_multiplicities(&cols.rho_l, n_r, m_j, n);
     let mult_r = source_multiplicities(&cols.rho_r, n_s, m_j, n);
 
-    let pairs = prove_binary_pairs(&cols, &mult_l, &mult_r, n_r, n_s, m_j, radix, com, transcript)?;
+    let pairs = prove_binary_pairs(
+        &cols, &mult_l, &mult_r, n_r, n_s, m_j, radix, com, transcript,
+    )?;
 
     // U distinctness over [0, n_U).
     let u_full = padded(&witness.u, n);
-    let sorted_u = prove_strictly_sorted(&u_full, n_u, &com.u, transcript)?;
+    let sorted_u = prove_strictly_sorted_bits(&u_full, n_u, key_bits, &com.u, transcript)?;
     // r_key is the image of U under w_L, s_key the image under w_R (both sides masked).
     let w_l_full = padded(&witness.w_l, n);
     let w_r_full = padded(&witness.w_r, n);
     let membership_l = prove_membership_with_mult_with_witness(
-        &u_full, &cols.r_key, &w_l_full, n_u, n_r, &com.u, &com.r_key, &com.w_l, transcript,
+        &u_full,
+        &cols.r_key,
+        &w_l_full,
+        n_u,
+        n_r,
+        &com.u,
+        &com.r_key,
+        &com.w_l,
+        transcript,
     )?;
     let membership_r = prove_membership_with_mult_with_witness(
-        &u_full, &cols.s_key, &w_r_full, n_u, n_s, &com.u, &com.s_key, &com.w_r, transcript,
+        &u_full,
+        &cols.s_key,
+        &w_r_full,
+        n_u,
+        n_s,
+        &com.u,
+        &com.s_key,
+        &com.w_r,
+        transcript,
     )?;
     // Count Σ chi_{n_U} w_L*w_R = m_J (true n_U -- audit fix).
-    let count = prove_count_identity(&w_l_full, &w_r_full, n_u, m_j, &com.w_l, &com.w_r, transcript)?;
+    let count = prove_count_identity(
+        &w_l_full, &w_r_full, n_u, m_j, &com.w_l, &com.w_r, transcript,
+    )?;
 
     Ok(BinaryJoinProof {
         pairs,
@@ -745,8 +818,23 @@ pub fn verify_binary_join(
     proof: &BinaryJoinProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
+    verify_binary_join_with_key_bits(com, n_r, n_s, m_j, 64, proof, transcript)
+}
+
+/// Verify a join using the public integer width of its canonical key representation.
+pub fn verify_binary_join_with_key_bits(
+    com: &BinaryJoinCommitments,
+    n_r: usize,
+    n_s: usize,
+    m_j: usize,
+    key_bits: usize,
+    proof: &BinaryJoinProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
     let radix = combined_index_radix(n_r, n_s)?;
-    verify_binary_join_inner(com, n_r, n_s, proof.n_u, m_j, radix, proof, transcript)
+    verify_binary_join_inner(
+        com, n_r, n_s, proof.n_u, m_j, radix, key_bits, proof, transcript,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -757,15 +845,37 @@ fn verify_binary_join_inner(
     n_u: usize,
     m_j: usize,
     radix: usize,
+    key_bits: usize,
     proof: &BinaryJoinProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    bind_instance(transcript, com, n_r, n_s, n_u, m_j);
-    verify_binary_pairs(com, n_r, n_s, m_j, radix, &proof.pairs, transcript)?;
-    verify_strictly_sorted(&com.u, n_u, &proof.sorted_u, transcript)?;
-    verify_membership_with_mult(&com.u, &com.r_key, &com.w_l, n_u, n_r, &proof.membership_l, transcript)?;
-    verify_membership_with_mult(&com.u, &com.s_key, &com.w_r, n_u, n_s, &proof.membership_r, transcript)?;
-    verify_count_identity(&com.w_l, &com.w_r, n_u, m_j, &proof.count, transcript)?;
+    bind_instance(transcript, com, n_r, n_s, n_u, m_j, key_bits);
+    verify_binary_pairs(com, n_r, n_s, m_j, radix, &proof.pairs, transcript)
+        .map_err(|error| invalid(format!("binary pair verification failed: {error}")))?;
+    verify_strictly_sorted_bits(&com.u, n_u, key_bits, &proof.sorted_u, transcript)
+        .map_err(|error| invalid(format!("join-key universe sort failed: {error}")))?;
+    verify_membership_with_mult(
+        &com.u,
+        &com.r_key,
+        &com.w_l,
+        n_u,
+        n_r,
+        &proof.membership_l,
+        transcript,
+    )
+    .map_err(|error| invalid(format!("left join-key membership failed: {error}")))?;
+    verify_membership_with_mult(
+        &com.u,
+        &com.s_key,
+        &com.w_r,
+        n_u,
+        n_s,
+        &proof.membership_r,
+        transcript,
+    )
+    .map_err(|error| invalid(format!("right join-key membership failed: {error}")))?;
+    verify_count_identity(&com.w_l, &com.w_r, n_u, m_j, &proof.count, transcript)
+        .map_err(|error| invalid(format!("join completeness count failed: {error}")))?;
     Ok(())
 }
 
@@ -845,7 +955,10 @@ mod tests {
         let (witness, com) = honest_setup(&r_key, &r_other, &s_key, &s_other);
         assert_eq!(witness.m_j, 2);
         assert_eq!(witness.r_other_out, vec![frs(&[1, 3]), frs(&[7, 9])]);
-        assert_eq!(witness.s_other_out, vec![frs(&[100, 100]), frs(&[111, 111])]);
+        assert_eq!(
+            witness.s_other_out,
+            vec![frs(&[100, 100]), frs(&[111, 111])]
+        );
         let ro = refs(&r_other);
         let so = refs(&s_other);
         let mut pt = transcript();
@@ -920,6 +1033,7 @@ mod tests {
             witness.n_u,
             witness.m_j,
             radix,
+            64,
             &proof,
             &mut vt,
         )
@@ -960,7 +1074,9 @@ mod tests {
         assert_eq!(witness.m_j, 6);
         let correct = combined_index_radix(2, 3).unwrap();
         assert_eq!(correct, 4);
-        assert!(attempt_with_witness(&r_key, &r_other, &s_key, &s_other, &witness, correct).is_ok());
+        assert!(
+            attempt_with_witness(&r_key, &r_other, &s_key, &s_other, &witness, correct).is_ok()
+        );
         // Wrong radix (next_pow2(n_R) = 2) rejects.
         assert!(attempt_with_witness(&r_key, &r_other, &s_key, &s_other, &witness, 2).is_err());
     }
@@ -1063,7 +1179,7 @@ mod tests {
             v
         };
         let cols = JoinColumns {
-            r_key: mk(&[(0, 5), (1, 5)]),   // real row 0; fake padding row 1 (key 5)
+            r_key: mk(&[(0, 5), (1, 5)]), // real row 0; fake padding row 1 (key 5)
             r_other: vec![mk(&[(0, 1), (1, 99)])], // emp: real 1; fake 99
             s_key: mk(&[(0, 5)]),
             s_other: vec![mk(&[(0, 10)])],
@@ -1082,7 +1198,8 @@ mod tests {
         let radix = combined_index_radix(n_r, n_s).unwrap();
         let mut pt = transcript();
         let proof =
-            prove_binary_pairs(&cols, &mult_l, &mult_r, n_r, n_s, m_j, radix, &com, &mut pt).unwrap();
+            prove_binary_pairs(&cols, &mult_l, &mult_r, n_r, n_s, m_j, radix, &com, &mut pt)
+                .unwrap();
         let mut vt = transcript();
         assert!(verify_binary_pairs(&com, n_r, n_s, m_j, radix, &proof, &mut vt).is_err());
 
@@ -1099,10 +1216,21 @@ mod tests {
         let hmult_l = source_multiplicities(&honest_cols.rho_l, n_r, 1, n);
         let hmult_r = source_multiplicities(&honest_cols.rho_r, n_s, 1, n);
         let mut pt2 = transcript();
-        let honest_proof =
-            prove_binary_pairs(&honest_cols, &hmult_l, &hmult_r, n_r, n_s, 1, radix, &honest_com, &mut pt2)
-                .unwrap();
+        let honest_proof = prove_binary_pairs(
+            &honest_cols,
+            &hmult_l,
+            &hmult_r,
+            n_r,
+            n_s,
+            1,
+            radix,
+            &honest_com,
+            &mut pt2,
+        )
+        .unwrap();
         let mut vt2 = transcript();
-        assert!(verify_binary_pairs(&honest_com, n_r, n_s, 1, radix, &honest_proof, &mut vt2).is_ok());
+        assert!(
+            verify_binary_pairs(&honest_com, n_r, n_s, 1, radix, &honest_proof, &mut vt2).is_ok()
+        );
     }
 }

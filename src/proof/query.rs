@@ -656,10 +656,10 @@ pub struct SecondRangeSubproof {
 }
 
 /// A layer BGP plan: `k` atoms and the `k - 1` left-deep join steps. `joins[j]` names
-/// the single shared variable's column on the evolving accumulator (`acc_key`) and on
-/// atom `j + 1`'s relation (`rel_key`). Each atom relation has ONE column per VARIABLE
-/// (in S,O order): two for an all-variable atom, one for a subject/object-constant atom.
-/// The accumulator schema evolves as `[r_other_out.., key, s_other_out..]` per step.
+/// the first shared variable's column on the evolving accumulator (`acc_key`) and on
+/// atom `j + 1`'s relation (`rel_key`), plus any further shared key pairs. Each atom
+/// relation has ONE column per VARIABLE (in S,O order): two for an all-variable atom,
+/// one for a subject/object-constant atom.
 #[derive(Clone, Debug)]
 pub struct LayerBgpPlan {
     pub atoms: Vec<LayerBgpAtom>,
@@ -945,6 +945,20 @@ fn bind_layer_bgp_statement(
             b"pow/bgp-layer/rel-key",
             &(step.rel_key as u64).to_le_bytes(),
         );
+        transcript.append_bytes(
+            b"pow/bgp-layer/additional-key-count",
+            &(step.additional_keys.len() as u64).to_le_bytes(),
+        );
+        for (acc_key, rel_key) in &step.additional_keys {
+            transcript.append_bytes(
+                b"pow/bgp-layer/additional-acc-key",
+                &(*acc_key as u64).to_le_bytes(),
+            );
+            transcript.append_bytes(
+                b"pow/bgp-layer/additional-rel-key",
+                &(*rel_key as u64).to_le_bytes(),
+            );
+        }
     }
 }
 
@@ -2409,10 +2423,12 @@ mod tests {
                 JoinStep {
                     acc_key: 1,
                     rel_key: 0,
+                    additional_keys: Vec::new(),
                 }, // y = O(knows) == S(likes)
                 JoinStep {
                     acc_key: 2,
                     rel_key: 0,
+                    additional_keys: Vec::new(),
                 }, // z = O(likes) == S(owns)
             ],
         };
@@ -2471,6 +2487,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 1,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }],
         };
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
@@ -2513,6 +2530,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 1,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }],
         };
         let (mut proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
@@ -2532,10 +2550,12 @@ mod tests {
                 JoinStep {
                     acc_key: 1,
                     rel_key: 0,
+                    additional_keys: Vec::new(),
                 },
                 JoinStep {
                     acc_key: 2,
                     rel_key: 0,
+                    additional_keys: Vec::new(),
                 },
             ],
         };
@@ -2565,6 +2585,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 1,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }],
         };
         assert!(prove_layer_bgp(&lc, &plan).is_err());
@@ -2733,6 +2754,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 0,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }], // x = S(likes) == S(knows)
         };
         let (proof, _coms, _m, _ids) = prove_layer_bgp(&lc, &plan).unwrap();
@@ -2797,6 +2819,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 0,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }], // x = S(name) == S(knows)
         };
         let (proof, _coms, _m, _ids) = prove_layer_bgp(&lc, &plan).unwrap();
@@ -2833,6 +2856,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 0,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }], // y = O(knows) == S(likes)
         };
         let (proof, _coms, _m, _ids) = prove_layer_bgp(&lc, &plan).unwrap();
@@ -2871,6 +2895,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 1,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }], // y = O(knows) == S(likes)
         };
         // Honest: result [x, y] = {(a,b),(c,b)}.
@@ -2939,6 +2964,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 1,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }],
         };
         let err = prove_layer_bgp(&lc, &plan).unwrap_err();
@@ -2965,6 +2991,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 0,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }],
         };
         assert!(prove_layer_bgp(&lc, &ground).is_err());
@@ -2983,6 +3010,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 0,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }],
         };
         assert!(prove_layer_bgp(&lc, &value_subject).is_err());
@@ -3104,6 +3132,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 0,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }],
         }
     }
@@ -3356,6 +3385,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 0,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }],
         };
         assert!(verify_layer_bgp(
@@ -3410,6 +3440,7 @@ mod tests {
             joins: vec![JoinStep {
                 acc_key: 0,
                 rel_key: 0,
+                additional_keys: Vec::new(),
             }],
         };
         assert!(prove_layer_bgp(&lc, &plan).is_err());

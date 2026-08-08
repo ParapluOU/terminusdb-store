@@ -347,7 +347,7 @@ fn ranged_plan() -> LayerBgpPlan {
             }),
             LayerBgpAtom::all_variables(KNOWS.to_vec()),
         ],
-        joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+        joins: vec![JoinStep { acc_key: 0, rel_key: 0, additional_keys: Vec::new() }],
     }
 }
 
@@ -357,7 +357,7 @@ fn plain_plan() -> LayerBgpPlan {
             LayerBgpAtom::all_variables(AGE.to_vec()),
             LayerBgpAtom::all_variables(KNOWS.to_vec()),
         ],
-        joins: vec![JoinStep { acc_key: 0, rel_key: 0 }],
+        joins: vec![JoinStep { acc_key: 0, rel_key: 0, additional_keys: Vec::new() }],
     }
 }
 

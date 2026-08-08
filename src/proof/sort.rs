@@ -51,7 +51,6 @@ const COL_MULT_C: usize = 2;
 const COL_REC_C: usize = 3;
 const COL_REC_D: usize = 4;
 const COL_BIT_BASE: usize = 5;
-const NUM_COLUMNS: usize = COL_BIT_BASE + BITS; // 69
 // chi_bounds index for chi_{n-1} (the difference domain).
 const CHI_N1: usize = 0;
 
@@ -69,7 +68,11 @@ fn f1() -> ArkFr {
 }
 #[inline]
 fn pow2(j: usize) -> ArkFr {
-    ArkFr::from_u64(1u64 << j)
+    let mut value = f1();
+    for _ in 0..j {
+        value = value + value;
+    }
+    value
 }
 
 /// A strict-sortedness proof: the batched sumcheck over the shift LogUp + range
@@ -181,9 +184,9 @@ pub(crate) fn booleanity_claim(
 }
 
 /// `chi_{n-1} * (Sum_j bit_j*2^j - (U_shift - U - 1)) = 0`.
-fn recomposition_claim() -> SumcheckClaim {
-    let mut terms = Vec::with_capacity(BITS + 3);
-    for j in 0..BITS {
+fn recomposition_claim(bits: usize) -> SumcheckClaim {
+    let mut terms = Vec::with_capacity(bits + 3);
+    for j in 0..bits {
         terms.push(Term {
             coeff: pow2(j),
             operands: vec![Operand::Chi(CHI_N1), Operand::Column(COL_BIT_BASE + j)],
@@ -208,7 +211,14 @@ fn recomposition_claim() -> SumcheckClaim {
     }
 }
 
-fn sort_shape(k: usize, n: usize, alpha: ArkFr, beta: ArkFr, tau: ArkFr) -> SumcheckShape {
+fn sort_shape(
+    k: usize,
+    n: usize,
+    bits: usize,
+    alpha: ArkFr,
+    beta: ArkFr,
+    tau: ArkFr,
+) -> SumcheckShape {
     // rec_c: c_fold = idx + beta*U. rec_d: d_fold = (idx+1) + beta*U_shift.
     let rec_c = reciprocal_with_offset(
         COL_REC_C,
@@ -231,14 +241,14 @@ fn sort_shape(k: usize, n: usize, alpha: ArkFr, beta: ArkFr, tau: ArkFr) -> Sumc
     );
     SumcheckShape {
         num_vars: k,
-        num_columns: NUM_COLUMNS,
+        num_columns: COL_BIT_BASE + bits,
         chi_bounds: vec![n.saturating_sub(1)],
         claims: vec![
             rec_c,
             rec_d,
             shift,
-            booleanity_claim(CHI_N1, COL_BIT_BASE, BITS, tau),
-            recomposition_claim(),
+            booleanity_claim(CHI_N1, COL_BIT_BASE, bits, tau),
+            recomposition_claim(bits),
         ],
     }
 }
@@ -263,7 +273,8 @@ pub(crate) fn prove_strictly_sorted_with_witness(
     if u_shift.len() != n_domain || mult_c.len() != n_domain {
         return Err(invalid("shift/multiplicity column length mismatch"));
     }
-    if bit_columns.len() != BITS || bit_columns.iter().any(|c| c.len() != n_domain) {
+    let bits = bit_columns.len();
+    if bits == 0 || bits > 253 || bit_columns.iter().any(|c| c.len() != n_domain) {
         return Err(invalid("bit column layout mismatch"));
     }
     let k = n_domain.trailing_zeros() as usize;
@@ -273,7 +284,7 @@ pub(crate) fn prove_strictly_sorted_with_witness(
     // bind them (with the given com_u).
     let u_shift_commitment = commit_column(u_shift)?;
     let mult_c_commitment = commit_column(mult_c)?;
-    let mut bit_commitments = Vec::with_capacity(BITS);
+    let mut bit_commitments = Vec::with_capacity(bits);
     for column in bit_columns {
         bit_commitments.push(commit_column(column)?);
     }
@@ -289,7 +300,9 @@ pub(crate) fn prove_strictly_sorted_with_witness(
 
     // Round 2: reciprocal witnesses over the fingerprinted (index-augmented) rows.
     let idx_col: Vec<ArkFr> = (0..n_domain).map(|i| ArkFr::from_u64(i as u64)).collect();
-    let idx_plus1: Vec<ArkFr> = (0..n_domain).map(|i| ArkFr::from_u64(i as u64 + 1)).collect();
+    let idx_plus1: Vec<ArkFr> = (0..n_domain)
+        .map(|i| ArkFr::from_u64(i as u64 + 1))
+        .collect();
     let rec_c = reciprocal_witness(alpha, &rlc_fold(beta, &[&idx_col, &u_p]));
     let rec_d = reciprocal_witness(alpha, &rlc_fold(beta, &[&idx_plus1, u_shift]));
     let rec_c_commitment = commit_column(&rec_c)?;
@@ -297,14 +310,8 @@ pub(crate) fn prove_strictly_sorted_with_witness(
     transcript.append_group(b"pow/sort/com-rec-c", &rec_c_commitment);
     transcript.append_group(b"pow/sort/com-rec-d", &rec_d_commitment);
 
-    let shape = sort_shape(k, n, alpha, beta, tau);
-    let mut columns = vec![
-        u_p,
-        u_shift.to_vec(),
-        mult_c.to_vec(),
-        rec_c,
-        rec_d,
-    ];
+    let shape = sort_shape(k, n, bits, alpha, beta, tau);
+    let mut columns = vec![u_p, u_shift.to_vec(), mult_c.to_vec(), rec_c, rec_d];
     columns.extend(bit_columns.iter().cloned());
 
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
@@ -323,7 +330,12 @@ pub(crate) fn prove_strictly_sorted_with_witness(
 
 /// The honest witnesses: `U_shift[i] = U[i+1]`; `mult_c[i] = 1` for `i in [1,n)`;
 /// `bit_columns[j][i]` = bit `j` of `U[i+1] - U[i] - 1` for `i < n-1`.
-fn honest_witness(u: &[ArkFr], n: usize, n_domain: usize) -> (Vec<ArkFr>, Vec<ArkFr>, Vec<Vec<ArkFr>>) {
+fn honest_witness(
+    u: &[ArkFr],
+    n: usize,
+    n_domain: usize,
+    bits: usize,
+) -> (Vec<ArkFr>, Vec<ArkFr>, Vec<Vec<ArkFr>>) {
     let u_p = padded(u, n_domain);
     let mut u_shift = vec![f0(); n_domain];
     for i in 0..n.saturating_sub(1) {
@@ -333,11 +345,11 @@ fn honest_witness(u: &[ArkFr], n: usize, n_domain: usize) -> (Vec<ArkFr>, Vec<Ar
     for i in 1..n {
         mult_c[i] = f1();
     }
-    let mut bit_columns = vec![vec![f0(); n_domain]; BITS];
+    let mut bit_columns = vec![vec![f0(); n_domain]; bits];
     for i in 0..n.saturating_sub(1) {
-        let bits = low_bits(u_shift[i] - u_p[i] - f1(), BITS);
-        for j in 0..BITS {
-            bit_columns[j][i] = bits[j];
+        let value_bits = low_bits(u_shift[i] - u_p[i] - f1(), bits);
+        for j in 0..bits {
+            bit_columns[j][i] = value_bits[j];
         }
     }
     (u_shift, mult_c, bit_columns)
@@ -352,7 +364,24 @@ pub fn prove_strictly_sorted(
     transcript: &mut Transcript254,
 ) -> io::Result<SortedProof> {
     let n_domain = column_domain(u.len(), n)?;
-    let (u_shift, mult_c, bit_columns) = honest_witness(u, n, n_domain);
+    let (u_shift, mult_c, bit_columns) = honest_witness(u, n, n_domain, BITS);
+    prove_strictly_sorted_with_witness(u, n, com_u, &u_shift, &mult_c, &bit_columns, transcript)
+}
+
+/// Prove strict ordering for values whose positive consecutive differences fit in
+/// `bits`. Composite two-u64 keys use 128; scalar graph IDs use the 64-bit wrapper.
+pub fn prove_strictly_sorted_bits(
+    u: &[ArkFr],
+    n: usize,
+    bits: usize,
+    com_u: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<SortedProof> {
+    if bits == 0 || bits > 253 {
+        return Err(invalid("sort bit width must be in 1..=253"));
+    }
+    let n_domain = column_domain(u.len(), n)?;
+    let (u_shift, mult_c, bit_columns) = honest_witness(u, n, n_domain, bits);
     prove_strictly_sorted_with_witness(u, n, com_u, &u_shift, &mult_c, &bit_columns, transcript)
 }
 
@@ -363,6 +392,17 @@ pub fn verify_strictly_sorted(
     proof: &SortedProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
+    verify_strictly_sorted_bits(com_u, n, BITS, proof, transcript)
+}
+
+/// Verify the variable-width strict-order argument used by composite keys.
+pub fn verify_strictly_sorted_bits(
+    com_u: &ArkGT,
+    n: usize,
+    bits: usize,
+    proof: &SortedProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
     let k = proof.sumcheck.round_polys.len();
     if k == 0 || k >= usize::BITS as usize {
         return Err(invalid("sort proof has an implausible variable count"));
@@ -370,8 +410,10 @@ pub fn verify_strictly_sorted(
     if n > (1usize << k) {
         return Err(invalid("real length exceeds the sort domain"));
     }
-    if proof.bit_commitments.len() != BITS {
-        return Err(invalid("sort proof has the wrong number of bit commitments"));
+    if bits == 0 || bits > 253 || proof.bit_commitments.len() != bits {
+        return Err(invalid(
+            "sort proof has the wrong number of bit commitments",
+        ));
     }
 
     transcript.append_group(b"pow/sort/com-u", com_u);
@@ -386,7 +428,7 @@ pub fn verify_strictly_sorted(
     transcript.append_group(b"pow/sort/com-rec-c", &proof.rec_c_commitment);
     transcript.append_group(b"pow/sort/com-rec-d", &proof.rec_d_commitment);
 
-    let shape = sort_shape(k, n, alpha, beta, tau);
+    let shape = sort_shape(k, n, bits, alpha, beta, tau);
     let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
 
     let mut commitments = vec![
@@ -464,14 +506,20 @@ mod tests {
         let n = u.len();
         let n_domain = sort_domain(n).unwrap();
         let com_u = commit_u(&u, n);
-        let (u_shift, mult_c, honest_bits) = honest_witness(&u, n, n_domain);
+        let (u_shift, mult_c, honest_bits) = honest_witness(&u, n, n_domain, BITS);
 
         // Non-boolean bit at a real row -> booleanity rejects.
         let mut non_boolean = honest_bits.clone();
         non_boolean[0][0] = fr(2);
         let mut pt = transcript();
         let proof = prove_strictly_sorted_with_witness(
-            &u, n, &com_u, &u_shift, &mult_c, &non_boolean, &mut pt,
+            &u,
+            n,
+            &com_u,
+            &u_shift,
+            &mult_c,
+            &non_boolean,
+            &mut pt,
         )
         .unwrap();
         let mut vt = transcript();
@@ -482,7 +530,13 @@ mod tests {
         wrong_recompose[0][0] = f1() - wrong_recompose[0][0]; // flip the low bit of row 0
         let mut pt2 = transcript();
         let proof2 = prove_strictly_sorted_with_witness(
-            &u, n, &com_u, &u_shift, &mult_c, &wrong_recompose, &mut pt2,
+            &u,
+            n,
+            &com_u,
+            &u_shift,
+            &mult_c,
+            &wrong_recompose,
+            &mut pt2,
         )
         .unwrap();
         let mut vt2 = transcript();
