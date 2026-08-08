@@ -959,6 +959,7 @@ pub mod argument;
 pub mod bgp;
 pub mod count;
 pub mod dict;
+pub mod envelope;
 pub mod filter;
 pub mod join;
 pub mod join2;
