@@ -245,14 +245,6 @@ pub struct ProofRecord {
     pub triple: CanonicalTriple,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ResolvedPattern {
-    pub subject: Option<u64>,
-    pub predicate: Option<u64>,
-    pub object: Option<u64>,
-    pub value_range: Option<(u64, u64)>,
-}
-
 impl CanonicalTriple {
     pub fn node(
         subject: impl Into<Vec<u8>>,
@@ -321,177 +313,6 @@ pub enum ProofIndex {
     SubjectDictionary = 4,
     PredicateDictionary = 5,
     ObjectDictionary = 6,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TriplePattern {
-    pub subject: Option<Vec<u8>>,
-    pub predicate: Option<Vec<u8>>,
-    pub object: Option<CanonicalObject>,
-    pub value_range: Option<CanonicalValueRange>,
-    pub reverse: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CanonicalValueRange {
-    pub datatype: CanonicalDatatype,
-    pub low: Vec<u8>,
-    pub high: Vec<u8>,
-}
-
-impl CanonicalValueRange {
-    pub fn from_store_bounds(
-        low: &tdb_succinct::TypedDictEntry,
-        high: &tdb_succinct::TypedDictEntry,
-    ) -> io::Result<Self> {
-        if low.datatype() != high.datatype() {
-            return Err(invalid("typed value range bounds have different datatypes"));
-        }
-        let range = Self {
-            datatype: CanonicalDatatype::from_store(low.datatype()),
-            low: low.to_bytes().to_vec(),
-            high: high.to_bytes().to_vec(),
-        };
-        range.validate()?;
-        Ok(range)
-    }
-
-    fn validate(&self) -> io::Result<()> {
-        // These are the only Store lexical encodings whose byte ordering is
-        // currently covered by differential tests against native range scans.
-        // Other datatypes remain explicit in exact-value proofs, but ranges fail
-        // closed until their ordering is independently established.
-        if !matches!(
-            self.datatype,
-            CanonicalDatatype::String | CanonicalDatatype::UInt32
-        ) {
-            return Err(invalid(
-                "datatype is not supported for authenticated ranges",
-            ));
-        }
-        if self.low >= self.high {
-            return Err(invalid("typed value range must be non-empty and half-open"));
-        }
-        Ok(())
-    }
-
-    fn classify(&self, object: &CanonicalObject) -> Ordering {
-        match object {
-            CanonicalObject::Node(_) => Ordering::Less,
-            CanonicalObject::Value { datatype, lexical } => match datatype.cmp(&self.datatype) {
-                Ordering::Equal if lexical < &self.low => Ordering::Less,
-                Ordering::Equal if lexical >= &self.high => Ordering::Greater,
-                Ordering::Equal => Ordering::Equal,
-                other => other,
-            },
-        }
-    }
-}
-
-impl TriplePattern {
-    // Retained scheme-independent query-pattern logic. `validate`/`carrier_cmp`
-    // are currently unused because the Merkle query engine was removed; the
-    // Proof-of-WOQL query argument (a sumcheck over committed columns) will
-    // reuse them. See TODO(proof-of-woql) in `proof::commitment`.
-    #[allow(dead_code)]
-    fn validate(&self) -> io::Result<()> {
-        if self.reverse && self.value_range.is_none() {
-            return Err(invalid(
-                "reverse scans are supported only for authenticated value ranges",
-            ));
-        }
-        if self.object.is_some() && self.value_range.is_some() {
-            return Err(invalid(
-                "exact object and value range are mutually exclusive",
-            ));
-        }
-        if let Some(range) = &self.value_range {
-            range.validate()?;
-        }
-        Ok(())
-    }
-
-    pub fn index(&self) -> ProofIndex {
-        if self.value_range.is_some() {
-            ProofIndex::Value
-        } else if self.subject.is_some() {
-            ProofIndex::Spo
-        } else if self.object.is_some() || self.value_range.is_some() {
-            ProofIndex::Osp
-        } else if self.predicate.is_some() {
-            ProofIndex::Pos
-        } else {
-            ProofIndex::Spo
-        }
-    }
-
-    pub fn matches(&self, triple: &CanonicalTriple) -> bool {
-        self.subject.as_ref().map_or(true, |v| v == &triple.subject)
-            && self
-                .predicate
-                .as_ref()
-                .map_or(true, |v| v == &triple.predicate)
-            && self.object.as_ref().map_or(true, |v| v == &triple.object)
-            && self.value_range.as_ref().map_or(true, |range| {
-                range.classify(&triple.object) == Ordering::Equal
-            })
-    }
-
-    #[allow(dead_code)]
-    fn carrier_cmp(
-        &self,
-        record: &ProofRecord,
-        resolved: &ResolvedPattern,
-        index: ProofIndex,
-    ) -> Ordering {
-        let cmp = |actual: u64, wanted: u64| actual.cmp(&wanted);
-        let fields: Vec<Ordering> = match index {
-            ProofIndex::Spo => {
-                let mut v = Vec::new();
-                if let Some(s) = resolved.subject {
-                    v.push(cmp(record.subject_id, s));
-                    if let Some(p) = resolved.predicate {
-                        v.push(cmp(record.predicate_id, p));
-                        if let Some(o) = resolved.object {
-                            v.push(cmp(record.object_id, o));
-                        }
-                    }
-                }
-                v
-            }
-            ProofIndex::Pos => {
-                let mut v = Vec::new();
-                if let Some(p) = resolved.predicate {
-                    v.push(cmp(record.predicate_id, p));
-                    if let Some(o) = resolved.object {
-                        v.push(cmp(record.object_id, o));
-                    }
-                }
-                v
-            }
-            ProofIndex::Osp => {
-                let mut v = Vec::new();
-                if let Some(object) = resolved.object {
-                    v.push(cmp(record.object_id, object));
-                }
-                v
-            }
-            ProofIndex::Value => {
-                let mut v = Vec::new();
-                if let Some(range) = &self.value_range {
-                    v.push(range.classify(&record.triple.object));
-                }
-                v
-            }
-            ProofIndex::SubjectDictionary
-            | ProofIndex::PredicateDictionary
-            | ProofIndex::ObjectDictionary => Vec::new(),
-        };
-        fields
-            .into_iter()
-            .find(|o| *o != Ordering::Equal)
-            .unwrap_or(Ordering::Equal)
-    }
 }
 
 fn triple_cmp(a: &ProofRecord, b: &ProofRecord, index: ProofIndex) -> Ordering {
@@ -953,7 +774,7 @@ fn validate_construction_heap_budget(
     )
 }
 
-pub use commitment::{CommitmentState, LayerCommitment, QueryProof};
+pub use commitment::{CommitmentState, LayerCommitment};
 
 pub mod argument;
 pub mod bgp;
@@ -1387,13 +1208,6 @@ pub mod commitment {
         ArkGT::deserialize_compressed(bytes)
             .map_err(|error| invalid(format!("commitment deserialization failed: {error}")))
     }
-
-    /// Placeholder for the query-time argument produced by the Proof-of-WOQL
-    /// scheme once query witnesses are implemented.
-    // TODO(proof-of-woql): carry the sumcheck/opening argument over the
-    // committed columns instead of an empty marker.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct QueryProof;
 
     /// Small authenticated summary of a layer's committed delta. Mirrors the
     /// fields the old Merkle `ProofLayerState` exposed, minus the per-index

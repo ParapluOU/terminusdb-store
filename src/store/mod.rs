@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, ValueTriple};
-use crate::proof::{CommitmentState, LayerCommitment, ProofHash, QueryProof, TriplePattern};
+use crate::proof::{CommitmentState, LayerCommitment, ProofHash};
 use crate::storage::archive::{ArchiveLayerStore, DirectoryArchiveBackend, LruArchiveBackend};
 use crate::storage::directory::{DirectoryLabelStore, DirectoryLayerStore};
 use crate::storage::memory::{MemoryLabelStore, MemoryLayerStore};
@@ -332,15 +332,6 @@ impl StoreLayer {
         self.store
             .layer_store
             .migrate_proof_chain(self.layer.name())
-            .await
-    }
-
-    /// Generate a query-time proof for a logical triple pattern.
-    /// STUB: fails closed until the commitment-scheme query argument lands.
-    pub async fn proof_range_witness(&self, pattern: &TriplePattern) -> io::Result<QueryProof> {
-        self.store
-            .layer_store
-            .proof_range_witness(self.layer.name(), pattern)
             .await
     }
 

@@ -17,7 +17,7 @@ use crate::layer::{
 };
 use crate::proof::{
     CanonicalObject, CanonicalTriple, CommitmentState, LayerCommitment, ProofConstructionBudget,
-    ProofRecord, QueryProof, TriplePattern,
+    ProofRecord,
 };
 use crate::Layer;
 use tdb_succinct::bitarray::bitarray_len_from_file;
@@ -274,9 +274,6 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         let node_value_count = layer.node_and_value_count() as u64;
         let predicate_count = layer.predicate_count() as u64;
         tokio::task::spawn_blocking(move || {
-            // TODO(proof-of-woql): from_native_delta currently builds a
-            // placeholder-committed sidecar; the real homomorphic column
-            // commitment (Dory) attaches here.
             LayerCommitment::from_native_delta(
                 parent_state_root,
                 additions,
@@ -349,23 +346,6 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
             top = Some(state);
         }
         top.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty migration chain"))
-    }
-
-    /// Produce a query-time proof for a logical triple pattern.
-    ///
-    /// STUB: the commitment scheme's query argument (a sumcheck over the
-    /// committed columns) is not implemented yet, so this fails closed.
-    // TODO(proof-of-woql): generate the QueryProof (sumcheck/opening argument)
-    // against the per-layer column commitments for the given pattern.
-    async fn proof_range_witness(
-        &self,
-        _name: [u32; 5],
-        _pattern: &TriplePattern,
-    ) -> io::Result<QueryProof> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "query-proof witness not implemented for commitment scheme yet",
-        ))
     }
 
     async fn get_layer_parent_name(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>>;

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, ValueTriple};
 use std::sync::Arc;
 
-use crate::proof::{CommitmentState, LayerCommitment, ProofHash, QueryProof, TriplePattern};
+use crate::proof::{CommitmentState, LayerCommitment, ProofHash};
 use crate::storage::PackImportLimits;
 use crate::store::{
     open_directory_store, open_memory_store, NamedGraph, Store, StoreLayer, StoreLayerBuilder,
@@ -146,10 +146,6 @@ impl SyncStoreLayer {
 
     pub fn migrate_proof_chain(&self) -> io::Result<CommitmentState> {
         task_sync(self.inner.migrate_proof_chain())
-    }
-
-    pub fn proof_range_witness(&self, pattern: &TriplePattern) -> io::Result<QueryProof> {
-        task_sync(self.inner.proof_range_witness(pattern))
     }
 
     /// Create a layer builder based on this layer.
