@@ -790,6 +790,68 @@ pub fn verify_result_columns(
     Ok(())
 }
 
+/// Resolve proven Store ID columns through the layer's authenticated node/value
+/// dictionary. The clear catalog in [`LayerCommitment`] is a verifier-side opening of
+/// the root-bound dictionary commitments, so it is not trusted until both its `(hash,
+/// id)` columns have been rebuilt and recommitted here.
+pub fn resolve_result_objects(
+    layer: &LayerCommitment,
+    expected_root: ProofHash,
+    columns: &[Vec<ArkFr>],
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    if layer.state.commitment_root != expected_root {
+        return Err(invalid(
+            "layer commitment_root does not match the externally-trusted expected root",
+        ));
+    }
+    layer.validate()?;
+
+    let (hashes, ids) = layer.node_value_dictionary_columns()?;
+    if commit_column(&hashes)? != layer.node_value_dict_commitments.0
+        || commit_column(&ids)? != layer.node_value_dict_commitments.1
+    {
+        return Err(invalid(
+            "node/value catalog does not open the root-bound dictionary commitments",
+        ));
+    }
+
+    columns
+        .iter()
+        .map(|column| {
+            column
+                .iter()
+                .map(|id| {
+                    layer
+                        .node_value_catalog
+                        .iter()
+                        .find(|record| ArkFr::from_u64(record.object_id) == *id)
+                        .map(|record| record.triple.object.clone())
+                        .ok_or_else(|| {
+                            invalid("result id is absent from the node/value dictionary")
+                        })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Verify caller-delivered canonical IRIs/typed literals against proven Store ID
+/// columns and the root-authenticated node/value dictionary.
+pub fn verify_result_objects(
+    layer: &LayerCommitment,
+    expected_root: ProofHash,
+    columns: &[Vec<ArkFr>],
+    objects: &[Vec<CanonicalObject>],
+) -> io::Result<()> {
+    let resolved = resolve_result_objects(layer, expected_root, columns)?;
+    if resolved != objects {
+        return Err(invalid(
+            "delivered result objects do not match the authenticated Store IDs",
+        ));
+    }
+    Ok(())
+}
+
 /// The resolved dictionary ids for one atom's constants: the predicate is always a
 /// constant in v1 (so `predicate_id` is unconditional); `subject_id`/`object_id` are
 /// `Some` iff that position is a constant.
@@ -2484,6 +2546,45 @@ mod tests {
             &tampered,
             result.result_len,
             result.result_log_domain,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn delivered_lexical_objects_are_bound_to_authenticated_result_ids() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
+        let plan = LayerBgpPlan {
+            atoms: vec![atom(KNOWS)],
+            joins: Vec::new(),
+        };
+        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+        let columns = result.real_columns();
+        let objects = resolve_result_objects(&lc, lc.state.commitment_root, &columns).unwrap();
+
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0][0], CanonicalObject::Node(iri("a").into_bytes()));
+        assert_eq!(objects[1][0], CanonicalObject::Node(iri("b").into_bytes()));
+        verify_result_objects(&lc, lc.state.commitment_root, &columns, &objects).unwrap();
+
+        let mut tampered = objects.clone();
+        tampered[1][0] = CanonicalObject::Node(iri("c").into_bytes());
+        assert!(
+            verify_result_objects(&lc, lc.state.commitment_root, &columns, &tampered,).is_err()
+        );
+
+        let mut wrong_root = lc.state.commitment_root;
+        wrong_root[0] ^= 0xff;
+        assert!(resolve_result_objects(&lc, wrong_root, &columns).is_err());
+
+        // The serialized catalog is only a claimed opening. Changing it without
+        // changing the root-bound commitment must not change the resolved value.
+        let mut tampered_catalog = (*lc).clone();
+        tampered_catalog.node_value_catalog[0].triple.object =
+            CanonicalObject::Node(iri("forged").into_bytes());
+        assert!(resolve_result_objects(
+            &tampered_catalog,
+            lc.state.commitment_root,
+            &columns,
         )
         .is_err());
     }
