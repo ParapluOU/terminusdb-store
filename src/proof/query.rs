@@ -618,6 +618,8 @@ pub struct LayerBgpAtom {
     pub predicate_term: Vec<u8>,
     pub object: AtomTerm,
     pub object_range: Option<ObjectRangeSpec>,
+    /// Require the subject and object variables to be equal within each selected row.
+    pub subject_object_equal: bool,
 }
 
 impl LayerBgpAtom {
@@ -629,6 +631,7 @@ impl LayerBgpAtom {
             predicate_term,
             object: AtomTerm::Variable,
             object_range: None,
+            subject_object_equal: false,
         }
     }
 
@@ -798,6 +801,14 @@ fn validate_atom(atom: &LayerBgpAtom) -> io::Result<()> {
             ));
         }
     }
+    if atom.subject_object_equal
+        && (!matches!(atom.subject, AtomTerm::Variable)
+            || !matches!(atom.object, AtomTerm::Variable))
+    {
+        return Err(invalid(
+            "subject/object equality requires two variable positions",
+        ));
+    }
     Ok(())
 }
 
@@ -837,7 +848,17 @@ fn atom_filter_spec(atom: &LayerBgpAtom, ids: &AtomIds) -> AtomFilterSpec {
     if matches!(atom.object, AtomTerm::Variable) {
         kept.push(Position::O);
     }
-    AtomFilterSpec { constants, kept }
+    let equalities = if atom.subject_object_equal {
+        kept.retain(|position| *position != Position::O);
+        vec![(Position::S, Position::O)]
+    } else {
+        Vec::new()
+    };
+    AtomFilterSpec {
+        constants,
+        kept,
+        equalities,
+    }
 }
 
 /// Bind one atom term (subject or object) plus its optional resolved id into the shared
@@ -877,6 +898,10 @@ fn bind_layer_bgp_statement(
         transcript.append_bytes(b"pow/bgp-layer/pred-term", &atom.predicate_term);
         transcript.append_bytes(b"pow/bgp-layer/pred-id", &ids.predicate_id.to_le_bytes());
         bind_atom_term(transcript, &atom.object, ids.object_id);
+        transcript.append_bytes(
+            b"pow/bgp-layer/subject-object-equal",
+            &[u8::from(atom.subject_object_equal)],
+        );
         // Pin the optional object range (op, datatype T, constant c, bit-width) so the
         // whole comparison is part of the statement the challenges depend on.
         match &atom.object_range {
@@ -2702,6 +2727,7 @@ mod tests {
                     predicate_term: KNOWS.to_vec(),
                     object: node_const("b"),
                     object_range: None,
+                    subject_object_equal: false,
                 },
             ],
             joins: vec![JoinStep {
@@ -2764,6 +2790,7 @@ mod tests {
                     predicate_term: NAME.to_vec(),
                     object: AtomTerm::ValueConstant(dt, lex),
                     object_range: None,
+                    subject_object_equal: false,
                 },
                 LayerBgpAtom::all_variables(KNOWS.to_vec()),
             ],
@@ -2799,6 +2826,7 @@ mod tests {
                     predicate_term: KNOWS.to_vec(),
                     object: AtomTerm::Variable,
                     object_range: None,
+                    subject_object_equal: false,
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
@@ -2837,6 +2865,7 @@ mod tests {
                     predicate_term: LIKES.to_vec(),
                     object: node_const("g"),
                     object_range: None,
+                    subject_object_equal: false,
                 },
             ],
             joins: vec![JoinStep {
@@ -2904,6 +2933,7 @@ mod tests {
                     predicate_term: LIKES.to_vec(),
                     object: node_const("absent"),
                     object_range: None,
+                    subject_object_equal: false,
                 },
             ],
             joins: vec![JoinStep {
@@ -2928,6 +2958,7 @@ mod tests {
                     predicate_term: KNOWS.to_vec(),
                     object: node_const("b"),
                     object_range: None,
+                    subject_object_equal: false,
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
@@ -2945,6 +2976,7 @@ mod tests {
                     predicate_term: KNOWS.to_vec(),
                     object: AtomTerm::Variable,
                     object_range: None,
+                    subject_object_equal: false,
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
@@ -3226,6 +3258,58 @@ mod tests {
     }
 
     #[test]
+    fn layer_bgp_subject_object_self_loop_is_same_row_equality() {
+        let lc = build_layer(&[
+            ("a", "knows", "a"),
+            ("a", "knows", "b"),
+            ("c", "knows", "c"),
+            ("x", "likes", "x"),
+        ]);
+        let mut atom = LayerBgpAtom::all_variables(KNOWS.to_vec());
+        atom.subject_object_equal = true;
+        let plan = LayerBgpPlan {
+            atoms: vec![atom],
+            joins: vec![],
+        };
+        let (proof, commitments, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        assert_eq!(m, 2);
+        assert_eq!(commitments.len(), 1);
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &ids,
+            &commitments,
+            m,
+            &proof,
+        )
+        .unwrap();
+
+        let mut equality_removed = plan.clone();
+        equality_removed.atoms[0].subject_object_equal = false;
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &equality_removed,
+            &ids,
+            &commitments,
+            m,
+            &proof,
+        )
+        .is_err());
+
+        let predicate_id = ids[0];
+        let mut expected: Vec<ArkFr> = lc
+            .additions
+            .iter()
+            .filter(|row| row.predicate_id == predicate_id && row.subject_id == row.object_id)
+            .map(|row| fr(row.subject_id))
+            .collect();
+        expected.resize(padded_len(lc.additions.len()).unwrap(), f0());
+        assert_eq!(commitments[0], commit_column(&expected).unwrap());
+    }
+
+    #[test]
     fn layer_bgp_object_range_wrong_expected_root_is_rejected() {
         let lc = build_age_name_layer();
         let plan = age_range_plan(RangeOp::Gt, 18);
@@ -3319,6 +3403,7 @@ mod tests {
                         b_bits: 64,
                         second: None,
                     }),
+                    subject_object_equal: false,
                 },
                 LayerBgpAtom::all_variables(NAME.to_vec()),
             ],

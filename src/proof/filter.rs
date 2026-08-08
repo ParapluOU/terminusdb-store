@@ -318,6 +318,9 @@ impl Position {
 pub struct AtomFilterSpec {
     pub constants: Vec<(Position, ArkFr)>,
     pub kept: Vec<Position>,
+    /// Same-row equality constraints. The right-hand position is an alias of the left
+    /// and is therefore omitted from `kept`.
+    pub equalities: Vec<(Position, Position)>,
 }
 
 /// A kept (output) column source: a variable base position, or the public all-ones
@@ -334,11 +337,12 @@ impl AtomFilterSpec {
         Self {
             constants: vec![(Position::P, pred)],
             kept: vec![Position::S, Position::O],
+            equalities: Vec::new(),
         }
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.constants.len() + self.kept.len() != 3 {
+        if self.constants.len() + self.kept.len() + self.equalities.len() != 3 {
             return Err(invalid("atom filter spec must cover S, P, O exactly once"));
         }
         let mut is_constant = [false; 3];
@@ -348,10 +352,16 @@ impl AtomFilterSpec {
             }
             is_constant[pos.tag() as usize] = true;
         }
+        for (left, right) in &self.equalities {
+            if left == right || is_constant[left.tag() as usize] || is_constant[right.tag() as usize] {
+                return Err(invalid("atom filter equality must relate two distinct variable positions"));
+            }
+        }
+        let aliased: Vec<Position> = self.equalities.iter().map(|(_, right)| *right).collect();
         let expected: Vec<Position> = [Position::S, Position::P, Position::O]
             .iter()
             .copied()
-            .filter(|p| !is_constant[p.tag() as usize])
+            .filter(|p| !is_constant[p.tag() as usize] && !aliased.contains(p))
             .collect();
         if self.kept != expected {
             return Err(invalid(
@@ -398,7 +408,7 @@ fn a_col_unit_in(num_kept: usize) -> usize {
 ///   A: sel * lhs = 0        B: (chi_n - sel) - lhs * w = 0
 /// For |C| = 1 this is exactly the classic Q1 (a single term, `beta_c^0 = 1`).
 fn selection_claims(spec: &AtomFilterSpec, beta_c: ArkFr) -> (SumcheckClaim, SumcheckClaim) {
-    let mut a_terms = Vec::with_capacity(2 * spec.constants.len());
+    let mut a_terms = Vec::with_capacity(2 * (spec.constants.len() + spec.equalities.len()));
     let mut b_terms = vec![
         Term {
             coeff: f1(),
@@ -429,6 +439,27 @@ fn selection_claims(spec: &AtomFilterSpec, beta_c: ArkFr) -> (SumcheckClaim, Sum
         b_terms.push(Term {
             coeff: power * *c,
             operands: vec![Operand::Column(A_COL_W)],
+        });
+        power = power * beta_c;
+    }
+    for (left, right) in &spec.equalities {
+        let left_col = left.base_col();
+        let right_col = right.base_col();
+        a_terms.push(Term {
+            coeff: power,
+            operands: vec![Operand::Column(A_COL_SEL), Operand::Column(left_col)],
+        });
+        a_terms.push(Term {
+            coeff: f0() - power,
+            operands: vec![Operand::Column(A_COL_SEL), Operand::Column(right_col)],
+        });
+        b_terms.push(Term {
+            coeff: f0() - power,
+            operands: vec![Operand::Column(left_col), Operand::Column(A_COL_W)],
+        });
+        b_terms.push(Term {
+            coeff: power,
+            operands: vec![Operand::Column(right_col), Operand::Column(A_COL_W)],
         });
         power = power * beta_c;
     }
@@ -521,6 +552,9 @@ fn bind_spec(transcript: &mut Transcript254, spec: &AtomFilterSpec) {
     for pos in &spec.kept {
         transcript.append_bytes(A_LABEL_SPEC, &[pos.tag()]);
     }
+    for (left, right) in &spec.equalities {
+        transcript.append_bytes(A_LABEL_SPEC, &[left.tag(), right.tag()]);
+    }
 }
 
 /// Honest selection: `sel_i = 1` iff `i < real_rows` AND every constant position matches.
@@ -537,7 +571,10 @@ fn atom_sel(
                 && spec
                     .constants
                     .iter()
-                    .all(|(pos, c)| base_column(*pos, s, p, o)[i] == *c);
+                    .all(|(pos, c)| base_column(*pos, s, p, o)[i] == *c)
+                && spec.equalities.iter().all(|(left, right)| {
+                    base_column(*left, s, p, o)[i] == base_column(*right, s, p, o)[i]
+                });
             if matches {
                 f1()
             } else {
@@ -566,6 +603,13 @@ fn atom_w(
             let mut power = f1();
             for (pos, c) in &spec.constants {
                 acc = acc + power * (base_column(*pos, s, p, o)[i] - *c);
+                power = power * beta_c;
+            }
+            for (left, right) in &spec.equalities {
+                acc = acc
+                    + power
+                        * (base_column(*left, s, p, o)[i]
+                            - base_column(*right, s, p, o)[i]);
                 power = power * beta_c;
             }
             acc
@@ -1686,6 +1730,7 @@ mod tests {
         AtomFilterSpec {
             constants: constants.iter().map(|(p, c)| (*p, fr(*c))).collect(),
             kept: kept.to_vec(),
+            equalities: Vec::new(),
         }
     }
 
@@ -1712,6 +1757,21 @@ mod tests {
         let mut vt = transcript();
         verify_atom_filter(spec, n, &com_s, &com_p, &com_o, &com_kept, m, &proof, &mut vt)?;
         Ok((m, com_kept))
+    }
+
+    #[test]
+    fn atom_filter_same_row_equality_is_complete() {
+        let s = col16(&[1, 2, 3, 4]);
+        let p = col16(&[10, 10, 10, 10]);
+        let o = col16(&[1, 9, 3, 8]);
+        let spec = AtomFilterSpec {
+            constants: vec![(Position::P, fr(10))],
+            kept: vec![Position::S],
+            equalities: vec![(Position::S, Position::O)],
+        };
+        let (m, commitments) = atom_honest(&spec, &s, &p, &o, 4).unwrap();
+        assert_eq!(m, 2);
+        assert_eq!(commitments.len(), 1);
     }
 
     // Prove+verify a compacted atom filter with an EXPLICIT sel + kept_out (malicious
