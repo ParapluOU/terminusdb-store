@@ -23,6 +23,9 @@ use super::filter::{
     AtomFilterProof, BooleanProductProof, CompactionOnlyProof, FilterProof, FullFilterProof,
     SelectionOnlyProof,
 };
+use super::group::{
+    verify_group_extrema, GroupExtremaEntryProof, GroupExtremaKind, GroupExtremaProof,
+};
 use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
 use super::query::{
@@ -51,7 +54,8 @@ const VERSION: u32 = 4;
 const UNION_VERSION: u32 = 2;
 const ANTI_VERSION: u32 = 4;
 const OUTER_VERSION: u32 = 1;
-const RECURSIVE_VERSION: u32 = 1;
+// v2 adds the scalar-key GroupBy+RangeMin/RangeMax recursive node (wire tag 5).
+const RECURSIVE_VERSION: u32 = 2;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -301,6 +305,38 @@ wire_struct!(RelationEqualityProof {
     inverse_commitment,
     compaction
 });
+wire_struct!(GroupExtremaEntryProof {
+    group,
+    group_commitments,
+    group_len,
+    membership,
+    membership_commitments,
+    membership_len,
+    relocate_value,
+    relocate_dict_id,
+    relocate_dict_value,
+    relocate_dict_datatype,
+    com_value_at_d,
+    com_dict_id_at_d,
+    com_dict_value_at_d,
+    com_dict_datatype_at_d,
+    range,
+    com_range_selection
+});
+wire_struct!(GroupExtremaProof { entries });
+
+impl Wire for GroupExtremaKind {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self { Self::Min => 0u8, Self::Max => 1u8 }.put(out)
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        match u8::get(reader)? {
+            0 => Ok(Self::Min),
+            1 => Ok(Self::Max),
+            _ => Err(invalid("invalid group-extrema kind")),
+        }
+    }
+}
 wire_struct!(RelocationProof {
     source_eval,
     target_eval,
@@ -1569,6 +1605,15 @@ pub enum RelationProofPlanKind {
         input: Box<RelationProofPlan>,
         constraint: RelationEqualityPlan,
     },
+    /// Scalar-key `GroupBy`, with its private bag consumed immediately by
+    /// `RangeMin`/`RangeMax`; output is exactly `[key, original-value-id]`.
+    GroupExtrema {
+        input: Box<RelationProofPlan>,
+        key_column: usize,
+        value_column: usize,
+        datatype: CanonicalDatatype,
+        kind: GroupExtremaKind,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1823,6 +1868,21 @@ impl RelationProofPlan {
                 validate_equality_plan(constraint, &descriptors, ground)?;
                 Ok((descriptors, ground))
             }
+            RelationProofPlanKind::GroupExtrema { input, key_column, value_column, datatype, .. } => {
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                if ground || *key_column == *value_column {
+                    return Err(invalid("invalid group-extrema child shape"));
+                }
+                let key = descriptors.get(*key_column).copied().ok_or_else(|| invalid("group-extrema key column out of range"))?;
+                let value = descriptors.get(*value_column).copied().ok_or_else(|| invalid("group-extrema value column out of range"))?;
+                if key.nullable || value.nullable || value.namespace != ResultIdNamespace::NodeValue {
+                    return Err(invalid("group-extrema requires nonnullable Store-id columns"));
+                }
+                if !numeric_datatype(*datatype) || matches!(datatype, CanonicalDatatype::Decimal | CanonicalDatatype::BigInt | CanonicalDatatype::PositiveInteger | CanonicalDatatype::NonNegativeInteger | CanonicalDatatype::NonPositiveInteger | CanonicalDatatype::NegativeInteger) {
+                    return Err(invalid("group-extrema datatype is not fixed-width order-preserving"));
+                }
+                Ok((vec![key, ResultColumnDescriptor { namespace: ResultIdNamespace::NodeValue, nullable: false }], false))
+            }
         }
     }
 
@@ -1866,6 +1926,10 @@ pub enum RecursiveRelationProof {
     Equality {
         input: Box<RecursiveRelationEnvelope>,
         proof: Box<RelationEqualityProof>,
+    },
+    GroupExtrema {
+        input: Box<RecursiveRelationEnvelope>,
+        proof: Box<GroupExtremaProof>,
     },
 }
 
@@ -2102,6 +2166,33 @@ impl RecursiveRelationEnvelope {
                     &mut transcript,
                 )?;
             }
+            (
+                RecursiveRelationProof::GroupExtrema { input, proof },
+                RelationProofPlanKind::GroupExtrema { input: input_plan, key_column, value_column, datatype, kind },
+            ) => {
+                input.verify_bounded(layer, expected_root, input_plan, depth + 1, nodes)?;
+                if self.result_columns.len() != 2 || self.result_len > self.result_columns[0].len() || self.result_len > self.result_columns[1].len() {
+                    return Err(invalid("group-extrema result column shape mismatch"));
+                }
+                let key_namespace = expected_descriptors[0].namespace;
+                let view = layer.verifier_view();
+                let resolve_id = |field: ArkFr, namespace: ResultIdNamespace| -> io::Result<u64> {
+                    match namespace {
+                        ResultIdNamespace::Predicate => view.predicate_catalog.iter()
+                            .find(|r| ArkFr::from_u64(r.predicate_id) == field).map(|r| r.predicate_id),
+                        ResultIdNamespace::NodeValue => view.node_value_catalog.iter()
+                            .find(|r| ArkFr::from_u64(r.object_id) == field).map(|r| r.object_id),
+                    }.ok_or_else(|| invalid("group-extrema output id absent from planned namespace"))
+                };
+                let rows = (0..self.result_len).map(|i| Ok((
+                    resolve_id(self.result_columns[0][i], key_namespace)?,
+                    resolve_id(self.result_columns[1][i], ResultIdNamespace::NodeValue)?,
+                ))).collect::<io::Result<Vec<_>>>()?;
+                let mut transcript = super::argument::Transcript254::new(b"parture-group-extrema-envelope");
+                transcript.append_bytes(b"pow/group-envelope/root", &expected_root);
+                transcript.append_bytes(b"pow/group-envelope/query", &plan.query_digest);
+                verify_group_extrema(&input.relation_commit(None)?, *key_column, *value_column, *datatype, *kind, &rows, layer, proof, &mut transcript)?;
+            }
             _ => return Err(invalid("recursive relation proof variant mismatch")),
         }
 
@@ -2191,6 +2282,11 @@ impl RecursiveRelationEnvelope {
                 input.put_bounded(out, depth + 1, nodes)?;
                 proof.put(out)?;
             }
+            RecursiveRelationProof::GroupExtrema { input, proof } => {
+                5u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+                proof.put(out)?;
+            }
         }
         self.result_commitments.put(out)?;
         self.result_columns.put(out)?;
@@ -2241,6 +2337,10 @@ impl RecursiveRelationEnvelope {
             4 => RecursiveRelationProof::Equality {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 proof: Box::<RelationEqualityProof>::get(reader)?,
+            },
+            5 => RecursiveRelationProof::GroupExtrema {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                proof: Box::<GroupExtremaProof>::get(reader)?,
             },
             _ => return Err(invalid("invalid recursive relation proof tag")),
         };

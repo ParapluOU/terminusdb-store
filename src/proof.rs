@@ -812,6 +812,7 @@ pub mod count;
 pub mod dict;
 pub mod envelope;
 pub mod equality;
+pub mod group;
 pub mod filter;
 pub mod join;
 pub mod join2;
@@ -1293,7 +1294,7 @@ pub mod commitment {
     /// are `<= 8`, so the value always fits a `u64`. A supported type whose lexical
     /// width does NOT match the expected fixed width is treated as corruption and
     /// fails closed (this cannot happen for store-produced values).
-    fn node_value_op_value(object: &CanonicalObject) -> io::Result<ArkFr> {
+    pub(crate) fn node_value_op_value(object: &CanonicalObject) -> io::Result<ArkFr> {
         let (datatype, lexical) = match object {
             CanonicalObject::Value { datatype, lexical } => (*datatype, lexical),
             CanonicalObject::Node(_) => return Ok(<ArkFr as DoryField>::zero()),
