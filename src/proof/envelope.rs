@@ -35,6 +35,8 @@ use super::group::{
 };
 use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
+use super::multiorder::{prove_exact_multi_order_with_context, verify_exact_multi_order, ExactMultiOrderProof};
+use super::lexsort::LexicographicSortedProof;
 use super::order::{
     prove_exact_scalar_order_with_context, verify_exact_scalar_order, ExactScalarOrderProof,
     OrderDirection,
@@ -70,7 +72,7 @@ const UNION_VERSION: u32 = 2;
 const ANTI_VERSION: u32 = 4;
 const OUTER_VERSION: u32 = 1;
 // v4 adds exact ordered Start/Limit slices (wire tag 7).
-const RECURSIVE_VERSION: u32 = 4;
+const RECURSIVE_VERSION: u32 = 5;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -358,6 +360,8 @@ wire_struct!(ExactScalarOrderProof {
     datatype_inverse_commitment,
     sorted
 });
+wire_struct!(LexicographicSortedProof { sorted });
+wire_struct!(ExactMultiOrderProof { permutation, lexicographic });
 
 impl Wire for OrderDirection {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
@@ -1684,6 +1688,11 @@ pub enum RelationProofPlanKind {
         datatype: CanonicalDatatype,
         direction: OrderDirection,
     },
+    ExactMultiOrder {
+        input: Box<RelationProofPlan>,
+        datatypes: Vec<CanonicalDatatype>,
+        directions: Vec<OrderDirection>,
+    },
     /// Exact contiguous slice of an authenticated ordered relation. `None` returns the
     /// complete suffix after `offset`; `Some(limit)` returns at most that many rows.
     ExactOrderedSlice {
@@ -1990,6 +1999,14 @@ impl RelationProofPlan {
                 }
                 Ok((descriptors, false))
             }
+            RelationProofPlanKind::ExactMultiOrder { input, datatypes, directions } => {
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                if ground || !(2..=3).contains(&descriptors.len()) || datatypes.len() != descriptors.len() || directions.len() != descriptors.len()
+                    || descriptors.iter().any(|d| d.nullable || d.namespace != ResultIdNamespace::NodeValue) {
+                    return Err(invalid("invalid exact multikey order child shape"));
+                }
+                Ok((descriptors, false))
+            }
             RelationProofPlanKind::ExactOrderedSlice { input, .. } => {
                 if !matches!(
                     input.kind,
@@ -2066,6 +2083,10 @@ pub enum RecursiveRelationProof {
     ExactScalarOrder {
         input: Box<RecursiveRelationEnvelope>,
         proof: Box<ExactScalarOrderProof>,
+    },
+    ExactMultiOrder {
+        input: Box<RecursiveRelationEnvelope>,
+        proof: Box<ExactMultiOrderProof>,
     },
     ExactOrderedSlice {
         input: Box<RecursiveRelationEnvelope>,
@@ -2316,6 +2337,14 @@ impl RecursiveRelationEnvelope {
                     result.log_domain,
                     result.n,
                 )
+            }
+            RelationProofPlanKind::ExactMultiOrder { input, datatypes, directions } => {
+                let input_envelope = Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let mut transcript = Transcript254::new(b"parture-multi-order-envelope");
+                transcript.append_bytes(b"pow/multi-order-envelope/root", &layer.state.commitment_root);
+                transcript.append_bytes(b"pow/multi-order-envelope/query", &plan.query_digest);
+                let result = prove_exact_multi_order_with_context(context, layer, &input_envelope.relation_witness(None)?, datatypes, directions, &mut transcript)?;
+                Self::finish_proved(layer, plan, RecursiveRelationProof::ExactMultiOrder { input: Box::new(input_envelope), proof: Box::new(result.proof) }, result.commitments, result.columns, result.log_domain, result.n)
             }
             RelationProofPlanKind::ExactOrderedSlice {
                 input,
@@ -2632,6 +2661,16 @@ impl RecursiveRelationEnvelope {
                 )?;
             }
             (
+                RecursiveRelationProof::ExactMultiOrder { input, proof },
+                RelationProofPlanKind::ExactMultiOrder { input: input_plan, datatypes, directions },
+            ) => {
+                input.verify_bounded(layer, expected_root, input_plan, depth + 1, nodes)?;
+                let mut transcript = Transcript254::new(b"parture-multi-order-envelope");
+                transcript.append_bytes(b"pow/multi-order-envelope/root", &expected_root);
+                transcript.append_bytes(b"pow/multi-order-envelope/query", &plan.query_digest);
+                verify_exact_multi_order(layer, &input.relation_commit(None)?, &self.result_columns, datatypes, directions, &self.result_commitments, self.result_len, self.result_log_domain, proof, &mut transcript)?;
+            }
+            (
                 RecursiveRelationProof::ExactOrderedSlice { input },
                 RelationProofPlanKind::ExactOrderedSlice {
                     input: input_plan,
@@ -2798,6 +2837,11 @@ impl RecursiveRelationEnvelope {
                 7u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
             }
+            RecursiveRelationProof::ExactMultiOrder { input, proof } => {
+                8u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+                proof.put(out)?;
+            }
             RecursiveRelationProof::GroupExtrema { input, proof } => {
                 5u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
@@ -2864,6 +2908,10 @@ impl RecursiveRelationEnvelope {
             },
             7 => RecursiveRelationProof::ExactOrderedSlice {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+            },
+            8 => RecursiveRelationProof::ExactMultiOrder {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                proof: Box::<ExactMultiOrderProof>::get(reader)?,
             },
             _ => return Err(invalid("invalid recursive relation proof tag")),
         };
