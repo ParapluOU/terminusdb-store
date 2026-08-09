@@ -85,8 +85,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v19 adds exact private Collect-list sum with findall's empty-list policy.
-const RECURSIVE_VERSION: u32 = 19;
+// v20 adds exact private Collect-list integral extrema.
+const RECURSIVE_VERSION: u32 = 20;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1779,6 +1779,14 @@ pub enum RelationProofPlanKind {
         template: CollectionSumTemplate,
         datatype: CanonicalDatatype,
     },
+    /// Exact min/max of a private list produced by `findall/3`. Empty input
+    /// fails like leading Prolog RangeMin/RangeMax and therefore emits no row.
+    CollectionExtrema {
+        input: Box<RelationProofPlan>,
+        value_column: usize,
+        datatype: CanonicalDatatype,
+        kind: GroupExtremaKind,
+    },
     BagUnion {
         branches: Vec<RelationProofPlan>,
         /// Parent output column -> child output column, once per ordered branch.
@@ -2249,6 +2257,38 @@ impl RelationProofPlan {
                     false,
                 ))
             }
+            RelationProofPlanKind::CollectionExtrema {
+                input,
+                value_column,
+                datatype,
+                ..
+            } => {
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                let value = descriptors
+                    .get(*value_column)
+                    .copied()
+                    .ok_or_else(|| invalid("collection-extrema value column out of range"))?;
+                if ground
+                    || value.nullable
+                    || value.namespace != ResultIdNamespace::NodeValue
+                    || !matches!(
+                        datatype,
+                        CanonicalDatatype::UInt8
+                            | CanonicalDatatype::UInt16
+                            | CanonicalDatatype::UInt32
+                            | CanonicalDatatype::UInt64
+                            | CanonicalDatatype::Int8
+                            | CanonicalDatatype::Int16
+                            | CanonicalDatatype::Int32
+                            | CanonicalDatatype::Int64
+                    )
+                {
+                    return Err(invalid(
+                        "collection-extrema requires one exact nonnullable integral Store value",
+                    ));
+                }
+                Ok((vec![value], false))
+            }
             RelationProofPlanKind::BagUnion { branches, mappings } => {
                 if branches.len() < 2
                     || branches.len() != mappings.len()
@@ -2511,6 +2551,9 @@ pub enum RecursiveRelationProof {
         input: Box<RecursiveRelationEnvelope>,
     },
     CollectionSum {
+        input: Box<RecursiveRelationEnvelope>,
+    },
+    CollectionExtrema {
         input: Box<RecursiveRelationEnvelope>,
     },
     BagUnion {
@@ -2979,6 +3022,50 @@ fn derived_collection_sum_column(
     Ok(vec![vec![sum.field()?]])
 }
 
+fn derived_collection_extrema_column(
+    layer: &impl VerifierLayer,
+    input: &RecursiveRelationEnvelope,
+    value_column: usize,
+    datatype: CanonicalDatatype,
+    kind: GroupExtremaKind,
+) -> io::Result<Vec<Vec<ArkFr>>> {
+    let values = input
+        .result_columns
+        .get(value_column)
+        .ok_or_else(|| invalid("collection-extrema value column out of range"))?;
+    if values.len() != input.result_len {
+        return Err(invalid("collection-extrema input column length mismatch"));
+    }
+    let view = layer.verifier_view();
+    view.validate()?;
+    let mut selected: Option<(ArkFr, ark_bn254::Fr)> = None;
+    for field in values.iter().take(input.result_len) {
+        let record = view
+            .node_value_catalog
+            .iter()
+            .find(|record| ArkFr::from_u64(record.object_id) == *field)
+            .ok_or_else(|| invalid("collection-extrema value is absent from the catalog"))?;
+        let CanonicalObject::Value {
+            datatype: actual, ..
+        } = &record.triple.object
+        else {
+            return Err(invalid("collection-extrema value is not a typed literal"));
+        };
+        if *actual != datatype {
+            return Err(invalid("collection-extrema value has the wrong exact datatype"));
+        }
+        let encoding = super::commitment::node_value_op_value(&record.triple.object)?.0;
+        let replace = selected.as_ref().is_none_or(|(_, current)| match kind {
+            GroupExtremaKind::Min => encoding.into_bigint() < current.into_bigint(),
+            GroupExtremaKind::Max => encoding.into_bigint() > current.into_bigint(),
+        });
+        if replace {
+            selected = Some((*field, encoding));
+        }
+    }
+    Ok(vec![selected.map(|(field, _)| vec![field]).unwrap_or_default()])
+}
+
 impl RecursiveRelationEnvelope {
     fn relation_commit(&self, mapping: Option<&[usize]>) -> io::Result<RelationCommit> {
         let commitments = match mapping {
@@ -3135,6 +3222,36 @@ impl RecursiveRelationEnvelope {
                     vec![column],
                     1,
                     1,
+                )
+            }
+            RelationProofPlanKind::CollectionExtrema {
+                input,
+                value_column,
+                datatype,
+                kind,
+            } => {
+                let input_envelope =
+                    Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let mut columns = derived_collection_extrema_column(
+                    layer,
+                    &input_envelope,
+                    *value_column,
+                    *datatype,
+                    *kind,
+                )?;
+                let n = columns[0].len();
+                columns[0].resize(2, ArkFr::zero());
+                let commitments = vec![context.commit_column(&columns[0])?];
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::CollectionExtrema {
+                        input: Box::new(input_envelope),
+                    },
+                    commitments,
+                    columns,
+                    1,
+                    n,
                 )
             }
             RelationProofPlanKind::GeneratedU64Filter {
@@ -3918,6 +4035,44 @@ impl RecursiveRelationEnvelope {
                     return Err(invalid("collection-sum commitment mismatch"));
                 }
             }
+            (
+                RecursiveRelationProof::CollectionExtrema { input },
+                RelationProofPlanKind::CollectionExtrema {
+                    input: input_plan,
+                    value_column,
+                    datatype,
+                    kind,
+                },
+            ) => {
+                input.verify_bounded(
+                    layer,
+                    expected_root,
+                    input_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let expected_columns = derived_collection_extrema_column(
+                    layer,
+                    input,
+                    *value_column,
+                    *datatype,
+                    *kind,
+                )?;
+                let expected_len = expected_columns[0].len();
+                if self.result_len != expected_len
+                    || self.result_log_domain != 1
+                    || self.result_columns != expected_columns
+                {
+                    return Err(invalid(
+                        "collection-extrema result is not the exact derived extremum",
+                    ));
+                }
+                let mut padded = expected_columns[0].clone();
+                padded.resize(2, ArkFr::zero());
+                if self.result_commitments != vec![commit_column(&padded)?] {
+                    return Err(invalid("collection-extrema commitment mismatch"));
+                }
+            }
             (RecursiveRelationProof::Bgp(envelope), RelationProofPlanKind::Bgp(bgp)) => {
                 envelope.verify(layer, expected_root, bgp, plan.query_digest)?;
                 if self.result_commitments != envelope.result_commitments
@@ -4419,6 +4574,10 @@ impl RecursiveRelationEnvelope {
                 18u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
             }
+            RecursiveRelationProof::CollectionExtrema { input } => {
+                19u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+            }
             RecursiveRelationProof::Bgp(envelope) => {
                 0u8.put(out)?;
                 envelope.put(out)?;
@@ -4524,6 +4683,9 @@ impl RecursiveRelationEnvelope {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             18 => RecursiveRelationProof::CollectionSum {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+            },
+            19 => RecursiveRelationProof::CollectionExtrema {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             0 => RecursiveRelationProof::Bgp(Box::<LayerBgpEnvelope>::get(reader)?),
@@ -5792,6 +5954,99 @@ mod tests {
             .unwrap(),
             vec![vec![ArkFr::zero()]]
         );
+    }
+
+    #[test]
+    fn recursive_collection_extrema_preserves_original_id_and_empty_has_no_row() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (subject, value) in [
+            ("a", i64::MIN),
+            ("b", -3),
+            ("c", -3),
+            ("d", 2),
+            ("e", i64::MAX),
+        ] {
+            builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri(subject),
+                    &iri("p"),
+                    i64::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let source = |predicate: &str, digest| RelationProofPlan {
+            query_digest: digest,
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
+                joins: Vec::new(),
+            }),
+        };
+        let extrema = |kind, digest| RelationProofPlan {
+            query_digest: digest,
+            kind: RelationProofPlanKind::CollectionExtrema {
+                input: Box::new(source("p", [126u8; 32])),
+                value_column: 1,
+                datatype: CanonicalDatatype::Int64,
+                kind,
+            },
+        };
+        let min_plan = extrema(GroupExtremaKind::Min, [127u8; 32]);
+        let min = RecursiveRelationEnvelope::prove(&layer, &min_plan).unwrap();
+        min.verify(&layer, layer.state.commitment_root, &min_plan)
+            .unwrap();
+        assert_eq!(min.result_len, 1);
+        let expected_min = CanonicalObject::from_store_object(
+            &ValueTriple::new_value("", "", i64::make_entry(&i64::MIN)).object,
+        );
+        assert_eq!(
+            min.result_values,
+            vec![vec![CanonicalResultValue::Object(expected_min)]]
+        );
+        let decoded = RecursiveRelationEnvelope::decode(&min.encode().unwrap()).unwrap();
+        decoded
+            .verify(&layer, layer.state.commitment_root, &min_plan)
+            .unwrap();
+
+        let max_plan = extrema(GroupExtremaKind::Max, [128u8; 32]);
+        let max = RecursiveRelationEnvelope::prove(&layer, &max_plan).unwrap();
+        max.verify(&layer, layer.state.commitment_root, &max_plan)
+            .unwrap();
+        assert_eq!(max.result_len, 1);
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &max_plan)
+            .is_err());
+
+        let RecursiveRelationProof::CollectionExtrema { input } = &decoded.proof else {
+            unreachable!()
+        };
+        let non_extreme = input.result_columns[1][1];
+        let non_extreme_value = input.result_values[1][1].clone();
+        let mut tampered = decoded;
+        tampered.result_columns[0][0] = non_extreme;
+        tampered.result_values[0][0] = non_extreme_value;
+        tampered.result_commitments[0] =
+            commit_column(&[non_extreme, ArkFr::zero()]).unwrap();
+        assert!(tampered
+            .verify(&layer, layer.state.commitment_root, &min_plan)
+            .is_err());
+
+        let empty_plan = RelationProofPlan {
+            query_digest: [129u8; 32],
+            kind: RelationProofPlanKind::CollectionExtrema {
+                input: Box::new(source("missing", [130u8; 32])),
+                value_column: 1,
+                datatype: CanonicalDatatype::Int64,
+                kind: GroupExtremaKind::Min,
+            },
+        };
+        let empty = RecursiveRelationEnvelope::prove(&layer, &empty_plan).unwrap();
+        empty
+            .verify(&layer, layer.state.commitment_root, &empty_plan)
+            .unwrap();
+        assert_eq!(empty.result_len, 0);
+        assert_eq!(empty.result_values, vec![Vec::new()]);
     }
 
     #[test]
