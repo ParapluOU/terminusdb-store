@@ -2031,7 +2031,7 @@ impl RelationProofPlan {
                     .ok_or_else(|| invalid("group-sum value column out of range"))?;
                 if key.nullable
                     || value.nullable
-                    || key.namespace == ResultIdNamespace::GeneratedDecimalU64
+                    || key.namespace != ResultIdNamespace::NodeValue
                     || value.namespace != ResultIdNamespace::NodeValue
                     || !matches!(
                         datatype,
@@ -2041,7 +2041,7 @@ impl RelationProofPlan {
                     )
                 {
                     return Err(invalid(
-                        "group-sum requires a nonnullable Store-ID key and UInt8/UInt16/UInt32 value",
+                        "group-sum requires a nonnullable node key and UInt8/UInt16/UInt32 value",
                     ));
                 }
                 Ok((
@@ -2481,21 +2481,19 @@ fn derived_group_sum_columns(
     }
     let view = layer.verifier_view();
     view.validate()?;
-    let resolve_key = |field: ArkFr| -> io::Result<u64> {
-        match key_descriptor.namespace {
-            ResultIdNamespace::NodeValue => view
-                .node_value_catalog
-                .iter()
-                .find(|record| ArkFr::from_u64(record.object_id) == field)
-                .map(|record| record.object_id),
-            ResultIdNamespace::Predicate => view
-                .predicate_catalog
-                .iter()
-                .find(|record| ArkFr::from_u64(record.predicate_id) == field)
-                .map(|record| record.predicate_id),
-            ResultIdNamespace::GeneratedDecimalU64 => None,
-        }
-        .ok_or_else(|| invalid("group-sum key is absent from its authenticated namespace"))
+    if key_descriptor.namespace != ResultIdNamespace::NodeValue {
+        return Err(invalid("group-sum key is not in the node namespace"));
+    }
+    let resolve_key = |field: ArkFr| -> io::Result<(Vec<u8>, u64)> {
+        let record = view
+            .node_value_catalog
+            .iter()
+            .find(|record| ArkFr::from_u64(record.object_id) == field)
+            .ok_or_else(|| invalid("group-sum key is absent from the node dictionary"))?;
+        let CanonicalObject::Node(iri) = &record.triple.object else {
+            return Err(invalid("group-sum key is not a node IRI"));
+        };
+        Ok((iri.clone(), record.object_id))
     };
     let resolve_value = |field: ArkFr| -> io::Result<u64> {
         let record = view
@@ -2505,18 +2503,25 @@ fn derived_group_sum_columns(
             .ok_or_else(|| invalid("group-sum value id is absent from the authenticated dictionary"))?;
         bounded_unsigned_catalog_value(&record.triple.object, datatype)
     };
-    let mut sums = std::collections::BTreeMap::<u64, u64>::new();
+    // SWI bagof enumerates atom-valued free keys in standard atom order. Expanded IRI
+    // nodes are UTF-8 bytes, whose lexicographic order preserves Unicode scalar order.
+    // Sort by the authenticated node value, never by Store ID (child IDs are appended).
+    let mut sums = std::collections::BTreeMap::<Vec<u8>, (u64, u64)>::new();
     for row in 0..input.result_len {
-        let key = resolve_key(keys[row])?;
+        let (canonical_key, key_id) = resolve_key(keys[row])?;
         let value = resolve_value(values[row])?;
-        let sum = sums.entry(key).or_default();
-        *sum = sum
+        let entry = sums.entry(canonical_key).or_insert((key_id, 0));
+        if entry.0 != key_id {
+            return Err(invalid("group-sum canonical node maps to multiple Store IDs"));
+        }
+        entry.1 = entry
+            .1
             .checked_add(value)
             .ok_or_else(|| invalid("group-sum arithmetic exceeds u64"))?;
     }
     Ok(vec![
-        sums.keys().map(|key| ArkFr::from_u64(*key)).collect(),
-        sums.values().map(|sum| ArkFr::from_u64(*sum)).collect(),
+        sums.values().map(|(key, _)| ArkFr::from_u64(*key)).collect(),
+        sums.values().map(|(_, sum)| ArkFr::from_u64(*sum)).collect(),
     ])
 }
 
@@ -4443,17 +4448,25 @@ mod tests {
     fn recursive_group_sum_preserves_duplicates_zero_and_safe_u32_max_and_rejects_tamper() {
         let store = open_sync_memory_store();
         let builder = store.create_base_layer().unwrap();
-        for (subject, predicate, value) in [
-            ("a", "p", 2u32),
-            ("a", "q", 2u32),
-            ("b", "p", 0u32),
-            ("b", "q", u32::MAX),
-        ] {
+        for (predicate, value) in [("p", 0u32), ("q", u32::MAX)] {
             builder
                 .add_value_triple(ValueTriple::new_value(
-                    &iri(subject),
+                    &iri("b"),
                     &iri(predicate),
                     u32::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let builder = base.open_write().unwrap();
+        // The lexically earlier key is introduced in a child and therefore has a later
+        // Store ID. Output must still follow SWI atom order (`a` before `b`).
+        for predicate in ["p", "q"] {
+            builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("a"),
+                    &iri(predicate),
+                    u32::make_entry(&2u32),
                 ))
                 .unwrap();
         }
@@ -4496,6 +4509,13 @@ mod tests {
             .map(|row| (resolved[0][row].clone(), resolved[1][row].clone()))
             .collect::<Vec<_>>();
         rows.sort();
+        assert_eq!(
+            envelope.result_values[0],
+            vec![
+                CanonicalResultValue::Object(CanonicalObject::Node(iri("a").into_bytes())),
+                CanonicalResultValue::Object(CanonicalObject::Node(iri("b").into_bytes())),
+            ]
+        );
         assert!(rows.iter().any(|(key, sum)| {
             key == &CanonicalResultValue::Object(CanonicalObject::Node(iri("a").into_bytes()))
                 && sum == &CanonicalResultValue::GeneratedDecimalU64(4)
