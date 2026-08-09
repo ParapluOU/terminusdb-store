@@ -1691,6 +1691,7 @@ pub enum RelationProofPlanKind {
     ExactMultiOrder {
         input: Box<RelationProofPlan>,
         datatypes: Vec<CanonicalDatatype>,
+        key_indices: Vec<usize>,
         directions: Vec<OrderDirection>,
     },
     /// Exact contiguous slice of an authenticated ordered relation. `None` returns the
@@ -1999,9 +2000,10 @@ impl RelationProofPlan {
                 }
                 Ok((descriptors, false))
             }
-            RelationProofPlanKind::ExactMultiOrder { input, datatypes, directions } => {
+            RelationProofPlanKind::ExactMultiOrder { input, datatypes, key_indices, directions } => {
                 let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
-                if ground || !(2..=3).contains(&descriptors.len()) || datatypes.len() != descriptors.len() || directions.len() != descriptors.len()
+                let mut sorted = key_indices.clone(); sorted.sort_unstable();
+                if ground || !(2..=3).contains(&descriptors.len()) || datatypes.len() != descriptors.len() || directions.len() != descriptors.len() || sorted != (0..descriptors.len()).collect::<Vec<_>>()
                     || descriptors.iter().any(|d| d.nullable || d.namespace != ResultIdNamespace::NodeValue) {
                     return Err(invalid("invalid exact multikey order child shape"));
                 }
@@ -2339,12 +2341,12 @@ impl RecursiveRelationEnvelope {
                     result.n,
                 )
             }
-            RelationProofPlanKind::ExactMultiOrder { input, datatypes, directions } => {
+            RelationProofPlanKind::ExactMultiOrder { input, datatypes, key_indices, directions } => {
                 let input_envelope = Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
                 let mut transcript = Transcript254::new(b"parture-multi-order-envelope");
                 transcript.append_bytes(b"pow/multi-order-envelope/root", &layer.state.commitment_root);
                 transcript.append_bytes(b"pow/multi-order-envelope/query", &plan.query_digest);
-                let result = prove_exact_multi_order_with_context(context, layer, &input_envelope.relation_witness(None)?, datatypes, directions, &mut transcript)?;
+                let result = prove_exact_multi_order_with_context(context, layer, &input_envelope.relation_witness(None)?, datatypes, key_indices, directions, &mut transcript)?;
                 Self::finish_proved(layer, plan, RecursiveRelationProof::ExactMultiOrder { input: Box::new(input_envelope), proof: Box::new(result.proof) }, result.commitments, result.columns, result.log_domain, result.n)
             }
             RelationProofPlanKind::ExactOrderedSlice {
@@ -2663,13 +2665,13 @@ impl RecursiveRelationEnvelope {
             }
             (
                 RecursiveRelationProof::ExactMultiOrder { input, proof },
-                RelationProofPlanKind::ExactMultiOrder { input: input_plan, datatypes, directions },
+                RelationProofPlanKind::ExactMultiOrder { input: input_plan, datatypes, key_indices, directions },
             ) => {
                 input.verify_bounded(layer, expected_root, input_plan, depth + 1, nodes)?;
                 let mut transcript = Transcript254::new(b"parture-multi-order-envelope");
                 transcript.append_bytes(b"pow/multi-order-envelope/root", &expected_root);
                 transcript.append_bytes(b"pow/multi-order-envelope/query", &plan.query_digest);
-                verify_exact_multi_order(layer, &input.relation_commit(None)?, &self.result_columns, datatypes, directions, &self.result_commitments, self.result_len, self.result_log_domain, proof, &mut transcript)?;
+                verify_exact_multi_order(layer, &input.relation_commit(None)?, &self.result_columns, datatypes, key_indices, directions, &self.result_commitments, self.result_len, self.result_log_domain, proof, &mut transcript)?;
             }
             (
                 RecursiveRelationProof::ExactOrderedSlice { input },
@@ -3262,7 +3264,8 @@ mod tests {
         let child = RelationProofPlan { query_digest: plan_digest(&bgp).unwrap(), kind: RelationProofPlanKind::Bgp(bgp) };
         let plan = RelationProofPlan { query_digest: [61u8; 32], kind: RelationProofPlanKind::ExactMultiOrder {
             input: Box::new(child), datatypes: vec![CanonicalDatatype::UInt32; 2],
-            directions: vec![OrderDirection::Ascending, OrderDirection::Descending],
+            key_indices: vec![1, 0],
+            directions: vec![OrderDirection::Descending, OrderDirection::Ascending],
         }};
         let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
         envelope.verify(&layer, layer.state.commitment_root, &plan).unwrap();
@@ -3272,13 +3275,13 @@ mod tests {
         decoded.verify(&layer, layer.state.commitment_root, &plan).unwrap();
 
         let mut wrong_direction = plan.clone();
-        if let RelationProofPlanKind::ExactMultiOrder { directions, .. } = &mut wrong_direction.kind { directions[1] = OrderDirection::Ascending; }
+        if let RelationProofPlanKind::ExactMultiOrder { directions, .. } = &mut wrong_direction.kind { directions[1] = OrderDirection::Descending; }
         assert!(decoded.verify(&layer, layer.state.commitment_root, &wrong_direction).is_err());
         let mut wrong_type = plan.clone();
         if let RelationProofPlanKind::ExactMultiOrder { datatypes, .. } = &mut wrong_type.kind { datatypes[0] = CanonicalDatatype::Int32; }
         assert!(decoded.verify(&layer, layer.state.commitment_root, &wrong_type).is_err());
         let mut wrong_key_order = plan.clone();
-        if let RelationProofPlanKind::ExactMultiOrder { directions, datatypes, .. } = &mut wrong_key_order.kind { directions.swap(0, 1); datatypes.swap(0, 1); }
+        if let RelationProofPlanKind::ExactMultiOrder { key_indices, .. } = &mut wrong_key_order.kind { key_indices[1] = 1; }
         assert!(decoded.verify(&layer, layer.state.commitment_root, &wrong_key_order).is_err());
 
         let mut reordered = RecursiveRelationEnvelope::decode(&bytes).unwrap();

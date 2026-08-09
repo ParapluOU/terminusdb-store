@@ -24,10 +24,12 @@ pub struct ExactMultiOrderResult {
     pub columns: Vec<Vec<ArkFr>>, pub log_domain: usize, pub n: usize,
 }
 
-fn validate_shape(arity: usize, datatypes: &[CanonicalDatatype], directions: &[OrderDirection]) -> io::Result<()> {
-    if !(2..=3).contains(&arity) || datatypes.len() != arity || directions.len() != arity {
+fn validate_shape(arity: usize, datatypes: &[CanonicalDatatype], key_indices: &[usize], directions: &[OrderDirection]) -> io::Result<()> {
+    if !(2..=3).contains(&arity) || datatypes.len() != arity || directions.len() != arity || key_indices.len() != arity {
         return Err(invalid("exact multi-order requires two or three complete-row keys"));
     }
+    let mut sorted = key_indices.to_vec(); sorted.sort_unstable();
+    if sorted != (0..arity).collect::<Vec<_>>() { return Err(invalid("multi-order key indices must be an exact column permutation")); }
     if datatypes.iter().any(|datatype| !matches!(datatype,
         CanonicalDatatype::Boolean | CanonicalDatatype::UInt8 | CanonicalDatatype::UInt16 |
         CanonicalDatatype::UInt32 | CanonicalDatatype::UInt64 | CanonicalDatatype::Int8 |
@@ -54,45 +56,49 @@ fn resolve_values(source: &impl VerifierLayer, columns: &[Vec<ArkFr>], n: usize,
     }).collect()
 }
 
-fn bind(transcript: &mut Transcript254, datatypes: &[CanonicalDatatype], directions: &[OrderDirection], n: usize) {
+fn bind(transcript: &mut Transcript254, datatypes: &[CanonicalDatatype], key_indices: &[usize], directions: &[OrderDirection], n: usize) {
     transcript.append_bytes(b"pow/multi-order/domain", b"parture/exact-multi-order/v0");
     transcript.append_bytes(b"pow/multi-order/rows", &(n as u64).to_le_bytes());
-    for (datatype, direction) in datatypes.iter().zip(directions) {
-        transcript.append_bytes(b"pow/multi-order/key", &[*datatype as u8, match direction { OrderDirection::Ascending => 0, OrderDirection::Descending => 1 }]);
+    for (index, direction) in key_indices.iter().zip(directions) {
+        transcript.append_bytes(b"pow/multi-order/key", &[(*index) as u8, match direction { OrderDirection::Ascending => 0, OrderDirection::Descending => 1 }]);
     }
+    for datatype in datatypes { transcript.append_bytes(b"pow/multi-order/datatype", &[*datatype as u8]); }
 }
 
-pub fn prove_exact_multi_order_with_context(context: &StoreProverContext<'_>, layer: &LayerCommitment, input: &RelationWitness, datatypes: &[CanonicalDatatype], directions: &[OrderDirection], transcript: &mut Transcript254) -> io::Result<ExactMultiOrderResult> {
-    validate_shape(input.columns.len(), datatypes, directions)?;
+pub fn prove_exact_multi_order_with_context(context: &StoreProverContext<'_>, layer: &LayerCommitment, input: &RelationWitness, datatypes: &[CanonicalDatatype], key_indices: &[usize], directions: &[OrderDirection], transcript: &mut Transcript254) -> io::Result<ExactMultiOrderResult> {
+    validate_shape(input.columns.len(), datatypes, key_indices, directions)?;
     let domain = 1usize << input.log_domain;
     let values = resolve_values(layer, &input.columns, input.n, datatypes, domain)?;
     let mut order = (0..input.n).collect::<Vec<_>>();
     order.sort_by(|left, right| {
-        for (column, direction) in values.iter().zip(directions) {
+        for (index, direction) in key_indices.iter().zip(directions) { let column = &values[*index];
             let cmp = column[*left].0.into_bigint().cmp(&column[*right].0.into_bigint());
             if cmp != Ordering::Equal { return if *direction == OrderDirection::Ascending { cmp } else { cmp.reverse() }; }
         } Ordering::Equal
     });
     if order.windows(2).any(|pair| values.iter().all(|column| column[pair[0]] == column[pair[1]])) { return Err(invalid("exact complete-row order contains a duplicate tuple")); }
-    bind(transcript, datatypes, directions, input.n);
+    bind(transcript, datatypes, key_indices, directions, input.n);
     let permutation = prove_relation_permutation_with_context(context, input, &order, transcript)?;
     let ordered_values = resolve_values(layer, &permutation.columns, input.n, datatypes, domain)?;
     let value_commitments = ordered_values.iter().map(|column| context.commit_column(column)).collect::<io::Result<Vec<_>>>()?;
     let mut chi = vec![ArkFr::zero(); domain]; chi[..input.n].fill(ArkFr::one());
     let chi_commitment = context.commit_column(&chi)?;
-    let lexicographic = prove_lexicographically_sorted_with_context(context, &ordered_values, &value_commitments, directions, &chi_commitment, input.n, transcript)?;
+    let ordered_key_values = key_indices.iter().map(|i| ordered_values[*i].clone()).collect::<Vec<_>>();
+    let ordered_key_commitments = key_indices.iter().map(|i| value_commitments[*i]).collect::<Vec<_>>();
+    let lexicographic = prove_lexicographically_sorted_with_context(context, &ordered_key_values, &ordered_key_commitments, directions, &chi_commitment, input.n, transcript)?;
     Ok(ExactMultiOrderResult { proof: ExactMultiOrderProof { permutation: permutation.proof, lexicographic }, commitments: permutation.commitments, columns: permutation.columns, log_domain: permutation.log_domain, n: permutation.n })
 }
 
-pub fn verify_exact_multi_order(source: &impl VerifierLayer, input: &RelationCommit, output_columns: &[Vec<ArkFr>], datatypes: &[CanonicalDatatype], directions: &[OrderDirection], output_commitments: &[ArkGT], output_len: usize, output_log_domain: usize, proof: &ExactMultiOrderProof, transcript: &mut Transcript254) -> io::Result<()> {
-    validate_shape(input.commitments.len(), datatypes, directions)?; bind(transcript, datatypes, directions, input.n);
+pub fn verify_exact_multi_order(source: &impl VerifierLayer, input: &RelationCommit, output_columns: &[Vec<ArkFr>], datatypes: &[CanonicalDatatype], key_indices: &[usize], directions: &[OrderDirection], output_commitments: &[ArkGT], output_len: usize, output_log_domain: usize, proof: &ExactMultiOrderProof, transcript: &mut Transcript254) -> io::Result<()> {
+    validate_shape(input.commitments.len(), datatypes, key_indices, directions)?; bind(transcript, datatypes, key_indices, directions, input.n);
     verify_relation_permutation(input, output_commitments, output_len, output_log_domain, &proof.permutation, transcript)?;
     if output_len != input.n || output_log_domain != input.log_domain || output_columns.len() != datatypes.len() { return Err(invalid("multi-order output shape mismatch")); }
     let domain = 1usize << output_log_domain;
     let values = resolve_values(source, output_columns, output_len, datatypes, domain)?;
     let commitments = values.iter().map(|column| commit_column(column)).collect::<io::Result<Vec<_>>>()?;
     let mut chi = vec![ArkFr::zero(); domain]; chi[..output_len].fill(ArkFr::one());
-    verify_lexicographically_sorted(&commitments, directions, &commit_column(&chi)?, output_len, &proof.lexicographic, transcript)
+    let key_commitments = key_indices.iter().map(|i| commitments[*i]).collect::<Vec<_>>();
+    verify_lexicographically_sorted(&key_commitments, directions, &commit_column(&chi)?, output_len, &proof.lexicographic, transcript)
 }
 
 #[cfg(test)]
@@ -115,13 +121,17 @@ mod tests {
         let layer = fixture();
         let input = RelationWitness::commit(vec![vec![id(&layer,2),id(&layer,1),id(&layer,1)], vec![id(&layer,8),id(&layer,3),id(&layer,9)]], 3).unwrap();
         let types = [CanonicalDatatype::UInt32, CanonicalDatatype::UInt32];
-        let dirs = [OrderDirection::Ascending, OrderDirection::Descending];
-        let result = prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &input, &types, &dirs, &mut Transcript254::new(b"multiorder-test")).unwrap();
-        assert_eq!(&result.columns[0][..3], &[id(&layer,1),id(&layer,1),id(&layer,2)]);
-        assert_eq!(&result.columns[1][..3], &[id(&layer,9),id(&layer,3),id(&layer,8)]);
-        verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-test")).unwrap();
+        let dirs = [OrderDirection::Descending, OrderDirection::Ascending];
+        let result = prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &input, &types, &[1,0], &dirs, &mut Transcript254::new(b"multiorder-test")).unwrap();
+        assert_eq!(&result.columns[0][..3], &[id(&layer,1),id(&layer,2),id(&layer,1)]);
+        assert_eq!(&result.columns[1][..3], &[id(&layer,9),id(&layer,8),id(&layer,3)]);
+        verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &[1,0], &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-test")).unwrap();
         let wrong = [OrderDirection::Ascending, OrderDirection::Ascending];
-        assert!(verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &wrong, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-test")).is_err());
+        assert!(verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &[1,0], &wrong, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-test")).is_err());
+        assert!(verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &[0,1], &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-test")).is_err());
+        for invalid in [&[0,0][..], &[0,2][..], &[0][..]] {
+            assert!(prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &input, &types, invalid, &dirs, &mut Transcript254::new(b"invalid-key-map")).is_err());
+        }
     }
     #[test]
     fn exact_three_key_order_and_invalid_rows_reject() {
@@ -132,15 +142,15 @@ mod tests {
             vec![id(&layer,3),id(&layer,4),id(&layer,1)],
         ], 3).unwrap();
         let types = [CanonicalDatatype::UInt32; 3];
-        let dirs = [OrderDirection::Ascending, OrderDirection::Ascending, OrderDirection::Descending];
-        let result = prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &input, &types, &dirs, &mut Transcript254::new(b"multiorder-3-test")).unwrap();
+        let dirs = [OrderDirection::Descending, OrderDirection::Ascending, OrderDirection::Ascending];
+        let result = prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &input, &types, &[2,0,1], &dirs, &mut Transcript254::new(b"multiorder-3-test")).unwrap();
         assert_eq!(&result.columns[2][..3], &[id(&layer,4),id(&layer,3),id(&layer,1)]);
-        verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-3-test")).unwrap();
+        verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &[2,0,1], &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-3-test")).unwrap();
 
         let duplicate = RelationWitness::commit(vec![vec![id(&layer,1);2], vec![id(&layer,2);2]], 2).unwrap();
-        assert!(prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &duplicate, &types[..2], &dirs[..2], &mut Transcript254::new(b"duplicate")).is_err());
+        assert!(prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &duplicate, &types[..2], &[0,1], &dirs[..2], &mut Transcript254::new(b"duplicate")).is_err());
         let node_id = ArkFr::from_u64(layer.node_value_catalog.iter().find(|r| matches!(r.triple.object, CanonicalObject::Node(_))).unwrap().object_id);
         let mixed = RelationWitness::commit(vec![vec![id(&layer,1),node_id], vec![id(&layer,2),id(&layer,3)]], 2).unwrap();
-        assert!(prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &mixed, &types[..2], &dirs[..2], &mut Transcript254::new(b"mixed")).is_err());
+        assert!(prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &mixed, &types[..2], &[0,1], &dirs[..2], &mut Transcript254::new(b"mixed")).is_err());
     }
 }
