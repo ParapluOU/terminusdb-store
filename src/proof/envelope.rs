@@ -85,8 +85,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v18 adds exact private Collect-list cardinality with findall's empty-list policy.
-const RECURSIVE_VERSION: u32 = 18;
+// v19 adds exact private Collect-list sum with findall's empty-list policy.
+const RECURSIVE_VERSION: u32 = 19;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1772,6 +1772,13 @@ pub enum RelationProofPlanKind {
     CollectionCount {
         input: Box<RelationProofPlan>,
     },
+    /// Exact sum of the private list produced by Prolog `findall/3`, consumed
+    /// immediately by `sum_list/2`. Empty input emits one typed generated zero.
+    CollectionSum {
+        input: Box<RelationProofPlan>,
+        template: CollectionSumTemplate,
+        datatype: CanonicalDatatype,
+    },
     BagUnion {
         branches: Vec<RelationProofPlan>,
         /// Parent output column -> child output column, once per ordered branch.
@@ -1847,6 +1854,13 @@ pub enum GeneratedU64ComparisonOp {
     Le,
     Gt,
     Ge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionSumTemplate {
+    Column(usize),
+    UnsignedConstant(u64),
+    SignedConstant(i64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2168,6 +2182,73 @@ impl RelationProofPlan {
                     false,
                 ))
             }
+            RelationProofPlanKind::CollectionSum {
+                input,
+                template,
+                datatype,
+            } => {
+                let (descriptors, _) = input.shape_bounded(depth + 1, nodes)?;
+                let signed = matches!(
+                    datatype,
+                    CanonicalDatatype::Int8
+                        | CanonicalDatatype::Int16
+                        | CanonicalDatatype::Int32
+                        | CanonicalDatatype::Int64
+                );
+                let unsigned = matches!(
+                    datatype,
+                    CanonicalDatatype::UInt8
+                        | CanonicalDatatype::UInt16
+                        | CanonicalDatatype::UInt32
+                        | CanonicalDatatype::UInt64
+                );
+                if !signed && !unsigned {
+                    return Err(invalid("collection-sum datatype is outside the integral subset"));
+                }
+                match template {
+                    CollectionSumTemplate::Column(column) => {
+                        let value = descriptors
+                            .get(*column)
+                            .copied()
+                            .ok_or_else(|| invalid("collection-sum value column out of range"))?;
+                        if value.nullable || value.namespace != ResultIdNamespace::NodeValue {
+                            return Err(invalid(
+                                "collection-sum column must be a nonnullable Store value",
+                            ));
+                        }
+                    }
+                    CollectionSumTemplate::UnsignedConstant(value)
+                        if unsigned
+                            && match datatype {
+                                CanonicalDatatype::UInt8 => *value <= u64::from(u8::MAX),
+                                CanonicalDatatype::UInt16 => *value <= u64::from(u16::MAX),
+                                CanonicalDatatype::UInt32 => *value <= u64::from(u32::MAX),
+                                CanonicalDatatype::UInt64 => true,
+                                _ => false,
+                            } => {}
+                    CollectionSumTemplate::SignedConstant(value)
+                        if signed
+                            && match datatype {
+                                CanonicalDatatype::Int8 => i8::try_from(*value).is_ok(),
+                                CanonicalDatatype::Int16 => i16::try_from(*value).is_ok(),
+                                CanonicalDatatype::Int32 => i32::try_from(*value).is_ok(),
+                                CanonicalDatatype::Int64 => true,
+                                _ => false,
+                            } => {}
+                    _ => return Err(invalid("collection-sum template/domain mismatch")),
+                }
+                Ok((
+                    vec![ResultColumnDescriptor {
+                        namespace: if signed {
+                            ResultIdNamespace::GeneratedDecimalI64
+                        } else {
+                            ResultIdNamespace::GeneratedDecimalU64
+                        },
+                        nullable: false,
+                    }],
+                    false,
+                ))
+            }
             RelationProofPlanKind::BagUnion { branches, mappings } => {
                 if branches.len() < 2
                     || branches.len() != mappings.len()
@@ -2427,6 +2508,9 @@ pub enum RecursiveRelationProof {
         input: Box<RecursiveRelationEnvelope>,
     },
     CollectionCount {
+        input: Box<RecursiveRelationEnvelope>,
+    },
+    CollectionSum {
         input: Box<RecursiveRelationEnvelope>,
     },
     BagUnion {
@@ -2852,6 +2936,49 @@ fn derived_cardinality_column(result_len: usize, emit_zero_for_empty: bool) -> i
     )]])
 }
 
+fn derived_collection_sum_column(
+    layer: &impl VerifierLayer,
+    input: &RecursiveRelationEnvelope,
+    template: CollectionSumTemplate,
+    datatype: CanonicalDatatype,
+) -> io::Result<Vec<Vec<ArkFr>>> {
+    let mut sum = GroupSumValue::zero(datatype)?;
+    match template {
+        CollectionSumTemplate::Column(column) => {
+            let values = input
+                .result_columns
+                .get(column)
+                .ok_or_else(|| invalid("collection-sum value column out of range"))?;
+            if values.len() != input.result_len {
+                return Err(invalid("collection-sum input column length mismatch"));
+            }
+            let view = layer.verifier_view();
+            view.validate()?;
+            for field in values.iter().take(input.result_len) {
+                let record = view
+                    .node_value_catalog
+                    .iter()
+                    .find(|record| ArkFr::from_u64(record.object_id) == *field)
+                    .ok_or_else(|| {
+                        invalid("collection-sum value id is absent from the authenticated dictionary")
+                    })?;
+                sum = sum.checked_add(integral_catalog_value(&record.triple.object, datatype)?)?;
+            }
+        }
+        CollectionSumTemplate::UnsignedConstant(value) => {
+            for _ in 0..input.result_len {
+                sum = sum.checked_add(GroupSumValue::Unsigned(value))?;
+            }
+        }
+        CollectionSumTemplate::SignedConstant(value) => {
+            for _ in 0..input.result_len {
+                sum = sum.checked_add(GroupSumValue::Signed(i128::from(value)))?;
+            }
+        }
+    }
+    Ok(vec![vec![sum.field()?]])
+}
+
 impl RecursiveRelationEnvelope {
     fn relation_commit(&self, mapping: Option<&[usize]>) -> io::Result<RelationCommit> {
         let commitments = match mapping {
@@ -3046,6 +3173,33 @@ impl RecursiveRelationEnvelope {
                     columns,
                     log_domain,
                     n,
+                )
+            }
+            RelationProofPlanKind::CollectionSum {
+                input,
+                template,
+                datatype,
+            } => {
+                let input_envelope =
+                    Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let mut columns = derived_collection_sum_column(
+                    layer,
+                    &input_envelope,
+                    *template,
+                    *datatype,
+                )?;
+                columns[0].resize(2, ArkFr::zero());
+                let commitments = vec![context.commit_column(&columns[0])?];
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::CollectionSum {
+                        input: Box::new(input_envelope),
+                    },
+                    commitments,
+                    columns,
+                    1,
+                    1,
                 )
             }
             RelationProofPlanKind::CollectionCount { input } => {
@@ -3733,6 +3887,37 @@ impl RecursiveRelationEnvelope {
                     return Err(invalid("collection-count commitment mismatch"));
                 }
             }
+            (
+                RecursiveRelationProof::CollectionSum { input },
+                RelationProofPlanKind::CollectionSum {
+                    input: input_plan,
+                    template,
+                    datatype,
+                },
+            ) => {
+                input.verify_bounded(
+                    layer,
+                    expected_root,
+                    input_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let expected_columns =
+                    derived_collection_sum_column(layer, input, *template, *datatype)?;
+                if self.result_len != 1
+                    || self.result_log_domain != 1
+                    || self.result_columns != expected_columns
+                {
+                    return Err(invalid(
+                        "collection-sum result is not the exact derived aggregate",
+                    ));
+                }
+                let mut padded = expected_columns[0].clone();
+                padded.resize(2, ArkFr::zero());
+                if self.result_commitments != vec![commit_column(&padded)?] {
+                    return Err(invalid("collection-sum commitment mismatch"));
+                }
+            }
             (RecursiveRelationProof::Bgp(envelope), RelationProofPlanKind::Bgp(bgp)) => {
                 envelope.verify(layer, expected_root, bgp, plan.query_digest)?;
                 if self.result_commitments != envelope.result_commitments
@@ -4230,6 +4415,10 @@ impl RecursiveRelationEnvelope {
                 17u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
             }
+            RecursiveRelationProof::CollectionSum { input } => {
+                18u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+            }
             RecursiveRelationProof::Bgp(envelope) => {
                 0u8.put(out)?;
                 envelope.put(out)?;
@@ -4332,6 +4521,9 @@ impl RecursiveRelationEnvelope {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             17 => RecursiveRelationProof::CollectionCount {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+            },
+            18 => RecursiveRelationProof::CollectionSum {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             0 => RecursiveRelationProof::Bgp(Box::<LayerBgpEnvelope>::get(reader)?),
@@ -5485,6 +5677,120 @@ mod tests {
         assert_eq!(
             empty.result_values,
             vec![vec![CanonicalResultValue::GeneratedDecimalU64(0)]]
+        );
+    }
+
+    #[test]
+    fn recursive_collection_sum_handles_signed_cancellation_empty_and_domain_bounds() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for value in [-3i64, 1, 2] {
+            builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("a"),
+                    &iri("p"),
+                    i64::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let source = RelationProofPlan {
+            query_digest: [124u8; 32],
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                atoms: vec![LayerBgpAtom::all_variables(iri("p").into_bytes())],
+                joins: Vec::new(),
+            }),
+        };
+        let plan = RelationProofPlan {
+            query_digest: [125u8; 32],
+            kind: RelationProofPlanKind::CollectionSum {
+                input: Box::new(source.clone()),
+                template: CollectionSumTemplate::Column(1),
+                datatype: CanonicalDatatype::Int64,
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+        assert_eq!(
+            envelope.result_values,
+            vec![vec![CanonicalResultValue::GeneratedDecimalI64(0)]]
+        );
+        let decoded = RecursiveRelationEnvelope::decode(&envelope.encode().unwrap()).unwrap();
+        decoded
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+        let group_plan = RelationProofPlan {
+            query_digest: [125u8; 32],
+            kind: RelationProofPlanKind::GroupSum {
+                input: Box::new(source.clone()),
+                key_columns: Vec::new(),
+                value_column: 1,
+                datatype: CanonicalDatatype::Int64,
+            },
+        };
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &group_plan)
+            .is_err());
+        let count_plan = RelationProofPlan {
+            query_digest: [125u8; 32],
+            kind: RelationProofPlanKind::CollectionCount {
+                input: Box::new(source),
+            },
+        };
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &count_plan)
+            .is_err());
+        let mut tampered = decoded;
+        tampered.result_columns[0][0] = generated_decimal_i64_field(1);
+        tampered.result_values[0][0] = CanonicalResultValue::GeneratedDecimalI64(1);
+        tampered.result_commitments[0] =
+            commit_column(&[generated_decimal_i64_field(1), ArkFr::zero()]).unwrap();
+        assert!(tampered
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .is_err());
+
+        let RecursiveRelationProof::CollectionSum { input } = &envelope.proof else {
+            unreachable!()
+        };
+        let mut one = (**input).clone();
+        one.result_len = 1;
+        assert_eq!(
+            derived_collection_sum_column(
+                &layer,
+                &one,
+                CollectionSumTemplate::UnsignedConstant(u64::MAX),
+                CanonicalDatatype::UInt64,
+            )
+            .unwrap(),
+            vec![vec![ArkFr::from_u64(u64::MAX)]]
+        );
+        assert!(derived_collection_sum_column(
+            &layer,
+            input,
+            CollectionSumTemplate::UnsignedConstant(u64::MAX),
+            CanonicalDatatype::UInt64,
+        )
+        .is_err());
+        assert!(derived_collection_sum_column(
+            &layer,
+            input,
+            CollectionSumTemplate::SignedConstant(i64::MAX),
+            CanonicalDatatype::Int64,
+        )
+        .is_err());
+        let mut empty = (**input).clone();
+        empty.result_len = 0;
+        assert_eq!(
+            derived_collection_sum_column(
+                &layer,
+                &empty,
+                CollectionSumTemplate::SignedConstant(-5),
+                CanonicalDatatype::Int64,
+            )
+            .unwrap(),
+            vec![vec![ArkFr::zero()]]
         );
     }
 
