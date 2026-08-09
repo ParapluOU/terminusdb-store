@@ -1240,7 +1240,9 @@ pub mod commitment {
     /// `0..=46`, `AnySimpleType = 44`, `DateTimeInterval = 46`), so `255` is safely
     /// distinct from every real discriminant. The later range gadget masks Node
     /// rows out by a datatype-inequality check against this tag.
-    const NODE_DATATYPE_TAG: u64 = 255;
+    /// Reserved discriminator committed in the node/value datatype dictionary column.
+    /// Every node has this tag; every literal uses a `CanonicalDatatype` discriminant.
+    pub const NODE_DATATYPE_TAG: u64 = 255;
 
     /// Padded length (a power of two `>= 2`, or `0` for an empty catalog) shared by
     /// EVERY committed node/value dictionary column — `hash`, `id`, `value`,
