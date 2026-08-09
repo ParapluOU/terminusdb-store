@@ -32,7 +32,9 @@ use dory_pcs::backends::arkworks::{
     BN254,
 };
 #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
-use dory_pcs::backends::arkworks::{BlitzarG1Backend, BlitzarRuntime, BlitzarRuntimeConfig};
+use dory_pcs::backends::arkworks::{BlitzarG1Backend, BlitzarRuntime};
+#[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+pub use dory_pcs::backends::arkworks::BlitzarRuntimeConfig;
 use dory_pcs::primitives::arithmetic::{Field, Group, ProverBackend};
 use dory_pcs::primitives::poly::Polynomial;
 use dory_pcs::primitives::transcript::Transcript;
