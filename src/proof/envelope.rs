@@ -5,6 +5,7 @@ use std::io::{self, Cursor};
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
+use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 use sha2::{Digest, Sha256};
 
@@ -17,6 +18,7 @@ use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit};
 use super::commitment::LayerCommitment;
 use super::count::CountProof;
 use super::dict::DictProof;
+use super::equality::{verify_relation_equality, RelationEqualityConstraint, RelationEqualityProof};
 use super::filter::{
     AtomFilterProof, BooleanProductProof, CompactionOnlyProof, FilterProof, FullFilterProof,
     SelectionOnlyProof,
@@ -292,6 +294,12 @@ wire_struct!(CompactionOnlyProof {
     opening,
     cstar_commitment,
     dstar_commitment
+});
+wire_struct!(RelationEqualityProof {
+    indicator,
+    selection_commitment,
+    inverse_commitment,
+    compaction
 });
 wire_struct!(RelocationProof {
     source_eval,
@@ -1557,6 +1565,162 @@ pub enum RelationProofPlanKind {
         right: Box<RelationProofPlan>,
         key_pairs: Vec<(usize, usize)>,
     },
+    Equality {
+        input: Box<RelationProofPlan>,
+        constraint: RelationEqualityPlan,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EqualityValueDomain {
+    Predicate,
+    Node,
+    Datatype(CanonicalDatatype),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelationEqualityPlan {
+    ColumnConstant {
+        column: usize,
+        domain: EqualityValueDomain,
+        value: CanonicalObject,
+        constant_on_left: bool,
+    },
+    Columns {
+        left: usize,
+        right: usize,
+        domain: EqualityValueDomain,
+    },
+    Constants {
+        left: CanonicalObject,
+        right: CanonicalObject,
+    },
+}
+
+fn numeric_datatype(datatype: CanonicalDatatype) -> bool {
+    matches!(
+        datatype,
+        CanonicalDatatype::UInt8
+            | CanonicalDatatype::Int8
+            | CanonicalDatatype::UInt16
+            | CanonicalDatatype::Int16
+            | CanonicalDatatype::UInt32
+            | CanonicalDatatype::Int32
+            | CanonicalDatatype::Float32
+            | CanonicalDatatype::UInt64
+            | CanonicalDatatype::Int64
+            | CanonicalDatatype::Float64
+            | CanonicalDatatype::Decimal
+            | CanonicalDatatype::BigInt
+            | CanonicalDatatype::PositiveInteger
+            | CanonicalDatatype::NonNegativeInteger
+            | CanonicalDatatype::NonPositiveInteger
+            | CanonicalDatatype::NegativeInteger
+    )
+}
+
+fn validate_equality_plan(
+    constraint: &RelationEqualityPlan,
+    descriptors: &[ResultColumnDescriptor],
+    ground: bool,
+) -> io::Result<()> {
+    let validate_column = |column: usize, domain: EqualityValueDomain| {
+        if ground {
+            return Err(invalid("equality column constraint cannot target a ground relation"));
+        }
+        let descriptor = descriptors
+            .get(column)
+            .ok_or_else(|| invalid("equality column out of range"))?;
+        if descriptor.nullable {
+            return Err(invalid("equality cannot target a nullable column"));
+        }
+        let namespace = match domain {
+            EqualityValueDomain::Predicate => ResultIdNamespace::Predicate,
+            EqualityValueDomain::Node | EqualityValueDomain::Datatype(_) => {
+                ResultIdNamespace::NodeValue
+            }
+        };
+        if descriptor.namespace != namespace {
+            return Err(invalid("equality column namespace mismatch"));
+        }
+        Ok(())
+    };
+    match constraint {
+        RelationEqualityPlan::ColumnConstant {
+            column,
+            domain,
+            value,
+            ..
+        } => {
+            validate_column(*column, *domain)?;
+            match (domain, value) {
+                (EqualityValueDomain::Node, CanonicalObject::Node(_)) => Ok(()),
+                (
+                    EqualityValueDomain::Datatype(expected),
+                    CanonicalObject::Value { datatype, .. },
+                ) if expected == datatype => Ok(()),
+                _ => Err(invalid("equality constant does not match its exact value domain")),
+            }
+        }
+        RelationEqualityPlan::Columns {
+            left,
+            right,
+            domain,
+        } => {
+            validate_column(*left, *domain)?;
+            validate_column(*right, *domain)
+        }
+        RelationEqualityPlan::Constants { left, right } => {
+            if let (
+                CanonicalObject::Value { datatype: left, .. },
+                CanonicalObject::Value {
+                    datatype: right, ..
+                },
+            ) = (left, right)
+            {
+                if left != right && (numeric_datatype(*left) || numeric_datatype(*right)) {
+                    return Err(invalid(
+                        "cross-datatype numeric Equals has coercive executor semantics",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+pub fn resolve_relation_equality_constraint(
+    layer: &LayerCommitment,
+    constraint: &RelationEqualityPlan,
+) -> io::Result<RelationEqualityConstraint> {
+    match constraint {
+        RelationEqualityPlan::ColumnConstant { column, value, .. } => {
+            layer.validate()?;
+            let id = layer
+                .node_value_catalog
+                .iter()
+                .find(|record| &record.triple.object == value)
+                .map(|record| record.object_id)
+                .unwrap_or_else(|| layer.state.node_value_count.saturating_add(1));
+            Ok(RelationEqualityConstraint::ColumnConstant {
+                column: *column,
+                value: ArkFr::from_u64(id),
+            })
+        }
+        RelationEqualityPlan::Columns { left, right, .. } => {
+            Ok(RelationEqualityConstraint::Columns {
+                left: *left,
+                right: *right,
+            })
+        }
+        RelationEqualityPlan::Constants { left, right } => {
+            let equal = left == right;
+            Ok(RelationEqualityConstraint::Constants {
+                left: ArkFr::zero(),
+                right: if equal { ArkFr::zero() } else { ArkFr::one() },
+            })
+        }
+    }
 }
 
 impl RelationProofPlan {
@@ -1653,6 +1817,11 @@ impl RelationProofPlan {
                 ));
                 Ok((descriptors, false))
             }
+            RelationProofPlanKind::Equality { input, constraint } => {
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                validate_equality_plan(constraint, &descriptors, ground)?;
+                Ok((descriptors, ground))
+            }
         }
     }
 
@@ -1692,6 +1861,10 @@ pub enum RecursiveRelationProof {
         left: Box<RecursiveRelationEnvelope>,
         right: Box<RecursiveRelationEnvelope>,
         proof: Box<LeftOuterJoinProof>,
+    },
+    Equality {
+        input: Box<RecursiveRelationEnvelope>,
+        proof: Box<RelationEqualityProof>,
     },
 }
 
@@ -1899,6 +2072,35 @@ impl RecursiveRelationEnvelope {
                     )?;
                 }
             }
+            (
+                RecursiveRelationProof::Equality { input, proof },
+                RelationProofPlanKind::Equality {
+                    input: input_plan,
+                    constraint,
+                },
+            ) => {
+                input.verify_bounded(
+                    layer,
+                    expected_root,
+                    input_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let resolved = resolve_relation_equality_constraint(layer, constraint)?;
+                let mut transcript =
+                    super::argument::Transcript254::new(b"parture-equality-envelope");
+                transcript.append_bytes(b"pow/equality-envelope/root", &expected_root);
+                transcript.append_bytes(b"pow/equality-envelope/query", &plan.query_digest);
+                verify_relation_equality(
+                    &input.relation_commit(None)?,
+                    &resolved,
+                    &self.result_commitments,
+                    self.result_len,
+                    self.result_log_domain,
+                    proof,
+                    &mut transcript,
+                )?;
+            }
             _ => return Err(invalid("recursive relation proof variant mismatch")),
         }
 
@@ -1983,6 +2185,11 @@ impl RecursiveRelationEnvelope {
                 right.put_bounded(out, depth + 1, nodes)?;
                 proof.put(out)?;
             }
+            RecursiveRelationProof::Equality { input, proof } => {
+                4u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+                proof.put(out)?;
+            }
         }
         self.result_commitments.put(out)?;
         self.result_columns.put(out)?;
@@ -2029,6 +2236,10 @@ impl RecursiveRelationEnvelope {
                 left: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 right: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 proof: Box::<LeftOuterJoinProof>::get(reader)?,
+            },
+            4 => RecursiveRelationProof::Equality {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                proof: Box::<RelationEqualityProof>::get(reader)?,
             },
             _ => return Err(invalid("invalid recursive relation proof tag")),
         };
