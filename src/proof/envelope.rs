@@ -50,7 +50,7 @@ use super::query::{
     has_ground_result_unit, prove_layer_bgp_with_result_and_context,
     resolve_typed_result_objects, result_id_namespaces,
     resolve_result_values, verify_layer_bgp, verify_layer_bgp_result_log_domain,
-    verify_result_columns, AtomTerm, CanonicalResultValue, DictionaryAbsence,
+    verify_result_columns, generated_decimal_i64_field, AtomTerm, CanonicalResultValue, DictionaryAbsence,
     DictionaryAbsencePosition, LayerBgpAtom,
     LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectKindFilter, ObjectRangeBound,
     ObjectRangeSpec, RangeAtomSubproof, ResultColumnDescriptor, ResultIdNamespace,
@@ -85,8 +85,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v14 permits exact UInt64 inputs in the grouped-u64 sum statement (wire tag 14).
-const RECURSIVE_VERSION: u32 = 14;
+// v15 adds a distinct signed generated-decimal domain for grouped sums (wire tag 14).
+const RECURSIVE_VERSION: u32 = 15;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -185,6 +185,15 @@ impl Wire for u64 {
     }
     fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
         Ok(u64::from_le_bytes(reader.take(8)?.try_into().unwrap()))
+    }
+}
+impl Wire for i64 {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        out.extend_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        Ok(i64::from_le_bytes(reader.take(8)?.try_into().unwrap()))
     }
 }
 impl Wire for usize {
@@ -746,6 +755,7 @@ impl Wire for ResultIdNamespace {
             Self::NodeValue => 0u8.put(out),
             Self::Predicate => 1u8.put(out),
             Self::GeneratedDecimalU64 => 2u8.put(out),
+            Self::GeneratedDecimalI64 => 3u8.put(out),
         }
     }
     fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
@@ -753,6 +763,7 @@ impl Wire for ResultIdNamespace {
             0 => Ok(Self::NodeValue),
             1 => Ok(Self::Predicate),
             2 => Ok(Self::GeneratedDecimalU64),
+            3 => Ok(Self::GeneratedDecimalI64),
             _ => Err(invalid("invalid result namespace tag")),
         }
     }
@@ -773,6 +784,10 @@ impl Wire for CanonicalResultValue {
                 2u8.put(out)?;
                 value.put(out)
             }
+            Self::GeneratedDecimalI64(value) => {
+                3u8.put(out)?;
+                value.put(out)
+            }
         }
     }
     fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
@@ -780,6 +795,7 @@ impl Wire for CanonicalResultValue {
             0 => Ok(Self::Object(Wire::get(reader)?)),
             1 => Ok(Self::Null),
             2 => Ok(Self::GeneratedDecimalU64(u64::get(reader)?)),
+            3 => Ok(Self::GeneratedDecimalI64(i64::get(reader)?)),
             _ => Err(invalid("invalid canonical result value tag")),
         }
     }
@@ -1724,7 +1740,7 @@ pub enum RelationProofPlanKind {
         constant: u64,
         constant_on_left: bool,
     },
-    /// Exact zero-/one-key grouping and checked u64 sum over UInt8/UInt16/UInt32/UInt64
+    /// Exact zero-/one-key grouping and checked u64/i64 sum over fixed-width integral
     /// Store values.
     /// The child rows and root-bound dictionary are public to the verifier, so the
     /// aggregate is derived directly without exposing the private intermediate list.
@@ -2034,14 +2050,28 @@ impl RelationProofPlan {
                             | CanonicalDatatype::UInt16
                             | CanonicalDatatype::UInt32
                             | CanonicalDatatype::UInt64
+                            | CanonicalDatatype::Int8
+                            | CanonicalDatatype::Int16
+                            | CanonicalDatatype::Int32
+                            | CanonicalDatatype::Int64
                     )
                 {
                     return Err(invalid(
-                        "group-sum requires an optional nonnullable node key and UInt8/UInt16/UInt32/UInt64 value",
+                        "group-sum requires an optional nonnullable node key and a fixed-width integral value",
                     ));
                 }
                 let generated = ResultColumnDescriptor {
-                    namespace: ResultIdNamespace::GeneratedDecimalU64,
+                    namespace: if matches!(
+                        datatype,
+                        CanonicalDatatype::Int8
+                            | CanonicalDatatype::Int16
+                            | CanonicalDatatype::Int32
+                            | CanonicalDatatype::Int64
+                    ) {
+                        ResultIdNamespace::GeneratedDecimalI64
+                    } else {
+                        ResultIdNamespace::GeneratedDecimalU64
+                    },
                     nullable: false,
                 };
                 let result = match key_column {
@@ -2417,10 +2447,59 @@ fn generated_u64_filtered_columns(
         .collect()
 }
 
-fn bounded_unsigned_catalog_value(
+#[derive(Clone, Copy)]
+enum GroupSumValue {
+    Unsigned(u64),
+    // Signed Prolog arithmetic is unbounded. The public envelope caps rows at four
+    // million, so i128 can accumulate every possible i64 input without intermediate
+    // overflow; only the final result is required to fit the generated i64 domain.
+    Signed(i128),
+}
+
+impl GroupSumValue {
+    fn zero(datatype: CanonicalDatatype) -> io::Result<Self> {
+        match datatype {
+            CanonicalDatatype::UInt8
+            | CanonicalDatatype::UInt16
+            | CanonicalDatatype::UInt32
+            | CanonicalDatatype::UInt64 => Ok(Self::Unsigned(0)),
+            CanonicalDatatype::Int8
+            | CanonicalDatatype::Int16
+            | CanonicalDatatype::Int32
+            | CanonicalDatatype::Int64 => Ok(Self::Signed(0)),
+            _ => Err(invalid("group-sum datatype is outside the integral subset")),
+        }
+    }
+
+    fn checked_add(self, rhs: Self) -> io::Result<Self> {
+        match (self, rhs) {
+            (Self::Unsigned(left), Self::Unsigned(right)) => left
+                .checked_add(right)
+                .map(Self::Unsigned)
+                .ok_or_else(|| invalid("group-sum unsigned arithmetic exceeds u64")),
+            (Self::Signed(left), Self::Signed(right)) => left
+                .checked_add(right)
+                .map(Self::Signed)
+                .ok_or_else(|| invalid("group-sum signed arithmetic exceeds i64")),
+            _ => Err(invalid("group-sum mixes signed and unsigned values")),
+        }
+    }
+
+    fn field(self) -> io::Result<ArkFr> {
+        match self {
+            Self::Unsigned(value) => Ok(ArkFr::from_u64(value)),
+            Self::Signed(value) => Ok(generated_decimal_i64_field(
+                i64::try_from(value)
+                    .map_err(|_| invalid("group-sum signed result exceeds i64"))?,
+            )),
+        }
+    }
+}
+
+fn integral_catalog_value(
     object: &CanonicalObject,
     datatype: CanonicalDatatype,
-) -> io::Result<u64> {
+) -> io::Result<GroupSumValue> {
     let CanonicalObject::Value {
         datatype: actual,
         lexical,
@@ -2432,23 +2511,42 @@ fn bounded_unsigned_catalog_value(
         return Err(invalid("group-sum value has the wrong exact datatype"));
     }
     Ok(match datatype {
-        CanonicalDatatype::UInt8 if lexical.len() == 1 => u64::from(lexical[0]),
+        CanonicalDatatype::UInt8 if lexical.len() == 1 => GroupSumValue::Unsigned(u64::from(lexical[0])),
         CanonicalDatatype::UInt16 if lexical.len() == 2 => {
-            u64::from(u16::from_be_bytes(lexical.as_slice().try_into().unwrap()))
+            GroupSumValue::Unsigned(u64::from(u16::from_be_bytes(lexical.as_slice().try_into().unwrap())))
         }
         CanonicalDatatype::UInt32 if lexical.len() == 4 => {
-            u64::from(u32::from_be_bytes(lexical.as_slice().try_into().unwrap()))
+            GroupSumValue::Unsigned(u64::from(u32::from_be_bytes(lexical.as_slice().try_into().unwrap())))
         }
         CanonicalDatatype::UInt64 if lexical.len() == 8 => {
-            u64::from_be_bytes(lexical.as_slice().try_into().unwrap())
+            GroupSumValue::Unsigned(u64::from_be_bytes(lexical.as_slice().try_into().unwrap()))
+        }
+        CanonicalDatatype::Int8 if lexical.len() == 1 => {
+            GroupSumValue::Signed(i128::from((lexical[0] ^ 0x80) as i8))
+        }
+        CanonicalDatatype::Int16 if lexical.len() == 2 => {
+            let encoded = u16::from_be_bytes(lexical.as_slice().try_into().unwrap());
+            GroupSumValue::Signed(i128::from((encoded ^ (1 << 15)) as i16))
+        }
+        CanonicalDatatype::Int32 if lexical.len() == 4 => {
+            let encoded = u32::from_be_bytes(lexical.as_slice().try_into().unwrap());
+            GroupSumValue::Signed(i128::from((encoded ^ (1 << 31)) as i32))
+        }
+        CanonicalDatatype::Int64 if lexical.len() == 8 => {
+            let encoded = u64::from_be_bytes(lexical.as_slice().try_into().unwrap());
+            GroupSumValue::Signed(i128::from((encoded ^ (1 << 63)) as i64))
         }
         CanonicalDatatype::UInt8
         | CanonicalDatatype::UInt16
         | CanonicalDatatype::UInt32
-        | CanonicalDatatype::UInt64 => {
+        | CanonicalDatatype::UInt64
+        | CanonicalDatatype::Int8
+        | CanonicalDatatype::Int16
+        | CanonicalDatatype::Int32
+        | CanonicalDatatype::Int64 => {
             return Err(invalid("group-sum value has a noncanonical lexical width"))
         }
-        _ => return Err(invalid("group-sum datatype is outside the bounded unsigned subset")),
+        _ => return Err(invalid("group-sum datatype is outside the integral subset")),
     })
 }
 
@@ -2479,25 +2577,23 @@ fn derived_group_sum_columns(
         };
         Ok((iri.clone(), record.object_id))
     };
-    let resolve_value = |field: ArkFr| -> io::Result<u64> {
+    let resolve_value = |field: ArkFr| -> io::Result<GroupSumValue> {
         let record = view
             .node_value_catalog
             .iter()
             .find(|record| ArkFr::from_u64(record.object_id) == field)
             .ok_or_else(|| invalid("group-sum value id is absent from the authenticated dictionary"))?;
-        bounded_unsigned_catalog_value(&record.triple.object, datatype)
+        integral_catalog_value(&record.triple.object, datatype)
     };
     let Some(key_column) = key_column else {
         if input.result_len == 0 {
             return Ok(vec![Vec::new()]);
         }
-        let mut sum = 0u64;
+        let mut sum = GroupSumValue::zero(datatype)?;
         for field in values {
-            sum = sum
-                .checked_add(resolve_value(*field)?)
-                .ok_or_else(|| invalid("global group-sum arithmetic exceeds u64"))?;
+            sum = sum.checked_add(resolve_value(*field)?)?;
         }
-        return Ok(vec![vec![ArkFr::from_u64(sum)]]);
+        return Ok(vec![vec![sum.field()?]]);
     };
     let key_descriptor = input
         .result_descriptors
@@ -2517,22 +2613,21 @@ fn derived_group_sum_columns(
     // SWI bagof enumerates atom-valued free keys in standard atom order. Expanded IRI
     // nodes are UTF-8 bytes, whose lexicographic order preserves Unicode scalar order.
     // Sort by the authenticated node value, never by Store ID (child IDs are appended).
-    let mut sums = std::collections::BTreeMap::<Vec<u8>, (u64, u64)>::new();
+    let mut sums = std::collections::BTreeMap::<Vec<u8>, (u64, GroupSumValue)>::new();
     for row in 0..input.result_len {
         let (canonical_key, key_id) = resolve_key(keys[row])?;
         let value = resolve_value(values[row])?;
-        let entry = sums.entry(canonical_key).or_insert((key_id, 0));
+        let entry = sums
+            .entry(canonical_key)
+            .or_insert((key_id, GroupSumValue::zero(datatype)?));
         if entry.0 != key_id {
             return Err(invalid("group-sum canonical node maps to multiple Store IDs"));
         }
-        entry.1 = entry
-            .1
-            .checked_add(value)
-            .ok_or_else(|| invalid("group-sum arithmetic exceeds u64"))?;
+        entry.1 = entry.1.checked_add(value)?;
     }
     Ok(vec![
         sums.values().map(|(key, _)| ArkFr::from_u64(*key)).collect(),
-        sums.values().map(|(_, sum)| ArkFr::from_u64(*sum)).collect(),
+        sums.values().map(|(_, sum)| sum.field()).collect::<io::Result<Vec<_>>>()?,
     ])
 }
 
@@ -2786,7 +2881,8 @@ impl RecursiveRelationEnvelope {
                             .iter()
                             .find(|record| ArkFr::from_u64(record.object_id) == field)
                             .map(|record| record.object_id),
-                        ResultIdNamespace::GeneratedDecimalU64 => None,
+                        ResultIdNamespace::GeneratedDecimalU64
+                        | ResultIdNamespace::GeneratedDecimalI64 => None,
                     }
                     .ok_or_else(|| invalid("distinct input id absent from planned namespace"))
                 };
@@ -3036,7 +3132,8 @@ impl RecursiveRelationEnvelope {
                     let id = match namespace {
                         ResultIdNamespace::Predicate => view.predicate_catalog.iter().find_map(|record| (ArkFr::from_u64(record.predicate_id) == field).then_some(record.predicate_id)),
                         ResultIdNamespace::NodeValue => view.node_value_catalog.iter().find_map(|record| (ArkFr::from_u64(record.object_id) == field).then_some(record.object_id)),
-                        ResultIdNamespace::GeneratedDecimalU64 => None,
+                        ResultIdNamespace::GeneratedDecimalU64
+                        | ResultIdNamespace::GeneratedDecimalI64 => None,
                     };
                     id.ok_or_else(|| invalid("group-extrema input id absent from planned namespace"))
                 };
@@ -3340,7 +3437,8 @@ impl RecursiveRelationEnvelope {
                             .iter()
                             .find(|record| ArkFr::from_u64(record.object_id) == field)
                             .map(|record| record.object_id),
-                        ResultIdNamespace::GeneratedDecimalU64 => None,
+                        ResultIdNamespace::GeneratedDecimalU64
+                        | ResultIdNamespace::GeneratedDecimalI64 => None,
                     }
                     .ok_or_else(|| invalid("distinct output id absent from planned namespace"))
                 };
@@ -3610,7 +3708,8 @@ impl RecursiveRelationEnvelope {
                             .find(|r| ArkFr::from_u64(r.predicate_id) == field).map(|r| r.predicate_id),
                         ResultIdNamespace::NodeValue => view.node_value_catalog.iter()
                             .find(|r| ArkFr::from_u64(r.object_id) == field).map(|r| r.object_id),
-                        ResultIdNamespace::GeneratedDecimalU64 => None,
+                        ResultIdNamespace::GeneratedDecimalU64
+                        | ResultIdNamespace::GeneratedDecimalI64 => None,
                     }.ok_or_else(|| invalid("group-extrema output id absent from planned namespace"))
                 };
                 let rows = (0..self.result_len).map(|i| Ok((
@@ -4732,6 +4831,186 @@ mod tests {
             CanonicalDatatype::UInt64,
         )
         .is_err());
+    }
+
+    #[test]
+    fn recursive_group_sum_authenticates_signed_values_domains_and_overflow() {
+        for value in [i64::MIN, -1, 0, 1, i64::MAX] {
+            assert_eq!(
+                super::super::query::generated_decimal_i64_value(
+                    generated_decimal_i64_field(value),
+                )
+                .unwrap(),
+                value
+            );
+        }
+        for (datatype, lexical, expected) in [
+            (CanonicalDatatype::Int8, vec![(-3i8 as u8) ^ 0x80], -3i128),
+            (
+                CanonicalDatatype::Int16,
+                ((-300i16 as u16) ^ (1 << 15)).to_be_bytes().to_vec(),
+                -300i128,
+            ),
+            (
+                CanonicalDatatype::Int32,
+                ((-30_000i32 as u32) ^ (1 << 31)).to_be_bytes().to_vec(),
+                -30_000i128,
+            ),
+            (
+                CanonicalDatatype::Int64,
+                ((-3_000_000_000i64 as u64) ^ (1 << 63)).to_be_bytes().to_vec(),
+                -3_000_000_000i128,
+            ),
+        ] {
+            let GroupSumValue::Signed(actual) = integral_catalog_value(
+                &CanonicalObject::Value { datatype, lexical },
+                datatype,
+            )
+            .unwrap()
+            else {
+                panic!("signed datatype decoded into unsigned sum domain")
+            };
+            assert_eq!(actual, expected);
+        }
+        let store = open_sync_memory_store();
+        let base_builder = store.create_base_layer().unwrap();
+        for (predicate, value) in [("p", i64::MIN), ("q", i64::MAX), ("r", 1)] {
+            base_builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("b"),
+                    &iri(predicate),
+                    i64::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let base = base_builder.commit().unwrap();
+        let child_builder = base.open_write().unwrap();
+        // Duplicate numeric solutions use distinct predicates because triples are a set.
+        // `a` is appended after `b`, but must remain the first canonical node group.
+        for (predicate, value) in [("p", -5i64), ("q", 2), ("r", 2)] {
+            child_builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("a"),
+                    &iri(predicate),
+                    i64::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let layer = child_builder.commit().unwrap().proof_commitment().unwrap();
+        let source = RelationProofPlan {
+            query_digest: [108u8; 32],
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                atoms: vec![LayerBgpAtom {
+                    subject: AtomTerm::Variable,
+                    predicate_term: Vec::new(),
+                    predicate_variable: true,
+                    object: AtomTerm::Variable,
+                    object_range: None,
+                    object_kind: ObjectKindFilter::Any,
+                    subject_object_equal: false,
+                }],
+                joins: Vec::new(),
+            }),
+        };
+        let keyed_plan = RelationProofPlan {
+            query_digest: [109u8; 32],
+            kind: RelationProofPlanKind::GroupSum {
+                input: Box::new(source.clone()),
+                key_column: Some(0),
+                value_column: 2,
+                datatype: CanonicalDatatype::Int64,
+            },
+        };
+        let keyed = RecursiveRelationEnvelope::prove(&layer, &keyed_plan).unwrap();
+        keyed
+            .verify(&layer, layer.state.commitment_root, &keyed_plan)
+            .unwrap();
+        assert_eq!(
+            keyed.result_descriptors[1].namespace,
+            ResultIdNamespace::GeneratedDecimalI64
+        );
+        assert_eq!(
+            keyed.result_values[0],
+            vec![
+                CanonicalResultValue::Object(CanonicalObject::Node(iri("a").into_bytes())),
+                CanonicalResultValue::Object(CanonicalObject::Node(iri("b").into_bytes())),
+            ]
+        );
+        assert_eq!(
+            keyed.result_values[1],
+            vec![
+                CanonicalResultValue::GeneratedDecimalI64(-1),
+                CanonicalResultValue::GeneratedDecimalI64(0),
+            ]
+        );
+        let decoded = RecursiveRelationEnvelope::decode(&keyed.encode().unwrap()).unwrap();
+        decoded
+            .verify(&layer, layer.state.commitment_root, &keyed_plan)
+            .unwrap();
+
+        let mut sign_tamper = decoded.clone();
+        sign_tamper.result_columns[1][0] = generated_decimal_i64_field(1);
+        let mut padded = sign_tamper.result_columns[1].clone();
+        padded.resize(1usize << sign_tamper.result_log_domain, ArkFr::zero());
+        sign_tamper.result_commitments[1] = commit_column(&padded).unwrap();
+        assert!(sign_tamper
+            .verify(&layer, layer.state.commitment_root, &keyed_plan)
+            .is_err());
+
+        let mut domain_tamper = decoded.clone();
+        domain_tamper.result_descriptors[1].namespace =
+            ResultIdNamespace::GeneratedDecimalU64;
+        assert!(domain_tamper
+            .verify(&layer, layer.state.commitment_root, &keyed_plan)
+            .is_err());
+
+        let global_plan = RelationProofPlan {
+            query_digest: [110u8; 32],
+            kind: RelationProofPlanKind::GroupSum {
+                input: Box::new(source.clone()),
+                key_column: None,
+                value_column: 2,
+                datatype: CanonicalDatatype::Int64,
+            },
+        };
+        let global = RecursiveRelationEnvelope::prove(&layer, &global_plan).unwrap();
+        global
+            .verify(&layer, layer.state.commitment_root, &global_plan)
+            .unwrap();
+        assert_eq!(
+            global.result_values,
+            vec![vec![CanonicalResultValue::GeneratedDecimalI64(-1)]]
+        );
+
+        let overflow_layer = |values: [i64; 2]| {
+            let store = open_sync_memory_store();
+            let builder = store.create_base_layer().unwrap();
+            for (predicate, value) in [("p", values[0]), ("q", values[1])] {
+                builder
+                    .add_value_triple(ValueTriple::new_value(
+                        &iri("a"),
+                        &iri(predicate),
+                        i64::make_entry(&value),
+                    ))
+                    .unwrap();
+            }
+            builder.commit().unwrap().proof_commitment().unwrap()
+        };
+        for overflow in [
+            overflow_layer([i64::MAX, 1]),
+            overflow_layer([i64::MIN, -1]),
+        ] {
+            assert!(RecursiveRelationEnvelope::prove(&overflow, &global_plan).is_err());
+            let child = RecursiveRelationEnvelope::prove(&overflow, &source).unwrap();
+            assert!(derived_group_sum_columns(
+                &overflow,
+                &child,
+                None,
+                2,
+                CanonicalDatatype::Int64,
+            )
+            .is_err());
+        }
     }
 
     #[test]
