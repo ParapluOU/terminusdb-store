@@ -102,8 +102,8 @@ fn materialized_layer_columns(
     Ok((s, p, o, n))
 }
 
-/// Resolve a predicate IRI (term bytes) to its dictionary id in this layer, or
-/// fail closed if the term is not present (non-membership proofs are deferred).
+/// Resolve a predicate IRI (term bytes) to its dictionary id in this layer. A missing
+/// term is authenticated only for a standalone ground query; relational atoms fail closed.
 fn resolve_predicate_id(layer: &LayerCommitment, predicate_term: &[u8]) -> io::Result<u64> {
     layer
         .predicate_catalog
@@ -672,6 +672,17 @@ pub struct LayerBgpAtomProof {
 pub struct LayerBgpProof {
     pub atoms: Vec<LayerBgpAtomProof>,
     pub chain: Option<BgpChainProof>,
+    /// A single fully-ground query whose result is empty because this term is absent
+    /// from a root-authenticated dictionary. No row-filter proof is needed: a triple
+    /// containing a dictionary-absent term cannot exist.
+    pub ground_absence: Option<GroundAbsence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroundAbsence {
+    Predicate,
+    Subject,
+    Object,
 }
 
 /// Prover-side BGP output including the values bound by the result commitments. Columns
@@ -818,8 +829,8 @@ fn atom_term_object(term: &AtomTerm) -> Option<CanonicalObject> {
 }
 
 /// Resolve a subject/object CONSTANT to its node/value dictionary id in this layer, or
-/// fail closed if the constant is absent (non-membership proofs are deferred, mirroring
-/// [`resolve_predicate_id`]). Subjects share the node/value id space with node objects, so
+/// fail closed if the constant is absent (except for the standalone-ground shortcut).
+/// Subjects share the node/value id space with node objects, so
 /// the same `(hash_object(term), id)` row authenticates the constant in either position.
 fn resolve_node_value_id(layer: &LayerCommitment, object: &CanonicalObject) -> io::Result<u64> {
     layer
@@ -1039,6 +1050,42 @@ pub(crate) fn has_ground_result_unit(plan: &LayerBgpPlan) -> bool {
     matches!(plan.atoms.as_slice(), [atom]
         if !matches!(atom.subject, AtomTerm::Variable)
             && !matches!(atom.object, AtomTerm::Variable))
+}
+
+fn ground_dictionary_absence(
+    layer: &LayerCommitment,
+    plan: &LayerBgpPlan,
+) -> Option<GroundAbsence> {
+    let [atom] = plan.atoms.as_slice() else {
+        return None;
+    };
+    if matches!(atom.subject, AtomTerm::Variable) || matches!(atom.object, AtomTerm::Variable) {
+        return None;
+    }
+    if !layer
+        .predicate_catalog
+        .iter()
+        .any(|record| record.triple.predicate == atom.predicate_term)
+    {
+        return Some(GroundAbsence::Predicate);
+    }
+    let subject = atom_term_object(&atom.subject).expect("ground subject must be constant");
+    if !layer
+        .node_value_catalog
+        .iter()
+        .any(|record| record.triple.object == subject)
+    {
+        return Some(GroundAbsence::Subject);
+    }
+    let object = atom_term_object(&atom.object).expect("ground object must be constant");
+    if !layer
+        .node_value_catalog
+        .iter()
+        .any(|record| record.triple.object == object)
+    {
+        return Some(GroundAbsence::Object);
+    }
+    None
 }
 
 /// The padded power-of-two length of every committed node/value dictionary column,
@@ -1597,6 +1644,26 @@ pub fn prove_layer_bgp_with_result(
     let k = validate_bgp_plan(plan)?;
     let (s, p, o, n) = materialized_layer_columns(layer)?;
 
+    if let Some(absence) = ground_dictionary_absence(layer, plan) {
+        // The authenticated dictionary does not contain one public ground term, so the
+        // triple cannot occur. Preserve the filter gadget's one hidden UNIT column shape,
+        // but commit its empty (all-zero) result directly.
+        let domain = padded_len(n)?;
+        let zero_column = vec![f0(); domain];
+        return Ok(LayerBgpResult {
+            proof: LayerBgpProof {
+                atoms: Vec::new(),
+                chain: None,
+                ground_absence: Some(absence),
+            },
+            result_commitments: vec![commit_column(&zero_column)?],
+            result_columns: vec![zero_column],
+            result_log_domain: domain.trailing_zeros() as usize,
+            result_len: 0,
+            predicate_ids: Vec::new(),
+        });
+    }
+
     // Resolve every atom's constant ids up front (fail closed if any is absent): the
     // predicate IRI via the predicate dictionary, each subject/object constant via the
     // node/value dictionary.
@@ -1762,6 +1829,7 @@ pub fn prove_layer_bgp_with_result(
         proof: LayerBgpProof {
             atoms: atom_proofs,
             chain,
+            ground_absence: None,
         },
         result_commitments: result_coms,
         result_columns,
@@ -1798,6 +1866,37 @@ pub fn verify_layer_bgp(
         ));
     }
     let k = validate_bgp_plan(plan)?;
+    if let Some(claimed_absence) = proof.ground_absence {
+        if !has_ground_result_unit(plan) {
+            return Err(invalid(
+                "dictionary-absence shortcut requires a single ground atom",
+            ));
+        }
+        // Recommit every clear catalog/table before using catalog nonmembership. This
+        // turns the scan below into an opening of the externally trusted layer root,
+        // rather than trusting an unauthenticated convenience catalog.
+        layer.validate()?;
+        if ground_dictionary_absence(layer, plan) != Some(claimed_absence) {
+            return Err(invalid(
+                "claimed ground dictionary absence is not authentic",
+            ));
+        }
+        if !proof.atoms.is_empty()
+            || proof.chain.is_some()
+            || !predicate_ids.is_empty()
+            || m != 0
+            || result_coms.len() != 1
+        {
+            return Err(invalid("invalid ground dictionary-absence proof shape"));
+        }
+        let zero_column = vec![f0(); padded_len(layer.state.materialized_count as usize)?];
+        if result_coms[0] != commit_column(&zero_column)? {
+            return Err(invalid(
+                "ground dictionary-absence result is not the empty UNIT relation",
+            ));
+        }
+        return Ok(());
+    }
     if proof.atoms.len() != k || predicate_ids.len() != k {
         return Err(invalid("layer BGP proof/atom/id count mismatch"));
     }
@@ -3160,9 +3259,9 @@ mod tests {
     #[test]
     fn layer_bgp_single_ground_atom_proves_presence_and_absence() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
-        let atom = |predicate: &[u8], object: &str| LayerBgpPlan {
+        let atom = |subject: &str, predicate: &[u8], object: &str| LayerBgpPlan {
             atoms: vec![LayerBgpAtom {
-                subject: node_const("a"),
+                subject: node_const(subject),
                 predicate_term: predicate.to_vec(),
                 object: node_const(object),
                 object_range: None,
@@ -3171,9 +3270,28 @@ mod tests {
             joins: Vec::new(),
         };
 
-        for (plan, expected_len) in [(atom(KNOWS, "b"), 1), (atom(LIKES, "c"), 0)] {
+        for (plan, expected_len, expected_absence) in [
+            (atom("a", KNOWS, "b"), 1, None),
+            (atom("a", LIKES, "c"), 0, None),
+            (
+                atom("a", KNOWS, "missing-object"),
+                0,
+                Some(GroundAbsence::Object),
+            ),
+            (
+                atom("missing-subject", KNOWS, "b"),
+                0,
+                Some(GroundAbsence::Subject),
+            ),
+            (
+                atom("a", b"http://ex/missing-predicate", "b"),
+                0,
+                Some(GroundAbsence::Predicate),
+            ),
+        ] {
             let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
             assert_eq!(result.result_len, expected_len);
+            assert_eq!(result.proof.ground_absence, expected_absence);
             assert_eq!(result.result_commitments.len(), 1);
             assert_eq!(result.result_columns.len(), 1);
             verify_layer_bgp(
@@ -3186,6 +3304,36 @@ mod tests {
                 &result.proof,
             )
             .unwrap();
+            if let Some(absence) = expected_absence {
+                let mut forged = result.proof.clone();
+                forged.ground_absence = Some(match absence {
+                    GroundAbsence::Predicate => GroundAbsence::Subject,
+                    GroundAbsence::Subject | GroundAbsence::Object => GroundAbsence::Predicate,
+                });
+                assert!(verify_layer_bgp(
+                    &lc,
+                    lc.state.commitment_root,
+                    &plan,
+                    &result.predicate_ids,
+                    &result.result_commitments,
+                    result.result_len,
+                    &forged,
+                )
+                .is_err());
+
+                let mut forged_present = result.proof.clone();
+                forged_present.ground_absence = None;
+                assert!(verify_layer_bgp(
+                    &lc,
+                    lc.state.commitment_root,
+                    &plan,
+                    &result.predicate_ids,
+                    &result.result_commitments,
+                    1,
+                    &forged_present,
+                )
+                .is_err());
+            }
         }
     }
 

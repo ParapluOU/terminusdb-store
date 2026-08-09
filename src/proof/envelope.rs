@@ -20,8 +20,8 @@ use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
 use super::query::{
     has_ground_result_unit, resolve_result_objects, verify_layer_bgp, verify_result_columns,
-    verify_result_objects, AtomTerm, LayerBgpAtom, LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof,
-    ObjectRangeBound, ObjectRangeSpec, RangeAtomSubproof, SecondRangeSubproof,
+    verify_result_objects, AtomTerm, GroundAbsence, LayerBgpAtom, LayerBgpAtomProof, LayerBgpPlan,
+    LayerBgpProof, ObjectRangeBound, ObjectRangeSpec, RangeAtomSubproof, SecondRangeSubproof,
 };
 use super::range::{
     DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp, RangeSelectProof,
@@ -31,10 +31,9 @@ use super::sort::SortedProof;
 use super::{CanonicalDatatype, CanonicalObject, ProofHash};
 
 const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
-// v2 binds the deterministic Dory parameter-set identity into every opening
-// transcript. v1 envelopes fail explicitly instead of reaching cryptographic
-// verification under an ambiguously different transcript.
-const VERSION: u32 = 2;
+// v3 adds the root-authenticated ground dictionary-absence branch. Older envelopes fail
+// explicitly; v2 had already bound the deterministic Dory parameter-set identity.
+const VERSION: u32 = 3;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -388,7 +387,11 @@ wire_struct!(LayerBgpAtomProof {
     subject_id,
     object_id
 });
-wire_struct!(LayerBgpProof { atoms, chain });
+wire_struct!(LayerBgpProof {
+    atoms,
+    chain,
+    ground_absence
+});
 wire_struct!(JoinStep {
     acc_key,
     rel_key,
@@ -410,6 +413,26 @@ wire_struct!(LayerBgpAtom {
     subject_object_equal
 });
 wire_struct!(LayerBgpPlan { atoms, joins });
+
+impl Wire for GroundAbsence {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Predicate => 0u8,
+            Self::Subject => 1u8,
+            Self::Object => 2u8,
+        }
+        .put(out)
+    }
+
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        match u8::get(reader)? {
+            0 => Ok(Self::Predicate),
+            1 => Ok(Self::Subject),
+            2 => Ok(Self::Object),
+            _ => Err(invalid("invalid ground-absence tag")),
+        }
+    }
+}
 
 impl Wire for AtomFilterProof {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
@@ -729,6 +752,27 @@ mod tests {
     }
 
     #[test]
+    fn ground_absence_wire_tags_are_strict() {
+        for (tag, expected) in [
+            (0, GroundAbsence::Predicate),
+            (1, GroundAbsence::Subject),
+            (2, GroundAbsence::Object),
+        ] {
+            let mut reader = Reader {
+                bytes: &[tag],
+                pos: 0,
+            };
+            assert_eq!(GroundAbsence::get(&mut reader).unwrap(), expected);
+            reader.finish().unwrap();
+        }
+        let mut reader = Reader {
+            bytes: &[3],
+            pos: 0,
+        };
+        assert!(GroundAbsence::get(&mut reader).is_err());
+    }
+
+    #[test]
     fn ground_result_unit_is_authenticated_but_not_dictionary_resolved() {
         let (layer, _) = fixture();
         let plan = LayerBgpPlan {
@@ -795,7 +839,7 @@ mod tests {
         assert!(LayerBgpEnvelope::decode(&corrupt).is_err());
 
         let mut wrong_version = encoded.clone();
-        wrong_version[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&3u32.to_le_bytes());
+        wrong_version[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&4u32.to_le_bytes());
         refresh_checksum(&mut wrong_version);
         assert!(LayerBgpEnvelope::decode(&wrong_version).is_err());
 
