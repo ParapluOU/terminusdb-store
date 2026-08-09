@@ -520,6 +520,22 @@ pub enum ResultIdNamespace {
     Predicate,
 }
 
+/// Authoritative interpretation of one public result column. Nullability is a query-plan
+/// property, never inferred from a delivered field value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResultColumnDescriptor {
+    pub namespace: ResultIdNamespace,
+    pub nullable: bool,
+}
+
+/// Canonical public result value. `Null` is distinct from every Store dictionary object
+/// and is represented by field zero only in a nullable result column.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CanonicalResultValue {
+    Object(CanonicalObject),
+    Null,
+}
+
 /// A numeric RANGE filter on an atom's VARIABLE object: `?o op c`, where the object's
 /// dict-authenticated typed value (of datatype discriminant `T`) is compared to the
 /// PUBLIC order-preserving-encoded constant `c`. `b_bits` is the range gadget's
@@ -841,6 +857,89 @@ pub fn resolve_typed_result_objects(
                 .collect()
         })
         .collect()
+}
+
+/// Resolve nullable typed result columns. Every real Store dictionary ID must be
+/// nonzero. Zero resolves to `Null` exactly for a descriptor marked nullable; it is an
+/// error in a nonnullable column and is never looked up in either dictionary catalog.
+pub fn resolve_result_values(
+    layer: &LayerCommitment,
+    expected_root: ProofHash,
+    columns: &[Vec<ArkFr>],
+    descriptors: &[ResultColumnDescriptor],
+) -> io::Result<Vec<Vec<CanonicalResultValue>>> {
+    if columns.len() != descriptors.len() {
+        return Err(invalid("result column descriptor shape mismatch"));
+    }
+    if layer.state.commitment_root != expected_root {
+        return Err(invalid(
+            "layer commitment_root does not match the externally-trusted expected root",
+        ));
+    }
+    layer.validate()?;
+    if layer
+        .predicate_catalog
+        .iter()
+        .any(|record| record.predicate_id == 0)
+        || layer
+            .node_value_catalog
+            .iter()
+            .any(|record| record.object_id == 0)
+    {
+        return Err(invalid(
+            "Store dictionary id zero is reserved for nullable query results",
+        ));
+    }
+
+    columns
+        .iter()
+        .zip(descriptors)
+        .map(|(column, descriptor)| {
+            column
+                .iter()
+                .map(|id| {
+                    if id.is_zero() {
+                        return if descriptor.nullable {
+                            Ok(CanonicalResultValue::Null)
+                        } else {
+                            Err(invalid("null id in a nonnullable result column"))
+                        };
+                    }
+                    let object = match descriptor.namespace {
+                        ResultIdNamespace::NodeValue => layer
+                            .node_value_catalog
+                            .iter()
+                            .find(|record| ArkFr::from_u64(record.object_id) == *id)
+                            .map(|record| record.triple.object.clone())
+                            .ok_or_else(|| {
+                                invalid("result id is absent from the node/value dictionary")
+                            })?,
+                        ResultIdNamespace::Predicate => layer
+                            .predicate_catalog
+                            .iter()
+                            .find(|record| ArkFr::from_u64(record.predicate_id) == *id)
+                            .map(|record| CanonicalObject::Node(record.triple.predicate.clone()))
+                            .ok_or_else(|| {
+                                invalid("result id is absent from the predicate dictionary")
+                            })?,
+                    };
+                    Ok(CanonicalResultValue::Object(object))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub fn result_column_descriptors(
+    plan: &LayerBgpPlan,
+) -> io::Result<Vec<ResultColumnDescriptor>> {
+    Ok(result_id_namespaces(plan)?
+        .into_iter()
+        .map(|namespace| ResultColumnDescriptor {
+            namespace,
+            nullable: false,
+        })
+        .collect())
 }
 
 /// Derive the namespace of every final result column while validating that each natural
@@ -2944,6 +3043,73 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn nullable_result_descriptors_are_authoritative() {
+        let lc = build_layer(&[("a", "knows", "b")]);
+        let node_id = lc
+            .node_value_catalog
+            .iter()
+            .find(|record| record.triple.object == CanonicalObject::Node(iri("a").into_bytes()))
+            .unwrap()
+            .object_id;
+        let predicate_id = resolve_predicate_id(&lc, KNOWS).unwrap();
+        let columns = vec![
+            vec![ArkFr::from_u64(node_id)],
+            vec![ArkFr::from_u64(predicate_id)],
+            vec![ArkFr::zero()],
+        ];
+        let descriptors = vec![
+            ResultColumnDescriptor {
+                namespace: ResultIdNamespace::NodeValue,
+                nullable: false,
+            },
+            ResultColumnDescriptor {
+                namespace: ResultIdNamespace::Predicate,
+                nullable: false,
+            },
+            ResultColumnDescriptor {
+                namespace: ResultIdNamespace::NodeValue,
+                nullable: true,
+            },
+        ];
+        let values = resolve_result_values(
+            &lc,
+            lc.state.commitment_root,
+            &columns,
+            &descriptors,
+        )
+        .unwrap();
+        assert_eq!(
+            values[0][0],
+            CanonicalResultValue::Object(CanonicalObject::Node(iri("a").into_bytes()))
+        );
+        assert_eq!(
+            values[1][0],
+            CanonicalResultValue::Object(CanonicalObject::Node(iri("knows").into_bytes()))
+        );
+        assert_eq!(values[2][0], CanonicalResultValue::Null);
+
+        let mut nonnullable = descriptors.clone();
+        nonnullable[2].nullable = false;
+        assert!(resolve_result_values(
+            &lc,
+            lc.state.commitment_root,
+            &columns,
+            &nonnullable,
+        )
+        .is_err());
+
+        let mut forged = columns;
+        forged[2][0] = ArkFr::from_u64(u64::MAX);
+        assert!(resolve_result_values(
+            &lc,
+            lc.state.commitment_root,
+            &forged,
+            &descriptors,
+        )
+        .is_err());
     }
 
     // Independently recompute the complete BGP result columns (real length) and the final
