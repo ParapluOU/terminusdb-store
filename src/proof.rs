@@ -820,6 +820,7 @@ pub mod logup;
 pub mod membership;
 pub mod order;
 pub mod lexsort;
+pub mod multiorder;
 pub mod pairs;
 pub mod permutation;
 pub mod query;

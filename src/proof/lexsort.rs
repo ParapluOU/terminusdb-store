@@ -1,10 +1,9 @@
 //! Strict lexicographic ordering for two or three authenticated 64-bit key columns.
 
 use std::io;
-use ark_ff::PrimeField;
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::Field;
-use super::argument::{commit_column, StoreProverContext, Transcript254};
+use super::argument::{StoreProverContext, Transcript254};
 use super::order::OrderDirection;
 use super::sort::{prove_strictly_sorted_bits_with_context, verify_strictly_sorted_bits, SortedProof};
 use super::invalid;
@@ -77,6 +76,8 @@ pub fn verify_lexicographically_sorted(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_ff::PrimeField;
+    use super::super::argument::commit_column;
 
     fn padded(values: &[u64]) -> Vec<ArkFr> {
         let mut out = values.iter().map(|v| ArkFr::from_u64(*v)).collect::<Vec<_>>();
