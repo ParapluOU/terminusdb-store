@@ -15,6 +15,13 @@ deliberately left to the application or `terminusdb-rs` domain layer.
 Parture payment policy is intentionally outside this generic Store and prover
 framework.
 
+`StoreProverContext` selects prover arithmetic without changing storage or proof
+formats. Its stock and Blitzar-G1 constructors retain Arkworks BN254 G2, while
+`cpu_with_g2_backend` and `blitzar_with_g2_backend` accept a caller-owned exact
+`ArkG2` provider for profiling or a future accelerator. Blitzar 4.3.0 does not
+expose the BN254 G2 twist/Fq2 ABI, so Store never coerces G2 through its G1
+handle.
+
 The active implementation commits materialized layer columns with Dory, proves
 constant filtering and one- or two-sided object ranges, and composes connected single-key BGPs with
 sumcheck and LogUp arguments. It supports one or more atoms. Verification is anchored

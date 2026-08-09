@@ -38,7 +38,9 @@ pub use dory_pcs::backends::arkworks::BlitzarRuntimeConfig;
 use dory_pcs::primitives::arithmetic::{Field, Group, ProverBackend};
 use dory_pcs::primitives::poly::Polynomial;
 use dory_pcs::primitives::transcript::Transcript;
-use dory_pcs::{prove_with_context, verify, DoryProof, ProverContext, RoutineBackend, Transparent};
+use dory_pcs::{
+    prove_with_context, verify, DoryProof, ProverContext, RoutineBackend, Transparent,
+};
 
 use super::commitment::{matrix_dims, prover_setup, setup_parameter_id, verifier_setup};
 use super::invalid;
@@ -139,10 +141,73 @@ impl ProverBackend<ArkG1> for StoreG1Backend<'_> {
     }
 }
 
+enum StoreG2Backend {
+    Cpu(RoutineBackend<G2Routines>),
+    Provider(Box<dyn ProverBackend<ArkG2> + Send + Sync>),
+}
+
+impl ProverBackend<ArkG2> for StoreG2Backend {
+    fn msm(&self, bases: &[ArkG2], scalars: &[ArkFr]) -> ArkG2 {
+        match self {
+            Self::Cpu(backend) => backend.msm(bases, scalars),
+            Self::Provider(backend) => backend.msm(bases, scalars),
+        }
+    }
+
+    fn batch_msm_same_bases(&self, bases: &[ArkG2], batches: &[&[ArkFr]]) -> Vec<ArkG2> {
+        match self {
+            Self::Cpu(backend) => backend.batch_msm_same_bases(bases, batches),
+            Self::Provider(backend) => backend.batch_msm_same_bases(bases, batches),
+        }
+    }
+
+    fn fixed_base_vector_scalar_mul(&self, base: &ArkG2, scalars: &[ArkFr]) -> Vec<ArkG2> {
+        match self {
+            Self::Cpu(backend) => backend.fixed_base_vector_scalar_mul(base, scalars),
+            Self::Provider(backend) => backend.fixed_base_vector_scalar_mul(base, scalars),
+        }
+    }
+
+    fn fixed_scalar_mul_bases_then_add(
+        &self,
+        bases: &[ArkG2],
+        values: &mut [ArkG2],
+        scalar: &ArkFr,
+    ) {
+        match self {
+            Self::Cpu(backend) => backend.fixed_scalar_mul_bases_then_add(bases, values, scalar),
+            Self::Provider(backend) => {
+                backend.fixed_scalar_mul_bases_then_add(bases, values, scalar)
+            }
+        }
+    }
+
+    fn fixed_scalar_mul_vs_then_add(
+        &self,
+        values: &mut [ArkG2],
+        addends: &[ArkG2],
+        scalar: &ArkFr,
+    ) {
+        match self {
+            Self::Cpu(backend) => backend.fixed_scalar_mul_vs_then_add(values, addends, scalar),
+            Self::Provider(backend) => {
+                backend.fixed_scalar_mul_vs_then_add(values, addends, scalar)
+            }
+        }
+    }
+
+    fn fold_field_vectors(&self, left: &mut [ArkFr], right: &[ArkFr], scalar: &ArkFr) {
+        match self {
+            Self::Cpu(backend) => backend.fold_field_vectors(left, right, scalar),
+            Self::Provider(backend) => backend.fold_field_vectors(left, right, scalar),
+        }
+    }
+}
+
 /// Caller-created Store proving arithmetic. It is never serialized or consulted
 /// by verification, and selecting it cannot change proof bytes.
 pub struct StoreProverContext<'runtime> {
-    inner: ProverContext<BN254, StoreG1Backend<'runtime>, RoutineBackend<G2Routines>>,
+    inner: ProverContext<BN254, StoreG1Backend<'runtime>, StoreG2Backend>,
     accelerated_tier: Option<ProverSetupTier>,
 }
 
@@ -152,7 +217,23 @@ impl StoreProverContext<'static> {
         Self {
             inner: ProverContext::new(
                 StoreG1Backend::Cpu(RoutineBackend::new(), std::marker::PhantomData),
-                RoutineBackend::new(),
+                StoreG2Backend::Cpu(RoutineBackend::new()),
+            ),
+            accelerated_tier: None,
+        }
+    }
+
+    /// Construct the portable CPU-G1 context with a caller-owned exact BN254
+    /// G2 provider. This is an arithmetic-only choice and cannot affect proof
+    /// format or verification.
+    pub fn cpu_with_g2_backend<B>(g2_backend: B) -> Self
+    where
+        B: ProverBackend<ArkG2> + Send + Sync + 'static,
+    {
+        Self {
+            inner: ProverContext::new(
+                StoreG1Backend::Cpu(RoutineBackend::new(), std::marker::PhantomData),
+                StoreG2Backend::Provider(Box::new(g2_backend)),
             ),
             accelerated_tier: None,
         }
@@ -160,6 +241,20 @@ impl StoreProverContext<'static> {
 
     #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
     pub fn blitzar(runtime: &Arc<BlitzarRuntime>, tier: ProverSetupTier) -> io::Result<Self> {
+        Self::blitzar_with_g2_backend(runtime, tier, RoutineBackend::<G2Routines>::new())
+    }
+
+    /// Construct the native Blitzar-G1 context with a caller-owned exact BN254
+    /// G2 provider. Blitzar itself does not provide BN254 G2/Fq2 arithmetic.
+    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+    pub fn blitzar_with_g2_backend<B>(
+        runtime: &Arc<BlitzarRuntime>,
+        tier: ProverSetupTier,
+        g2_backend: B,
+    ) -> io::Result<Self>
+    where
+        B: ProverBackend<ArkG2> + Send + Sync + 'static,
+    {
         let setup = prover_setup(tier.log_domain())?;
         Ok(Self {
             inner: ProverContext::new(
@@ -167,7 +262,7 @@ impl StoreProverContext<'static> {
                     Arc::clone(runtime),
                     &setup.g1_vec,
                 )),
-                RoutineBackend::new(),
+                StoreG2Backend::Provider(Box::new(g2_backend)),
             ),
             accelerated_tier: Some(tier),
         })
@@ -935,8 +1030,8 @@ pub fn verify_column_openings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
     use ark_serialize::CanonicalSerialize;
+    use dory_pcs::ProfiledBackend;
 
     fn fr(v: u64) -> ArkFr {
         ArkFr::from_u64(v)
@@ -1133,6 +1228,40 @@ mod tests {
         let (r_v, evals_v) = verify_sumcheck(&shape, &proof, &mut vt).unwrap();
         assert_eq!(r, r_v);
         verify_column_openings(&[commitment], &r_v, &evals_v, &opening, &mut vt).unwrap();
+    }
+
+    #[test]
+    fn caller_owned_g2_provider_preserves_opening_bytes_and_reports_work() {
+        let g2 = ProfiledBackend::new(RoutineBackend::<G2Routines>::new());
+        let profile = g2.profile();
+        let provided = StoreProverContext::cpu_with_g2_backend(g2);
+        let cpu = StoreProverContext::cpu();
+        let column = column(6, 92);
+        let point = (0..6).map(|i| fr(17 * i as u64 + 3)).collect::<Vec<_>>();
+
+        let mut cpu_transcript = Transcript254::new(b"store-g2-provider-equivalence");
+        let cpu_proof = cpu
+            .prove_column_openings(&[column.clone()], &point, &mut cpu_transcript)
+            .unwrap();
+        let mut provided_transcript = Transcript254::new(b"store-g2-provider-equivalence");
+        let provided_proof = provided
+            .prove_column_openings(&[column], &point, &mut provided_transcript)
+            .unwrap();
+        assert_eq!(cpu_proof, provided_proof);
+
+        let mut cpu_bytes = Vec::new();
+        cpu_proof.serialize_compressed(&mut cpu_bytes).unwrap();
+        let mut provided_bytes = Vec::new();
+        provided_proof
+            .serialize_compressed(&mut provided_bytes)
+            .unwrap();
+        assert_eq!(cpu_bytes, provided_bytes);
+
+        let snapshot = profile.snapshot();
+        assert!(snapshot.msm_calls > 0);
+        assert!(snapshot.msm_scalar_terms > 0);
+        assert!(snapshot.fixed_base_outputs > 0);
+        assert!(snapshot.vector_fma_elements > 0);
     }
 
     #[test]
