@@ -9,8 +9,8 @@ use dory_pcs::primitives::transcript::Transcript;
 use sha2::{Digest, Sha256};
 
 use super::anti::{
-    verify_global_not, verify_left_anti_join_with_keys, verify_left_outer_join_with_keys,
-    LeftAntiJoinProof, LeftOuterJoinProof,
+    verify_global_left_outer_join, verify_global_not, verify_left_anti_join_with_keys,
+    verify_left_outer_join_with_keys, LeftAntiJoinProof, LeftOuterJoinProof,
 };
 use super::argument::{ColumnOpening, SumcheckProof};
 use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit};
@@ -1307,8 +1307,8 @@ fn outer_descriptors(
 ) -> io::Result<Vec<ResultColumnDescriptor>> {
     let left = result_id_namespaces(left_plan)?;
     let right = result_id_namespaces(right_plan)?;
-    if !(1..=2).contains(&key_pairs.len()) {
-        return Err(invalid("left-outer envelope needs one or two shared keys"));
+    if key_pairs.len() > 2 {
+        return Err(invalid("left-outer envelope supports at most two shared keys"));
     }
     let mut shared_right = Vec::with_capacity(key_pairs.len());
     for (left_index, right_index) in key_pairs {
@@ -1361,24 +1361,27 @@ impl LeftOuterJoinEnvelope {
         let mut transcript = super::argument::Transcript254::new(b"parture-left-outer-envelope");
         transcript.append_bytes(b"pow/outer-envelope/root", &expected_root);
         transcript.append_bytes(b"pow/outer-envelope/query", &query_digest);
-        verify_left_outer_join_with_keys(
-            &RelationCommit {
+        let left_commit = RelationCommit {
                 commitments: left.result_commitments.clone(),
                 log_domain: left.result_log_domain,
                 n: left.result_len,
-            },
-            &RelationCommit {
+            };
+        let right_commit = RelationCommit {
                 commitments: right.result_commitments.clone(),
                 log_domain: right.result_log_domain,
                 n: right.result_len,
-            },
-            &key_pairs,
-            &result_commitments,
-            result_len,
-            result_log_domain,
-            &outer_proof,
-            &mut transcript,
-        )?;
+            };
+        if key_pairs.is_empty() {
+            verify_global_left_outer_join(
+                &left_commit, &right_commit, &result_commitments, result_len,
+                result_log_domain, &outer_proof, &mut transcript,
+            )?;
+        } else {
+            verify_left_outer_join_with_keys(
+                &left_commit, &right_commit, &key_pairs, &result_commitments, result_len,
+                result_log_domain, &outer_proof, &mut transcript,
+            )?;
+        }
         verify_result_columns(
             &result_commitments,
             &result_columns,
@@ -1432,24 +1435,27 @@ impl LeftOuterJoinEnvelope {
         let mut transcript = super::argument::Transcript254::new(b"parture-left-outer-envelope");
         transcript.append_bytes(b"pow/outer-envelope/root", &expected_root);
         transcript.append_bytes(b"pow/outer-envelope/query", &query_digest);
-        verify_left_outer_join_with_keys(
-            &RelationCommit {
+        let left_commit = RelationCommit {
                 commitments: self.left.result_commitments.clone(),
                 log_domain: self.left.result_log_domain,
                 n: self.left.result_len,
-            },
-            &RelationCommit {
+            };
+        let right_commit = RelationCommit {
                 commitments: self.right.result_commitments.clone(),
                 log_domain: self.right.result_log_domain,
                 n: self.right.result_len,
-            },
-            key_pairs,
-            &self.result_commitments,
-            self.result_len,
-            self.result_log_domain,
-            &self.outer_proof,
-            &mut transcript,
-        )?;
+            };
+        if key_pairs.is_empty() {
+            verify_global_left_outer_join(
+                &left_commit, &right_commit, &self.result_commitments, self.result_len,
+                self.result_log_domain, &self.outer_proof, &mut transcript,
+            )?;
+        } else {
+            verify_left_outer_join_with_keys(
+                &left_commit, &right_commit, key_pairs, &self.result_commitments,
+                self.result_len, self.result_log_domain, &self.outer_proof, &mut transcript,
+            )?;
+        }
         verify_result_columns(
             &self.result_commitments,
             &self.result_columns,

@@ -816,6 +816,97 @@ pub fn verify_left_outer_join_with_keys(
     )
 }
 
+fn unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
+    let mut column = vec![f0(); 1usize << log_domain];
+    column[..n].fill(ArkFr::one());
+    column
+}
+
+fn augment_with_unit(relation: &RelationWitness) -> io::Result<RelationWitness> {
+    validate_witness(relation, "global outer")?;
+    let mut columns = relation.columns.clone();
+    let unit = unit_column(relation.n, relation.log_domain);
+    let mut commitments = relation.commitments.clone();
+    commitments.push(commit_column(&unit)?);
+    columns.push(unit);
+    Ok(RelationWitness {
+        columns,
+        commitments,
+        log_domain: relation.log_domain,
+        n: relation.n,
+    })
+}
+
+fn augment_commit_with_unit(relation: &RelationCommit) -> io::Result<RelationCommit> {
+    validate_relation(relation, "global outer")?;
+    let mut commitments = relation.commitments.clone();
+    commitments.push(commit_column(&unit_column(relation.n, relation.log_domain))?);
+    Ok(RelationCommit {
+        commitments,
+        log_domain: relation.log_domain,
+        n: relation.n,
+    })
+}
+
+/// Prove an uncorrelated Optional. A verifier-known UNIT key turns the matched branch
+/// into the exact Cartesian product. If the independently authenticated right relation
+/// is empty, the same outer-join composition emits exactly one null-extension per left
+/// row. The hidden UNIT column is removed from the public result; its output commitment
+/// is verifier-derived when checking the proof.
+pub fn prove_global_left_outer_join(
+    left: &RelationWitness,
+    right: &RelationWitness,
+    transcript: &mut Transcript254,
+) -> io::Result<LeftOuterJoinResult> {
+    let left_arity = left.columns.len();
+    let right_arity = right.columns.len();
+    let augmented_left = augment_with_unit(left)?;
+    let augmented_right = augment_with_unit(right)?;
+    let mut result = prove_left_outer_join_with_keys(
+        &augmented_left,
+        &augmented_right,
+        &[(left_arity, right_arity)],
+        transcript,
+    )?;
+    result.commitments.remove(left_arity);
+    result.columns.remove(left_arity);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_global_left_outer_join(
+    left: &RelationCommit,
+    right: &RelationCommit,
+    output_commitments: &[ArkGT],
+    output_len: usize,
+    output_log_domain: usize,
+    proof: &LeftOuterJoinProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    if output_commitments.len() != left.commitments.len() + right.commitments.len() {
+        return Err(invalid("global Optional output arity mismatch"));
+    }
+    let left_arity = left.commitments.len();
+    let right_arity = right.commitments.len();
+    let augmented_left = augment_commit_with_unit(left)?;
+    let augmented_right = augment_commit_with_unit(right)?;
+    let mut augmented_output = output_commitments.to_vec();
+    augmented_output.insert(
+        left_arity,
+        commit_column(&unit_column(output_len, output_log_domain))?,
+    );
+    verify_left_outer_join_with_keys(
+        &augmented_left,
+        &augmented_right,
+        &[(left_arity, right_arity)],
+        &augmented_output,
+        output_len,
+        output_log_domain,
+        proof,
+        transcript,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,6 +925,18 @@ mod tests {
             n,
         )
         .unwrap()
+    }
+
+    fn assert_row_bag(mut actual: Vec<Vec<ArkFr>>, expected: Vec<Vec<ArkFr>>) {
+        assert_eq!(actual.len(), expected.len());
+        for row in expected {
+            let index = actual
+                .iter()
+                .position(|candidate| *candidate == row)
+                .expect("expected row missing from result bag");
+            actual.swap_remove(index);
+        }
+        assert!(actual.is_empty());
     }
 
     #[test]
@@ -877,6 +980,121 @@ mod tests {
             &mut verifier,
         )
         .is_err());
+    }
+
+    #[test]
+    fn left_outer_join_composite_keys_reject_partial_and_swapped_matches() {
+        let left = relation(&[
+            &[1, 1, 2, 3],
+            &[10, 11, 10, 12],
+            &[100, 101, 200, 300],
+        ]);
+        // Right keys are (b,a), with two matches for (1,10). The final right row
+        // shares only `a=1` and must not consume the left (1,11) row.
+        let right = relation(&[
+            &[10, 10, 10, 99],
+            &[1, 1, 2, 1],
+            &[900, 901, 902, 999],
+        ]);
+        let keys = [(0usize, 1usize), (1usize, 0usize)];
+        let mut prover = Transcript254::new(b"left-outer-composite-test");
+        let result =
+            prove_left_outer_join_with_keys(&left, &right, &keys, &mut prover).unwrap();
+        assert_eq!(result.n, 5);
+        let rows: Vec<_> = (0..result.n)
+            .map(|row| result.columns.iter().map(|column| column[row]).collect::<Vec<_>>())
+            .collect();
+        let expected = vec![
+            vec![fr(1), fr(10), fr(100), fr(900)],
+            vec![fr(1), fr(10), fr(100), fr(901)],
+            vec![fr(1), fr(11), fr(101), f0()],
+            vec![fr(2), fr(10), fr(200), fr(902)],
+            vec![fr(3), fr(12), fr(300), f0()],
+        ];
+        assert_row_bag(rows, expected);
+        let mut verifier = Transcript254::new(b"left-outer-composite-test");
+        verify_left_outer_join_with_keys(
+            &left.view(),
+            &right.view(),
+            &keys,
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut verifier,
+        )
+        .unwrap();
+
+        let mut verifier = Transcript254::new(b"left-outer-composite-test");
+        assert!(verify_left_outer_join_with_keys(
+            &left.view(),
+            &right.view(),
+            &[keys[1], keys[0]],
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut verifier,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn global_left_outer_join_selects_cartesian_or_null_branch_from_right_length() {
+        let left = relation(&[&[1, 2], &[10, 20]]);
+        for (right, expected) in [
+            (
+                relation(&[&[3, 4], &[30, 40]]),
+                vec![
+                    vec![fr(1), fr(10), fr(3), fr(30)],
+                    vec![fr(1), fr(10), fr(4), fr(40)],
+                    vec![fr(2), fr(20), fr(3), fr(30)],
+                    vec![fr(2), fr(20), fr(4), fr(40)],
+                ],
+            ),
+            (
+                relation(&[&[], &[]]),
+                vec![
+                    vec![fr(1), fr(10), f0(), f0()],
+                    vec![fr(2), fr(20), f0(), f0()],
+                ],
+            ),
+        ] {
+            let mut prover = Transcript254::new(b"global-left-outer-test");
+            let result = prove_global_left_outer_join(&left, &right, &mut prover).unwrap();
+            let rows: Vec<_> = (0..result.n)
+                .map(|row| result.columns.iter().map(|column| column[row]).collect::<Vec<_>>())
+                .collect();
+            assert_row_bag(rows, expected);
+            let mut verifier = Transcript254::new(b"global-left-outer-test");
+            verify_global_left_outer_join(
+                &left.view(),
+                &right.view(),
+                &result.commitments,
+                result.n,
+                result.log_domain,
+                &result.proof,
+                &mut verifier,
+            )
+            .unwrap();
+        }
+
+        let empty_left = relation(&[&[], &[]]);
+        let right = relation(&[&[3], &[30]]);
+        let mut prover = Transcript254::new(b"global-left-outer-empty-left-test");
+        let result = prove_global_left_outer_join(&empty_left, &right, &mut prover).unwrap();
+        assert_eq!(result.n, 0);
+        let mut verifier = Transcript254::new(b"global-left-outer-empty-left-test");
+        verify_global_left_outer_join(
+            &empty_left.view(),
+            &right.view(),
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut verifier,
+        )
+        .unwrap();
     }
 
     fn transcript() -> Transcript254 {
