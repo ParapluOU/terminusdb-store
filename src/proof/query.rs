@@ -542,7 +542,7 @@ pub struct ObjectRangeSpec {
 /// VARIABLE (a kept output column) or a CONSTANT (authenticated against the layer's
 /// node/value dictionary and folded into the atom filter). A fully-ground atom is
 /// represented internally by the filter gadget's authenticated UNIT column and is
-/// accepted only as a single-atom plan. An optional `object_range`
+/// accepted alone or in an all-ground conjunction. An optional `object_range`
 /// adds a numeric RANGE filter on the object — valid ONLY when the object is a
 /// `Variable` (a ranged object is a kept variable, never a constant). Constraints
 /// (enforced at prove AND verify): the subject may not be a `ValueConstant` (literals
@@ -591,7 +591,8 @@ pub struct SecondRangeSubproof {
     pub com_intersection_sel: ArkGT,
 }
 
-/// A layer BGP plan: `k` atoms and the `k - 1` left-deep join steps. `joins[j]` names
+/// A layer BGP plan: a relational plan has `k` atoms and `k - 1` left-deep join steps;
+/// an all-ground zero-arity conjunction has no keyed joins. `joins[j]` names
 /// the first shared variable's column on the evolving accumulator (`acc_key`) and on
 /// atom `j + 1`'s relation (`rel_key`), plus any further shared key pairs. Each atom
 /// relation has ONE column per VARIABLE (in S,O order): two for an all-variable atom,
@@ -842,8 +843,8 @@ fn resolve_node_value_id(layer: &LayerCommitment, object: &CanonicalObject) -> i
 }
 
 /// Enforce the atom constraints: the subject is a variable or a node constant (never a
-/// value literal). Fully-ground atoms are valid here; [`validate_bgp_plan`] restricts
-/// them to a single-atom existence query because the join chain has no zero-arity join.
+/// value literal). Fully-ground atoms are valid here; [`validate_bgp_plan`] allows them
+/// only when every atom is ground, because mixed boolean/relation composition is separate.
 fn validate_atom(atom: &LayerBgpAtom) -> io::Result<()> {
     if matches!(atom.subject, AtomTerm::ValueConstant(..)) {
         return Err(invalid(
@@ -1028,28 +1029,40 @@ fn validate_bgp_plan(plan: &LayerBgpPlan) -> io::Result<usize> {
     if k == 0 {
         return Err(invalid("layer BGP needs at least one atom"));
     }
-    if plan.joins.len() != k - 1 {
-        return Err(invalid("layer BGP plan must have exactly k-1 join steps"));
-    }
-    if k > 1
-        && plan.atoms.iter().any(|atom| {
+    let ground_count = plan
+        .atoms
+        .iter()
+        .filter(|atom| {
             !matches!(atom.subject, AtomTerm::Variable)
                 && !matches!(atom.object, AtomTerm::Variable)
         })
-    {
+        .count();
+    if ground_count == k {
+        if !plan.joins.is_empty() {
+            return Err(invalid("all-ground BGP must not carry keyed join steps"));
+        }
+    } else if ground_count != 0 {
         return Err(invalid(
-            "ground atoms in a multi-atom BGP require authenticated boolean composition",
+            "mixing ground and variable BGP atoms requires authenticated boolean composition",
+        ));
+    } else if plan.joins.len() != k - 1 {
+        return Err(invalid(
+            "relational BGP plan must have exactly k-1 join steps",
         ));
     }
     Ok(k)
 }
 
+fn is_all_ground(plan: &LayerBgpPlan) -> bool {
+    plan.atoms.iter().all(|atom| {
+        !matches!(atom.subject, AtomTerm::Variable) && !matches!(atom.object, AtomTerm::Variable)
+    })
+}
+
 /// Whether the plan's sole result column is the filter gadget's internal UNIT column.
 /// It authenticates a zero-arity relation's cardinality but is not a Store dictionary ID.
 pub(crate) fn has_ground_result_unit(plan: &LayerBgpPlan) -> bool {
-    matches!(plan.atoms.as_slice(), [atom]
-        if !matches!(atom.subject, AtomTerm::Variable)
-            && !matches!(atom.object, AtomTerm::Variable))
+    !plan.atoms.is_empty() && is_all_ground(plan)
 }
 
 fn ground_dictionary_absence(
@@ -1805,7 +1818,14 @@ pub fn prove_layer_bgp_with_result(
 
     // (5) The left-deep chain over the filtered relations, when there is something to
     // join. For k=1 the complete atom filter result is already the query result.
-    let (chain, result_coms, result_columns, result_log_domain, result_m) = if k == 1 {
+    let (chain, result_coms, result_columns, result_log_domain, result_m) = if is_all_ground(plan) {
+        let result_m = usize::from(relations.iter().all(|relation| relation.n == 1));
+        let mut unit = vec![f0(); 1usize << a];
+        if result_m == 1 {
+            unit[0] = ArkFr::one();
+        }
+        (None, vec![commit_column(&unit)?], vec![unit], a, result_m)
+    } else if k == 1 {
         let relation = &relations[0];
         (
             None,
@@ -2056,7 +2076,21 @@ pub fn verify_layer_bgp(
     // (4) The left-deep chain over the filtered relations, when k >= 2. A k=1 proof
     // must not smuggle in an unrelated chain: its public result is exactly the verified
     // atom-filter output.
-    let (chain_coms, chain_m) = if k == 1 {
+    let (chain_coms, chain_m) = if is_all_ground(plan) {
+        if proof.chain.is_some()
+            || relations
+                .iter()
+                .any(|relation| relation.commitments.len() != 1 || relation.n > 1)
+        {
+            return Err(invalid("invalid all-ground BGP relation shape"));
+        }
+        let result_m = usize::from(relations.iter().all(|relation| relation.n == 1));
+        let mut unit = vec![f0(); 1usize << a];
+        if result_m == 1 {
+            unit[0] = ArkFr::one();
+        }
+        (vec![commit_column(&unit)?], result_m)
+    } else if k == 1 {
         if proof.chain.is_some() {
             return Err(invalid("single-atom layer BGP carries a join-chain proof"));
         }
@@ -3334,6 +3368,78 @@ mod tests {
                 )
                 .is_err());
             }
+        }
+    }
+
+    #[test]
+    fn layer_bgp_all_ground_conjunction_ands_authenticated_existence_bits() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
+        let atom = |subject: &str, predicate: &[u8], object: &str| LayerBgpAtom {
+            subject: node_const(subject),
+            predicate_term: predicate.to_vec(),
+            object: node_const(object),
+            object_range: None,
+            subject_object_equal: false,
+        };
+        for (plan, expected_len) in [
+            (
+                LayerBgpPlan {
+                    atoms: vec![atom("a", KNOWS, "b"), atom("b", LIKES, "c")],
+                    joins: Vec::new(),
+                },
+                1,
+            ),
+            (
+                LayerBgpPlan {
+                    atoms: vec![atom("a", KNOWS, "b"), atom("a", LIKES, "c")],
+                    joins: Vec::new(),
+                },
+                0,
+            ),
+            (
+                LayerBgpPlan {
+                    atoms: vec![atom("a", KNOWS, "b"), atom("a", KNOWS, "b")],
+                    joins: Vec::new(),
+                },
+                1,
+            ),
+        ] {
+            let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+            assert_eq!(result.result_len, expected_len);
+            assert_eq!(result.result_commitments.len(), 1);
+            verify_layer_bgp(
+                &lc,
+                lc.state.commitment_root,
+                &plan,
+                &result.predicate_ids,
+                &result.result_commitments,
+                result.result_len,
+                &result.proof,
+            )
+            .unwrap();
+
+            let mut forged_atom = result.proof.clone();
+            forged_atom.atoms[0].m = 1 - forged_atom.atoms[0].m;
+            assert!(verify_layer_bgp(
+                &lc,
+                lc.state.commitment_root,
+                &plan,
+                &result.predicate_ids,
+                &result.result_commitments,
+                result.result_len,
+                &forged_atom,
+            )
+            .is_err());
+            assert!(verify_layer_bgp(
+                &lc,
+                lc.state.commitment_root,
+                &plan,
+                &result.predicate_ids,
+                &result.result_commitments,
+                1 - expected_len,
+                &result.proof,
+            )
+            .is_err());
         }
     }
 
