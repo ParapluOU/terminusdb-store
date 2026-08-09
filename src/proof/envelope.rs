@@ -85,8 +85,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v13 permits zero-key/global mode in the grouped-u64 sum statement (wire tag 14).
-const RECURSIVE_VERSION: u32 = 13;
+// v14 permits exact UInt64 inputs in the grouped-u64 sum statement (wire tag 14).
+const RECURSIVE_VERSION: u32 = 14;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1724,7 +1724,8 @@ pub enum RelationProofPlanKind {
         constant: u64,
         constant_on_left: bool,
     },
-    /// Exact one-key grouping and checked u64 sum over UInt8/UInt16/UInt32 Store values.
+    /// Exact zero-/one-key grouping and checked u64 sum over UInt8/UInt16/UInt32/UInt64
+    /// Store values.
     /// The child rows and root-bound dictionary are public to the verifier, so the
     /// aggregate is derived directly without exposing the private intermediate list.
     GroupSum {
@@ -2032,10 +2033,11 @@ impl RelationProofPlan {
                         CanonicalDatatype::UInt8
                             | CanonicalDatatype::UInt16
                             | CanonicalDatatype::UInt32
+                            | CanonicalDatatype::UInt64
                     )
                 {
                     return Err(invalid(
-                        "group-sum requires a nonnullable node key and UInt8/UInt16/UInt32 value",
+                        "group-sum requires an optional nonnullable node key and UInt8/UInt16/UInt32/UInt64 value",
                     ));
                 }
                 let generated = ResultColumnDescriptor {
@@ -2437,9 +2439,13 @@ fn bounded_unsigned_catalog_value(
         CanonicalDatatype::UInt32 if lexical.len() == 4 => {
             u64::from(u32::from_be_bytes(lexical.as_slice().try_into().unwrap()))
         }
+        CanonicalDatatype::UInt64 if lexical.len() == 8 => {
+            u64::from_be_bytes(lexical.as_slice().try_into().unwrap())
+        }
         CanonicalDatatype::UInt8
         | CanonicalDatatype::UInt16
-        | CanonicalDatatype::UInt32 => {
+        | CanonicalDatatype::UInt32
+        | CanonicalDatatype::UInt64 => {
             return Err(invalid("group-sum value has a noncanonical lexical width"))
         }
         _ => return Err(invalid("group-sum datatype is outside the bounded unsigned subset")),
@@ -2453,18 +2459,6 @@ fn derived_group_sum_columns(
     value_column: usize,
     datatype: CanonicalDatatype,
 ) -> io::Result<Vec<Vec<ArkFr>>> {
-    let max_value = match datatype {
-        CanonicalDatatype::UInt8 => u64::from(u8::MAX),
-        CanonicalDatatype::UInt16 => u64::from(u16::MAX),
-        CanonicalDatatype::UInt32 => u64::from(u32::MAX),
-        _ => return Err(invalid("group-sum datatype is outside the bounded unsigned subset")),
-    };
-    let row_count = u64::try_from(input.result_len)
-        .map_err(|_| invalid("group-sum row count exceeds u64"))?;
-    max_value
-        .checked_mul(row_count)
-        .ok_or_else(|| invalid("group-sum setup bound cannot establish a u64 total"))?;
-
     let values = input
         .result_columns
         .get(value_column)
@@ -4638,6 +4632,106 @@ mod tests {
             .unwrap();
         assert_eq!(empty_global.result_len, 0);
         assert_eq!(empty_global.result_values, vec![Vec::new()]);
+    }
+
+    #[test]
+    fn recursive_group_sum_accepts_exact_u64_totals_and_rejects_actual_overflow() {
+        let layer_with = |values: &[(&str, &str, u64)]| {
+            let store = open_sync_memory_store();
+            let builder = store.create_base_layer().unwrap();
+            for (subject, predicate, value) in values {
+                builder
+                    .add_value_triple(ValueTriple::new_value(
+                        &iri(subject),
+                        &iri(predicate),
+                        u64::make_entry(value),
+                    ))
+                    .unwrap();
+            }
+            builder.commit().unwrap().proof_commitment().unwrap()
+        };
+        let source = || RelationProofPlan {
+            query_digest: [105u8; 32],
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                atoms: vec![LayerBgpAtom {
+                    subject: AtomTerm::Variable,
+                    predicate_term: Vec::new(),
+                    predicate_variable: true,
+                    object: AtomTerm::Variable,
+                    object_range: None,
+                    object_kind: ObjectKindFilter::Any,
+                    subject_object_equal: false,
+                }],
+                joins: Vec::new(),
+            }),
+        };
+        let sum_plan = |key_column| RelationProofPlan {
+            query_digest: [106u8; 32],
+            kind: RelationProofPlanKind::GroupSum {
+                input: Box::new(source()),
+                key_column,
+                value_column: 2,
+                datatype: CanonicalDatatype::UInt64,
+            },
+        };
+
+        // The maximum is accepted as a checked partitioned sum. This is safe because
+        // the BN254 scalar modulus exceeds u64::MAX.
+        let partitioned = layer_with(&[("a", "p", u64::MAX - 5), ("a", "q", 5)]);
+        let keyed_plan = sum_plan(Some(0));
+        let keyed = RecursiveRelationEnvelope::prove(&partitioned, &keyed_plan).unwrap();
+        keyed
+            .verify(&partitioned, partitioned.state.commitment_root, &keyed_plan)
+            .unwrap();
+        assert_eq!(
+            keyed.result_values[1],
+            vec![CanonicalResultValue::GeneratedDecimalU64(u64::MAX)]
+        );
+
+        let near_max = layer_with(&[("a", "p", u64::MAX - 5), ("a", "q", 4)]);
+        let near_max_plan = sum_plan(None);
+        let near_max_envelope =
+            RecursiveRelationEnvelope::prove(&near_max, &near_max_plan).unwrap();
+        near_max_envelope
+            .verify(&near_max, near_max.state.commitment_root, &near_max_plan)
+            .unwrap();
+        assert_eq!(
+            near_max_envelope.result_values,
+            vec![vec![CanonicalResultValue::GeneratedDecimalU64(u64::MAX - 1)]]
+        );
+
+        let mut tampered = near_max_envelope;
+        tampered.result_columns[0][0] = ArkFr::from_u64(u64::MAX);
+        let mut padded = tampered.result_columns[0].clone();
+        padded.resize(1usize << tampered.result_log_domain, ArkFr::zero());
+        tampered.result_commitments[0] = commit_column(&padded).unwrap();
+        assert!(tampered
+            .verify(&near_max, near_max.state.commitment_root, &near_max_plan)
+            .is_err());
+
+        let wrong_datatype = RelationProofPlan {
+            query_digest: [107u8; 32],
+            kind: RelationProofPlanKind::GroupSum {
+                input: Box::new(source()),
+                key_column: None,
+                value_column: 2,
+                datatype: CanonicalDatatype::UInt32,
+            },
+        };
+        assert!(RecursiveRelationEnvelope::prove(&partitioned, &wrong_datatype).is_err());
+
+        let overflow = layer_with(&[("a", "p", u64::MAX), ("a", "q", 1)]);
+        let overflow_plan = sum_plan(None);
+        assert!(RecursiveRelationEnvelope::prove(&overflow, &overflow_plan).is_err());
+        let child = RecursiveRelationEnvelope::prove(&overflow, &source()).unwrap();
+        assert!(derived_group_sum_columns(
+            &overflow,
+            &child,
+            None,
+            2,
+            CanonicalDatatype::UInt64,
+        )
+        .is_err());
     }
 
     #[test]
