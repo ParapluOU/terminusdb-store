@@ -1,4 +1,4 @@
-//! Authenticated ascending order for a one-column exact numeric relation.
+//! Authenticated order for a one-column exact numeric relation.
 //!
 //! This deliberately narrow gadget is the first sound `OrderBy` slice: the sole output
 //! column is also the complete sort key, every value is a nonnullable Store ID resolving
@@ -36,6 +36,12 @@ use super::{invalid, CanonicalDatatype};
 
 const ORDER_DOMAIN: &[u8] = b"parture/proof-of-woql/exact-scalar-order/v0";
 const ORDER_BITS: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderDirection {
+    Ascending,
+    Descending,
+}
 
 #[derive(Clone, Debug)]
 pub struct ExactScalarOrderProof {
@@ -89,11 +95,16 @@ fn pad(column: &[ArkFr], size: usize) -> Vec<ArkFr> {
 fn bind_statement(
     transcript: &mut Transcript254,
     datatype: CanonicalDatatype,
+    direction: OrderDirection,
     n: usize,
     common_log_domain: usize,
 ) {
     transcript.append_bytes(b"pow/order/domain", ORDER_DOMAIN);
     transcript.append_bytes(b"pow/order/datatype", &[datatype as u8]);
+    transcript.append_bytes(b"pow/order/direction", &[match direction {
+        OrderDirection::Ascending => 0,
+        OrderDirection::Descending => 1,
+    }]);
     transcript.append_bytes(b"pow/order/rows", &(n as u64).to_le_bytes());
     transcript.append_bytes(
         b"pow/order/common-log-domain",
@@ -106,6 +117,7 @@ pub fn prove_exact_scalar_order_with_context(
     layer: &LayerCommitment,
     input: &RelationWitness,
     datatype: CanonicalDatatype,
+    direction: OrderDirection,
     transcript: &mut Transcript254,
 ) -> io::Result<ExactScalarOrderResult> {
     if !supported_datatype(datatype) || input.columns.len() != 1 || input.commitments.len() != 1 {
@@ -153,6 +165,9 @@ pub fn prove_exact_scalar_order_with_context(
             .into_bigint()
             .cmp(&input_values[*right].0.into_bigint())
     });
+    if direction == OrderDirection::Descending {
+        row_order.reverse();
+    }
     if row_order
         .windows(2)
         .any(|rows| input_values[rows[0]] == input_values[rows[1]])
@@ -160,7 +175,7 @@ pub fn prove_exact_scalar_order_with_context(
         return Err(invalid("exact scalar order key is not unique"));
     }
 
-    bind_statement(transcript, datatype, input.n, common_log_domain);
+    bind_statement(transcript, datatype, direction, input.n, common_log_domain);
     let permutation =
         prove_relation_permutation_with_context(context, input, &row_order, transcript)?;
     let output_id_at_d = pad(&permutation.columns[0], common_domain);
@@ -252,12 +267,32 @@ pub fn prove_exact_scalar_order_with_context(
         input.n,
         n_dict,
     );
+    let sort_values = match direction {
+        OrderDirection::Ascending => output_values.clone(),
+        OrderDirection::Descending => {
+            let max = ArkFr::from_u64(u64::MAX);
+            output_values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| if index < input.n { max - *value } else { ArkFr::zero() })
+                .collect()
+        }
+    };
+    let sort_commitment = match direction {
+        OrderDirection::Ascending => lookup.com_v_val,
+        OrderDirection::Descending => {
+            ArkFr::from_u64(u64::MAX) * datatype_selection_commitment - lookup.com_v_val
+        }
+    };
+    if context.commit_column(&sort_values)? != sort_commitment {
+        return Err(invalid("descending affine sort-key commitment mismatch"));
+    }
     let sorted = prove_strictly_sorted_bits_with_context(
         context,
-        &output_values,
+        &sort_values,
         input.n,
         ORDER_BITS,
-        &lookup.com_v_val,
+        &sort_commitment,
         transcript,
     )?;
 
@@ -311,6 +346,7 @@ pub fn verify_exact_scalar_order(
     source: &impl VerifierLayer,
     input: &RelationCommit,
     datatype: CanonicalDatatype,
+    direction: OrderDirection,
     output_commitments: &[ArkGT],
     output_len: usize,
     output_log_domain: usize,
@@ -333,7 +369,7 @@ pub fn verify_exact_scalar_order(
     }
     let dict_log_domain = dict_id.len().trailing_zeros() as usize;
     let common_log_domain = input.log_domain.max(dict_log_domain);
-    bind_statement(transcript, datatype, input.n, common_log_domain);
+    bind_statement(transcript, datatype, direction, input.n, common_log_domain);
     verify_relation_permutation(
         input,
         output_commitments,
@@ -400,8 +436,15 @@ pub fn verify_exact_scalar_order(
     if proof.datatype_selection_commitment != commit_column(&chi)? {
         return Err(invalid("exact scalar order datatype selection is not complete"));
     }
+    let sort_commitment = match direction {
+        OrderDirection::Ascending => proof.lookup.com_v_val,
+        OrderDirection::Descending => {
+            ArkFr::from_u64(u64::MAX) * proof.datatype_selection_commitment
+                - proof.lookup.com_v_val
+        }
+    };
     verify_strictly_sorted_bits(
-        &proof.lookup.com_v_val,
+        &sort_commitment,
         output_len,
         ORDER_BITS,
         &proof.sorted,
@@ -420,7 +463,7 @@ mod tests {
     fn layer() -> std::sync::Arc<LayerCommitment> {
         let store = open_sync_memory_store();
         let builder = store.create_base_layer().unwrap();
-        for (subject, value) in [("a", 30u32), ("b", 10), ("c", 20)] {
+        for (subject, value) in [("a", 30u32), ("b", 10), ("c", 20), ("z", 0), ("m", u32::MAX)] {
             builder
                 .add_value_triple(ValueTriple::new_value(
                     subject,
@@ -463,6 +506,7 @@ mod tests {
             &layer,
             &input,
             CanonicalDatatype::UInt32,
+            OrderDirection::Ascending,
             &mut prover,
         )
         .unwrap();
@@ -479,6 +523,7 @@ mod tests {
             &layer,
             &input.view(),
             CanonicalDatatype::UInt32,
+            OrderDirection::Ascending,
             &result.commitments,
             result.n,
             result.log_domain,
@@ -492,6 +537,7 @@ mod tests {
             &layer,
             &input.view(),
             CanonicalDatatype::Int32,
+            OrderDirection::Ascending,
             &result.commitments,
             result.n,
             result.log_domain,
@@ -504,6 +550,7 @@ mod tests {
             &layer,
             &input.view(),
             CanonicalDatatype::UInt32,
+            OrderDirection::Ascending,
             &result.commitments,
             result.n - 1,
             result.log_domain,
@@ -527,6 +574,7 @@ mod tests {
             &layer,
             &duplicate,
             CanonicalDatatype::UInt32,
+            OrderDirection::Ascending,
             &mut transcript(),
         )
         .is_err());
@@ -547,8 +595,34 @@ mod tests {
             &layer,
             &mixed,
             CanonicalDatatype::UInt32,
+            OrderDirection::Ascending,
             &mut transcript(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn proves_descending_edges_and_rejects_ascending_substitution() {
+        let layer = layer();
+        let ids = [0u32, u32::MAX, 20]
+            .map(|value| ArkFr::from_u64(id_for(&layer, value)));
+        let input = RelationWitness::commit(vec![ids.to_vec()], 3).unwrap();
+        let result = prove_exact_scalar_order_with_context(
+            &StoreProverContext::cpu(), &layer, &input, CanonicalDatatype::UInt32,
+            OrderDirection::Descending, &mut transcript(),
+        ).unwrap();
+        assert_eq!(&result.columns[0][..3], &[
+            ArkFr::from_u64(id_for(&layer, u32::MAX)),
+            ArkFr::from_u64(id_for(&layer, 20)),
+            ArkFr::from_u64(id_for(&layer, 0)),
+        ]);
+        verify_exact_scalar_order(
+            &layer, &input.view(), CanonicalDatatype::UInt32, OrderDirection::Descending,
+            &result.commitments, result.n, result.log_domain, &result.proof, &mut transcript(),
+        ).unwrap();
+        assert!(verify_exact_scalar_order(
+            &layer, &input.view(), CanonicalDatatype::UInt32, OrderDirection::Ascending,
+            &result.commitments, result.n, result.log_domain, &result.proof, &mut transcript(),
+        ).is_err());
     }
 }

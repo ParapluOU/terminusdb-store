@@ -37,6 +37,7 @@ use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
 use super::order::{
     prove_exact_scalar_order_with_context, verify_exact_scalar_order, ExactScalarOrderProof,
+    OrderDirection,
 };
 use super::permutation::RelationPermutationProof;
 use super::query::{
@@ -357,6 +358,19 @@ wire_struct!(ExactScalarOrderProof {
     datatype_inverse_commitment,
     sorted
 });
+
+impl Wire for OrderDirection {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self { Self::Ascending => 0u8, Self::Descending => 1u8 }.put(out)
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        match u8::get(reader)? {
+            0 => Ok(Self::Ascending),
+            1 => Ok(Self::Descending),
+            _ => Err(invalid("invalid order direction")),
+        }
+    }
+}
 wire_struct!(GroupExtremaEntryProof {
     group,
     group_commitments,
@@ -1668,6 +1682,7 @@ pub enum RelationProofPlanKind {
     ExactScalarOrder {
         input: Box<RelationProofPlan>,
         datatype: CanonicalDatatype,
+        direction: OrderDirection,
     },
     /// Exact contiguous slice of an authenticated ordered relation. `None` returns the
     /// complete suffix after `offset`; `Some(limit)` returns at most that many rows.
@@ -1954,7 +1969,7 @@ impl RelationProofPlan {
                 validate_equality_plan(constraint, &descriptors, ground)?;
                 Ok((descriptors, ground))
             }
-            RelationProofPlanKind::ExactScalarOrder { input, datatype } => {
+            RelationProofPlanKind::ExactScalarOrder { input, datatype, .. } => {
                 let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
                 if ground
                     || descriptors.len() != 1
@@ -2275,7 +2290,7 @@ impl RecursiveRelationEnvelope {
                     input: Box::new(input_envelope), proof: Box::new(result.proof),
                 }, result.commitments, result.columns, result.log_domain, result.n)
             }
-            RelationProofPlanKind::ExactScalarOrder { input, datatype } => {
+            RelationProofPlanKind::ExactScalarOrder { input, datatype, direction } => {
                 let input_envelope =
                     Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
                 let mut transcript = Transcript254::new(b"parture-order-envelope");
@@ -2286,6 +2301,7 @@ impl RecursiveRelationEnvelope {
                     layer,
                     &input_envelope.relation_witness(None)?,
                     *datatype,
+                    *direction,
                     &mut transcript,
                 )?;
                 Self::finish_proved(
@@ -2590,6 +2606,7 @@ impl RecursiveRelationEnvelope {
                 RelationProofPlanKind::ExactScalarOrder {
                     input: input_plan,
                     datatype,
+                    direction,
                 },
             ) => {
                 input.verify_bounded(
@@ -2606,6 +2623,7 @@ impl RecursiveRelationEnvelope {
                     layer,
                     &input.relation_commit(None)?,
                     *datatype,
+                    *direction,
                     &self.result_commitments,
                     self.result_len,
                     self.result_log_domain,
@@ -3055,6 +3073,7 @@ mod tests {
             kind: RelationProofPlanKind::ExactScalarOrder {
                 input: Box::new(child),
                 datatype: CanonicalDatatype::UInt32,
+                direction: OrderDirection::Ascending,
             },
         };
         let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
@@ -3108,6 +3127,7 @@ mod tests {
             kind: RelationProofPlanKind::ExactScalarOrder {
                 input: Box::new(leaf),
                 datatype: CanonicalDatatype::UInt32,
+                direction: OrderDirection::Ascending,
             },
         };
         let plan = RelationProofPlan {
