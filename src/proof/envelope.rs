@@ -39,7 +39,8 @@ use super::query::{
     has_ground_result_unit, prove_layer_bgp_with_result_and_context,
     resolve_typed_result_objects, result_id_namespaces,
     resolve_result_values, verify_layer_bgp, verify_layer_bgp_result_log_domain,
-    verify_result_columns, AtomTerm, CanonicalResultValue, GroundAbsence, LayerBgpAtom,
+    verify_result_columns, AtomTerm, CanonicalResultValue, DictionaryAbsence,
+    DictionaryAbsencePosition, LayerBgpAtom,
     LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectRangeBound, ObjectRangeSpec,
     RangeAtomSubproof, ResultColumnDescriptor, ResultIdNamespace, SecondRangeSubproof,
 };
@@ -515,7 +516,7 @@ wire_struct!(LayerBgpAtomProof {
 wire_struct!(LayerBgpProof {
     atoms,
     chain,
-    ground_absence
+    dictionary_absence
 });
 wire_struct!(JoinStep {
     acc_key,
@@ -540,7 +541,12 @@ wire_struct!(LayerBgpAtom {
 });
 wire_struct!(LayerBgpPlan { atoms, joins });
 
-impl Wire for GroundAbsence {
+wire_struct!(DictionaryAbsence {
+    atom_index,
+    position
+});
+
+impl Wire for DictionaryAbsencePosition {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
         match self {
             Self::Predicate => 0u8,
@@ -555,7 +561,7 @@ impl Wire for GroundAbsence {
             0 => Ok(Self::Predicate),
             1 => Ok(Self::Subject),
             2 => Ok(Self::Object),
-            _ => Err(invalid("invalid ground-absence tag")),
+            _ => Err(invalid("invalid dictionary-absence position tag")),
         }
     }
 }
@@ -2750,18 +2756,18 @@ mod tests {
     }
 
     #[test]
-    fn ground_absence_wire_tags_are_strict() {
+    fn dictionary_absence_position_wire_tags_are_strict() {
         for (tag, expected) in [
-            (0, GroundAbsence::Predicate),
-            (1, GroundAbsence::Subject),
-            (2, GroundAbsence::Object),
+            (0, DictionaryAbsencePosition::Predicate),
+            (1, DictionaryAbsencePosition::Subject),
+            (2, DictionaryAbsencePosition::Object),
         ] {
             let mut reader = Reader {
                 bytes: &[tag],
                 pos: 0,
                 decoded_items: 0,
             };
-            assert_eq!(GroundAbsence::get(&mut reader).unwrap(), expected);
+            assert_eq!(DictionaryAbsencePosition::get(&mut reader).unwrap(), expected);
             reader.finish().unwrap();
         }
         let mut reader = Reader {
@@ -2769,7 +2775,7 @@ mod tests {
             pos: 0,
             decoded_items: 0,
         };
-        assert!(GroundAbsence::get(&mut reader).is_err());
+        assert!(DictionaryAbsencePosition::get(&mut reader).is_err());
     }
 
     #[test]

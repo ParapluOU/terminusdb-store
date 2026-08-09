@@ -730,14 +730,21 @@ pub struct LayerBgpAtomProof {
 pub struct LayerBgpProof {
     pub atoms: Vec<LayerBgpAtomProof>,
     pub chain: Option<BgpChainProof>,
-    /// A single fully-ground query whose result is empty because this term is absent
-    /// from a root-authenticated dictionary. No row-filter proof is needed: a triple
-    /// containing a dictionary-absent term cannot exist.
-    pub ground_absence: Option<GroundAbsence>,
+    /// The whole BGP is empty because a constant in one atom is absent from a
+    /// root-authenticated dictionary. No row-filter or join proof is needed: a triple
+    /// containing a dictionary-absent term cannot exist, so its conjunction cannot have
+    /// a solution. The atom index and position make the public claim unambiguous.
+    pub dictionary_absence: Option<DictionaryAbsence>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GroundAbsence {
+pub struct DictionaryAbsence {
+    pub atom_index: usize,
+    pub position: DictionaryAbsencePosition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictionaryAbsencePosition {
     Predicate,
     Subject,
     Object,
@@ -1281,6 +1288,9 @@ fn validate_bgp_plan(plan: &LayerBgpPlan) -> io::Result<usize> {
     if k == 0 {
         return Err(invalid("layer BGP needs at least one atom"));
     }
+    for atom in &plan.atoms {
+        validate_atom(atom)?;
+    }
     let ground_count = plan
         .atoms
         .iter()
@@ -1335,40 +1345,47 @@ pub(crate) fn has_ground_result_unit(plan: &LayerBgpPlan) -> bool {
     !plan.atoms.is_empty() && is_all_ground(plan)
 }
 
-fn ground_dictionary_absence(
+fn dictionary_absence(
     source: &impl VerifierLayer,
     plan: &LayerBgpPlan,
-) -> Option<GroundAbsence> {
+) -> Option<DictionaryAbsence> {
     let layer = source.verifier_view();
-    let [atom] = plan.atoms.as_slice() else {
-        return None;
-    };
-    if matches!(atom.subject, AtomTerm::Variable) || matches!(atom.object, AtomTerm::Variable) {
-        return None;
-    }
-    if !atom.predicate_variable
-        && !layer
-        .predicate_catalog
-        .iter()
-        .any(|record| record.triple.predicate == atom.predicate_term)
-    {
-        return Some(GroundAbsence::Predicate);
-    }
-    let subject = atom_term_object(&atom.subject).expect("ground subject must be constant");
-    if !layer
-        .node_value_catalog
-        .iter()
-        .any(|record| record.triple.object == subject)
-    {
-        return Some(GroundAbsence::Subject);
-    }
-    let object = atom_term_object(&atom.object).expect("ground object must be constant");
-    if !layer
-        .node_value_catalog
-        .iter()
-        .any(|record| record.triple.object == object)
-    {
-        return Some(GroundAbsence::Object);
+    for (atom_index, atom) in plan.atoms.iter().enumerate() {
+        if !atom.predicate_variable
+            && !layer
+                .predicate_catalog
+                .iter()
+                .any(|record| record.triple.predicate == atom.predicate_term)
+        {
+            return Some(DictionaryAbsence {
+                atom_index,
+                position: DictionaryAbsencePosition::Predicate,
+            });
+        }
+        if let Some(subject) = atom_term_object(&atom.subject) {
+            if !layer
+                .node_value_catalog
+                .iter()
+                .any(|record| record.triple.object == subject)
+            {
+                return Some(DictionaryAbsence {
+                    atom_index,
+                    position: DictionaryAbsencePosition::Subject,
+                });
+            }
+        }
+        if let Some(object) = atom_term_object(&atom.object) {
+            if !layer
+                .node_value_catalog
+                .iter()
+                .any(|record| record.triple.object == object)
+            {
+                return Some(DictionaryAbsence {
+                    atom_index,
+                    position: DictionaryAbsencePosition::Object,
+                });
+            }
+        }
     }
     None
 }
@@ -1945,20 +1962,22 @@ pub fn prove_layer_bgp_with_result_and_context(
     let k = validate_bgp_plan(plan)?;
     let (s, p, o, n) = materialized_layer_columns(layer)?;
 
-    if let Some(absence) = ground_dictionary_absence(layer, plan) {
-        // The authenticated dictionary does not contain one public ground term, so the
-        // triple cannot occur. Preserve the filter gadget's one hidden UNIT column shape,
-        // but commit its empty (all-zero) result directly.
+    if let Some(absence) = dictionary_absence(layer, plan) {
+        // A root-authenticated dictionary omits one public constant, so the atom and the
+        // whole conjunction are empty. Emit canonical zero commitments at the layer table
+        // domain, preserving either the public relational arity or the hidden ground UNIT.
         let domain = padded_len(n)?;
         let zero_column = vec![f0(); domain];
+        let result_arity = result_id_namespaces(plan)?.len().max(1);
+        let zero_commitment = context.commit_column(&zero_column)?;
         return Ok(LayerBgpResult {
             proof: LayerBgpProof {
                 atoms: Vec::new(),
                 chain: None,
-                ground_absence: Some(absence),
+                dictionary_absence: Some(absence),
             },
-            result_commitments: vec![context.commit_column(&zero_column)?],
-            result_columns: vec![zero_column],
+            result_commitments: vec![zero_commitment; result_arity],
+            result_columns: vec![zero_column; result_arity],
             result_log_domain: domain.trailing_zeros() as usize,
             result_len: 0,
             predicate_ids: Vec::new(),
@@ -2171,7 +2190,7 @@ pub fn prove_layer_bgp_with_result_and_context(
         proof: LayerBgpProof {
             atoms: atom_proofs,
             chain,
-            ground_absence: None,
+            dictionary_absence: None,
         },
         result_commitments: result_coms,
         result_columns,
@@ -2209,33 +2228,30 @@ pub fn verify_layer_bgp(
         ));
     }
     let k = validate_bgp_plan(plan)?;
-    if let Some(claimed_absence) = proof.ground_absence {
-        if !has_ground_result_unit(plan) {
-            return Err(invalid(
-                "dictionary-absence shortcut requires a single ground atom",
-            ));
-        }
+    if let Some(claimed_absence) = proof.dictionary_absence {
         // Recommit every clear catalog/table before using catalog nonmembership. This
         // turns the scan below into an opening of the externally trusted layer root,
         // rather than trusting an unauthenticated convenience catalog.
         layer.validate()?;
-        if ground_dictionary_absence(&layer, plan) != Some(claimed_absence) {
+        if dictionary_absence(&layer, plan) != Some(claimed_absence) {
             return Err(invalid(
-                "claimed ground dictionary absence is not authentic",
+                "claimed dictionary absence is not authentic",
             ));
         }
+        let result_arity = result_id_namespaces(plan)?.len().max(1);
         if !proof.atoms.is_empty()
             || proof.chain.is_some()
             || !predicate_ids.is_empty()
             || m != 0
-            || result_coms.len() != 1
+            || result_coms.len() != result_arity
         {
-            return Err(invalid("invalid ground dictionary-absence proof shape"));
+            return Err(invalid("invalid dictionary-absence proof shape"));
         }
         let zero_column = vec![f0(); padded_len(layer.state.materialized_count as usize)?];
-        if result_coms[0] != commit_column(&zero_column)? {
+        let zero_commitment = commit_column(&zero_column)?;
+        if result_coms.iter().any(|commitment| *commitment != zero_commitment) {
             return Err(invalid(
-                "ground dictionary-absence result is not the empty UNIT relation",
+                "dictionary-absence result is not the canonical empty relation",
             ));
         }
         return Ok(());
@@ -2485,7 +2501,7 @@ pub fn verify_layer_bgp_result_log_domain(
     let layer = source.verifier_view();
     validate_bgp_plan(plan)?;
     let relational_count = relational_atom_count(plan);
-    let expected = if relational_count <= 1 {
+    let expected = if proof.dictionary_absence.is_some() || relational_count <= 1 {
         padded_len(layer.state.materialized_count as usize)?.trailing_zeros() as usize
     } else {
         proof
@@ -3442,7 +3458,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_bgp_absent_predicate_fails_closed() {
+    fn layer_bgp_absent_predicate_authenticates_empty_relation() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
         let plan = LayerBgpPlan {
             atoms: vec![atom(KNOWS), atom(b"http://ex/absent")],
@@ -3452,7 +3468,26 @@ mod tests {
                 additional_keys: Vec::new(),
             }],
         };
-        assert!(prove_layer_bgp(&lc, &plan).is_err());
+        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+        assert_eq!(result.result_len, 0);
+        assert_eq!(result.result_commitments.len(), 3);
+        assert_eq!(
+            result.proof.dictionary_absence,
+            Some(DictionaryAbsence {
+                atom_index: 1,
+                position: DictionaryAbsencePosition::Predicate,
+            })
+        );
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
     }
 
     // ---- Q_k with subject/object CONSTANTS (node/value dictionary) end-to-end ----
@@ -3815,7 +3850,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_bgp_absent_constant_fails_closed() {
+    fn layer_bgp_absent_constant_authenticates_empty_relational_result() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
         // The object constant <absent> is not in the layer's node/value dictionary.
         let plan = LayerBgpPlan {
@@ -3836,10 +3871,59 @@ mod tests {
                 additional_keys: Vec::new(),
             }],
         };
-        let err = prove_layer_bgp(&lc, &plan).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("constant not in layer node/value dictionary"));
+        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+        assert_eq!(result.result_len, 0);
+        assert_eq!(result.result_commitments.len(), 2);
+        assert_eq!(
+            result.proof.dictionary_absence,
+            Some(DictionaryAbsence {
+                atom_index: 1,
+                position: DictionaryAbsencePosition::Object,
+            })
+        );
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
+        verify_layer_bgp_result_log_domain(
+            &lc,
+            &plan,
+            &result.proof,
+            result.result_log_domain,
+        )
+        .unwrap();
+
+        let mut wrong_atom = result.proof.clone();
+        wrong_atom.dictionary_absence.as_mut().unwrap().atom_index = 0;
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &wrong_atom,
+        )
+        .is_err());
+
+        let mut wrong_commitments = result.result_commitments.clone();
+        wrong_commitments.pop();
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &result.predicate_ids,
+            &wrong_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .is_err());
     }
 
     #[test]
@@ -3863,22 +3947,22 @@ mod tests {
             (
                 atom("a", KNOWS, "missing-object"),
                 0,
-                Some(GroundAbsence::Object),
+                Some(DictionaryAbsence { atom_index: 0, position: DictionaryAbsencePosition::Object }),
             ),
             (
                 atom("missing-subject", KNOWS, "b"),
                 0,
-                Some(GroundAbsence::Subject),
+                Some(DictionaryAbsence { atom_index: 0, position: DictionaryAbsencePosition::Subject }),
             ),
             (
                 atom("a", b"http://ex/missing-predicate", "b"),
                 0,
-                Some(GroundAbsence::Predicate),
+                Some(DictionaryAbsence { atom_index: 0, position: DictionaryAbsencePosition::Predicate }),
             ),
         ] {
             let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
             assert_eq!(result.result_len, expected_len);
-            assert_eq!(result.proof.ground_absence, expected_absence);
+            assert_eq!(result.proof.dictionary_absence, expected_absence);
             assert_eq!(result.result_commitments.len(), 1);
             assert_eq!(result.result_columns.len(), 1);
             verify_layer_bgp(
@@ -3893,9 +3977,12 @@ mod tests {
             .unwrap();
             if let Some(absence) = expected_absence {
                 let mut forged = result.proof.clone();
-                forged.ground_absence = Some(match absence {
-                    GroundAbsence::Predicate => GroundAbsence::Subject,
-                    GroundAbsence::Subject | GroundAbsence::Object => GroundAbsence::Predicate,
+                forged.dictionary_absence = Some(DictionaryAbsence {
+                    atom_index: absence.atom_index,
+                    position: match absence.position {
+                        DictionaryAbsencePosition::Predicate => DictionaryAbsencePosition::Subject,
+                        DictionaryAbsencePosition::Subject | DictionaryAbsencePosition::Object => DictionaryAbsencePosition::Predicate,
+                    },
                 });
                 assert!(verify_layer_bgp(
                     &lc,
@@ -3909,7 +3996,7 @@ mod tests {
                 .is_err());
 
                 let mut forged_present = result.proof.clone();
-                forged_present.ground_absence = None;
+                forged_present.dictionary_absence = None;
                 assert!(verify_layer_bgp(
                     &lc,
                     lc.state.commitment_root,
