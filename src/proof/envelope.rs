@@ -85,8 +85,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v12 adds the verifier-derived bounded grouped-u64 sum (wire tag 14).
-const RECURSIVE_VERSION: u32 = 12;
+// v13 permits zero-key/global mode in the grouped-u64 sum statement (wire tag 14).
+const RECURSIVE_VERSION: u32 = 13;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1729,7 +1729,7 @@ pub enum RelationProofPlanKind {
     /// aggregate is derived directly without exposing the private intermediate list.
     GroupSum {
         input: Box<RelationProofPlan>,
-        key_column: usize,
+        key_column: Option<usize>,
         value_column: usize,
         datatype: CanonicalDatatype,
     },
@@ -2018,20 +2018,14 @@ impl RelationProofPlan {
                 datatype,
             } => {
                 let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
-                if ground || *key_column == *value_column {
-                    return Err(invalid("group-sum requires distinct non-ground columns"));
+                if ground || key_column.is_some_and(|key| key == *value_column) {
+                    return Err(invalid("group-sum requires a non-ground value column distinct from its optional key"));
                 }
-                let key = descriptors
-                    .get(*key_column)
-                    .copied()
-                    .ok_or_else(|| invalid("group-sum key column out of range"))?;
                 let value = descriptors
                     .get(*value_column)
                     .copied()
                     .ok_or_else(|| invalid("group-sum value column out of range"))?;
-                if key.nullable
-                    || value.nullable
-                    || key.namespace != ResultIdNamespace::NodeValue
+                if value.nullable
                     || value.namespace != ResultIdNamespace::NodeValue
                     || !matches!(
                         datatype,
@@ -2044,16 +2038,24 @@ impl RelationProofPlan {
                         "group-sum requires a nonnullable node key and UInt8/UInt16/UInt32 value",
                     ));
                 }
-                Ok((
-                    vec![
-                        key,
-                        ResultColumnDescriptor {
-                            namespace: ResultIdNamespace::GeneratedDecimalU64,
-                            nullable: false,
-                        },
-                    ],
-                    false,
-                ))
+                let generated = ResultColumnDescriptor {
+                    namespace: ResultIdNamespace::GeneratedDecimalU64,
+                    nullable: false,
+                };
+                let result = match key_column {
+                    Some(key_column) => {
+                        let key = descriptors
+                            .get(*key_column)
+                            .copied()
+                            .ok_or_else(|| invalid("group-sum key column out of range"))?;
+                        if key.nullable || key.namespace != ResultIdNamespace::NodeValue {
+                            return Err(invalid("group-sum key must be a nonnullable node"));
+                        }
+                        vec![key, generated]
+                    }
+                    None => vec![generated],
+                };
+                Ok((result, false))
             }
             RelationProofPlanKind::BagUnion { branches, mappings } => {
                 if branches.len() < 2
@@ -2447,7 +2449,7 @@ fn bounded_unsigned_catalog_value(
 fn derived_group_sum_columns(
     layer: &impl VerifierLayer,
     input: &RecursiveRelationEnvelope,
-    key_column: usize,
+    key_column: Option<usize>,
     value_column: usize,
     datatype: CanonicalDatatype,
 ) -> io::Result<Vec<Vec<ArkFr>>> {
@@ -2463,27 +2465,15 @@ fn derived_group_sum_columns(
         .checked_mul(row_count)
         .ok_or_else(|| invalid("group-sum setup bound cannot establish a u64 total"))?;
 
-    let key_descriptor = input
-        .result_descriptors
-        .get(key_column)
-        .copied()
-        .ok_or_else(|| invalid("group-sum key descriptor out of range"))?;
-    let keys = input
-        .result_columns
-        .get(key_column)
-        .ok_or_else(|| invalid("group-sum key column out of range"))?;
     let values = input
         .result_columns
         .get(value_column)
         .ok_or_else(|| invalid("group-sum value column out of range"))?;
-    if keys.len() != input.result_len || values.len() != input.result_len {
+    if values.len() != input.result_len {
         return Err(invalid("group-sum input column length mismatch"));
     }
     let view = layer.verifier_view();
     view.validate()?;
-    if key_descriptor.namespace != ResultIdNamespace::NodeValue {
-        return Err(invalid("group-sum key is not in the node namespace"));
-    }
     let resolve_key = |field: ArkFr| -> io::Result<(Vec<u8>, u64)> {
         let record = view
             .node_value_catalog
@@ -2503,6 +2493,33 @@ fn derived_group_sum_columns(
             .ok_or_else(|| invalid("group-sum value id is absent from the authenticated dictionary"))?;
         bounded_unsigned_catalog_value(&record.triple.object, datatype)
     };
+    let Some(key_column) = key_column else {
+        if input.result_len == 0 {
+            return Ok(vec![Vec::new()]);
+        }
+        let mut sum = 0u64;
+        for field in values {
+            sum = sum
+                .checked_add(resolve_value(*field)?)
+                .ok_or_else(|| invalid("global group-sum arithmetic exceeds u64"))?;
+        }
+        return Ok(vec![vec![ArkFr::from_u64(sum)]]);
+    };
+    let key_descriptor = input
+        .result_descriptors
+        .get(key_column)
+        .copied()
+        .ok_or_else(|| invalid("group-sum key descriptor out of range"))?;
+    if key_descriptor.namespace != ResultIdNamespace::NodeValue {
+        return Err(invalid("group-sum key is not in the node namespace"));
+    }
+    let keys = input
+        .result_columns
+        .get(key_column)
+        .ok_or_else(|| invalid("group-sum key column out of range"))?;
+    if keys.len() != input.result_len {
+        return Err(invalid("group-sum key length mismatch"));
+    }
     // SWI bagof enumerates atom-valued free keys in standard atom order. Expanded IRI
     // nodes are UTF-8 bytes, whose lexicographic order preserves Unicode scalar order.
     // Sort by the authenticated node value, never by Store ID (child IDs are appended).
@@ -4490,7 +4507,7 @@ mod tests {
             query_digest: [100u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(source.clone()),
-                key_column: 0,
+                key_column: Some(0),
                 value_column: 2,
                 datatype: CanonicalDatatype::UInt32,
             },
@@ -4539,11 +4556,42 @@ mod tests {
             .verify(&layer, layer.state.commitment_root, &plan)
             .is_err());
 
+        let global_plan = RelationProofPlan {
+            query_digest: [103u8; 32],
+            kind: RelationProofPlanKind::GroupSum {
+                input: Box::new(source.clone()),
+                key_column: None,
+                value_column: 2,
+                datatype: CanonicalDatatype::UInt32,
+            },
+        };
+        let global = RecursiveRelationEnvelope::prove(&layer, &global_plan).unwrap();
+        global
+            .verify(&layer, layer.state.commitment_root, &global_plan)
+            .unwrap();
+        assert_eq!(global.result_len, 1);
+        assert_eq!(
+            global.result_values,
+            vec![vec![CanonicalResultValue::GeneratedDecimalU64(
+                u64::from(u32::MAX) + 4,
+            )]]
+        );
+        let mut forged_global = global.clone();
+        forged_global.result_columns[0][0] = ArkFr::from_u64(u64::from(u32::MAX) + 5);
+        forged_global.result_commitments[0] = commit_column(&[
+            ArkFr::from_u64(u64::from(u32::MAX) + 5),
+            ArkFr::zero(),
+        ])
+        .unwrap();
+        assert!(forged_global
+            .verify(&layer, layer.state.commitment_root, &global_plan)
+            .is_err());
+
         let wrong_datatype = RelationProofPlan {
             query_digest: [100u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(source),
-                key_column: 0,
+                key_column: Some(0),
                 value_column: 2,
                 datatype: CanonicalDatatype::UInt16,
             },
@@ -4552,17 +4600,18 @@ mod tests {
             .verify(&layer, layer.state.commitment_root, &wrong_datatype)
             .is_err());
 
+        let empty_source = RelationProofPlan {
+            query_digest: [102u8; 32],
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                atoms: vec![LayerBgpAtom::all_variables(iri("missing").into_bytes())],
+                joins: Vec::new(),
+            }),
+        };
         let empty_plan = RelationProofPlan {
             query_digest: [101u8; 32],
             kind: RelationProofPlanKind::GroupSum {
-                input: Box::new(RelationProofPlan {
-                    query_digest: [102u8; 32],
-                    kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
-                        atoms: vec![LayerBgpAtom::all_variables(iri("missing").into_bytes())],
-                        joins: Vec::new(),
-                    }),
-                }),
-                key_column: 0,
+                input: Box::new(empty_source.clone()),
+                key_column: Some(0),
                 value_column: 1,
                 datatype: CanonicalDatatype::UInt32,
             },
@@ -4573,6 +4622,22 @@ mod tests {
             .unwrap();
         assert_eq!(empty.result_len, 0);
         assert_eq!(empty.result_values, vec![Vec::new(), Vec::new()]);
+
+        let empty_global_plan = RelationProofPlan {
+            query_digest: [104u8; 32],
+            kind: RelationProofPlanKind::GroupSum {
+                input: Box::new(empty_source),
+                key_column: None,
+                value_column: 1,
+                datatype: CanonicalDatatype::UInt32,
+            },
+        };
+        let empty_global = RecursiveRelationEnvelope::prove(&layer, &empty_global_plan).unwrap();
+        empty_global
+            .verify(&layer, layer.state.commitment_root, &empty_global_plan)
+            .unwrap();
+        assert_eq!(empty_global.result_len, 0);
+        assert_eq!(empty_global.result_values, vec![Vec::new()]);
     }
 
     #[test]
