@@ -21,10 +21,10 @@ use super::filter::{
 use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
 use super::query::{
-    has_ground_result_unit, resolve_result_objects, verify_layer_bgp,
-    verify_layer_bgp_result_log_domain, verify_result_columns, verify_result_objects, AtomTerm,
-    GroundAbsence, LayerBgpAtom, LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectRangeBound,
-    ObjectRangeSpec, RangeAtomSubproof, SecondRangeSubproof,
+    has_ground_result_unit, resolve_typed_result_objects, result_id_namespaces,
+    verify_layer_bgp, verify_layer_bgp_result_log_domain, verify_result_columns, AtomTerm,
+    GroundAbsence, LayerBgpAtom, LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof,
+    ObjectRangeBound, ObjectRangeSpec, RangeAtomSubproof, SecondRangeSubproof,
 };
 use super::range::{
     DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp, RangeSelectProof,
@@ -39,9 +39,9 @@ const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
 const ANTI_MAGIC: &[u8; 12] = b"TDBWQANTI\0\0\0";
 // v3 adds the root-authenticated ground dictionary-absence branch. Older envelopes fail
 // explicitly; v2 had already bound the deterministic Dory parameter-set identity.
-const VERSION: u32 = 3;
-const UNION_VERSION: u32 = 1;
-const ANTI_VERSION: u32 = 3;
+const VERSION: u32 = 4;
+const UNION_VERSION: u32 = 2;
+const ANTI_VERSION: u32 = 4;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -434,6 +434,7 @@ wire_struct!(ObjectRangeSpec {
 wire_struct!(LayerBgpAtom {
     subject,
     predicate_term,
+    predicate_variable,
     object,
     object_range,
     subject_object_equal
@@ -557,7 +558,7 @@ pub fn plan_digest(plan: &LayerBgpPlan) -> io::Result<ProofHash> {
     let mut bytes = Vec::new();
     plan.put(&mut bytes)?;
     let mut hasher = Sha256::new();
-    hasher.update(b"terminus-store/query-proof-plan/v1");
+    hasher.update(b"terminus-store/query-proof-plan/v2");
     hasher.update(&bytes);
     Ok(hasher.finalize().into())
 }
@@ -631,7 +632,12 @@ impl LayerBgpEnvelope {
             }
             Vec::new()
         } else {
-            resolve_result_objects(layer, expected_root, &result_columns)?
+            resolve_typed_result_objects(
+                layer,
+                expected_root,
+                &result_columns,
+                &result_id_namespaces(plan)?,
+            )?
         };
         Ok(Self {
             layer_root: expected_root,
@@ -688,12 +694,18 @@ impl LayerBgpEnvelope {
             }
             Ok(())
         } else {
-            verify_result_objects(
+            let resolved = resolve_typed_result_objects(
                 layer,
                 expected_root,
                 &self.result_columns,
-                &self.result_objects,
-            )
+                &result_id_namespaces(plan)?,
+            )?;
+            if resolved != self.result_objects {
+                return Err(invalid(
+                    "delivered result objects do not match typed authenticated Store IDs",
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -825,7 +837,13 @@ impl BagUnionEnvelope {
             }
             Vec::new()
         } else {
-            resolve_result_objects(layer, expected_root, &result_columns)?
+            let namespaces = result_id_namespaces(&branch_plans[0])?;
+            for plan in &branch_plans[1..] {
+                if result_id_namespaces(plan)? != namespaces {
+                    return Err(invalid("bag-union branch result namespace mismatch"));
+                }
+            }
+            resolve_typed_result_objects(layer, expected_root, &result_columns, &namespaces)?
         };
         Ok(Self {
             layer_root: expected_root,
@@ -901,12 +919,24 @@ impl BagUnionEnvelope {
             }
             Ok(())
         } else {
-            verify_result_objects(
+            let namespaces = result_id_namespaces(&branch_plans[0])?;
+            for plan in &branch_plans[1..] {
+                if result_id_namespaces(plan)? != namespaces {
+                    return Err(invalid("bag-union branch result namespace mismatch"));
+                }
+            }
+            let resolved = resolve_typed_result_objects(
                 layer,
                 expected_root,
                 &self.result_columns,
-                &self.result_objects,
-            )
+                &namespaces,
+            )?;
+            if resolved != self.result_objects {
+                return Err(invalid(
+                    "delivered result objects do not match typed authenticated Store IDs",
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -1041,7 +1071,12 @@ impl LeftAntiJoinEnvelope {
         let result_objects = if ground_result {
             Vec::new()
         } else {
-            resolve_result_objects(layer, expected_root, &result_columns)?
+            resolve_typed_result_objects(
+                layer,
+                expected_root,
+                &result_columns,
+                &result_id_namespaces(left_plan)?,
+            )?
         };
         Ok(Self {
             layer_root: expected_root,
@@ -1125,9 +1160,18 @@ impl LeftAntiJoinEnvelope {
             }
             Ok(())
         } else {
-            verify_result_objects(
-                layer, expected_root, &self.result_columns, &self.result_objects,
-            )
+            let resolved = resolve_typed_result_objects(
+                layer,
+                expected_root,
+                &self.result_columns,
+                &result_id_namespaces(left_plan)?,
+            )?;
+            if resolved != self.result_objects {
+                return Err(invalid(
+                    "delivered result objects do not match typed authenticated Store IDs",
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -1242,6 +1286,7 @@ mod tests {
             atoms: vec![LayerBgpAtom {
                 subject: AtomTerm::NodeConstant(iri("a").into_bytes()),
                 predicate_term: iri("knows").into_bytes(),
+                predicate_variable: false,
                 object: AtomTerm::NodeConstant(iri("b").into_bytes()),
                 object_range: None,
                 subject_object_equal: false,
@@ -1306,7 +1351,7 @@ mod tests {
         assert!(LayerBgpEnvelope::decode(&corrupt).is_err());
 
         let mut wrong_version = encoded.clone();
-        wrong_version[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&4u32.to_le_bytes());
+        wrong_version[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&5u32.to_le_bytes());
         refresh_checksum(&mut wrong_version);
         assert!(LayerBgpEnvelope::decode(&wrong_version).is_err());
 

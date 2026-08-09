@@ -498,7 +498,7 @@ pub fn verify_layer_graph_pattern2(
 // Q_k: general k-atom conjunctive BGP over ONE committed layer, left-deep.
 // ===========================================================================
 
-const LAYER_BGP_DOMAIN: &[u8] = b"parture/proof-of-woql/qk-layer-bgp-by-iri/v0";
+const LAYER_BGP_DOMAIN: &[u8] = b"parture/proof-of-woql/qk-layer-bgp-by-iri/v1";
 
 /// One term (subject or object) of a layer BGP atom: a query VARIABLE (kept as an
 /// output column) or a CONSTANT authenticated against the layer's node/value dictionary.
@@ -510,6 +510,14 @@ pub enum AtomTerm {
     Variable,
     NodeConstant(Vec<u8>),
     ValueConstant(CanonicalDatatype, Vec<u8>),
+}
+
+/// Store ID namespace for an authenticated result column. Predicate dictionary IDs and
+/// node/value dictionary IDs are independent even when their numeric field values match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultIdNamespace {
+    NodeValue,
+    Predicate,
 }
 
 /// A numeric RANGE filter on an atom's VARIABLE object: `?o op c`, where the object's
@@ -537,8 +545,9 @@ pub struct ObjectRangeSpec {
     pub second: Option<ObjectRangeBound>,
 }
 
-/// One atom of a layer BGP. v1 SCOPE: the PREDICATE is always a constant IRI
-/// (authenticated by the layer's predicate dictionary). The subject/object may each be a
+/// One atom of a layer BGP. A constant predicate IRI is authenticated by the layer's
+/// predicate dictionary; a predicate variable retains the root-bound materialized P
+/// column directly. The subject/object may each be a
 /// VARIABLE (a kept output column) or a CONSTANT (authenticated against the layer's
 /// node/value dictionary and folded into the atom filter). A fully-ground atom is
 /// represented internally by the filter gadget's authenticated UNIT column and is
@@ -551,7 +560,9 @@ pub struct ObjectRangeSpec {
 #[derive(Clone, Debug)]
 pub struct LayerBgpAtom {
     pub subject: AtomTerm,
+    /// Empty for a predicate variable; otherwise the constant predicate IRI.
     pub predicate_term: Vec<u8>,
+    pub predicate_variable: bool,
     pub object: AtomTerm,
     pub object_range: Option<ObjectRangeSpec>,
     /// Require the subject and object variables to be equal within each selected row.
@@ -565,6 +576,7 @@ impl LayerBgpAtom {
         Self {
             subject: AtomTerm::Variable,
             predicate_term,
+            predicate_variable: false,
             object: AtomTerm::Variable,
             object_range: None,
             subject_object_equal: false,
@@ -595,8 +607,7 @@ pub struct SecondRangeSubproof {
 /// an all-ground zero-arity conjunction has no keyed joins. `joins[j]` names
 /// the first shared variable's column on the evolving accumulator (`acc_key`) and on
 /// atom `j + 1`'s relation (`rel_key`), plus any further shared key pairs. Each atom
-/// relation has ONE column per VARIABLE (in S,O order): two for an all-variable atom,
-/// one for a subject/object-constant atom.
+/// relation has ONE column per distinct VARIABLE (in S,P,O order).
 #[derive(Clone, Debug)]
 pub struct LayerBgpPlan {
     pub atoms: Vec<LayerBgpAtom>,
@@ -643,10 +654,10 @@ pub struct RangeAtomSubproof {
     pub compaction: CompactionOnlyProof,
 }
 
-/// The per-atom half of a layer BGP proof: the dictionary binding of the predicate IRI to
-/// its id, the optional subject/object CONSTANT bindings (node/value dictionary), the
+/// The per-atom half of a layer BGP proof: an optional dictionary binding for a constant
+/// predicate IRI, optional subject/object CONSTANT bindings (node/value dictionary), the
 /// per-atom selection (EITHER a plain constant `filter` OR a `range` subproof, matching
-/// the plan atom), one commitment per kept column (in S,O order), the result length, and
+/// the plan atom), one commitment per kept column (in S,P,O order), the result length, and
 /// the REVEALED subject/object constant ids. Those ids are public inputs to verification:
 /// the verifier feeds the SAME id to both the membership check (constant -> id) and the
 /// filter's constant, so a prover cannot authenticate one id and filter on another.
@@ -654,7 +665,7 @@ pub struct RangeAtomSubproof {
 /// `object_range` (never by the prover-supplied proof).
 #[derive(Clone, Debug)]
 pub struct LayerBgpAtomProof {
-    pub predicate_membership: DictProof,
+    pub predicate_membership: Option<DictProof>,
     pub subject_membership: Option<DictProof>,
     pub object_membership: Option<DictProof>,
     pub filter: Option<AtomFilterProof>,
@@ -747,7 +758,7 @@ pub fn verify_result_columns(
 /// dictionary. The clear catalog in [`LayerCommitment`] is a verifier-side opening of
 /// the root-bound dictionary commitments, so it is not trusted until both its `(hash,
 /// id)` columns have been rebuilt and recommitted here.
-pub fn resolve_result_objects(
+pub fn resolve_node_value_result_objects(
     layer: &LayerCommitment,
     expected_root: ProofHash,
     columns: &[Vec<ArkFr>],
@@ -788,15 +799,116 @@ pub fn resolve_result_objects(
         .collect()
 }
 
+/// Resolve result columns through their explicitly declared, plan-derived Store ID
+/// namespaces. Predicate IDs are opened only against the root-bound predicate catalog;
+/// subject/object IDs only against the node/value catalog.
+pub fn resolve_typed_result_objects(
+    layer: &LayerCommitment,
+    expected_root: ProofHash,
+    columns: &[Vec<ArkFr>],
+    namespaces: &[ResultIdNamespace],
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    if columns.len() != namespaces.len() {
+        return Err(invalid("result column namespace shape mismatch"));
+    }
+    if layer.state.commitment_root != expected_root {
+        return Err(invalid(
+            "layer commitment_root does not match the externally-trusted expected root",
+        ));
+    }
+    layer.validate()?;
+
+    columns
+        .iter()
+        .zip(namespaces)
+        .map(|(column, namespace)| {
+            column
+                .iter()
+                .map(|id| match namespace {
+                    ResultIdNamespace::NodeValue => layer
+                        .node_value_catalog
+                        .iter()
+                        .find(|record| ArkFr::from_u64(record.object_id) == *id)
+                        .map(|record| record.triple.object.clone())
+                        .ok_or_else(|| invalid("result id is absent from the node/value dictionary")),
+                    ResultIdNamespace::Predicate => layer
+                        .predicate_catalog
+                        .iter()
+                        .find(|record| ArkFr::from_u64(record.predicate_id) == *id)
+                        .map(|record| CanonicalObject::Node(record.triple.predicate.clone()))
+                        .ok_or_else(|| invalid("result id is absent from the predicate dictionary")),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Derive the namespace of every final result column while validating that each natural
+/// join compares IDs from the same Store dictionary namespace.
+pub fn result_id_namespaces(plan: &LayerBgpPlan) -> io::Result<Vec<ResultIdNamespace>> {
+    fn atom_namespaces(atom: &LayerBgpAtom) -> Vec<ResultIdNamespace> {
+        let mut out = Vec::new();
+        if matches!(atom.subject, AtomTerm::Variable) {
+            out.push(ResultIdNamespace::NodeValue);
+        }
+        if atom.predicate_variable {
+            out.push(ResultIdNamespace::Predicate);
+        }
+        if matches!(atom.object, AtomTerm::Variable) && !atom.subject_object_equal {
+            out.push(ResultIdNamespace::NodeValue);
+        }
+        out
+    }
+
+    let relational = relational_atom_count(plan);
+    if relational == 0 {
+        return Ok(Vec::new());
+    }
+    let mut acc = atom_namespaces(&plan.atoms[0]);
+    for (step, atom) in plan.joins.iter().zip(&plan.atoms[1..relational]) {
+        let rel = atom_namespaces(atom);
+        if step.is_cross_product() {
+            acc.extend(rel);
+            continue;
+        }
+        let mut pairs = vec![(step.acc_key, step.rel_key)];
+        pairs.extend(step.additional_keys.iter().copied());
+        for (left, right) in &pairs {
+            if *left >= acc.len() || *right >= rel.len() {
+                return Err(invalid("BGP join namespace column index out of range"));
+            }
+            if acc[*left] != rel[*right] {
+                return Err(invalid(
+                    "BGP join compares predicate and node/value ID namespaces",
+                ));
+            }
+        }
+        if step.additional_keys.is_empty() {
+            let key = acc.remove(step.acc_key);
+            let mut rel_other = rel;
+            rel_other.remove(step.rel_key);
+            acc.push(key);
+            acc.extend(rel_other);
+        } else {
+            for (index, namespace) in rel.into_iter().enumerate() {
+                if !pairs.iter().any(|(_, right)| *right == index) {
+                    acc.push(namespace);
+                }
+            }
+        }
+    }
+    Ok(acc)
+}
+
 /// Verify caller-delivered canonical IRIs/typed literals against proven Store ID
 /// columns and the root-authenticated node/value dictionary.
-pub fn verify_result_objects(
+pub fn verify_node_value_result_objects(
     layer: &LayerCommitment,
     expected_root: ProofHash,
     columns: &[Vec<ArkFr>],
     objects: &[Vec<CanonicalObject>],
 ) -> io::Result<()> {
-    let resolved = resolve_result_objects(layer, expected_root, columns)?;
+    let resolved = resolve_node_value_result_objects(layer, expected_root, columns)?;
     if resolved != objects {
         return Err(invalid(
             "delivered result objects do not match the authenticated Store IDs",
@@ -805,12 +917,11 @@ pub fn verify_result_objects(
     Ok(())
 }
 
-/// The resolved dictionary ids for one atom's constants: the predicate is always a
-/// constant in v1 (so `predicate_id` is unconditional); `subject_id`/`object_id` are
-/// `Some` iff that position is a constant.
+/// The resolved dictionary ids for one atom's constants. Each id is `Some` exactly when
+/// that position is a constant.
 #[derive(Clone, Copy, Debug)]
 struct AtomIds {
-    predicate_id: u64,
+    predicate_id: Option<u64>,
     subject_id: Option<u64>,
     object_id: Option<u64>,
 }
@@ -846,6 +957,11 @@ fn resolve_node_value_id(layer: &LayerCommitment, object: &CanonicalObject) -> i
 /// value literal). Fully-ground atoms are valid here; [`validate_bgp_plan`] allows them
 /// only when every atom is ground, because mixed boolean/relation composition is separate.
 fn validate_atom(atom: &LayerBgpAtom) -> io::Result<()> {
+    if atom.predicate_variable != atom.predicate_term.is_empty() {
+        return Err(invalid(
+            "predicate variable must have an empty term and predicate constant must not",
+        ));
+    }
     if matches!(atom.subject, AtomTerm::ValueConstant(..)) {
         return Err(invalid(
             "layer BGP subject may not be a value-literal constant",
@@ -879,6 +995,11 @@ fn validate_atom(atom: &LayerBgpAtom) -> io::Result<()> {
 /// malformed proof that, e.g., claims a subject id for a variable subject (which would
 /// otherwise silently reshape the filter spec).
 fn check_ids_consistent(atom: &LayerBgpAtom, ids: &AtomIds) -> io::Result<()> {
+    if atom.predicate_variable != ids.predicate_id.is_none() {
+        return Err(invalid(
+            "layer BGP predicate constant/id presence does not match the plan",
+        ));
+    }
     let subject_is_constant = !matches!(atom.subject, AtomTerm::Variable);
     let object_is_constant = !matches!(atom.object, AtomTerm::Variable);
     if subject_is_constant != ids.subject_id.is_some()
@@ -891,12 +1012,14 @@ fn check_ids_consistent(atom: &LayerBgpAtom, ids: &AtomIds) -> io::Result<()> {
     Ok(())
 }
 
-/// The atom's [`AtomFilterSpec`] from its resolved ids: `P` is always a constant; `S`/`O`
-/// are constants iff their id is `Some`; the kept (variable) positions are the constants'
-/// complement in S,P,O order (a subset of `{S, O}` since `P` is always constant). The
-/// constant list order (P, then S, then O) is fixed and identical on both sides.
+/// The atom's [`AtomFilterSpec`] from its resolved ids. Constant positions carry their
+/// authenticated IDs; variable positions are retained in S,P,O order. The constant list
+/// order (P, then S, then O) is fixed and identical on both sides.
 fn atom_filter_spec(atom: &LayerBgpAtom, ids: &AtomIds) -> AtomFilterSpec {
-    let mut constants = vec![(Position::P, ArkFr::from_u64(ids.predicate_id))];
+    let mut constants = Vec::new();
+    if let Some(predicate_id) = ids.predicate_id {
+        constants.push((Position::P, ArkFr::from_u64(predicate_id)));
+    }
     if let Some(subject_id) = ids.subject_id {
         constants.push((Position::S, ArkFr::from_u64(subject_id)));
     }
@@ -906,6 +1029,9 @@ fn atom_filter_spec(atom: &LayerBgpAtom, ids: &AtomIds) -> AtomFilterSpec {
     let mut kept = Vec::new();
     if matches!(atom.subject, AtomTerm::Variable) {
         kept.push(Position::S);
+    }
+    if atom.predicate_variable {
+        kept.push(Position::P);
     }
     if matches!(atom.object, AtomTerm::Variable) {
         kept.push(Position::O);
@@ -942,8 +1068,8 @@ fn bind_atom_term(transcript: &mut Transcript254, term: &AtomTerm, id: Option<u6
 
 /// Bind the public statement of a layer BGP: the trust anchor (`commitment_root`, which
 /// binds the column, predicate-dictionary AND node/value-dictionary commitments), `k`, and
-/// every atom's subject term, predicate IRI + id, and object term (each constant carrying
-/// its revealed id), then the join plan. Identical on both sides.
+/// every atom's subject term, predicate variant/term/optional id, and object term (each
+/// constant carrying its revealed id), then the join plan. Identical on both sides.
 fn bind_layer_bgp_statement(
     transcript: &mut Transcript254,
     layer: &LayerCommitment,
@@ -957,8 +1083,14 @@ fn bind_layer_bgp_statement(
     transcript.append_bytes(b"pow/bgp-layer/k", &(plan.atoms.len() as u64).to_le_bytes());
     for (atom, ids) in plan.atoms.iter().zip(atom_ids.iter()) {
         bind_atom_term(transcript, &atom.subject, ids.subject_id);
+        transcript.append_bytes(
+            b"pow/bgp-layer/pred-variable",
+            &[u8::from(atom.predicate_variable)],
+        );
         transcript.append_bytes(b"pow/bgp-layer/pred-term", &atom.predicate_term);
-        transcript.append_bytes(b"pow/bgp-layer/pred-id", &ids.predicate_id.to_le_bytes());
+        if let Some(predicate_id) = ids.predicate_id {
+            transcript.append_bytes(b"pow/bgp-layer/pred-id", &predicate_id.to_le_bytes());
+        }
         bind_atom_term(transcript, &atom.object, ids.object_id);
         transcript.append_bytes(
             b"pow/bgp-layer/subject-object-equal",
@@ -1033,7 +1165,8 @@ fn validate_bgp_plan(plan: &LayerBgpPlan) -> io::Result<usize> {
         .atoms
         .iter()
         .filter(|atom| {
-            !matches!(atom.subject, AtomTerm::Variable)
+            !atom.predicate_variable
+                && !matches!(atom.subject, AtomTerm::Variable)
                 && !matches!(atom.object, AtomTerm::Variable)
         })
         .count();
@@ -1058,11 +1191,14 @@ fn validate_bgp_plan(plan: &LayerBgpPlan) -> io::Result<usize> {
             ));
         }
     }
+    result_id_namespaces(plan)?;
     Ok(k)
 }
 
 fn atom_is_ground(atom: &LayerBgpAtom) -> bool {
-    !matches!(atom.subject, AtomTerm::Variable) && !matches!(atom.object, AtomTerm::Variable)
+    !atom.predicate_variable
+        && !matches!(atom.subject, AtomTerm::Variable)
+        && !matches!(atom.object, AtomTerm::Variable)
 }
 
 fn relational_atom_count(plan: &LayerBgpPlan) -> usize {
@@ -1089,7 +1225,8 @@ fn ground_dictionary_absence(
     if matches!(atom.subject, AtomTerm::Variable) || matches!(atom.object, AtomTerm::Variable) {
         return None;
     }
-    if !layer
+    if !atom.predicate_variable
+        && !layer
         .predicate_catalog
         .iter()
         .any(|record| record.triple.predicate == atom.predicate_term)
@@ -1133,7 +1270,7 @@ fn dict_domain_len(n_dict: usize) -> io::Result<usize> {
 }
 
 /// The full (padded) base column for a kept position — a subset of `{S, O}` for a ranged
-/// atom (predicate is always constant; a ranged object is a variable).
+/// atom (a ranged object is a variable).
 fn kept_base_column(pos: Position, s: &[ArkFr], p: &[ArkFr], o: &[ArkFr]) -> Vec<ArkFr> {
     match pos {
         Position::S => s.to_vec(),
@@ -1640,9 +1777,9 @@ fn verify_ranged_atom(
 }
 
 /// Prove the COMPLETE result of a k-atom conjunctive BGP against a materialized head
-/// layer. Each atom is filtered by its (dictionary-authenticated) constant PREDICATE and
-/// any (dictionary-authenticated) subject/object CONSTANTS into its dense KEPT (variable)
-/// columns; the resulting `k` relations (one column per variable, in S,O order) are joined
+/// layer. Each atom is filtered by its dictionary-authenticated constants into its dense
+/// KEPT columns; predicate variables retain P directly. The resulting `k` relations (one
+/// column per variable, in S,P,O order) are joined
 /// by the left-deep binary-join chain ([`super::bgp`]) on the plan's shared variables — all
 /// under ONE shared transcript anchored to `commitment_root`. Returns the combined proof
 /// (whose per-atom parts carry the revealed subject/object constant ids), the final result
@@ -1697,7 +1834,11 @@ pub fn prove_layer_bgp_with_result(
     let mut atom_ids = Vec::with_capacity(k);
     for atom in &plan.atoms {
         validate_atom(atom)?;
-        let predicate_id = resolve_predicate_id(layer, &atom.predicate_term)?;
+        let predicate_id = if atom.predicate_variable {
+            None
+        } else {
+            Some(resolve_predicate_id(layer, &atom.predicate_term)?)
+        };
         let subject_id = match atom_term_object(&atom.subject) {
             Some(object) => Some(resolve_node_value_id(layer, &object)?),
             None => None,
@@ -1712,7 +1853,12 @@ pub fn prove_layer_bgp_with_result(
             object_id,
         });
     }
-    let predicate_ids: Vec<u64> = atom_ids.iter().map(|ids| ids.predicate_id).collect();
+    // Keep the legacy one-entry-per-atom public vector. Predicate variables have no
+    // dictionary membership opening and use the plan-bound canonical placeholder zero.
+    let predicate_ids: Vec<u64> = atom_ids
+        .iter()
+        .map(|ids| ids.predicate_id.unwrap_or(0))
+        .collect();
 
     let (pred_dict_hash, pred_dict_id) = layer.predicate_dictionary_columns()?;
     let com_pred_hash = layer.predicate_dict_commitments.0;
@@ -1730,15 +1876,18 @@ pub fn prove_layer_bgp_with_result(
     let mut relations: Vec<RelationWitness> = Vec::with_capacity(k);
     for (atom, ids) in plan.atoms.iter().zip(atom_ids.iter()) {
         // (1) Predicate IRI -> id, authenticated by the predicate dictionary.
-        let predicate_membership = prove_dict_membership(
-            &pred_dict_hash,
-            &pred_dict_id,
-            &com_pred_hash,
-            &com_pred_id,
-            hash_term(&atom.predicate_term),
-            ArkFr::from_u64(ids.predicate_id),
-            &mut transcript,
-        )?;
+        let predicate_membership = match ids.predicate_id {
+            Some(predicate_id) => Some(prove_dict_membership(
+                &pred_dict_hash,
+                &pred_dict_id,
+                &com_pred_hash,
+                &com_pred_id,
+                hash_term(&atom.predicate_term),
+                ArkFr::from_u64(predicate_id),
+                &mut transcript,
+            )?),
+            None => None,
+        };
         // (2) Subject / object CONSTANT -> id, authenticated by the node/value dictionary.
         // The SAME id is folded into the atom filter below, so a prover cannot authenticate
         // one id here and filter on a different one.
@@ -1966,13 +2115,23 @@ pub fn verify_layer_bgp(
     for (i, (atom, ap)) in plan.atoms.iter().zip(proof.atoms.iter()).enumerate() {
         validate_atom(atom)?;
         let ids = AtomIds {
-            predicate_id: predicate_ids[i],
+            predicate_id: if atom.predicate_variable {
+                if predicate_ids[i] != 0 {
+                    return Err(invalid(
+                        "predicate variable must carry the canonical zero id placeholder",
+                    ));
+                }
+                None
+            } else {
+                Some(predicate_ids[i])
+            },
             subject_id: ap.subject_id,
             object_id: ap.object_id,
         };
         check_ids_consistent(atom, &ids)?;
         // The membership presence must match the constant structure too.
-        if ids.subject_id.is_some() != ap.subject_membership.is_some()
+        if ids.predicate_id.is_some() != ap.predicate_membership.is_some()
+            || ids.subject_id.is_some() != ap.subject_membership.is_some()
             || ids.object_id.is_some() != ap.object_membership.is_some()
         {
             return Err(invalid(
@@ -2008,14 +2167,18 @@ pub fn verify_layer_bgp(
             }
         }
         // (1) Predicate membership: the revealed id is authentic for this IRI.
-        verify_dict_membership(
-            &com_pred_hash,
-            &com_pred_id,
-            hash_term(&atom.predicate_term),
-            ArkFr::from_u64(ids.predicate_id),
-            &ap.predicate_membership,
-            &mut transcript,
-        )?;
+        if let Some(predicate_id) = ids.predicate_id {
+            verify_dict_membership(
+                &com_pred_hash,
+                &com_pred_id,
+                hash_term(&atom.predicate_term),
+                ArkFr::from_u64(predicate_id),
+                ap.predicate_membership
+                    .as_ref()
+                    .ok_or_else(|| invalid("constant predicate membership is absent"))?,
+                &mut transcript,
+            )?;
+        }
         // (2) Subject / object constant memberships, in the SAME order as the prover. The
         // authenticated id is reused verbatim in the filter spec below (the security tie).
         if let Some(subject_id) = ids.subject_id {
@@ -2744,22 +2907,29 @@ mod tests {
         };
         let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
         let columns = result.real_columns();
-        let objects = resolve_result_objects(&lc, lc.state.commitment_root, &columns).unwrap();
+        let objects =
+            resolve_node_value_result_objects(&lc, lc.state.commitment_root, &columns).unwrap();
 
         assert_eq!(objects.len(), 2);
         assert_eq!(objects[0][0], CanonicalObject::Node(iri("a").into_bytes()));
         assert_eq!(objects[1][0], CanonicalObject::Node(iri("b").into_bytes()));
-        verify_result_objects(&lc, lc.state.commitment_root, &columns, &objects).unwrap();
+        verify_node_value_result_objects(&lc, lc.state.commitment_root, &columns, &objects).unwrap();
 
         let mut tampered = objects.clone();
         tampered[1][0] = CanonicalObject::Node(iri("c").into_bytes());
         assert!(
-            verify_result_objects(&lc, lc.state.commitment_root, &columns, &tampered,).is_err()
+            verify_node_value_result_objects(
+                &lc,
+                lc.state.commitment_root,
+                &columns,
+                &tampered,
+            )
+            .is_err()
         );
 
         let mut wrong_root = lc.state.commitment_root;
         wrong_root[0] ^= 0xff;
-        assert!(resolve_result_objects(&lc, wrong_root, &columns).is_err());
+        assert!(resolve_node_value_result_objects(&lc, wrong_root, &columns).is_err());
 
         // The serialized catalog is only a claimed opening. Changing it without
         // changing the root-bound commitment must not change the resolved value.
@@ -2767,7 +2937,12 @@ mod tests {
         tampered_catalog.node_value_catalog[0].triple.object =
             CanonicalObject::Node(iri("forged").into_bytes());
         assert!(
-            resolve_result_objects(&tampered_catalog, lc.state.commitment_root, &columns,).is_err()
+            resolve_node_value_result_objects(
+                &tampered_catalog,
+                lc.state.commitment_root,
+                &columns,
+            )
+            .is_err()
         );
     }
 
@@ -2927,6 +3102,82 @@ mod tests {
         for (commitment, column) in coms.iter().zip(expected.iter()) {
             assert_eq!(*commitment, commit_column(&pad(column, domain)).unwrap());
         }
+    }
+
+    #[test]
+    fn predicate_variable_retains_root_bound_materialized_p_column() {
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("x", "likes", "y"),
+        ]);
+        let plan = LayerBgpPlan {
+            atoms: vec![LayerBgpAtom {
+                subject: AtomTerm::Variable,
+                predicate_term: Vec::new(),
+                predicate_variable: true,
+                object: AtomTerm::Variable,
+                object_range: None,
+                subject_object_equal: false,
+            }],
+            joins: vec![],
+        };
+
+        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
+
+        assert_eq!(result.predicate_ids, vec![0]);
+        assert_eq!(result.result_len, lc.materialized.len());
+        assert_eq!(result.result_commitments, lc.materialized_column_commitments);
+        assert_eq!(
+            result_id_namespaces(&plan).unwrap(),
+            vec![
+                ResultIdNamespace::NodeValue,
+                ResultIdNamespace::Predicate,
+                ResultIdNamespace::NodeValue,
+            ]
+        );
+        let resolved = resolve_typed_result_objects(
+            &lc,
+            lc.state.commitment_root,
+            &result.real_columns(),
+            &result_id_namespaces(&plan).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved[1].len(), lc.materialized.len());
+        assert!(resolved[1]
+            .iter()
+            .all(|value| matches!(value, CanonicalObject::Node(_))));
+    }
+
+    #[test]
+    fn predicate_to_node_value_join_is_rejected() {
+        let variable_predicate = LayerBgpAtom {
+            subject: node_const("a"),
+            predicate_term: Vec::new(),
+            predicate_variable: true,
+            object: node_const("b"),
+            object_range: None,
+            subject_object_equal: false,
+        };
+        let plan = LayerBgpPlan {
+            atoms: vec![variable_predicate, atom(KNOWS)],
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+                additional_keys: Vec::new(),
+            }],
+        };
+        assert!(result_id_namespaces(&plan).is_err());
     }
 
     #[test]
@@ -3153,6 +3404,7 @@ mod tests {
                 LayerBgpAtom {
                     subject: AtomTerm::Variable,
                     predicate_term: KNOWS.to_vec(),
+                    predicate_variable: false,
                     object: node_const("b"),
                     object_range: None,
                     subject_object_equal: false,
@@ -3217,6 +3469,7 @@ mod tests {
                 LayerBgpAtom {
                     subject: AtomTerm::Variable,
                     predicate_term: NAME.to_vec(),
+                    predicate_variable: false,
                     object: AtomTerm::ValueConstant(dt, lex),
                     object_range: None,
                     subject_object_equal: false,
@@ -3254,6 +3507,7 @@ mod tests {
                 LayerBgpAtom {
                     subject: node_const("a"),
                     predicate_term: KNOWS.to_vec(),
+                    predicate_variable: false,
                     object: AtomTerm::Variable,
                     object_range: None,
                     subject_object_equal: false,
@@ -3294,6 +3548,7 @@ mod tests {
                 LayerBgpAtom {
                     subject: AtomTerm::Variable,
                     predicate_term: LIKES.to_vec(),
+                    predicate_variable: false,
                     object: node_const("g"),
                     object_range: None,
                     subject_object_equal: false,
@@ -3363,6 +3618,7 @@ mod tests {
                 LayerBgpAtom {
                     subject: AtomTerm::Variable,
                     predicate_term: LIKES.to_vec(),
+                    predicate_variable: false,
                     object: node_const("absent"),
                     object_range: None,
                     subject_object_equal: false,
@@ -3387,6 +3643,7 @@ mod tests {
             atoms: vec![LayerBgpAtom {
                 subject: node_const(subject),
                 predicate_term: predicate.to_vec(),
+                predicate_variable: false,
                 object: node_const(object),
                 object_range: None,
                 subject_object_equal: false,
@@ -3467,6 +3724,7 @@ mod tests {
         let atom = |subject: &str, predicate: &[u8], object: &str| LayerBgpAtom {
             subject: node_const(subject),
             predicate_term: predicate.to_vec(),
+            predicate_variable: false,
             object: node_const(object),
             object_range: None,
             subject_object_equal: false,
@@ -3541,6 +3799,7 @@ mod tests {
                 LayerBgpAtom {
                     subject: node_const("a"),
                     predicate_term: KNOWS.to_vec(),
+                    predicate_variable: false,
                     object: node_const("b"),
                     object_range: None,
                     subject_object_equal: false,
@@ -3551,6 +3810,7 @@ mod tests {
                 LayerBgpAtom {
                     subject: node_const("a"),
                     predicate_term: LIKES.to_vec(),
+                    predicate_variable: false,
                     object: node_const("c"),
                     object_range: None,
                     subject_object_equal: false,
@@ -3598,6 +3858,7 @@ mod tests {
                 LayerBgpAtom {
                     subject: AtomTerm::ValueConstant(CanonicalDatatype::String, b"x".to_vec()),
                     predicate_term: KNOWS.to_vec(),
+                    predicate_variable: false,
                     object: AtomTerm::Variable,
                     object_range: None,
                     subject_object_equal: false,
@@ -4022,6 +4283,7 @@ mod tests {
                 LayerBgpAtom {
                     subject: AtomTerm::Variable,
                     predicate_term: AGE.to_vec(),
+                    predicate_variable: false,
                     object: node_const("alice_n"),
                     object_range: Some(ObjectRangeSpec {
                         op: RangeOp::Gt,
