@@ -16,7 +16,7 @@ use super::anti::{
     verify_global_left_outer_join, verify_global_not, verify_left_anti_join_with_keys,
     verify_left_outer_join_with_keys, LeftAntiJoinProof, LeftOuterJoinProof,
 };
-use super::argument::{ColumnOpening, StoreProverContext, SumcheckProof, Transcript254};
+use super::argument::{commit_column, ColumnOpening, StoreProverContext, SumcheckProof, Transcript254};
 use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit, RelationWitness};
 use super::commitment::{LayerCommitment, VerifierLayer};
 use super::count::CountProof;
@@ -68,8 +68,8 @@ const VERSION: u32 = 4;
 const UNION_VERSION: u32 = 2;
 const ANTI_VERSION: u32 = 4;
 const OUTER_VERSION: u32 = 1;
-// v3 adds exact one-column ascending scalar OrderBy (wire tag 6).
-const RECURSIVE_VERSION: u32 = 3;
+// v4 adds exact ordered Start/Limit slices (wire tag 7).
+const RECURSIVE_VERSION: u32 = 4;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1669,6 +1669,13 @@ pub enum RelationProofPlanKind {
         input: Box<RelationProofPlan>,
         datatype: CanonicalDatatype,
     },
+    /// Exact contiguous slice of an authenticated ordered relation. `None` returns the
+    /// complete suffix after `offset`; `Some(limit)` returns at most that many rows.
+    ExactOrderedSlice {
+        input: Box<RelationProofPlan>,
+        offset: u64,
+        limit: Option<u64>,
+    },
     /// Scalar-key `GroupBy`, with its private bag consumed immediately by
     /// `RangeMin`/`RangeMax`; output is exactly `[key, original-value-id]`.
     GroupExtrema {
@@ -1726,6 +1733,17 @@ fn numeric_datatype(datatype: CanonicalDatatype) -> bool {
             | CanonicalDatatype::NonPositiveInteger
             | CanonicalDatatype::NegativeInteger
     )
+}
+
+fn ordered_slice_bounds(source_len: usize, offset: u64, limit: Option<u64>) -> (usize, usize) {
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(source_len);
+    let available = source_len - start;
+    let take = limit
+        .map(|count| usize::try_from(count).unwrap_or(usize::MAX).min(available))
+        .unwrap_or(available);
+    (start, start + take)
 }
 
 fn validate_equality_plan(
@@ -1957,6 +1975,20 @@ impl RelationProofPlan {
                 }
                 Ok((descriptors, false))
             }
+            RelationProofPlanKind::ExactOrderedSlice { input, .. } => {
+                if !matches!(
+                    input.kind,
+                    RelationProofPlanKind::ExactScalarOrder { .. }
+                        | RelationProofPlanKind::ExactOrderedSlice { .. }
+                ) {
+                    return Err(invalid("ordered slice requires an authenticated ordered child"));
+                }
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                if ground || descriptors.is_empty() {
+                    return Err(invalid("ordered slice requires a non-ground ordered relation"));
+                }
+                Ok((descriptors, false))
+            }
             RelationProofPlanKind::GroupExtrema { input, key_column, value_column, datatype, .. } => {
                 let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
                 if ground || *key_column == *value_column {
@@ -2019,6 +2051,9 @@ pub enum RecursiveRelationProof {
     ExactScalarOrder {
         input: Box<RecursiveRelationEnvelope>,
         proof: Box<ExactScalarOrderProof>,
+    },
+    ExactOrderedSlice {
+        input: Box<RecursiveRelationEnvelope>,
     },
     GroupExtrema {
         input: Box<RecursiveRelationEnvelope>,
@@ -2264,6 +2299,41 @@ impl RecursiveRelationEnvelope {
                     result.columns,
                     result.log_domain,
                     result.n,
+                )
+            }
+            RelationProofPlanKind::ExactOrderedSlice {
+                input,
+                offset,
+                limit,
+            } => {
+                let input_envelope =
+                    Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let (start, end) = ordered_slice_bounds(input_envelope.result_len, *offset, *limit);
+                let take = end - start;
+                let log_domain = take.max(1).next_power_of_two().max(2).trailing_zeros() as usize;
+                let domain = 1usize << log_domain;
+                let mut columns = input_envelope
+                    .result_columns
+                    .iter()
+                    .map(|column| column[start..end].to_vec())
+                    .collect::<Vec<_>>();
+                for column in &mut columns {
+                    column.resize(domain, ArkFr::zero());
+                }
+                let commitments = columns
+                    .iter()
+                    .map(|column| context.commit_column(column))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::ExactOrderedSlice {
+                        input: Box::new(input_envelope),
+                    },
+                    commitments,
+                    columns,
+                    log_domain,
+                    take,
                 )
             }
             RelationProofPlanKind::GroupExtrema { input, key_column, value_column, datatype, kind } => {
@@ -2544,6 +2614,48 @@ impl RecursiveRelationEnvelope {
                 )?;
             }
             (
+                RecursiveRelationProof::ExactOrderedSlice { input },
+                RelationProofPlanKind::ExactOrderedSlice {
+                    input: input_plan,
+                    offset,
+                    limit,
+                },
+            ) => {
+                input.verify_bounded(
+                    layer,
+                    expected_root,
+                    input_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let (start, end) = ordered_slice_bounds(input.result_len, *offset, *limit);
+                let take = end - start;
+                let expected_log = take.max(1).next_power_of_two().max(2).trailing_zeros() as usize;
+                let expected_columns = input
+                    .result_columns
+                    .iter()
+                    .map(|column| column[start..end].to_vec())
+                    .collect::<Vec<_>>();
+                if self.result_len != take
+                    || self.result_log_domain != expected_log
+                    || self.result_columns != expected_columns
+                {
+                    return Err(invalid("ordered slice result is not the exact contiguous child slice"));
+                }
+                let domain = 1usize << expected_log;
+                let expected_commitments = expected_columns
+                    .iter()
+                    .map(|column| {
+                        let mut padded = column.clone();
+                        padded.resize(domain, ArkFr::zero());
+                        commit_column(&padded)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                if self.result_commitments != expected_commitments {
+                    return Err(invalid("ordered slice commitment mismatch"));
+                }
+            }
+            (
                 RecursiveRelationProof::GroupExtrema { input, proof },
                 RelationProofPlanKind::GroupExtrema { input: input_plan, key_column, value_column, datatype, kind },
             ) => {
@@ -2664,6 +2776,10 @@ impl RecursiveRelationEnvelope {
                 input.put_bounded(out, depth + 1, nodes)?;
                 proof.put(out)?;
             }
+            RecursiveRelationProof::ExactOrderedSlice { input } => {
+                7u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+            }
             RecursiveRelationProof::GroupExtrema { input, proof } => {
                 5u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
@@ -2727,6 +2843,9 @@ impl RecursiveRelationEnvelope {
             6 => RecursiveRelationProof::ExactScalarOrder {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 proof: Box::<ExactScalarOrderProof>::get(reader)?,
+            },
+            7 => RecursiveRelationProof::ExactOrderedSlice {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             _ => return Err(invalid("invalid recursive relation proof tag")),
         };
@@ -2955,6 +3074,93 @@ mod tests {
         assert!(decoded
             .verify(&layer, layer.state.commitment_root, &wrong_plan)
             .is_err());
+    }
+
+    #[test]
+    fn ordered_slice_bounds_cover_zero_overflow_and_wrapper_order() {
+        assert_eq!(ordered_slice_bounds(3, 0, None), (0, 3));
+        assert_eq!(ordered_slice_bounds(3, 0, Some(0)), (0, 0));
+        assert_eq!(ordered_slice_bounds(3, 99, None), (3, 3));
+        assert_eq!(ordered_slice_bounds(3, u64::MAX, Some(u64::MAX)), (3, 3));
+
+        // start(1, limit(2, Goal)): the inner limit first yields [0,2), then start
+        // drops one, leaving [1,2). limit(2, start(1, Goal)) instead yields [1,3).
+        let inner_limit = ordered_slice_bounds(3, 0, Some(2));
+        let outer_start = ordered_slice_bounds(inner_limit.1 - inner_limit.0, 1, None);
+        assert_eq!((inner_limit.0 + outer_start.0, inner_limit.0 + outer_start.1), (1, 2));
+        let inner_start = ordered_slice_bounds(3, 1, None);
+        let outer_limit = ordered_slice_bounds(inner_start.1 - inner_start.0, 0, Some(2));
+        assert_eq!((inner_start.0 + outer_limit.0, inner_start.0 + outer_limit.1), (1, 3));
+    }
+
+    fn assert_recursive_ordered_slice_roundtrips_and_rejects_content_and_plan_tamper() {
+        let (layer, bgp) = order_fixture();
+        let unordered_leaf = RelationProofPlan {
+            query_digest: plan_digest(&bgp).unwrap(),
+            kind: RelationProofPlanKind::Bgp(bgp.clone()),
+        };
+        let leaf = RelationProofPlan {
+            query_digest: plan_digest(&bgp).unwrap(),
+            kind: RelationProofPlanKind::Bgp(bgp),
+        };
+        let order = RelationProofPlan {
+            query_digest: [41u8; 32],
+            kind: RelationProofPlanKind::ExactScalarOrder {
+                input: Box::new(leaf),
+                datatype: CanonicalDatatype::UInt32,
+            },
+        };
+        let plan = RelationProofPlan {
+            query_digest: [43u8; 32],
+            kind: RelationProofPlanKind::ExactOrderedSlice {
+                input: Box::new(order),
+                offset: 1,
+                limit: Some(2),
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+        assert_eq!(envelope.result_len, 2);
+        let bytes = envelope.encode().unwrap();
+        let decoded = RecursiveRelationEnvelope::decode(&bytes).unwrap();
+        decoded.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+
+        let mut wrong_plan = plan.clone();
+        if let RelationProofPlanKind::ExactOrderedSlice { limit, .. } = &mut wrong_plan.kind {
+            *limit = Some(1);
+        }
+        assert!(decoded.verify(&layer, layer.state.commitment_root, &wrong_plan).is_err());
+
+        let mut reordered = RecursiveRelationEnvelope::decode(&bytes).unwrap();
+        reordered.result_columns[0].swap(0, 1);
+        let mut padded = reordered.result_columns[0].clone();
+        padded.resize(1usize << reordered.result_log_domain, ArkFr::zero());
+        reordered.result_commitments[0] = commit_column(&padded).unwrap();
+        assert!(reordered.verify(&layer, layer.state.commitment_root, &plan).is_err());
+
+        let unordered = RelationProofPlan {
+            query_digest: [44u8; 32],
+            kind: RelationProofPlanKind::ExactOrderedSlice {
+                input: Box::new(unordered_leaf),
+                offset: 0,
+                limit: Some(1),
+            },
+        };
+        assert!(unordered.result_shape().is_err());
+    }
+
+    #[test]
+    fn recursive_ordered_slice_roundtrips_and_rejects_content_and_plan_tamper() {
+        // Recursive Dory proof values are deliberately boxed in the envelope, but the
+        // debug prover itself has large temporary stack frames. Give this arithmetic
+        // test the same explicit headroom used by ordinary proving hosts.
+        std::thread::Builder::new()
+            .name("ordered-slice-proof".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(assert_recursive_ordered_slice_roundtrips_and_rejects_content_and_plan_tamper)
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
