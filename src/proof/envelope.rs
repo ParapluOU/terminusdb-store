@@ -42,17 +42,24 @@ const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
 const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
 const ANTI_MAGIC: &[u8; 12] = b"TDBWQANTI\0\0\0";
 const OUTER_MAGIC: &[u8; 12] = b"TDBWQOUTER\0\0";
+const RECURSIVE_MAGIC: &[u8; 12] = b"TDBWQTREE\0\0\0";
 // v3 adds the root-authenticated ground dictionary-absence branch. Older envelopes fail
 // explicitly; v2 had already bound the deterministic Dory parameter-set identity.
 const VERSION: u32 = 4;
 const UNION_VERSION: u32 = 2;
 const ANTI_VERSION: u32 = 4;
 const OUTER_VERSION: u32 = 1;
+const RECURSIVE_VERSION: u32 = 1;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 /// Hard cap for an untrusted portable query-proof envelope.
 pub const MAX_QUERY_ENVELOPE_BYTES: usize = 256 * 1024 * 1024;
+// Keep this conservative: decoding a node includes large cryptographic proof values on
+// the stack, so a much larger syntactic limit could exhaust ordinary verifier threads
+// before the guard is reached.
+pub const MAX_RELATION_PROOF_DEPTH: usize = 64;
+pub const MAX_RELATION_PROOF_NODES: usize = 4096;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -88,6 +95,17 @@ impl<'a> Reader<'a> {
 trait Wire: Sized {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()>;
     fn get(reader: &mut Reader<'_>) -> io::Result<Self>;
+}
+
+impl<T: Wire> Wire for Box<T> {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        (**self).put(out)
+    }
+
+    #[inline(never)]
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        Ok(Box::new(T::get(reader)?))
+    }
 }
 
 impl Wire for u8 {
@@ -1512,6 +1530,561 @@ impl LeftOuterJoinEnvelope {
     }
 }
 
+/// One authoritative recursive read-statement plan. Operator children are complete
+/// authenticated relations, so composition never needs to reinterpret a child proof as
+/// a leaf BGP. `query_digest` is the caller-domain identity for this exact node.
+#[derive(Clone, Debug)]
+pub struct RelationProofPlan {
+    pub query_digest: ProofHash,
+    pub kind: RelationProofPlanKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum RelationProofPlanKind {
+    Bgp(LayerBgpPlan),
+    BagUnion {
+        branches: Vec<RelationProofPlan>,
+        /// Parent output column -> child output column, once per ordered branch.
+        mappings: Vec<Vec<usize>>,
+    },
+    LeftAnti {
+        left: Box<RelationProofPlan>,
+        right: Box<RelationProofPlan>,
+        key_pairs: Vec<(usize, usize)>,
+    },
+    LeftOuter {
+        left: Box<RelationProofPlan>,
+        right: Box<RelationProofPlan>,
+        key_pairs: Vec<(usize, usize)>,
+    },
+}
+
+impl RelationProofPlan {
+    fn shape_bounded(
+        &self,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> io::Result<(Vec<ResultColumnDescriptor>, bool)> {
+        if depth > MAX_RELATION_PROOF_DEPTH || *nodes >= MAX_RELATION_PROOF_NODES {
+            return Err(invalid("recursive relation plan exceeds structural limits"));
+        }
+        *nodes += 1;
+        match &self.kind {
+            RelationProofPlanKind::Bgp(plan) => Ok((
+                super::query::result_column_descriptors(plan)?,
+                has_ground_result_unit(plan),
+            )),
+            RelationProofPlanKind::BagUnion { branches, mappings } => {
+                if branches.len() < 2
+                    || branches.len() != mappings.len()
+                    || branches.len() > MAX_RELATION_PROOF_NODES - *nodes
+                {
+                    return Err(invalid("recursive bag-union plan branch mismatch"));
+                }
+                let mut expected: Option<(Vec<ResultColumnDescriptor>, bool)> = None;
+                for (branch, mapping) in branches.iter().zip(mappings) {
+                    let (descriptors, ground) = branch.shape_bounded(depth + 1, nodes)?;
+                    let mapped = if ground {
+                        if !mapping.is_empty() {
+                            return Err(invalid("ground union branch mapping must be empty"));
+                        }
+                        Vec::new()
+                    } else {
+                        mapping
+                            .iter()
+                            .map(|index| {
+                                descriptors.get(*index).copied().ok_or_else(|| {
+                                    invalid("recursive union mapping out of range")
+                                })
+                            })
+                            .collect::<io::Result<Vec<_>>>()?
+                    };
+                    if let Some((prior, prior_ground)) = &expected {
+                        if *prior_ground != ground || prior != &mapped {
+                            return Err(invalid("recursive union branch schema mismatch"));
+                        }
+                    } else {
+                        expected = Some((mapped, ground));
+                    }
+                }
+                Ok(expected.expect("at least two branches"))
+            }
+            RelationProofPlanKind::LeftAnti { left, right, key_pairs } => {
+                let left_shape = left.shape_bounded(depth + 1, nodes)?;
+                let (right_descriptors, right_ground) =
+                    right.shape_bounded(depth + 1, nodes)?;
+                if key_pairs.is_empty() {
+                    return Ok(left_shape);
+                }
+                if left_shape.1 || right_ground || !(1..=2).contains(&key_pairs.len()) {
+                    return Err(invalid("invalid correlated recursive anti-join shape"));
+                }
+                for (left_index, right_index) in key_pairs {
+                    let l = left_shape.0.get(*left_index).ok_or_else(|| invalid("anti left key out of range"))?;
+                    let r = right_descriptors.get(*right_index).ok_or_else(|| invalid("anti right key out of range"))?;
+                    if l.namespace != r.namespace || l.nullable {
+                        return Err(invalid("anti correlation key descriptor mismatch"));
+                    }
+                }
+                Ok(left_shape)
+            }
+            RelationProofPlanKind::LeftOuter { left, right, key_pairs } => {
+                let (mut descriptors, left_ground) = left.shape_bounded(depth + 1, nodes)?;
+                let (right_descriptors, right_ground) = right.shape_bounded(depth + 1, nodes)?;
+                if left_ground || right_ground || key_pairs.len() > 2 {
+                    return Err(invalid("invalid recursive left-outer child shape"));
+                }
+                let mut shared_right = Vec::new();
+                for (left_index, right_index) in key_pairs {
+                    let l = descriptors.get(*left_index).ok_or_else(|| invalid("outer left key out of range"))?;
+                    let r = right_descriptors.get(*right_index).ok_or_else(|| invalid("outer right key out of range"))?;
+                    if l.namespace != r.namespace || l.nullable || shared_right.contains(right_index) {
+                        return Err(invalid("outer correlation key descriptor mismatch"));
+                    }
+                    shared_right.push(*right_index);
+                }
+                descriptors.extend(right_descriptors.into_iter().enumerate().filter_map(
+                    |(index, descriptor)| {
+                        (!shared_right.contains(&index)).then_some(ResultColumnDescriptor {
+                            namespace: descriptor.namespace,
+                            nullable: true,
+                        })
+                    },
+                ));
+                Ok((descriptors, false))
+            }
+        }
+    }
+
+    pub fn result_shape(&self) -> io::Result<(Vec<ResultColumnDescriptor>, bool)> {
+        let mut nodes = 0;
+        self.shape_bounded(1, &mut nodes)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RecursiveRelationEnvelope {
+    pub layer_root: ProofHash,
+    pub query_digest: ProofHash,
+    pub proof: RecursiveRelationProof,
+    pub result_commitments: Vec<ArkGT>,
+    pub result_columns: Vec<Vec<ArkFr>>,
+    pub result_log_domain: usize,
+    pub result_len: usize,
+    pub ground_result: bool,
+    pub result_descriptors: Vec<ResultColumnDescriptor>,
+    pub result_values: Vec<Vec<CanonicalResultValue>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum RecursiveRelationProof {
+    Bgp(Box<LayerBgpEnvelope>),
+    BagUnion {
+        branches: Vec<RecursiveRelationEnvelope>,
+        proof: Box<BagUnionProof>,
+    },
+    LeftAnti {
+        left: Box<RecursiveRelationEnvelope>,
+        right: Box<RecursiveRelationEnvelope>,
+        proof: Option<Box<LeftAntiJoinProof>>,
+    },
+    LeftOuter {
+        left: Box<RecursiveRelationEnvelope>,
+        right: Box<RecursiveRelationEnvelope>,
+        proof: Box<LeftOuterJoinProof>,
+    },
+}
+
+impl RecursiveRelationEnvelope {
+    fn relation_commit(&self, mapping: Option<&[usize]>) -> io::Result<RelationCommit> {
+        let commitments = match mapping {
+            Some(mapping) => mapping
+                .iter()
+                .map(|index| {
+                    self.result_commitments
+                        .get(*index)
+                        .cloned()
+                        .ok_or_else(|| invalid("recursive relation mapping out of range"))
+                })
+                .collect::<io::Result<Vec<_>>>()?,
+            None => self.result_commitments.clone(),
+        };
+        Ok(RelationCommit {
+            commitments,
+            log_domain: self.result_log_domain,
+            n: self.result_len,
+        })
+    }
+
+    fn verify_bounded(
+        &self,
+        layer: &LayerCommitment,
+        expected_root: ProofHash,
+        plan: &RelationProofPlan,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> io::Result<()> {
+        if depth > MAX_RELATION_PROOF_DEPTH || *nodes >= MAX_RELATION_PROOF_NODES {
+            return Err(invalid("recursive relation verification exceeds structural limits"));
+        }
+        *nodes += 1;
+        if self.layer_root != expected_root {
+            return Err(invalid("recursive relation root does not match trusted root"));
+        }
+        if self.query_digest != plan.query_digest {
+            return Err(invalid("recursive relation query identity mismatch"));
+        }
+        let (expected_descriptors, expected_ground) = plan.result_shape()?;
+        if self.ground_result != expected_ground
+            || self.result_descriptors != expected_descriptors
+        {
+            return Err(invalid("recursive relation result schema mismatch"));
+        }
+
+        match (&self.proof, &plan.kind) {
+            (RecursiveRelationProof::Bgp(envelope), RelationProofPlanKind::Bgp(bgp)) => {
+                envelope.verify(layer, expected_root, bgp, plan.query_digest)?;
+                if self.result_commitments != envelope.result_commitments
+                    || self.result_columns != envelope.result_columns
+                    || self.result_log_domain != envelope.result_log_domain
+                    || self.result_len != envelope.result_len
+                {
+                    return Err(invalid("recursive BGP result does not match leaf envelope"));
+                }
+            }
+            (
+                RecursiveRelationProof::BagUnion { branches, proof },
+                RelationProofPlanKind::BagUnion {
+                    branches: branch_plans,
+                    mappings,
+                },
+            ) => {
+                if branches.len() < 2
+                    || branches.len() != branch_plans.len()
+                    || branches.len() != mappings.len()
+                {
+                    return Err(invalid("recursive bag-union branch count mismatch"));
+                }
+                let mut inputs = Vec::with_capacity(branches.len());
+                for ((branch, branch_plan), mapping) in
+                    branches.iter().zip(branch_plans).zip(mappings)
+                {
+                    branch.verify_bounded(
+                        layer,
+                        expected_root,
+                        branch_plan,
+                        depth + 1,
+                        nodes,
+                    )?;
+                    inputs.push(if expected_ground {
+                        branch.relation_commit(None)?
+                    } else {
+                        branch.relation_commit(Some(mapping))?
+                    });
+                }
+                let mut transcript =
+                    super::argument::Transcript254::new(b"parture-union-envelope");
+                transcript.append_bytes(b"pow/union-envelope/root", &expected_root);
+                transcript.append_bytes(b"pow/union-envelope/query", &plan.query_digest);
+                verify_bag_union(
+                    &inputs,
+                    &self.result_commitments,
+                    self.result_len,
+                    self.result_log_domain,
+                    proof,
+                    &mut transcript,
+                )?;
+            }
+            (
+                RecursiveRelationProof::LeftAnti { left, right, proof },
+                RelationProofPlanKind::LeftAnti {
+                    left: left_plan,
+                    right: right_plan,
+                    key_pairs,
+                },
+            ) => {
+                left.verify_bounded(
+                    layer,
+                    expected_root,
+                    left_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                right.verify_bounded(
+                    layer,
+                    expected_root,
+                    right_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let left_commit = left.relation_commit(None)?;
+                let right_commit = right.relation_commit(None)?;
+                let mut transcript =
+                    super::argument::Transcript254::new(b"parture-left-anti-envelope");
+                transcript.append_bytes(b"pow/anti-envelope/root", &expected_root);
+                transcript.append_bytes(b"pow/anti-envelope/query", &plan.query_digest);
+                match (key_pairs.is_empty(), proof.as_ref()) {
+                    (true, None) => verify_global_not(
+                        &left_commit,
+                        &right_commit,
+                        &self.result_commitments,
+                        self.result_len,
+                        self.result_log_domain,
+                    )?,
+                    (false, Some(proof)) => verify_left_anti_join_with_keys(
+                        &left_commit,
+                        &right_commit,
+                        key_pairs,
+                        &self.result_commitments,
+                        self.result_len,
+                        self.result_log_domain,
+                        proof,
+                        &mut transcript,
+                    )?,
+                    _ => {
+                        return Err(invalid(
+                            "recursive left-anti key/proof variant mismatch",
+                        ))
+                    }
+                }
+            }
+            (
+                RecursiveRelationProof::LeftOuter { left, right, proof },
+                RelationProofPlanKind::LeftOuter {
+                    left: left_plan,
+                    right: right_plan,
+                    key_pairs,
+                },
+            ) => {
+                left.verify_bounded(
+                    layer,
+                    expected_root,
+                    left_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                right.verify_bounded(
+                    layer,
+                    expected_root,
+                    right_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let left_commit = left.relation_commit(None)?;
+                let right_commit = right.relation_commit(None)?;
+                let mut transcript =
+                    super::argument::Transcript254::new(b"parture-left-outer-envelope");
+                transcript.append_bytes(b"pow/outer-envelope/root", &expected_root);
+                transcript.append_bytes(b"pow/outer-envelope/query", &plan.query_digest);
+                if key_pairs.is_empty() {
+                    verify_global_left_outer_join(
+                        &left_commit,
+                        &right_commit,
+                        &self.result_commitments,
+                        self.result_len,
+                        self.result_log_domain,
+                        proof,
+                        &mut transcript,
+                    )?;
+                } else {
+                    verify_left_outer_join_with_keys(
+                        &left_commit,
+                        &right_commit,
+                        key_pairs,
+                        &self.result_commitments,
+                        self.result_len,
+                        self.result_log_domain,
+                        proof,
+                        &mut transcript,
+                    )?;
+                }
+            }
+            _ => return Err(invalid("recursive relation proof variant mismatch")),
+        }
+
+        verify_result_columns(
+            &self.result_commitments,
+            &self.result_columns,
+            self.result_len,
+            self.result_log_domain,
+        )?;
+        if self.ground_result {
+            if self.result_commitments.len() != 1
+                || self.result_columns.len() != 1
+                || !self.result_descriptors.is_empty()
+                || !self.result_values.is_empty()
+            {
+                return Err(invalid("invalid recursive ground-result shape"));
+            }
+        } else {
+            let values = resolve_result_values(
+                layer,
+                expected_root,
+                &self.result_columns,
+                &expected_descriptors,
+            )?;
+            if values != self.result_values {
+                return Err(invalid("recursive canonical result mismatch"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn verify(
+        &self,
+        layer: &LayerCommitment,
+        expected_root: ProofHash,
+        plan: &RelationProofPlan,
+    ) -> io::Result<()> {
+        // Validate the entire caller-supplied tree once with a global node budget before
+        // descending through the equally bounded delivered proof tree.
+        plan.result_shape()?;
+        let mut nodes = 0;
+        self.verify_bounded(layer, expected_root, plan, 1, &mut nodes)
+    }
+
+    fn put_bounded(
+        &self,
+        out: &mut Vec<u8>,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> io::Result<()> {
+        if depth > MAX_RELATION_PROOF_DEPTH || *nodes >= MAX_RELATION_PROOF_NODES {
+            return Err(invalid("recursive relation envelope exceeds structural limits"));
+        }
+        *nodes += 1;
+        self.layer_root.put(out)?;
+        self.query_digest.put(out)?;
+        match &self.proof {
+            RecursiveRelationProof::Bgp(envelope) => {
+                0u8.put(out)?;
+                envelope.put(out)?;
+            }
+            RecursiveRelationProof::BagUnion { branches, proof } => {
+                1u8.put(out)?;
+                if branches.len() > MAX_RELATION_PROOF_NODES {
+                    return Err(invalid("too many recursive union branches"));
+                }
+                branches.len().put(out)?;
+                for branch in branches {
+                    branch.put_bounded(out, depth + 1, nodes)?;
+                }
+                proof.put(out)?;
+            }
+            RecursiveRelationProof::LeftAnti { left, right, proof } => {
+                2u8.put(out)?;
+                left.put_bounded(out, depth + 1, nodes)?;
+                right.put_bounded(out, depth + 1, nodes)?;
+                proof.put(out)?;
+            }
+            RecursiveRelationProof::LeftOuter { left, right, proof } => {
+                3u8.put(out)?;
+                left.put_bounded(out, depth + 1, nodes)?;
+                right.put_bounded(out, depth + 1, nodes)?;
+                proof.put(out)?;
+            }
+        }
+        self.result_commitments.put(out)?;
+        self.result_columns.put(out)?;
+        self.result_log_domain.put(out)?;
+        self.result_len.put(out)?;
+        self.ground_result.put(out)?;
+        self.result_descriptors.put(out)?;
+        self.result_values.put(out)
+    }
+
+    fn get_bounded(
+        reader: &mut Reader<'_>,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> io::Result<Self> {
+        if depth > MAX_RELATION_PROOF_DEPTH || *nodes >= MAX_RELATION_PROOF_NODES {
+            return Err(invalid("recursive relation envelope exceeds structural limits"));
+        }
+        *nodes += 1;
+        let layer_root = ProofHash::get(reader)?;
+        let query_digest = ProofHash::get(reader)?;
+        let proof = match u8::get(reader)? {
+            0 => RecursiveRelationProof::Bgp(Box::<LayerBgpEnvelope>::get(reader)?),
+            1 => {
+                let len = usize::get(reader)?;
+                if len > MAX_RELATION_PROOF_NODES - *nodes {
+                    return Err(invalid("too many recursive union branches"));
+                }
+                let mut branches = Vec::new();
+                for _ in 0..len {
+                    branches.push(Self::get_bounded(reader, depth + 1, nodes)?);
+                }
+                RecursiveRelationProof::BagUnion {
+                    branches,
+                    proof: Box::<BagUnionProof>::get(reader)?,
+                }
+            }
+            2 => RecursiveRelationProof::LeftAnti {
+                left: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                right: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                proof: Option::<Box<LeftAntiJoinProof>>::get(reader)?,
+            },
+            3 => RecursiveRelationProof::LeftOuter {
+                left: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                right: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                proof: Box::<LeftOuterJoinProof>::get(reader)?,
+            },
+            _ => return Err(invalid("invalid recursive relation proof tag")),
+        };
+        Ok(Self {
+            layer_root,
+            query_digest,
+            proof,
+            result_commitments: Vec::<ArkGT>::get(reader)?,
+            result_columns: Vec::<Vec<ArkFr>>::get(reader)?,
+            result_log_domain: usize::get(reader)?,
+            result_len: usize::get(reader)?,
+            ground_result: bool::get(reader)?,
+            result_descriptors: Vec::<ResultColumnDescriptor>::get(reader)?,
+            result_values: Vec::<Vec<CanonicalResultValue>>::get(reader)?,
+        })
+    }
+
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(RECURSIVE_MAGIC);
+        out.extend_from_slice(&RECURSIVE_VERSION.to_le_bytes());
+        let mut nodes = 0;
+        self.put_bounded(&mut out, 1, &mut nodes)?;
+        if out.len().checked_add(CHECKSUM_BYTES).map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES) {
+            return Err(invalid("recursive relation envelope too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < RECURSIVE_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid recursive relation envelope size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("recursive relation envelope checksum mismatch"));
+        }
+        let mut reader = Reader { bytes: body, pos: 0 };
+        if reader.take(RECURSIVE_MAGIC.len())? != RECURSIVE_MAGIC {
+            return Err(invalid("unknown recursive relation envelope magic"));
+        }
+        if u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) != RECURSIVE_VERSION {
+            return Err(invalid("unsupported recursive relation envelope version"));
+        }
+        let mut nodes = 0;
+        let envelope = Self::get_bounded(&mut reader, 1, &mut nodes)?;
+        reader.finish()?;
+        Ok(envelope)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::query::prove_layer_bgp_with_result;
@@ -1548,6 +2121,58 @@ mod tests {
         let body_len = bytes.len() - CHECKSUM_BYTES;
         let checksum = Sha256::digest(&bytes[..body_len]);
         bytes[body_len..].copy_from_slice(&checksum);
+    }
+
+    fn recursive_leaf(
+        layer: &LayerCommitment,
+        plan: &LayerBgpPlan,
+    ) -> (RelationProofPlan, RecursiveRelationEnvelope) {
+        let result = prove_layer_bgp_with_result(layer, plan).unwrap();
+        let result_columns = result.real_columns();
+        let query_digest = plan_digest(plan).unwrap();
+        let leaf = LayerBgpEnvelope::new_verified(
+            layer,
+            layer.state.commitment_root,
+            plan,
+            query_digest,
+            result.proof,
+            result.result_commitments,
+            result_columns,
+            result.result_log_domain,
+            result.result_len,
+            result.predicate_ids,
+        )
+        .unwrap();
+        let result_descriptors = super::super::query::result_column_descriptors(plan).unwrap();
+        let result_values = leaf
+            .result_objects
+            .iter()
+            .map(|column| {
+                column
+                    .iter()
+                    .cloned()
+                    .map(CanonicalResultValue::Object)
+                    .collect()
+            })
+            .collect();
+        (
+            RelationProofPlan {
+                query_digest,
+                kind: RelationProofPlanKind::Bgp(plan.clone()),
+            },
+            RecursiveRelationEnvelope {
+                layer_root: layer.state.commitment_root,
+                query_digest,
+                result_commitments: leaf.result_commitments.clone(),
+                result_columns: leaf.result_columns.clone(),
+                result_log_domain: leaf.result_log_domain,
+                result_len: leaf.result_len,
+                ground_result: false,
+                result_descriptors,
+                result_values,
+                proof: RecursiveRelationProof::Bgp(Box::new(leaf)),
+            },
+        )
     }
 
     #[test]
@@ -1691,5 +2316,75 @@ mod tests {
         assert!(forged_objects
             .verify(&layer, layer.state.commitment_root, &plan, query_digest)
             .is_err());
+    }
+
+    #[test]
+    fn recursive_leaf_roundtrips_and_binds_plan_identity_and_schema() {
+        let (layer, bgp) = fixture();
+        let (plan, envelope) = recursive_leaf(&layer, &bgp);
+        envelope
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+        let encoded = envelope.encode().unwrap();
+        let decoded = RecursiveRelationEnvelope::decode(&encoded).unwrap();
+        decoded
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+
+        let mut wrong_digest = plan.clone();
+        wrong_digest.query_digest[0] ^= 1;
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &wrong_digest)
+            .is_err());
+
+        let mut wrong_schema = decoded.clone();
+        wrong_schema.result_descriptors[0].nullable = true;
+        assert!(wrong_schema
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .is_err());
+
+        let mut wrong_variant = plan.clone();
+        wrong_variant.kind = RelationProofPlanKind::LeftAnti {
+            left: Box::new(plan.clone()),
+            right: Box::new(plan.clone()),
+            key_pairs: Vec::new(),
+        };
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &wrong_variant)
+            .is_err());
+    }
+
+    #[test]
+    fn recursive_envelope_rejects_depth_bomb_before_proof_verification() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(RECURSIVE_MAGIC);
+        bytes.extend_from_slice(&RECURSIVE_VERSION.to_le_bytes());
+        // Only the hostile prefix is needed: decoding descends into the left child of
+        // each anti node and rejects the depth before touching any missing proof bytes.
+        for _ in 0..=MAX_RELATION_PROOF_DEPTH {
+            [0u8; 32].put(&mut bytes).unwrap();
+            [1u8; 32].put(&mut bytes).unwrap();
+            2u8.put(&mut bytes).unwrap();
+        }
+        let checksum = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&checksum);
+        let error = RecursiveRelationEnvelope::decode(&bytes).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("structural limits"));
+    }
+
+    #[test]
+    fn recursive_envelope_rejects_node_bomb_before_allocation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(RECURSIVE_MAGIC);
+        bytes.extend_from_slice(&RECURSIVE_VERSION.to_le_bytes());
+        [0u8; 32].put(&mut bytes).unwrap();
+        [1u8; 32].put(&mut bytes).unwrap();
+        1u8.put(&mut bytes).unwrap();
+        MAX_RELATION_PROOF_NODES.put(&mut bytes).unwrap();
+        let checksum = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&checksum);
+        let error = RecursiveRelationEnvelope::decode(&bytes).unwrap_err();
+        assert!(error.to_string().contains("too many recursive union branches"));
     }
 }
