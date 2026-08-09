@@ -35,6 +35,7 @@ use super::group::{
 };
 use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
+use super::permutation::RelationPermutationProof;
 use super::query::{
     has_ground_result_unit, prove_layer_bgp_with_result_and_context,
     resolve_typed_result_objects, result_id_namespaces,
@@ -330,6 +331,12 @@ wire_struct!(RelationEqualityProof {
     selection_commitment,
     inverse_commitment,
     compaction
+});
+wire_struct!(RelationPermutationProof {
+    input_reciprocal_commitment,
+    output_reciprocal_commitment,
+    sumcheck,
+    opening
 });
 wire_struct!(GroupExtremaEntryProof {
     group,
