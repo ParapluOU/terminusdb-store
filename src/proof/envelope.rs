@@ -85,8 +85,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v15 adds a distinct signed generated-decimal domain for grouped sums (wire tag 14).
-const RECURSIVE_VERSION: u32 = 15;
+// v16 extends GroupSum from zero/one key to an ordered zero-to-two-key tuple.
+const RECURSIVE_VERSION: u32 = 16;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1755,7 +1755,7 @@ pub enum RelationProofPlanKind {
     /// aggregate is derived directly without exposing the private intermediate list.
     GroupSum {
         input: Box<RelationProofPlan>,
-        key_column: Option<usize>,
+        key_columns: Vec<usize>,
         value_column: usize,
         datatype: CanonicalDatatype,
     },
@@ -2054,13 +2054,17 @@ impl RelationProofPlan {
             }
             RelationProofPlanKind::GroupSum {
                 input,
-                key_column,
+                key_columns,
                 value_column,
                 datatype,
             } => {
                 let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
-                if ground || key_column.is_some_and(|key| key == *value_column) {
-                    return Err(invalid("group-sum requires a non-ground value column distinct from its optional key"));
+                if ground
+                    || key_columns.len() > 2
+                    || key_columns.iter().any(|key| *key == *value_column)
+                    || (key_columns.len() == 2 && key_columns[0] == key_columns[1])
+                {
+                    return Err(invalid("group-sum requires zero to two unique key columns distinct from its value column"));
                 }
                 let value = descriptors
                     .get(*value_column)
@@ -2098,19 +2102,20 @@ impl RelationProofPlan {
                     },
                     nullable: false,
                 };
-                let result = match key_column {
-                    Some(key_column) => {
+                let mut result = key_columns
+                    .iter()
+                    .map(|key_column| {
                         let key = descriptors
                             .get(*key_column)
                             .copied()
                             .ok_or_else(|| invalid("group-sum key column out of range"))?;
                         if key.nullable || key.namespace != ResultIdNamespace::NodeValue {
-                            return Err(invalid("group-sum key must be a nonnullable node"));
+                            return Err(invalid("group-sum keys must be nonnullable nodes"));
                         }
-                        vec![key, generated]
-                    }
-                    None => vec![generated],
-                };
+                        Ok(key)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                result.push(generated);
                 Ok((result, false))
             }
             RelationProofPlanKind::BagUnion { branches, mappings } => {
@@ -2641,7 +2646,7 @@ fn integral_catalog_value(
 fn derived_group_sum_columns(
     layer: &impl VerifierLayer,
     input: &RecursiveRelationEnvelope,
-    key_column: Option<usize>,
+    key_columns: &[usize],
     value_column: usize,
     datatype: CanonicalDatatype,
 ) -> io::Result<Vec<Vec<ArkFr>>> {
@@ -2673,7 +2678,7 @@ fn derived_group_sum_columns(
             .ok_or_else(|| invalid("group-sum value id is absent from the authenticated dictionary"))?;
         integral_catalog_value(&record.triple.object, datatype)
     };
-    let Some(key_column) = key_column else {
+    if key_columns.is_empty() {
         if input.result_len == 0 {
             return Ok(vec![Vec::new()]);
         }
@@ -2682,41 +2687,62 @@ fn derived_group_sum_columns(
             sum = sum.checked_add(resolve_value(*field)?)?;
         }
         return Ok(vec![vec![sum.field()?]]);
-    };
-    let key_descriptor = input
-        .result_descriptors
-        .get(key_column)
-        .copied()
-        .ok_or_else(|| invalid("group-sum key descriptor out of range"))?;
-    if key_descriptor.namespace != ResultIdNamespace::NodeValue {
-        return Err(invalid("group-sum key is not in the node namespace"));
     }
-    let keys = input
-        .result_columns
-        .get(key_column)
-        .ok_or_else(|| invalid("group-sum key column out of range"))?;
-    if keys.len() != input.result_len {
-        return Err(invalid("group-sum key length mismatch"));
+    if key_columns.len() > 2
+        || key_columns.iter().any(|key| *key == value_column)
+        || (key_columns.len() == 2 && key_columns[0] == key_columns[1])
+    {
+        return Err(invalid("group-sum key tuple is invalid"));
     }
-    // SWI bagof enumerates atom-valued free keys in standard atom order. Expanded IRI
-    // nodes are UTF-8 bytes, whose lexicographic order preserves Unicode scalar order.
-    // Sort by the authenticated node value, never by Store ID (child IDs are appended).
-    let mut sums = std::collections::BTreeMap::<Vec<u8>, (u64, GroupSumValue)>::new();
+    let keys = key_columns
+        .iter()
+        .map(|key_column| {
+            let descriptor = input
+                .result_descriptors
+                .get(*key_column)
+                .copied()
+                .ok_or_else(|| invalid("group-sum key descriptor out of range"))?;
+            if descriptor.nullable || descriptor.namespace != ResultIdNamespace::NodeValue {
+                return Err(invalid("group-sum key is not a nonnullable node"));
+            }
+            let keys = input
+                .result_columns
+                .get(*key_column)
+                .ok_or_else(|| invalid("group-sum key column out of range"))?;
+            if keys.len() != input.result_len {
+                return Err(invalid("group-sum key length mismatch"));
+            }
+            Ok(keys)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    // SWI bagof orders free-variable tuples lexicographically in the declared
+    // `group_by` variable order. Resolve authenticated expanded IRI bytes for every
+    // component; never sort by child-schema position or append-order Store IDs.
+    let mut sums = std::collections::BTreeMap::<Vec<Vec<u8>>, (Vec<u64>, GroupSumValue)>::new();
     for row in 0..input.result_len {
-        let (canonical_key, key_id) = resolve_key(keys[row])?;
+        let resolved = keys
+            .iter()
+            .map(|column| resolve_key(column[row]))
+            .collect::<io::Result<Vec<_>>>()?;
+        let canonical_key = resolved.iter().map(|(iri, _)| iri.clone()).collect::<Vec<_>>();
+        let key_ids = resolved.iter().map(|(_, id)| *id).collect::<Vec<_>>();
         let value = resolve_value(values[row])?;
         let entry = sums
             .entry(canonical_key)
-            .or_insert((key_id, GroupSumValue::zero(datatype)?));
-        if entry.0 != key_id {
-            return Err(invalid("group-sum canonical node maps to multiple Store IDs"));
+            .or_insert((key_ids.clone(), GroupSumValue::zero(datatype)?));
+        if entry.0 != key_ids {
+            return Err(invalid("group-sum canonical node tuple maps to multiple Store IDs"));
         }
         entry.1 = entry.1.checked_add(value)?;
     }
-    Ok(vec![
-        sums.values().map(|(key, _)| ArkFr::from_u64(*key)).collect(),
-        sums.values().map(|(_, sum)| sum.field()).collect::<io::Result<Vec<_>>>()?,
-    ])
+    let mut output = vec![Vec::with_capacity(sums.len()); key_columns.len() + 1];
+    for (key_ids, sum) in sums.values() {
+        for (column, key_id) in output.iter_mut().zip(key_ids) {
+            column.push(ArkFr::from_u64(*key_id));
+        }
+        output[key_columns.len()].push(sum.field()?);
+    }
+    Ok(output)
 }
 
 impl RecursiveRelationEnvelope {
@@ -2955,7 +2981,7 @@ impl RecursiveRelationEnvelope {
             }
             RelationProofPlanKind::GroupSum {
                 input,
-                key_column,
+                key_columns,
                 value_column,
                 datatype,
             } => {
@@ -2964,7 +2990,7 @@ impl RecursiveRelationEnvelope {
                 let mut columns = derived_group_sum_columns(
                     layer,
                     &input_envelope,
-                    *key_column,
+                    key_columns,
                     *value_column,
                     *datatype,
                 )?;
@@ -3437,7 +3463,7 @@ impl RecursiveRelationEnvelope {
                 RecursiveRelationProof::GroupSum { input },
                 RelationProofPlanKind::GroupSum {
                     input: input_plan,
-                    key_column,
+                    key_columns,
                     value_column,
                     datatype,
                 },
@@ -3452,7 +3478,7 @@ impl RecursiveRelationEnvelope {
                 let expected_columns = derived_group_sum_columns(
                     layer,
                     input,
-                    *key_column,
+                    key_columns,
                     *value_column,
                     *datatype,
                 )?;
@@ -4784,7 +4810,7 @@ mod tests {
             query_digest: [100u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(source.clone()),
-                key_column: Some(0),
+                key_columns: vec![0],
                 value_column: 2,
                 datatype: CanonicalDatatype::UInt32,
             },
@@ -4837,7 +4863,7 @@ mod tests {
             query_digest: [103u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(source.clone()),
-                key_column: None,
+                key_columns: vec![],
                 value_column: 2,
                 datatype: CanonicalDatatype::UInt32,
             },
@@ -4868,7 +4894,7 @@ mod tests {
             query_digest: [100u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(source),
-                key_column: Some(0),
+                key_columns: vec![0],
                 value_column: 2,
                 datatype: CanonicalDatatype::UInt16,
             },
@@ -4888,7 +4914,7 @@ mod tests {
             query_digest: [101u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(empty_source.clone()),
-                key_column: Some(0),
+                key_columns: vec![0],
                 value_column: 1,
                 datatype: CanonicalDatatype::UInt32,
             },
@@ -4904,7 +4930,7 @@ mod tests {
             query_digest: [104u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(empty_source),
-                key_column: None,
+                key_columns: vec![],
                 value_column: 1,
                 datatype: CanonicalDatatype::UInt32,
             },
@@ -4915,6 +4941,125 @@ mod tests {
             .unwrap();
         assert_eq!(empty_global.result_len, 0);
         assert_eq!(empty_global.result_values, vec![Vec::new()]);
+    }
+
+    #[test]
+    fn recursive_two_key_group_sum_uses_declared_lexical_tuple_order() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node(&iri("z"), &iri("link"), &iri("z")))
+            .unwrap();
+        for value in [1u32, 2] {
+            builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("z"),
+                    &iri("score"),
+                    u32::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let builder = base.open_write().unwrap();
+        for (left, right) in [("a", "a"), ("a", "z"), ("z", "a")] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(left),
+                    &iri("link"),
+                    &iri(right),
+                ))
+                .unwrap();
+        }
+        for value in [3u32, 4, 5] {
+            builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("a"),
+                    &iri("score"),
+                    u32::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let source = RelationProofPlan {
+            query_digest: [112u8; 32],
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                atoms: vec![
+                    LayerBgpAtom::all_variables(iri("link").into_bytes()),
+                    LayerBgpAtom::all_variables(iri("score").into_bytes()),
+                ],
+                joins: vec![JoinStep {
+                    acc_key: 1,
+                    rel_key: 0,
+                    additional_keys: Vec::new(),
+                }],
+            }),
+        };
+        let plan = RelationProofPlan {
+            query_digest: [113u8; 32],
+            kind: RelationProofPlanKind::GroupSum {
+                input: Box::new(source.clone()),
+                // Child schema is [left,right,value]; declared group priority is
+                // deliberately [right,left].
+                key_columns: vec![1, 0],
+                value_column: 2,
+                datatype: CanonicalDatatype::UInt32,
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+        assert_eq!(envelope.result_len, 4);
+        let node = |name: &str| {
+            CanonicalResultValue::Object(CanonicalObject::Node(iri(name).into_bytes()))
+        };
+        assert_eq!(envelope.result_values[0], vec![node("a"), node("a"), node("z"), node("z")]);
+        assert_eq!(envelope.result_values[1], vec![node("a"), node("z"), node("a"), node("z")]);
+        assert_eq!(
+            envelope.result_values[2],
+            vec![
+                CanonicalResultValue::GeneratedDecimalU64(12),
+                CanonicalResultValue::GeneratedDecimalU64(12),
+                CanonicalResultValue::GeneratedDecimalU64(3),
+                CanonicalResultValue::GeneratedDecimalU64(3),
+            ]
+        );
+        let decoded = RecursiveRelationEnvelope::decode(&envelope.encode().unwrap()).unwrap();
+        decoded
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+
+        let reordered = RelationProofPlan {
+            query_digest: [113u8; 32],
+            kind: RelationProofPlanKind::GroupSum {
+                input: Box::new(source.clone()),
+                key_columns: vec![0, 1],
+                value_column: 2,
+                datatype: CanonicalDatatype::UInt32,
+            },
+        };
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &reordered)
+            .is_err());
+        for key_columns in [vec![0, 0], vec![0, 3], vec![0, 1, 2]] {
+            let invalid_plan = RelationProofPlan {
+                query_digest: [114u8; 32],
+                kind: RelationProofPlanKind::GroupSum {
+                    input: Box::new(source.clone()),
+                    key_columns,
+                    value_column: 2,
+                    datatype: CanonicalDatatype::UInt32,
+                },
+            };
+            assert!(invalid_plan.result_shape().is_err());
+        }
+        let mut tampered = decoded;
+        tampered.result_columns[2][2] = ArkFr::from_u64(8);
+        tampered.result_values[2][2] = CanonicalResultValue::GeneratedDecimalU64(8);
+        tampered.result_commitments[2] = commit_column(&tampered.result_columns[2]).unwrap();
+        assert!(tampered
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .is_err());
     }
 
     #[test]
@@ -4948,11 +5093,11 @@ mod tests {
                 joins: Vec::new(),
             }),
         };
-        let sum_plan = |key_column| RelationProofPlan {
+        let sum_plan = |key_columns| RelationProofPlan {
             query_digest: [106u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(source()),
-                key_column,
+                key_columns,
                 value_column: 2,
                 datatype: CanonicalDatatype::UInt64,
             },
@@ -4961,7 +5106,7 @@ mod tests {
         // The maximum is accepted as a checked partitioned sum. This is safe because
         // the BN254 scalar modulus exceeds u64::MAX.
         let partitioned = layer_with(&[("a", "p", u64::MAX - 5), ("a", "q", 5)]);
-        let keyed_plan = sum_plan(Some(0));
+        let keyed_plan = sum_plan(vec![0]);
         let keyed = RecursiveRelationEnvelope::prove(&partitioned, &keyed_plan).unwrap();
         keyed
             .verify(&partitioned, partitioned.state.commitment_root, &keyed_plan)
@@ -4972,7 +5117,7 @@ mod tests {
         );
 
         let near_max = layer_with(&[("a", "p", u64::MAX - 5), ("a", "q", 4)]);
-        let near_max_plan = sum_plan(None);
+        let near_max_plan = sum_plan(vec![]);
         let near_max_envelope =
             RecursiveRelationEnvelope::prove(&near_max, &near_max_plan).unwrap();
         near_max_envelope
@@ -4996,7 +5141,7 @@ mod tests {
             query_digest: [107u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(source()),
-                key_column: None,
+                key_columns: vec![],
                 value_column: 2,
                 datatype: CanonicalDatatype::UInt32,
             },
@@ -5004,13 +5149,13 @@ mod tests {
         assert!(RecursiveRelationEnvelope::prove(&partitioned, &wrong_datatype).is_err());
 
         let overflow = layer_with(&[("a", "p", u64::MAX), ("a", "q", 1)]);
-        let overflow_plan = sum_plan(None);
+        let overflow_plan = sum_plan(vec![]);
         assert!(RecursiveRelationEnvelope::prove(&overflow, &overflow_plan).is_err());
         let child = RecursiveRelationEnvelope::prove(&overflow, &source()).unwrap();
         assert!(derived_group_sum_columns(
             &overflow,
             &child,
-            None,
+            &[],
             2,
             CanonicalDatatype::UInt64,
         )
@@ -5099,7 +5244,7 @@ mod tests {
             query_digest: [109u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(source.clone()),
-                key_column: Some(0),
+                key_columns: vec![0],
                 value_column: 2,
                 datatype: CanonicalDatatype::Int64,
             },
@@ -5228,7 +5373,7 @@ mod tests {
             query_digest: [110u8; 32],
             kind: RelationProofPlanKind::GroupSum {
                 input: Box::new(source.clone()),
-                key_column: None,
+                key_columns: vec![],
                 value_column: 2,
                 datatype: CanonicalDatatype::Int64,
             },
@@ -5265,7 +5410,7 @@ mod tests {
             assert!(derived_group_sum_columns(
                 &overflow,
                 &child,
-                None,
+                &[],
                 2,
                 CanonicalDatatype::Int64,
             )
