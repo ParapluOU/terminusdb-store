@@ -70,6 +70,14 @@ const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
 const ANTI_MAGIC: &[u8; 12] = b"TDBWQANTI\0\0\0";
 const OUTER_MAGIC: &[u8; 12] = b"TDBWQOUTER\0\0";
 const RECURSIVE_MAGIC: &[u8; 12] = b"TDBWQTREE\0\0\0";
+
+/// Canonical hidden column for a zero-column relation: one on every real row and zero
+/// on commitment padding. This is the same representation used by all-ground BGPs.
+fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
+    let mut column = vec![ArkFr::zero(); 1usize << log_domain];
+    column[..n].fill(ArkFr::one());
+    column
+}
 // v5 adds the explicit transcript/wire-bound object-kind filter. Older envelopes fail
 // explicitly rather than guessing whether a variable object meant any value, a node,
 // or a literal.
@@ -1703,6 +1711,8 @@ pub enum RelationProofPlanKind {
     },
     /// Exact bag projection/reorder. Rows, domain, order, and multiplicity are inherited
     /// unchanged from the authenticated child; only a unique subset of columns is kept.
+    /// An empty subset converts a non-ground relation to the canonical hidden UNIT
+    /// representation of a zero-column relation.
     BagProjection {
         input: Box<RelationProofPlan>,
         indices: Vec<usize>,
@@ -1979,8 +1989,11 @@ impl RelationProofPlan {
             RelationProofPlanKind::BagProjection { input, indices } => {
                 let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
                 let mut seen = Vec::with_capacity(indices.len());
-                if ground || indices.is_empty() {
-                    return Err(invalid("bag projection requires a non-ground child and output"));
+                if ground {
+                    return Err(invalid("bag projection requires a non-ground child"));
+                }
+                if indices.is_empty() {
+                    return Ok((Vec::new(), true));
                 }
                 let projected = indices
                     .iter()
@@ -2454,28 +2467,34 @@ impl RecursiveRelationEnvelope {
             RelationProofPlanKind::BagProjection { input, indices } => {
                 let input_envelope =
                     Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
-                let commitments = indices
-                    .iter()
-                    .map(|index| {
-                        input_envelope
-                            .result_commitments
-                            .get(*index)
-                            .copied()
-                            .ok_or_else(|| invalid("bag projection index out of range"))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                let columns = indices
-                    .iter()
-                    .map(|index| {
-                        input_envelope
-                            .result_columns
-                            .get(*index)
-                            .cloned()
-                            .ok_or_else(|| invalid("bag projection index out of range"))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
                 let log_domain = input_envelope.result_log_domain;
                 let n = input_envelope.result_len;
+                let (commitments, columns) = if indices.is_empty() {
+                    let unit = ground_unit_column(n, log_domain);
+                    (vec![context.commit_column(&unit)?], vec![unit])
+                } else {
+                    let commitments = indices
+                        .iter()
+                        .map(|index| {
+                            input_envelope
+                                .result_commitments
+                                .get(*index)
+                                .copied()
+                                .ok_or_else(|| invalid("bag projection index out of range"))
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    let columns = indices
+                        .iter()
+                        .map(|index| {
+                            input_envelope
+                                .result_columns
+                                .get(*index)
+                                .cloned()
+                                .ok_or_else(|| invalid("bag projection index out of range"))
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    (commitments, columns)
+                };
                 Self::finish_proved(
                     layer,
                     plan,
@@ -2755,26 +2774,35 @@ impl RecursiveRelationEnvelope {
                     depth + 1,
                     nodes,
                 )?;
-                let expected_commitments = indices
-                    .iter()
-                    .map(|index| {
-                        input
-                            .result_commitments
-                            .get(*index)
-                            .copied()
-                            .ok_or_else(|| invalid("bag projection index out of range"))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                let expected_columns = indices
-                    .iter()
-                    .map(|index| {
-                        input
-                            .result_columns
-                            .get(*index)
-                            .cloned()
-                            .ok_or_else(|| invalid("bag projection index out of range"))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
+                let (expected_commitments, expected_columns) = if indices.is_empty() {
+                    let unit = ground_unit_column(input.result_len, input.result_log_domain);
+                    (
+                        vec![commit_column(&unit)?],
+                        vec![unit[..input.result_len].to_vec()],
+                    )
+                } else {
+                    let commitments = indices
+                        .iter()
+                        .map(|index| {
+                            input
+                                .result_commitments
+                                .get(*index)
+                                .copied()
+                                .ok_or_else(|| invalid("bag projection index out of range"))
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    let columns = indices
+                        .iter()
+                        .map(|index| {
+                            input
+                                .result_columns
+                                .get(*index)
+                                .cloned()
+                                .ok_or_else(|| invalid("bag projection index out of range"))
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    (commitments, columns)
+                };
                 if self.result_commitments != expected_commitments
                     || self.result_columns != expected_columns
                     || self.result_log_domain != input.result_log_domain
@@ -3665,6 +3693,81 @@ mod tests {
             },
         };
         assert!(duplicate_indices.result_shape().is_err());
+    }
+
+    #[test]
+    fn recursive_empty_bag_projection_emits_exact_ground_unit_and_handles_empty_child() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for object in ["x", "y"] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri("a"),
+                    &iri("p"),
+                    &iri(object),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let project = |bgp: LayerBgpPlan, digest| RelationProofPlan {
+            query_digest: digest,
+            kind: RelationProofPlanKind::BagProjection {
+                input: Box::new(RelationProofPlan {
+                    query_digest: plan_digest(&bgp).unwrap(),
+                    kind: RelationProofPlanKind::Bgp(bgp),
+                }),
+                indices: Vec::new(),
+            },
+        };
+
+        let present = project(
+            LayerBgpPlan {
+                atoms: vec![LayerBgpAtom::all_variables(iri("p").into_bytes())],
+                joins: Vec::new(),
+            },
+            [93u8; 32],
+        );
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &present).unwrap();
+        envelope
+            .verify(&layer, layer.state.commitment_root, &present)
+            .unwrap();
+        assert!(envelope.ground_result);
+        assert_eq!(envelope.result_len, 2);
+        assert_eq!(envelope.result_columns, vec![vec![ArkFr::one(); 2]]);
+        assert!(envelope.result_descriptors.is_empty());
+        assert!(envelope.result_values.is_empty());
+        let bytes = envelope.encode().unwrap();
+        let mut changed = RecursiveRelationEnvelope::decode(&bytes).unwrap();
+        changed.result_columns[0][0] = ArkFr::zero();
+        let mut padded = changed.result_columns[0].clone();
+        padded.resize(1usize << changed.result_log_domain, ArkFr::zero());
+        changed.result_commitments[0] = commit_column(&padded).unwrap();
+        assert!(changed
+            .verify(&layer, layer.state.commitment_root, &present)
+            .is_err());
+
+        let absent = project(
+            LayerBgpPlan {
+                atoms: vec![LayerBgpAtom {
+                    subject: AtomTerm::NodeConstant(iri("missing").into_bytes()),
+                    predicate_term: iri("p").into_bytes(),
+                    predicate_variable: false,
+                    object: AtomTerm::Variable,
+                    object_range: None,
+                    object_kind: ObjectKindFilter::Any,
+                    subject_object_equal: false,
+                }],
+                joins: Vec::new(),
+            },
+            [94u8; 32],
+        );
+        let empty = RecursiveRelationEnvelope::prove(&layer, &absent).unwrap();
+        empty
+            .verify(&layer, layer.state.commitment_root, &absent)
+            .unwrap();
+        assert!(empty.ground_result);
+        assert_eq!(empty.result_len, 0);
+        assert_eq!(empty.result_columns, vec![Vec::new()]);
     }
 
     #[test]
