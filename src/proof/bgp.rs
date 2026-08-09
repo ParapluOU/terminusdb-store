@@ -55,11 +55,23 @@ fn f0() -> ArkFr {
     ArkFr::zero()
 }
 
+#[inline]
+fn f1() -> ArkFr {
+    ArkFr::one()
+}
+
 /// Zero-pad `v` up to a power-of-two domain `2^log_domain` (the layout every column
 /// commitment uses). `v.len()` must not exceed the domain.
 fn zero_pad(v: &[ArkFr], log_domain: usize) -> Vec<ArkFr> {
     let mut out = v.to_vec();
     out.resize(1usize << log_domain, f0());
+    out
+}
+
+/// Public UNIT column: one on the real-row prefix and zero on padding.
+fn unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
+    let mut out = vec![f0(); 1usize << log_domain];
+    out[..n].fill(f1());
     out
 }
 
@@ -176,6 +188,25 @@ pub struct JoinStep {
     pub additional_keys: Vec<(usize, usize)>,
 }
 
+impl JoinStep {
+    /// A complete Cartesian product, encoded without changing the stable envelope wire
+    /// shape. Both sides are joined on verifier-derived UNIT columns and that synthetic
+    /// key is removed from the accumulator output.
+    pub fn cross_product() -> Self {
+        Self {
+            acc_key: usize::MAX,
+            rel_key: usize::MAX,
+            additional_keys: Vec::new(),
+        }
+    }
+
+    pub fn is_cross_product(&self) -> bool {
+        self.acc_key == usize::MAX
+            && self.rel_key == usize::MAX
+            && self.additional_keys.is_empty()
+    }
+}
+
 /// One stage's proof: the relocations that carry the accumulator's committed output
 /// columns AND the fresh relation's committed columns into this stage's binary-join
 /// input domain, plus the committed join instance, the join proof, and the proven
@@ -232,6 +263,15 @@ fn validate_shape(relations: &[RelationCommit], plan: &[JoinStep]) -> io::Result
     let mut acc_arity = relations[0].commitments.len();
     for (index, step) in plan.iter().enumerate() {
         let rel_arity = relations[index + 1].commitments.len();
+        if step.acc_key == usize::MAX || step.rel_key == usize::MAX {
+            if !step.is_cross_product() {
+                return Err(invalid("malformed BGP Cartesian-product step"));
+            }
+            acc_arity = acc_arity
+                .checked_add(rel_arity)
+                .ok_or_else(|| invalid("BGP Cartesian-product arity overflow"))?;
+            continue;
+        }
         let pairs = key_pairs(step);
         if pairs.len() > 2 {
             return Err(invalid("bgp composite key exceeds two u64 columns"));
@@ -434,7 +474,8 @@ fn prove_bgp_chain_inner_with_result(
         let rel = &relations[j + 1];
         let acc_arity = acc_cols.len();
         let rel_arity = rel.columns.len();
-        if step.acc_key >= acc_arity || step.rel_key >= rel_arity {
+        let cross_product = step.is_cross_product();
+        if !cross_product && (step.acc_key >= acc_arity || step.rel_key >= rel_arity) {
             return Err(invalid("bgp join key index out of range"));
         }
 
@@ -447,15 +488,28 @@ fn prove_bgp_chain_inner_with_result(
         // Real-length input columns for the join gadget (it derives the domain itself).
         let acc_real: Vec<Vec<ArkFr>> = acc_cols.iter().map(|c| c[..r_len].to_vec()).collect();
         let rel_real: Vec<Vec<ArkFr>> = rel.columns.iter().map(|c| c[..rel.n].to_vec()).collect();
-        let pairs = key_pairs(step);
-        let packing_radix = if step.additional_keys.is_empty() {
+        let pairs = if cross_product {
+            Vec::new()
+        } else {
+            key_pairs(step)
+        };
+        let packing_radix = if cross_product || step.additional_keys.is_empty() {
             None
         } else {
             Some(two_word_radix())
         };
         let (r_key_owned, s_key_owned);
         let (r_key, r_other, s_key, s_other): (&[ArkFr], Vec<&[ArkFr]>, &[ArkFr], Vec<&[ArkFr]>) =
-            if let Some(radix) = packing_radix {
+            if cross_product {
+                r_key_owned = vec![f1(); r_len];
+                s_key_owned = vec![f1(); rel.n];
+                (
+                    &r_key_owned,
+                    acc_real.iter().map(Vec::as_slice).collect(),
+                    &s_key_owned,
+                    rel_real.iter().map(Vec::as_slice).collect(),
+                )
+            } else if let Some(radix) = packing_radix {
                 r_key_owned = composite_key(&acc_real, &pairs, true, radix);
                 s_key_owned = composite_key(&rel_real, &pairs, false, radix);
                 (
@@ -479,7 +533,9 @@ fn prove_bgp_chain_inner_with_result(
         // (1) Relocate every accumulator column: prior output commitment (com_source at
         // the prior domain) -> this stage's r-input commitment (com_target at d_j). This
         // is what ties the join input to the actual prior output (continuity #1).
-        let acc_targets = if let Some(radix) = packing_radix {
+        let acc_targets = if cross_product {
+            com.r_other.clone()
+        } else if let Some(radix) = packing_radix {
             let derived = composite_commitment(&com.r_other, &pairs, true, radix);
             if derived != com.r_key {
                 return Err(invalid("bgp composite accumulator key commitment mismatch"));
@@ -499,9 +555,23 @@ fn prove_bgp_chain_inner_with_result(
                 transcript,
             )?);
         }
+        if cross_product {
+            let source = unit_column(acc_len, acc_domain_log);
+            let source_commitment = commit_column(&source)?;
+            let target = zero_pad(r_key, d_j_log);
+            acc_relocations.push(prove_column_relocation(
+                &source,
+                &source_commitment,
+                &target,
+                &com.r_key,
+                transcript,
+            )?);
+        }
 
         // (2) Relocate every fresh-relation column: its own commitment -> this s-input.
-        let rel_targets = if let Some(radix) = packing_radix {
+        let rel_targets = if cross_product {
+            com.s_other.clone()
+        } else if let Some(radix) = packing_radix {
             let derived = composite_commitment(&com.s_other, &pairs, false, radix);
             if derived != com.s_key {
                 return Err(invalid("bgp composite relation key commitment mismatch"));
@@ -521,6 +591,18 @@ fn prove_bgp_chain_inner_with_result(
                 transcript,
             )?);
         }
+        if cross_product {
+            let source = unit_column(rel.n, rel.log_domain);
+            let source_commitment = commit_column(&source)?;
+            let target = zero_pad(s_key, d_j_log);
+            rel_relocations.push(prove_column_relocation(
+                &source,
+                &source_commitment,
+                &target,
+                &com.s_key,
+                transcript,
+            )?);
+        }
 
         // (3) The audited binary join over the relocated inputs.
         let (join, out_coms, out_m) = if step.additional_keys.is_empty() {
@@ -533,7 +615,22 @@ fn prove_bgp_chain_inner_with_result(
         debug_assert_eq!(out_m, m_j);
 
         // Advance the accumulator to this stage's output (padded at d_j).
-        if step.additional_keys.is_empty() {
+        if cross_product {
+            let expected_key = commit_column(&unit_column(m_j, d_j_log))?;
+            if com.key != expected_key {
+                return Err(invalid("Cartesian-product output UNIT commitment mismatch"));
+            }
+            let mut new_cols: Vec<Vec<ArkFr>> = witness
+                .r_other_out
+                .iter()
+                .map(|c| zero_pad(c, d_j_log))
+                .collect();
+            new_cols.extend(witness.s_other_out.iter().map(|c| zero_pad(c, d_j_log)));
+            let mut new_coms = com.r_other_out.clone();
+            new_coms.extend(com.s_other_out.iter().copied());
+            acc_cols = new_cols;
+            acc_coms = new_coms;
+        } else if step.additional_keys.is_empty() {
             let mut new_cols: Vec<Vec<ArkFr>> = witness
                 .r_other_out
                 .iter()
@@ -606,12 +703,21 @@ pub fn verify_bgp_chain(
         let stage = &proof.stages[j];
         let acc_arity = acc_coms.len();
         let rel_arity = rel.commitments.len();
-        if step.acc_key >= acc_arity || step.rel_key >= rel_arity {
+        let cross_product = step.is_cross_product();
+        if !cross_product && (step.acc_key >= acc_arity || step.rel_key >= rel_arity) {
             return Err(invalid("bgp join key index out of range"));
         }
         let composite = !step.additional_keys.is_empty();
-        let expected_r_other = if composite { acc_arity } else { acc_arity - 1 };
-        let expected_s_other = if composite { rel_arity } else { rel_arity - 1 };
+        let expected_r_other = if composite || cross_product {
+            acc_arity
+        } else {
+            acc_arity - 1
+        };
+        let expected_s_other = if composite || cross_product {
+            rel_arity
+        } else {
+            rel_arity - 1
+        };
         // The committed stage schema must match the accumulator / relation arities.
         if stage.commitments.r_other.len() != expected_r_other
             || stage.commitments.r_other_out.len() != expected_r_other
@@ -620,7 +726,10 @@ pub fn verify_bgp_chain(
         {
             return Err(invalid("bgp stage commitment arity mismatch"));
         }
-        if stage.acc_relocations.len() != acc_arity || stage.rel_relocations.len() != rel_arity {
+        let synthetic_keys = usize::from(cross_product);
+        if stage.acc_relocations.len() != acc_arity + synthetic_keys
+            || stage.rel_relocations.len() != rel_arity + synthetic_keys
+        {
             return Err(invalid("bgp stage relocation count mismatch"));
         }
 
@@ -652,13 +761,19 @@ pub fn verify_bgp_chain(
         // MUST be relocate-linked to the prior stage's actual output commitment. The
         // relocation TARGET is the very commitment the join consumes, so a fresh/tampered
         // input that is not the prior output is rejected here, before the join runs.
-        let pairs = key_pairs(step);
+        let pairs = if cross_product {
+            Vec::new()
+        } else {
+            key_pairs(step)
+        };
         let packing_radix = if composite {
             Some(two_word_radix())
         } else {
             None
         };
-        let acc_targets = if let Some(radix) = packing_radix {
+        let acc_targets = if cross_product {
+            stage.commitments.r_other.clone()
+        } else if let Some(radix) = packing_radix {
             let derived = composite_commitment(&stage.commitments.r_other, &pairs, true, radix);
             if derived != stage.commitments.r_key {
                 return Err(invalid("bgp composite accumulator key commitment mismatch"));
@@ -683,9 +798,24 @@ pub fn verify_bgp_chain(
             )
             .map_err(|error| invalid(format!("bgp accumulator relocation {c} failed: {error}")))?;
         }
+        if cross_product {
+            let unit = unit_column(acc_len, acc_domain_log);
+            let unit_commitment = commit_column(&unit)?;
+            verify_column_relocation(
+                &unit_commitment,
+                acc_domain_log,
+                &stage.commitments.r_key,
+                d_j_log,
+                &stage.acc_relocations[acc_arity],
+                transcript,
+            )
+            .map_err(|error| invalid(format!("BGP accumulator UNIT relocation failed: {error}")))?;
+        }
 
         // Fresh-relation columns are likewise relocate-linked to their committed inputs.
-        let rel_targets = if let Some(radix) = packing_radix {
+        let rel_targets = if cross_product {
+            stage.commitments.s_other.clone()
+        } else if let Some(radix) = packing_radix {
             let derived = composite_commitment(&stage.commitments.s_other, &pairs, false, radix);
             if derived != stage.commitments.s_key {
                 return Err(invalid("bgp composite relation key commitment mismatch"));
@@ -710,6 +840,19 @@ pub fn verify_bgp_chain(
             )
             .map_err(|error| invalid(format!("bgp relation relocation {c} failed: {error}")))?;
         }
+        if cross_product {
+            let unit = unit_column(rel.n, rel.log_domain);
+            let unit_commitment = commit_column(&unit)?;
+            verify_column_relocation(
+                &unit_commitment,
+                rel.log_domain,
+                &stage.commitments.s_key,
+                d_j_log,
+                &stage.rel_relocations[rel_arity],
+                transcript,
+            )
+            .map_err(|error| invalid(format!("BGP relation UNIT relocation failed: {error}")))?;
+        }
 
         // The audited binary join, with n_r pinned to the prior length.
         let verified = if composite {
@@ -728,7 +871,15 @@ pub fn verify_bgp_chain(
         verified.map_err(|error| invalid(format!("bgp binary join stage {j} failed: {error}")))?;
 
         // Advance the accumulator.
-        acc_coms = if composite {
+        acc_coms = if cross_product {
+            let expected_key = commit_column(&unit_column(m_j, d_j_log))?;
+            if stage.commitments.key != expected_key {
+                return Err(invalid("Cartesian-product output UNIT commitment mismatch"));
+            }
+            let mut output = stage.commitments.r_other_out.clone();
+            output.extend(stage.commitments.s_other_out.iter().copied());
+            output
+        } else if composite {
             let novel = novel_relation_columns(rel_arity, &pairs);
             let mut output = stage.commitments.r_other_out.clone();
             output.extend(
@@ -867,6 +1018,70 @@ mod tests {
         }];
         let mut bad_vt = transcript();
         assert!(verify_bgp_chain(&views, &scalar_plan, &proof, &mut bad_vt).is_err());
+    }
+
+    #[test]
+    fn verifier_known_unit_key_proves_exact_cartesian_product() {
+        let rels = vec![
+            relation(&[&[1, 2]], 2),
+            relation(&[&[10, 20, 30]], 3),
+        ];
+        let views: Vec<RelationCommit> = rels.iter().map(RelationWitness::view).collect();
+        let plan = vec![JoinStep::cross_product()];
+
+        let mut pt = transcript();
+        let result = prove_bgp_chain_with_result(&rels, &plan, &mut pt).unwrap();
+        assert_eq!(result.n, 6);
+        assert_eq!(result.columns.len(), 2);
+        assert_eq!(&result.columns[0][..6], frs(&[1, 1, 1, 2, 2, 2]));
+        assert_eq!(&result.columns[1][..6], frs(&[10, 20, 30, 10, 20, 30]));
+
+        let mut vt = transcript();
+        let (commitments, result_len) =
+            verify_bgp_chain(&views, &plan, &result.proof, &mut vt).unwrap();
+        assert_eq!((commitments, result_len), (result.commitments, 6));
+
+        // Dropping or duplicating even one product row changes the authenticated
+        // completeness count and must fail.
+        for forged_len in [5, 7] {
+            let mut forged = result.proof.clone();
+            forged.stages[0].m_j = forged_len;
+            let mut bad_vt = transcript();
+            assert!(verify_bgp_chain(&views, &plan, &forged, &mut bad_vt).is_err());
+        }
+
+        // The sentinel encoding is transcript-bound and cannot be reinterpreted as a
+        // keyed join or a malformed half-sentinel step.
+        let keyed = vec![JoinStep {
+            acc_key: 0,
+            rel_key: 0,
+            additional_keys: Vec::new(),
+        }];
+        let mut bad_vt = transcript();
+        assert!(verify_bgp_chain(&views, &keyed, &result.proof, &mut bad_vt).is_err());
+        let malformed = vec![JoinStep {
+            acc_key: usize::MAX,
+            rel_key: 0,
+            additional_keys: Vec::new(),
+        }];
+        let mut bad_vt = transcript();
+        assert!(verify_bgp_chain(&views, &malformed, &result.proof, &mut bad_vt).is_err());
+    }
+
+    #[test]
+    fn cartesian_product_with_empty_side_is_empty() {
+        let rels = vec![relation(&[&[1, 2]], 2), relation(&[&[]], 0)];
+        let views: Vec<RelationCommit> = rels.iter().map(RelationWitness::view).collect();
+        let plan = vec![JoinStep::cross_product()];
+
+        let mut pt = transcript();
+        let result = prove_bgp_chain_with_result(&rels, &plan, &mut pt).unwrap();
+        assert_eq!(result.n, 0);
+        assert_eq!(result.columns.len(), 2);
+        let mut vt = transcript();
+        let (commitments, result_len) =
+            verify_bgp_chain(&views, &plan, &result.proof, &mut vt).unwrap();
+        assert_eq!((commitments, result_len), (result.commitments, 0));
     }
 
     #[test]
