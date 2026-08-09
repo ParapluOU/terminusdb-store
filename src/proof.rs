@@ -1553,10 +1553,10 @@ pub mod commitment {
                 &[],
                 &[],
                 &[],
-                &[
-                    subject_catalog,
-                    self.predicate_catalog.to_vec(),
-                    self.node_value_catalog.to_vec(),
+                [
+                    &subject_catalog,
+                    self.predicate_catalog,
+                    self.node_value_catalog,
                 ],
                 self.state.node_value_count,
                 self.state.predicate_count,
@@ -1679,10 +1679,10 @@ pub mod commitment {
                 &additions,
                 &removals,
                 &materialized,
-                &[
-                    subject_catalog,
-                    predicate_catalog.clone(),
-                    node_value_catalog.clone(),
+                [
+                    &subject_catalog,
+                    &predicate_catalog,
+                    &node_value_catalog,
                 ],
                 node_value_count,
                 predicate_count,
@@ -1825,10 +1825,10 @@ pub mod commitment {
                 &self.additions,
                 &self.removals,
                 &self.materialized,
-                &[
-                    subject_catalog,
-                    self.predicate_catalog.clone(),
-                    self.node_value_catalog.clone(),
+                [
+                    &subject_catalog,
+                    &self.predicate_catalog,
+                    &self.node_value_catalog,
                 ],
                 self.state.node_value_count,
                 self.state.predicate_count,
@@ -2314,9 +2314,9 @@ pub mod commitment {
         /// then recompute the PF4 v4 root from all retained public commitments.
         pub fn validate(&self) -> io::Result<()> {
             self.state.validate()?;
-            if self.state.addition_count as usize > MAX_RECORDS
-                || self.state.removal_count as usize > MAX_RECORDS
-                || self.state.materialized_count as usize > MAX_RECORDS
+            if self.state.addition_count > MAX_RECORDS as u64
+                || self.state.removal_count > MAX_RECORDS as u64
+                || self.state.materialized_count > MAX_RECORDS as u64
             {
                 return Err(invalid("verifier commitment count exceeds PF4 limit"));
             }
@@ -2325,10 +2325,10 @@ pub mod commitment {
                 &[],
                 &[],
                 &[],
-                &[
-                    subject_catalog,
-                    self.predicate_catalog.clone(),
-                    self.node_value_catalog.clone(),
+                [
+                    &subject_catalog,
+                    &self.predicate_catalog,
+                    &self.node_value_catalog,
                 ],
                 self.state.node_value_count,
                 self.state.predicate_count,
@@ -2816,7 +2816,7 @@ pub mod commitment {
     }
 
     fn validate_dictionary_catalogs(
-        actual: &[Vec<ProofRecord>; 3],
+        actual: [&[ProofRecord]; 3],
         node_value_count: u64,
         predicate_count: u64,
     ) -> io::Result<()> {
@@ -2897,7 +2897,7 @@ pub mod commitment {
         additions: &[ProofRecord],
         removals: &[ProofRecord],
         materialized: &[ProofRecord],
-        indexes: &[Vec<ProofRecord>; 3],
+        indexes: [&[ProofRecord]; 3],
         node_value_count: u64,
         predicate_count: u64,
     ) -> io::Result<()> {
