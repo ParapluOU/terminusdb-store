@@ -8,7 +8,7 @@ use dory_pcs::primitives::transcript::Transcript;
 use super::argument::{commit_column, StoreProverContext, Transcript254};
 use super::bgp::{RelationCommit, RelationWitness};
 use super::commitment::{node_value_op_value, LayerCommitment, VerifierLayer};
-use super::lexsort::{prove_lexicographically_sorted_with_context, verify_lexicographically_sorted, LexicographicSortedProof};
+use super::lexsort::{prove_lexicographically_nondecreasing_with_context, verify_lexicographically_nondecreasing, LexicographicSortedProof};
 use super::order::OrderDirection;
 use super::permutation::{prove_relation_permutation_with_context, verify_relation_permutation, RelationPermutationProof};
 use super::{invalid, CanonicalDatatype, CanonicalObject};
@@ -76,7 +76,6 @@ pub fn prove_exact_multi_order_with_context(context: &StoreProverContext<'_>, la
             if cmp != Ordering::Equal { return if *direction == OrderDirection::Ascending { cmp } else { cmp.reverse() }; }
         } Ordering::Equal
     });
-    if order.windows(2).any(|pair| values.iter().all(|column| column[pair[0]] == column[pair[1]])) { return Err(invalid("exact complete-row order contains a duplicate tuple")); }
     bind(transcript, datatypes, key_indices, directions, input.n);
     let permutation = prove_relation_permutation_with_context(context, input, &order, transcript)?;
     let ordered_values = resolve_values(layer, &permutation.columns, input.n, datatypes, domain)?;
@@ -85,7 +84,7 @@ pub fn prove_exact_multi_order_with_context(context: &StoreProverContext<'_>, la
     let chi_commitment = context.commit_column(&chi)?;
     let ordered_key_values = key_indices.iter().map(|i| ordered_values[*i].clone()).collect::<Vec<_>>();
     let ordered_key_commitments = key_indices.iter().map(|i| value_commitments[*i]).collect::<Vec<_>>();
-    let lexicographic = prove_lexicographically_sorted_with_context(context, &ordered_key_values, &ordered_key_commitments, directions, &chi_commitment, input.n, transcript)?;
+    let lexicographic = prove_lexicographically_nondecreasing_with_context(context, &ordered_key_values, &ordered_key_commitments, directions, &chi_commitment, input.n, transcript)?;
     Ok(ExactMultiOrderResult { proof: ExactMultiOrderProof { permutation: permutation.proof, lexicographic }, commitments: permutation.commitments, columns: permutation.columns, log_domain: permutation.log_domain, n: permutation.n })
 }
 
@@ -98,7 +97,7 @@ pub fn verify_exact_multi_order(source: &impl VerifierLayer, input: &RelationCom
     let commitments = values.iter().map(|column| commit_column(column)).collect::<io::Result<Vec<_>>>()?;
     let mut chi = vec![ArkFr::zero(); domain]; chi[..output_len].fill(ArkFr::one());
     let key_commitments = key_indices.iter().map(|i| commitments[*i]).collect::<Vec<_>>();
-    verify_lexicographically_sorted(&key_commitments, directions, &commit_column(&chi)?, output_len, &proof.lexicographic, transcript)
+    verify_lexicographically_nondecreasing(&key_commitments, directions, &commit_column(&chi)?, output_len, &proof.lexicographic, transcript)
 }
 
 #[cfg(test)]
@@ -148,7 +147,14 @@ mod tests {
         verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &[2,0,1], &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-3-test")).unwrap();
 
         let duplicate = RelationWitness::commit(vec![vec![id(&layer,1);2], vec![id(&layer,2);2]], 2).unwrap();
-        assert!(prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &duplicate, &types[..2], &[0,1], &dirs[..2], &mut Transcript254::new(b"duplicate")).is_err());
+        let duplicate_result = prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &duplicate, &types[..2], &[0,1], &dirs[..2], &mut Transcript254::new(b"duplicate")).unwrap();
+        assert_eq!(&duplicate_result.columns[0][..2], &[id(&layer,1);2]);
+        assert_eq!(&duplicate_result.columns[1][..2], &[id(&layer,2);2]);
+        verify_exact_multi_order(&layer, &duplicate.view(), &duplicate_result.columns, &types[..2], &[0,1], &dirs[..2], &duplicate_result.commitments, duplicate_result.n, duplicate_result.log_domain, &duplicate_result.proof, &mut Transcript254::new(b"duplicate")).unwrap();
+        let mut changed_columns = duplicate_result.columns.clone();
+        changed_columns[0][1] = id(&layer,3);
+        let changed_commitments = changed_columns.iter().map(|column| commit_column(column)).collect::<io::Result<Vec<_>>>().unwrap();
+        assert!(verify_exact_multi_order(&layer, &duplicate.view(), &changed_columns, &types[..2], &[0,1], &dirs[..2], &changed_commitments, duplicate_result.n, duplicate_result.log_domain, &duplicate_result.proof, &mut Transcript254::new(b"duplicate")).is_err());
         let node_id = ArkFr::from_u64(layer.node_value_catalog.iter().find(|r| matches!(r.triple.object, CanonicalObject::Node(_))).unwrap().object_id);
         let mixed = RelationWitness::commit(vec![vec![id(&layer,1),node_id], vec![id(&layer,2),id(&layer,3)]], 2).unwrap();
         assert!(prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &mixed, &types[..2], &[0,1], &dirs[..2], &mut Transcript254::new(b"mixed")).is_err());

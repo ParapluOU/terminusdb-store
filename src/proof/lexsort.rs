@@ -1,11 +1,11 @@
-//! Strict lexicographic ordering for two or three authenticated 64-bit key columns.
+//! Nondecreasing lexicographic ordering for two or three authenticated 64-bit key columns.
 
 use std::io;
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::Field;
 use super::argument::{StoreProverContext, Transcript254};
 use super::order::OrderDirection;
-use super::sort::{prove_strictly_sorted_bits_with_context, verify_strictly_sorted_bits, SortedProof};
+use super::sort::{prove_nondecreasing_bits_with_context, verify_nondecreasing_bits, SortedProof};
 use super::invalid;
 
 #[derive(Clone, Debug)]
@@ -53,7 +53,7 @@ fn pack(columns: &[Vec<ArkFr>], directions: &[OrderDirection], n: usize) -> io::
     }).collect())
 }
 
-pub fn prove_lexicographically_sorted_with_context(
+pub fn prove_lexicographically_nondecreasing_with_context(
     context: &StoreProverContext<'_>, columns: &[Vec<ArkFr>], commitments: &[ArkGT],
     directions: &[OrderDirection], chi_commitment: &ArkGT, n: usize,
     transcript: &mut Transcript254,
@@ -62,15 +62,15 @@ pub fn prove_lexicographically_sorted_with_context(
     let commitment = packed_commitment(commitments, directions, chi_commitment)?;
     if context.commit_column(&packed)? != commitment { return Err(invalid("packed lexicographic commitment mismatch")); }
     let bits = 64 * columns.len();
-    Ok(LexicographicSortedProof { sorted: prove_strictly_sorted_bits_with_context(context, &packed, n, bits, &commitment, transcript)? })
+    Ok(LexicographicSortedProof { sorted: prove_nondecreasing_bits_with_context(context, &packed, n, bits, &commitment, transcript)? })
 }
 
-pub fn verify_lexicographically_sorted(
+pub fn verify_lexicographically_nondecreasing(
     commitments: &[ArkGT], directions: &[OrderDirection], chi_commitment: &ArkGT,
     n: usize, proof: &LexicographicSortedProof, transcript: &mut Transcript254,
 ) -> io::Result<()> {
     let commitment = packed_commitment(commitments, directions, chi_commitment)?;
-    verify_strictly_sorted_bits(&commitment, n, 64 * commitments.len(), &proof.sorted, transcript)
+    verify_nondecreasing_bits(&commitment, n, 64 * commitments.len(), &proof.sorted, transcript)
 }
 
 #[cfg(test)]
@@ -85,24 +85,24 @@ mod tests {
     }
 
     #[test]
-    fn mixed_direction_two_key_order_and_tamper() {
-        let columns = vec![padded(&[1, 1, 2]), padded(&[9, 3, 8])];
+    fn mixed_direction_two_key_nondecreasing_ties_and_tamper() {
+        let columns = vec![padded(&[1, 1, 1]), padded(&[9, 9, 3])];
         let commitments = columns.iter().map(|c| commit_column(c).unwrap()).collect::<Vec<_>>();
         let chi = padded(&[1, 1, 1]);
         let chi_commitment = commit_column(&chi).unwrap();
         let directions = [OrderDirection::Ascending, OrderDirection::Descending];
         let mut prover = Transcript254::new(b"lexsort-test");
-        let proof = prove_lexicographically_sorted_with_context(&StoreProverContext::cpu(), &columns, &commitments, &directions, &chi_commitment, 3, &mut prover).unwrap();
-        verify_lexicographically_sorted(&commitments, &directions, &chi_commitment, 3, &proof, &mut Transcript254::new(b"lexsort-test")).unwrap();
+        let proof = prove_lexicographically_nondecreasing_with_context(&StoreProverContext::cpu(), &columns, &commitments, &directions, &chi_commitment, 3, &mut prover).unwrap();
+        verify_lexicographically_nondecreasing(&commitments, &directions, &chi_commitment, 3, &proof, &mut Transcript254::new(b"lexsort-test")).unwrap();
         let wrong = [OrderDirection::Ascending, OrderDirection::Ascending];
-        assert!(verify_lexicographically_sorted(&commitments, &wrong, &chi_commitment, 3, &proof, &mut Transcript254::new(b"lexsort-test")).is_err());
+        assert!(verify_lexicographically_nondecreasing(&commitments, &wrong, &chi_commitment, 3, &proof, &mut Transcript254::new(b"lexsort-test")).is_err());
 
         let packed = pack(&columns, &directions, 3).unwrap();
-        assert!(packed[0].0.into_bigint() < packed[1].0.into_bigint());
+        assert_eq!(packed[0], packed[1]);
         assert!(packed[1].0.into_bigint() < packed[2].0.into_bigint());
         assert_eq!(packed[3], ArkFr::zero(), "padding is excluded by chi");
         let duplicate = vec![padded(&[1, 1]), padded(&[3, 3])];
         let duplicate_packed = pack(&duplicate, &directions, 2).unwrap();
-        assert_eq!(duplicate_packed[0], duplicate_packed[1], "identical full-row ties cannot pass strict sort");
+        assert_eq!(duplicate_packed[0], duplicate_packed[1]);
     }
 }

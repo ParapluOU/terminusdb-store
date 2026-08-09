@@ -30,7 +30,7 @@ use super::relocate::{
     prove_column_relocation_with_context, verify_column_relocation, RelocationProof,
 };
 use super::sort::{
-    prove_strictly_sorted_bits_with_context, verify_strictly_sorted_bits, SortedProof,
+    prove_nondecreasing_bits_with_context, verify_nondecreasing_bits, SortedProof,
 };
 use super::{invalid, CanonicalDatatype};
 
@@ -168,13 +168,6 @@ pub fn prove_exact_scalar_order_with_context(
     if direction == OrderDirection::Descending {
         row_order.reverse();
     }
-    if row_order
-        .windows(2)
-        .any(|rows| input_values[rows[0]] == input_values[rows[1]])
-    {
-        return Err(invalid("exact scalar order key is not unique"));
-    }
-
     bind_statement(transcript, datatype, direction, input.n, common_log_domain);
     let permutation =
         prove_relation_permutation_with_context(context, input, &row_order, transcript)?;
@@ -287,7 +280,7 @@ pub fn prove_exact_scalar_order_with_context(
     if context.commit_column(&sort_values)? != sort_commitment {
         return Err(invalid("descending affine sort-key commitment mismatch"));
     }
-    let sorted = prove_strictly_sorted_bits_with_context(
+    let sorted = prove_nondecreasing_bits_with_context(
         context,
         &sort_values,
         input.n,
@@ -443,7 +436,7 @@ pub fn verify_exact_scalar_order(
                 - proof.lookup.com_v_val
         }
     };
-    verify_strictly_sorted_bits(
+    verify_nondecreasing_bits(
         &sort_commitment,
         output_len,
         ORDER_BITS,
@@ -561,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_keys_and_mixed_datatypes() {
+    fn preserves_duplicate_keys_and_rejects_mixed_datatypes() {
         let layer = layer();
         let ten = id_for(&layer, 10);
         let duplicate = RelationWitness::commit(
@@ -569,15 +562,20 @@ mod tests {
             2,
         )
         .unwrap();
-        assert!(prove_exact_scalar_order_with_context(
+        let result = prove_exact_scalar_order_with_context(
             &StoreProverContext::cpu(),
             &layer,
             &duplicate,
             CanonicalDatatype::UInt32,
             OrderDirection::Ascending,
             &mut transcript(),
-        )
-        .is_err());
+        ).unwrap();
+        assert_eq!(&result.columns[0][..2], &[ArkFr::from_u64(ten); 2]);
+        verify_exact_scalar_order(
+            &layer, &duplicate.view(), CanonicalDatatype::UInt32,
+            OrderDirection::Ascending, &result.commitments, result.n,
+            result.log_domain, &result.proof, &mut transcript(),
+        ).unwrap();
 
         let node_id = layer
             .node_value_catalog
