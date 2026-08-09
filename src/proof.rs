@@ -803,6 +803,7 @@ fn validate_construction_heap_budget(
 pub(crate) use commitment::decode_legacy_v3;
 pub use commitment::{CommitmentState, LayerCommitment};
 
+pub mod anti;
 pub mod argument;
 pub mod bgp;
 pub mod count;

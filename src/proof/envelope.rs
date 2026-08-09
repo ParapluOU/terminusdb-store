@@ -8,6 +8,7 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::transcript::Transcript;
 use sha2::{Digest, Sha256};
 
+use super::anti::{verify_left_anti_join, LeftAntiJoinProof};
 use super::argument::{ColumnOpening, SumcheckProof};
 use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit};
 use super::commitment::LayerCommitment;
@@ -35,10 +36,12 @@ use super::{CanonicalDatatype, CanonicalObject, ProofHash};
 
 const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
 const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
+const ANTI_MAGIC: &[u8; 12] = b"TDBWQANTI\0\0\0";
 // v3 adds the root-authenticated ground dictionary-absence branch. Older envelopes fail
 // explicitly; v2 had already bound the deterministic Dory parameter-set identity.
 const VERSION: u32 = 3;
 const UNION_VERSION: u32 = 1;
+const ANTI_VERSION: u32 = 1;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -278,6 +281,17 @@ wire_struct!(BagUnionProof {
     reciprocal_commitments,
     sumcheck,
     opening
+});
+wire_struct!(LeftAntiJoinProof {
+    left_relocations,
+    right_relocations,
+    join_commitments,
+    join,
+    join_len,
+    zero,
+    zero_selection_commitment,
+    zero_inverse_commitment,
+    compaction
 });
 wire_struct!(SortedProof {
     sumcheck,
@@ -658,12 +672,7 @@ impl LayerBgpEnvelope {
             self.result_len,
             &self.proof,
         )?;
-        verify_layer_bgp_result_log_domain(
-            layer,
-            plan,
-            &self.proof,
-            self.result_log_domain,
-        )?;
+        verify_layer_bgp_result_log_domain(layer, plan, &self.proof, self.result_log_domain)?;
         verify_result_columns(
             &self.result_commitments,
             &self.result_columns,
@@ -810,7 +819,9 @@ impl BagUnionEnvelope {
         )?;
         let result_objects = if ground_result {
             if result_columns.len() != 1 || result_commitments.len() != 1 {
-                return Err(invalid("ground bag union must carry one internal UNIT column"));
+                return Err(invalid(
+                    "ground bag union must carry one internal UNIT column",
+                ));
             }
             Vec::new()
         } else {
@@ -839,7 +850,9 @@ impl BagUnionEnvelope {
         expected_ground_result: bool,
     ) -> io::Result<()> {
         if self.layer_root != expected_root {
-            return Err(invalid("bag-union envelope root does not match trusted root"));
+            return Err(invalid(
+                "bag-union envelope root does not match trusted root",
+            ));
         }
         if self.query_digest != query_digest {
             return Err(invalid("bag-union public-query identity mismatch"));
@@ -935,6 +948,211 @@ impl BagUnionEnvelope {
         let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
         if version != UNION_VERSION {
             return Err(invalid("unsupported bag-union envelope version"));
+        }
+        let envelope = Self::get(&mut reader)?;
+        reader.finish()?;
+        Ok(envelope)
+    }
+}
+
+/// Portable correlated-Not envelope. Both BGP inputs remain independently verifiable
+/// against the trusted layer root; the anti proof authenticates the exact surviving
+/// outer rows.
+#[derive(Clone, Debug)]
+pub struct LeftAntiJoinEnvelope {
+    pub layer_root: ProofHash,
+    pub query_digest: ProofHash,
+    pub left: LayerBgpEnvelope,
+    pub right: LayerBgpEnvelope,
+    pub left_key: usize,
+    pub right_key: usize,
+    pub anti_proof: LeftAntiJoinProof,
+    pub result_commitments: Vec<ArkGT>,
+    pub result_columns: Vec<Vec<ArkFr>>,
+    pub result_log_domain: usize,
+    pub result_len: usize,
+    pub result_objects: Vec<Vec<CanonicalObject>>,
+}
+
+wire_struct!(LeftAntiJoinEnvelope {
+    layer_root,
+    query_digest,
+    left,
+    right,
+    left_key,
+    right_key,
+    anti_proof,
+    result_commitments,
+    result_columns,
+    result_log_domain,
+    result_len,
+    result_objects
+});
+
+impl LeftAntiJoinEnvelope {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_verified(
+        layer: &LayerCommitment,
+        expected_root: ProofHash,
+        left_plan: &LayerBgpPlan,
+        right_plan: &LayerBgpPlan,
+        query_digest: ProofHash,
+        left: LayerBgpEnvelope,
+        right: LayerBgpEnvelope,
+        left_key: usize,
+        right_key: usize,
+        anti_proof: LeftAntiJoinProof,
+        result_commitments: Vec<ArkGT>,
+        result_columns: Vec<Vec<ArkFr>>,
+        result_log_domain: usize,
+        result_len: usize,
+    ) -> io::Result<Self> {
+        left.verify(layer, expected_root, left_plan, query_digest)?;
+        right.verify(layer, expected_root, right_plan, query_digest)?;
+        let mut transcript = super::argument::Transcript254::new(b"parture-left-anti-envelope");
+        transcript.append_bytes(b"pow/anti-envelope/root", &expected_root);
+        transcript.append_bytes(b"pow/anti-envelope/query", &query_digest);
+        verify_left_anti_join(
+            &RelationCommit {
+                commitments: left.result_commitments.clone(),
+                log_domain: left.result_log_domain,
+                n: left.result_len,
+            },
+            &RelationCommit {
+                commitments: right.result_commitments.clone(),
+                log_domain: right.result_log_domain,
+                n: right.result_len,
+            },
+            left_key,
+            right_key,
+            &result_commitments,
+            result_len,
+            result_log_domain,
+            &anti_proof,
+            &mut transcript,
+        )?;
+        verify_result_columns(
+            &result_commitments,
+            &result_columns,
+            result_len,
+            result_log_domain,
+        )?;
+        let result_objects = resolve_result_objects(layer, expected_root, &result_columns)?;
+        Ok(Self {
+            layer_root: expected_root,
+            query_digest,
+            left,
+            right,
+            left_key,
+            right_key,
+            anti_proof,
+            result_commitments,
+            result_columns,
+            result_log_domain,
+            result_len,
+            result_objects,
+        })
+    }
+
+    pub fn verify(
+        &self,
+        layer: &LayerCommitment,
+        expected_root: ProofHash,
+        left_plan: &LayerBgpPlan,
+        right_plan: &LayerBgpPlan,
+        query_digest: ProofHash,
+        left_key: usize,
+        right_key: usize,
+    ) -> io::Result<()> {
+        if self.layer_root != expected_root {
+            return Err(invalid(
+                "left-anti envelope root does not match trusted root",
+            ));
+        }
+        if self.query_digest != query_digest {
+            return Err(invalid("left-anti public-query identity mismatch"));
+        }
+        if self.left_key != left_key || self.right_key != right_key {
+            return Err(invalid("left-anti correlation key mismatch"));
+        }
+        self.left
+            .verify(layer, expected_root, left_plan, query_digest)?;
+        self.right
+            .verify(layer, expected_root, right_plan, query_digest)?;
+        let mut transcript = super::argument::Transcript254::new(b"parture-left-anti-envelope");
+        transcript.append_bytes(b"pow/anti-envelope/root", &expected_root);
+        transcript.append_bytes(b"pow/anti-envelope/query", &query_digest);
+        verify_left_anti_join(
+            &RelationCommit {
+                commitments: self.left.result_commitments.clone(),
+                log_domain: self.left.result_log_domain,
+                n: self.left.result_len,
+            },
+            &RelationCommit {
+                commitments: self.right.result_commitments.clone(),
+                log_domain: self.right.result_log_domain,
+                n: self.right.result_len,
+            },
+            left_key,
+            right_key,
+            &self.result_commitments,
+            self.result_len,
+            self.result_log_domain,
+            &self.anti_proof,
+            &mut transcript,
+        )?;
+        verify_result_columns(
+            &self.result_commitments,
+            &self.result_columns,
+            self.result_len,
+            self.result_log_domain,
+        )?;
+        verify_result_objects(
+            layer,
+            expected_root,
+            &self.result_columns,
+            &self.result_objects,
+        )
+    }
+
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(ANTI_MAGIC);
+        out.extend_from_slice(&ANTI_VERSION.to_le_bytes());
+        self.put(&mut out)?;
+        if out
+            .len()
+            .checked_add(CHECKSUM_BYTES)
+            .map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES)
+        {
+            return Err(invalid("left-anti envelope too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < ANTI_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid left-anti envelope size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("left-anti envelope checksum mismatch"));
+        }
+        let mut reader = Reader {
+            bytes: body,
+            pos: 0,
+        };
+        if reader.take(ANTI_MAGIC.len())? != ANTI_MAGIC {
+            return Err(invalid("unknown left-anti envelope magic"));
+        }
+        let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if version != ANTI_VERSION {
+            return Err(invalid("unsupported left-anti envelope version"));
         }
         let envelope = Self::get(&mut reader)?;
         reader.finish()?;
