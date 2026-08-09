@@ -810,6 +810,7 @@ pub mod argument;
 pub mod bgp;
 pub mod count;
 pub mod dict;
+pub mod distinct;
 pub mod envelope;
 pub mod equality;
 pub mod group;

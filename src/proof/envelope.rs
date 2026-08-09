@@ -21,6 +21,10 @@ use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit, Relatio
 use super::commitment::{LayerCommitment, VerifierLayer};
 use super::count::CountProof;
 use super::dict::DictProof;
+use super::distinct::{
+    prove_relation_distinct_with_context, verify_relation_distinct,
+    RelationDistinctEntryProof, RelationDistinctProof,
+};
 use super::equality::{
     prove_relation_equality_with_context, verify_relation_equality, RelationEqualityConstraint,
     RelationEqualityProof,
@@ -73,8 +77,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v8 adds exact recursive bag projection (wire tag 10).
-const RECURSIVE_VERSION: u32 = 8;
+// v9 adds exact unordered recursive distinct projection (wire tag 11).
+const RECURSIVE_VERSION: u32 = 9;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -340,6 +344,12 @@ wire_struct!(RelationEqualityProof {
     inverse_commitment,
     compaction
 });
+wire_struct!(RelationDistinctEntryProof {
+    filters,
+    commitments,
+    lengths
+});
+wire_struct!(RelationDistinctProof { entries });
 wire_struct!(RelationPermutationProof {
     input_reciprocal_commitment,
     output_reciprocal_commitment,
@@ -1697,6 +1707,13 @@ pub enum RelationProofPlanKind {
         input: Box<RelationProofPlan>,
         indices: Vec<usize>,
     },
+    /// Exact unordered set of the selected one or two child columns. This statement
+    /// authenticates equivalence classes and multiplicity removal, but not SWI's
+    /// first-occurrence output order.
+    Distinct {
+        input: Box<RelationProofPlan>,
+        key_columns: Vec<usize>,
+    },
     LeftAnti {
         left: Box<RelationProofPlan>,
         right: Box<RelationProofPlan>,
@@ -1980,6 +1997,31 @@ impl RelationProofPlan {
                     .collect::<io::Result<Vec<_>>>()?;
                 Ok((projected, false))
             }
+            RelationProofPlanKind::Distinct { input, key_columns } => {
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                if ground || !(1..=2).contains(&key_columns.len()) {
+                    return Err(invalid("distinct requires one or two non-ground key columns"));
+                }
+                let mut seen = Vec::with_capacity(key_columns.len());
+                let projected = key_columns
+                    .iter()
+                    .map(|index| {
+                        if seen.contains(index) {
+                            return Err(invalid("distinct key columns must be unique"));
+                        }
+                        seen.push(*index);
+                        let descriptor = descriptors
+                            .get(*index)
+                            .copied()
+                            .ok_or_else(|| invalid("distinct key column out of range"))?;
+                        if descriptor.nullable {
+                            return Err(invalid("distinct key columns must be nonnullable"));
+                        }
+                        Ok(descriptor)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                Ok((projected, false))
+            }
             RelationProofPlanKind::LeftAnti { left, right, key_pairs } => {
                 let left_shape = left.shape_bounded(depth + 1, nodes)?;
                 let (right_descriptors, right_ground) =
@@ -2147,6 +2189,10 @@ pub enum RecursiveRelationProof {
     },
     BagProjection {
         input: Box<RecursiveRelationEnvelope>,
+    },
+    Distinct {
+        input: Box<RecursiveRelationEnvelope>,
+        proof: Box<RelationDistinctProof>,
     },
     LeftAnti {
         left: Box<RecursiveRelationEnvelope>,
@@ -2326,6 +2372,65 @@ impl RecursiveRelationEnvelope {
                     leaf.result_columns,
                     leaf.result_log_domain,
                     leaf.result_len,
+                )
+            }
+            RelationProofPlanKind::Distinct { input, key_columns } => {
+                let input_envelope =
+                    Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let witness = input_envelope.relation_witness(None)?;
+                let view = layer.verifier_view();
+                let resolve_id = |field: ArkFr, namespace: ResultIdNamespace| -> io::Result<u64> {
+                    match namespace {
+                        ResultIdNamespace::Predicate => view
+                            .predicate_catalog
+                            .iter()
+                            .find(|record| ArkFr::from_u64(record.predicate_id) == field)
+                            .map(|record| record.predicate_id),
+                        ResultIdNamespace::NodeValue => view
+                            .node_value_catalog
+                            .iter()
+                            .find(|record| ArkFr::from_u64(record.object_id) == field)
+                            .map(|record| record.object_id),
+                    }
+                    .ok_or_else(|| invalid("distinct input id absent from planned namespace"))
+                };
+                let mut seen = std::collections::BTreeSet::new();
+                let mut rows = Vec::new();
+                for row in 0..witness.n {
+                    let tuple = key_columns
+                        .iter()
+                        .map(|column| {
+                            resolve_id(
+                                witness.columns[*column][row],
+                                input_envelope.result_descriptors[*column].namespace,
+                            )
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    if seen.insert(tuple.clone()) {
+                        rows.push(tuple);
+                    }
+                }
+                let mut transcript = Transcript254::new(b"parture-distinct-envelope");
+                transcript.append_bytes(b"pow/distinct-envelope/root", &layer.state.commitment_root);
+                transcript.append_bytes(b"pow/distinct-envelope/query", &plan.query_digest);
+                let result = prove_relation_distinct_with_context(
+                    context,
+                    &witness,
+                    key_columns,
+                    &rows,
+                    &mut transcript,
+                )?;
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::Distinct {
+                        input: Box::new(input_envelope),
+                        proof: Box::new(result.proof),
+                    },
+                    result.commitments,
+                    result.columns,
+                    result.log_domain,
+                    result.n,
                 )
             }
             RelationProofPlanKind::BagUnion { branches, mappings } => {
@@ -2679,6 +2784,58 @@ impl RecursiveRelationEnvelope {
                 }
             }
             (
+                RecursiveRelationProof::Distinct { input, proof },
+                RelationProofPlanKind::Distinct {
+                    input: input_plan,
+                    key_columns,
+                },
+            ) => {
+                input.verify_bounded(layer, expected_root, input_plan, depth + 1, nodes)?;
+                if self.result_columns.len() != key_columns.len()
+                    || self
+                        .result_columns
+                        .iter()
+                        .any(|column| self.result_len > column.len())
+                {
+                    return Err(invalid("distinct result column shape mismatch"));
+                }
+                let view = layer.verifier_view();
+                let resolve_id = |field: ArkFr, namespace: ResultIdNamespace| -> io::Result<u64> {
+                    match namespace {
+                        ResultIdNamespace::Predicate => view
+                            .predicate_catalog
+                            .iter()
+                            .find(|record| ArkFr::from_u64(record.predicate_id) == field)
+                            .map(|record| record.predicate_id),
+                        ResultIdNamespace::NodeValue => view
+                            .node_value_catalog
+                            .iter()
+                            .find(|record| ArkFr::from_u64(record.object_id) == field)
+                            .map(|record| record.object_id),
+                    }
+                    .ok_or_else(|| invalid("distinct output id absent from planned namespace"))
+                };
+                let rows = (0..self.result_len)
+                    .map(|row| {
+                        self.result_columns
+                            .iter()
+                            .zip(&expected_descriptors)
+                            .map(|(column, descriptor)| resolve_id(column[row], descriptor.namespace))
+                            .collect::<io::Result<Vec<_>>>()
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                let mut transcript = Transcript254::new(b"parture-distinct-envelope");
+                transcript.append_bytes(b"pow/distinct-envelope/root", &expected_root);
+                transcript.append_bytes(b"pow/distinct-envelope/query", &plan.query_digest);
+                verify_relation_distinct(
+                    &input.relation_commit(None)?,
+                    key_columns,
+                    &rows,
+                    proof,
+                    &mut transcript,
+                )?;
+            }
+            (
                 RecursiveRelationProof::LeftAnti { left, right, proof },
                 RelationProofPlanKind::LeftAnti {
                     left: left_plan,
@@ -3011,6 +3168,11 @@ impl RecursiveRelationEnvelope {
                 10u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
             }
+            RecursiveRelationProof::Distinct { input, proof } => {
+                11u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+                proof.put(out)?;
+            }
             RecursiveRelationProof::LeftAnti { left, right, proof } => {
                 2u8.put(out)?;
                 left.put_bounded(out, depth + 1, nodes)?;
@@ -3126,6 +3288,10 @@ impl RecursiveRelationEnvelope {
             },
             10 => RecursiveRelationProof::BagProjection {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+            },
+            11 => RecursiveRelationProof::Distinct {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                proof: Box::<RelationDistinctProof>::get(reader)?,
             },
             _ => return Err(invalid("invalid recursive relation proof tag")),
         };
@@ -3499,6 +3665,68 @@ mod tests {
             },
         };
         assert!(duplicate_indices.result_shape().is_err());
+    }
+
+    #[test]
+    fn recursive_distinct_proves_exact_classes_roundtrips_and_rejects_tamper() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (subject, object) in [("a", "x"), ("a", "y"), ("b", "z")] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(subject),
+                    &iri("p"),
+                    &iri(object),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let bgp = LayerBgpPlan {
+            atoms: vec![LayerBgpAtom::all_variables(iri("p").into_bytes())],
+            joins: Vec::new(),
+        };
+        let leaf = RelationProofPlan {
+            query_digest: plan_digest(&bgp).unwrap(),
+            kind: RelationProofPlanKind::Bgp(bgp),
+        };
+        let plan = RelationProofPlan {
+            query_digest: [93u8; 32],
+            kind: RelationProofPlanKind::Distinct {
+                input: Box::new(leaf),
+                key_columns: vec![0],
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+        assert_eq!(envelope.result_len, 2);
+        assert_eq!(envelope.result_columns.len(), 1);
+
+        let bytes = envelope.encode().unwrap();
+        let decoded = RecursiveRelationEnvelope::decode(&bytes).unwrap();
+        decoded.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+
+        let mut wrong_key = plan.clone();
+        if let RelationProofPlanKind::Distinct { key_columns, .. } = &mut wrong_key.kind {
+            key_columns[0] = 1;
+        }
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &wrong_key)
+            .is_err());
+
+        let mut duplicate = decoded.clone();
+        duplicate.result_columns[0][1] = duplicate.result_columns[0][0];
+        duplicate.result_commitments[0] = commit_column(&duplicate.result_columns[0]).unwrap();
+        assert!(duplicate
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .is_err());
+
+        let mut changed_proof = decoded.clone();
+        if let RecursiveRelationProof::Distinct { proof, .. } = &mut changed_proof.proof {
+            proof.entries[0].lengths[0] += 1;
+        }
+        assert!(changed_proof
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .is_err());
     }
 
     #[test]
