@@ -1994,10 +1994,12 @@ impl RecursiveRelationEnvelope {
         let columns = indexes
             .iter()
             .map(|index| {
-                self.result_columns
+                let mut column = self.result_columns
                     .get(*index)
                     .cloned()
-                    .ok_or_else(|| invalid("recursive relation mapping out of range"))
+                    .ok_or_else(|| invalid("recursive relation mapping out of range"))?;
+                column.resize(1usize << self.result_log_domain, ArkFr::zero());
+                Ok(column)
             })
             .collect::<io::Result<Vec<_>>>()?;
         let commitments = indexes
@@ -2027,6 +2029,13 @@ impl RecursiveRelationEnvelope {
         n: usize,
     ) -> io::Result<Self> {
         let (result_descriptors, ground_result) = plan.result_shape()?;
+        if columns.iter().any(|column| column.len() < n) {
+            return Err(invalid("recursive prover result column is shorter than its row count"));
+        }
+        let columns = columns
+            .into_iter()
+            .map(|column| column[..n].to_vec())
+            .collect::<Vec<_>>();
         let result_values = if ground_result {
             Vec::new()
         } else {
