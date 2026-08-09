@@ -10,10 +10,10 @@
 use std::io;
 
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
-use dory_pcs::primitives::arithmetic::Field;
+use dory_pcs::primitives::arithmetic::{Field, Group};
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::Transcript254;
+use super::argument::{commit_column, Transcript254};
 use super::bgp::{RelationCommit, RelationWitness};
 use super::filter::{
     prove_compaction_only, prove_filter_indicator, verify_compaction_only, verify_filter_indicator,
@@ -22,7 +22,8 @@ use super::filter::{
 use super::invalid;
 use super::join2::{
     binary_join_commitments, binary_join_domain, compute_binary_join, prove_binary_join,
-    verify_binary_join, BinaryJoinCommitments, BinaryJoinProof,
+    prove_binary_join_with_key_bits, verify_binary_join, verify_binary_join_with_key_bits,
+    BinaryJoinCommitments, BinaryJoinProof,
 };
 use super::relocate::{prove_column_relocation, verify_column_relocation, RelocationProof};
 
@@ -70,8 +71,7 @@ fn bind_statement(
     transcript: &mut Transcript254,
     left: &RelationCommit,
     right: &RelationCommit,
-    left_key: usize,
-    right_key: usize,
+    key_pairs: &[(usize, usize)],
     output_log_domain: usize,
 ) {
     transcript.append_bytes(b"pow/anti/domain", ANTI_DOMAIN);
@@ -80,8 +80,6 @@ fn bind_statement(
         left.n,
         right.log_domain,
         right.n,
-        left_key,
-        right_key,
         output_log_domain,
     ] {
         transcript.append_bytes(b"pow/anti/meta", &(value as u64).to_le_bytes());
@@ -92,6 +90,52 @@ fn bind_statement(
     for commitment in &right.commitments {
         transcript.append_group(b"pow/anti/right", commitment);
     }
+    transcript.append_bytes(b"pow/anti/key-count", &(key_pairs.len() as u64).to_le_bytes());
+    for (left_key, right_key) in key_pairs {
+        transcript.append_bytes(b"pow/anti/left-key", &(*left_key as u64).to_le_bytes());
+        transcript.append_bytes(b"pow/anti/right-key", &(*right_key as u64).to_le_bytes());
+    }
+}
+
+fn two_word_radix() -> ArkFr {
+    let mut radix = ArkFr::one();
+    for _ in 0..64 {
+        radix = radix + radix;
+    }
+    radix
+}
+
+fn composite_key(columns: &[Vec<ArkFr>], keys: &[usize], n: usize) -> Vec<ArkFr> {
+    let radix = two_word_radix();
+    (0..n)
+        .map(|row| columns[keys[0]][row] + radix * columns[keys[1]][row])
+        .collect()
+}
+
+fn composite_commitment(commitments: &[ArkGT], keys: &[usize]) -> ArkGT {
+    commitments[keys[0]].add(&commitments[keys[1]].scale(&two_word_radix()))
+}
+
+fn validate_keys(
+    left_arity: usize,
+    right_arity: usize,
+    key_pairs: &[(usize, usize)],
+) -> io::Result<()> {
+    if !(1..=2).contains(&key_pairs.len()) {
+        return Err(invalid("anti-join needs one or two shared key columns"));
+    }
+    if key_pairs
+        .iter()
+        .any(|(left, right)| *left >= left_arity || *right >= right_arity)
+    {
+        return Err(invalid("anti-join key column out of range"));
+    }
+    if key_pairs.len() == 2
+        && (key_pairs[0].0 == key_pairs[1].0 || key_pairs[0].1 == key_pairs[1].1)
+    {
+        return Err(invalid("anti-join composite key repeats a column"));
+    }
+    Ok(())
 }
 
 fn split_key<'a>(
@@ -168,6 +212,61 @@ pub struct LeftAntiJoinResult {
     pub n: usize,
 }
 
+/// Authenticated global negation needs no additional argument beyond the two input
+/// relation proofs: the verifier already knows the exact right length. An empty right
+/// retains the exact left commitment; a nonempty right yields canonical empty columns.
+pub fn prove_global_not(
+    left: &RelationWitness,
+    right: &RelationWitness,
+) -> io::Result<(Vec<ArkGT>, Vec<Vec<ArkFr>>, usize, usize)> {
+    validate_witness(left, "left")?;
+    validate_witness(right, "right")?;
+    if right.n == 0 {
+        return Ok((
+            left.commitments.clone(),
+            left.columns.clone(),
+            left.log_domain,
+            left.n,
+        ));
+    }
+    let size = 1usize << left.log_domain;
+    let columns = vec![vec![f0(); size]; left.columns.len()];
+    let commitments = columns
+        .iter()
+        .map(|column| commit_column(column))
+        .collect::<io::Result<_>>()?;
+    Ok((commitments, columns, left.log_domain, 0))
+}
+
+pub fn verify_global_not(
+    left: &RelationCommit,
+    right: &RelationCommit,
+    output_commitments: &[ArkGT],
+    output_len: usize,
+    output_log_domain: usize,
+) -> io::Result<()> {
+    validate_relation(left, "left")?;
+    validate_relation(right, "right")?;
+    if output_log_domain != left.log_domain || output_commitments.len() != left.commitments.len() {
+        return Err(invalid("global Not output shape mismatch"));
+    }
+    if right.n == 0 {
+        if output_len != left.n || output_commitments != left.commitments {
+            return Err(invalid("empty global Not did not retain the exact outer relation"));
+        }
+        return Ok(());
+    }
+    if output_len != 0 {
+        return Err(invalid("nonempty global Not must suppress every outer row"));
+    }
+    let zero = vec![f0(); 1usize << left.log_domain];
+    let expected = commit_column(&zero)?;
+    if output_commitments.iter().any(|commitment| *commitment != expected) {
+        return Err(invalid("global Not output is not canonically empty"));
+    }
+    Ok(())
+}
+
 /// Prove a correlated `Not` for exactly one shared (scalar Store-ID) key column.
 pub fn prove_left_anti_join(
     left: &RelationWitness,
@@ -176,28 +275,44 @@ pub fn prove_left_anti_join(
     right_key: usize,
     transcript: &mut Transcript254,
 ) -> io::Result<LeftAntiJoinResult> {
+    prove_left_anti_join_with_keys(left, right, &[(left_key, right_key)], transcript)
+}
+
+/// Prove a correlated `Not` over one scalar or two injectively packed Store-ID keys.
+pub fn prove_left_anti_join_with_keys(
+    left: &RelationWitness,
+    right: &RelationWitness,
+    key_pairs: &[(usize, usize)],
+    transcript: &mut Transcript254,
+) -> io::Result<LeftAntiJoinResult> {
     validate_witness(left, "left")?;
     validate_witness(right, "right")?;
-    if left_key >= left.columns.len() || right_key >= right.columns.len() {
-        return Err(invalid("anti-join key column out of range"));
-    }
+    validate_keys(left.columns.len(), right.columns.len(), key_pairs)?;
+    let composite = key_pairs.len() == 2;
+    let left_keys: Vec<usize> = key_pairs.iter().map(|pair| pair.0).collect();
+    let right_keys: Vec<usize> = key_pairs.iter().map(|pair| pair.1).collect();
+    let (left_key, right_key) = key_pairs[0];
 
-    let left_real_key = &left.columns[left_key][..left.n];
-    let right_real_key = &right.columns[right_key][..right.n];
-    let left_real_other: Vec<&[ArkFr]> = left
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != left_key)
-        .map(|(_, column)| &column[..left.n])
-        .collect();
-    let right_real_other: Vec<&[ArkFr]> = right
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != right_key)
-        .map(|(_, column)| &column[..right.n])
-        .collect();
+    let left_key_owned;
+    let right_key_owned;
+    let (left_real_key, left_real_other): (&[ArkFr], Vec<&[ArkFr]>) = if composite {
+        left_key_owned = composite_key(&left.columns, &left_keys, left.n);
+        (
+            &left_key_owned,
+            left.columns.iter().map(|column| &column[..left.n]).collect(),
+        )
+    } else {
+        split_key(&left.columns, left_key, left.n)
+    };
+    let (right_real_key, right_real_other): (&[ArkFr], Vec<&[ArkFr]>) = if composite {
+        right_key_owned = composite_key(&right.columns, &right_keys, right.n);
+        (
+            &right_key_owned,
+            right.columns.iter().map(|column| &column[..right.n]).collect(),
+        )
+    } else {
+        split_key(&right.columns, right_key, right.n)
+    };
     let witness = compute_binary_join(
         left_real_key,
         &left_real_other,
@@ -217,8 +332,26 @@ pub fn prove_left_anti_join(
         .iter()
         .map(|c| pad(&c[..right.n], size))
         .collect();
-    let (left_join_key, left_join_other) = split_key(&left_columns, left_key, left.n);
-    let (right_join_key, right_join_other) = split_key(&right_columns, right_key, right.n);
+    let left_join_key_owned;
+    let right_join_key_owned;
+    let (left_join_key, left_join_other): (&[ArkFr], Vec<&[ArkFr]>) = if composite {
+        left_join_key_owned = composite_key(&left_columns, &left_keys, left.n);
+        (
+            &left_join_key_owned,
+            left_columns.iter().map(|column| &column[..left.n]).collect(),
+        )
+    } else {
+        split_key(&left_columns, left_key, left.n)
+    };
+    let (right_join_key, right_join_other): (&[ArkFr], Vec<&[ArkFr]>) = if composite {
+        right_join_key_owned = composite_key(&right_columns, &right_keys, right.n);
+        (
+            &right_join_key_owned,
+            right_columns.iter().map(|column| &column[..right.n]).collect(),
+        )
+    } else {
+        split_key(&right_columns, right_key, right.n)
+    };
     let join_commitments = binary_join_commitments(
         left_join_key,
         &left_join_other,
@@ -226,8 +359,22 @@ pub fn prove_left_anti_join(
         &right_join_other,
         &witness,
     )?;
-    let left_targets = input_commitments(&join_commitments, true, left_key, left.columns.len());
-    let right_targets = input_commitments(&join_commitments, false, right_key, right.columns.len());
+    let left_targets = if composite {
+        if composite_commitment(&join_commitments.r_other, &left_keys) != join_commitments.r_key {
+            return Err(invalid("anti-join composite left key commitment mismatch"));
+        }
+        join_commitments.r_other.clone()
+    } else {
+        input_commitments(&join_commitments, true, left_key, left.columns.len())
+    };
+    let right_targets = if composite {
+        if composite_commitment(&join_commitments.s_other, &right_keys) != join_commitments.s_key {
+            return Err(invalid("anti-join composite right key commitment mismatch"));
+        }
+        join_commitments.s_other.clone()
+    } else {
+        input_commitments(&join_commitments, false, right_key, right.columns.len())
+    };
 
     let mut left_relocations = Vec::with_capacity(left.columns.len());
     let mut right_relocations = Vec::with_capacity(right.columns.len());
@@ -237,8 +384,7 @@ pub fn prove_left_anti_join(
         transcript,
         &left.view(),
         &right.view(),
-        left_key,
-        right_key,
+        key_pairs,
         log_domain,
     );
     for ((source, source_commitment), (target, target_commitment)) in left
@@ -269,14 +415,26 @@ pub fn prove_left_anti_join(
             transcript,
         )?);
     }
-    let (join, _, join_len) = prove_binary_join(
-        left_join_key,
-        &left_join_other,
-        right_join_key,
-        &right_join_other,
-        &join_commitments,
-        transcript,
-    )?;
+    let (join, _, join_len) = if composite {
+        prove_binary_join_with_key_bits(
+            left_join_key,
+            &left_join_other,
+            right_join_key,
+            &right_join_other,
+            128,
+            &join_commitments,
+            transcript,
+        )?
+    } else {
+        prove_binary_join(
+            left_join_key,
+            &left_join_other,
+            right_join_key,
+            &right_join_other,
+            &join_commitments,
+            transcript,
+        )?
+    };
     let mult = multiplicities(&witness.rho_l, left.n, join_len, size);
     let (zero, zero_selection_commitment, zero_inverse_commitment, _) = prove_filter_indicator(
         &mult,
@@ -335,11 +493,35 @@ pub fn verify_left_anti_join(
     proof: &LeftAntiJoinProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
+    verify_left_anti_join_with_keys(
+        left,
+        right,
+        &[(left_key, right_key)],
+        output_commitments,
+        output_len,
+        output_log_domain,
+        proof,
+        transcript,
+    )
+}
+
+pub fn verify_left_anti_join_with_keys(
+    left: &RelationCommit,
+    right: &RelationCommit,
+    key_pairs: &[(usize, usize)],
+    output_commitments: &[ArkGT],
+    output_len: usize,
+    output_log_domain: usize,
+    proof: &LeftAntiJoinProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
     validate_relation(left, "left")?;
     validate_relation(right, "right")?;
-    if left_key >= left.commitments.len() || right_key >= right.commitments.len() {
-        return Err(invalid("anti-join key column out of range"));
-    }
+    validate_keys(left.commitments.len(), right.commitments.len(), key_pairs)?;
+    let composite = key_pairs.len() == 2;
+    let left_keys: Vec<usize> = key_pairs.iter().map(|pair| pair.0).collect();
+    let right_keys: Vec<usize> = key_pairs.iter().map(|pair| pair.1).collect();
+    let (left_key, right_key) = key_pairs[0];
     if output_commitments.len() != left.commitments.len() {
         return Err(invalid("anti-join output arity mismatch"));
     }
@@ -356,22 +538,31 @@ pub fn verify_left_anti_join(
         transcript,
         left,
         right,
-        left_key,
-        right_key,
+        key_pairs,
         output_log_domain,
     );
-    let left_targets = input_commitments(
-        &proof.join_commitments,
-        true,
-        left_key,
-        left.commitments.len(),
-    );
-    let right_targets = input_commitments(
-        &proof.join_commitments,
-        false,
-        right_key,
-        right.commitments.len(),
-    );
+    let left_targets = if composite {
+        if proof.join_commitments.r_other.len() != left.commitments.len()
+            || composite_commitment(&proof.join_commitments.r_other, &left_keys)
+                != proof.join_commitments.r_key
+        {
+            return Err(invalid("anti-join composite left key commitment mismatch"));
+        }
+        proof.join_commitments.r_other.clone()
+    } else {
+        input_commitments(&proof.join_commitments, true, left_key, left.commitments.len())
+    };
+    let right_targets = if composite {
+        if proof.join_commitments.s_other.len() != right.commitments.len()
+            || composite_commitment(&proof.join_commitments.s_other, &right_keys)
+                != proof.join_commitments.s_key
+        {
+            return Err(invalid("anti-join composite right key commitment mismatch"));
+        }
+        proof.join_commitments.s_other.clone()
+    } else {
+        input_commitments(&proof.join_commitments, false, right_key, right.commitments.len())
+    };
     for column in 0..left.commitments.len() {
         verify_column_relocation(
             &left.commitments[column],
@@ -392,14 +583,26 @@ pub fn verify_left_anti_join(
             transcript,
         )?;
     }
-    verify_binary_join(
-        &proof.join_commitments,
-        left.n,
-        right.n,
-        proof.join_len,
-        &proof.join,
-        transcript,
-    )?;
+    if composite {
+        verify_binary_join_with_key_bits(
+            &proof.join_commitments,
+            left.n,
+            right.n,
+            proof.join_len,
+            128,
+            &proof.join,
+            transcript,
+        )?;
+    } else {
+        verify_binary_join(
+            &proof.join_commitments,
+            left.n,
+            right.n,
+            proof.join_len,
+            &proof.join,
+            transcript,
+        )?;
+    }
     verify_filter_indicator(
         &proof.join.pairs.mult_l_commitment,
         f0(),
@@ -542,5 +745,89 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn composite_keys_require_both_words_and_bind_pair_order() {
+        let left = relation(&[
+            &[1, 1, 2, 2],
+            &[10, 11, 10, 10],
+            &[100, 101, 200, 201],
+        ]);
+        // Right key columns are intentionally reversed: (b, a). The final row only
+        // matches `a=1` partially and must not suppress the `a=1,b=11` left row.
+        let right = relation(&[&[10, 10, 99], &[1, 2, 1], &[900, 901, 902]]);
+        let keys = [(0usize, 1usize), (1usize, 0usize)];
+        let mut pt = transcript();
+        let result = prove_left_anti_join_with_keys(&left, &right, &keys, &mut pt).unwrap();
+        assert_eq!(result.n, 1);
+        assert_eq!(result.columns[0][0], ArkFr::from_u64(1));
+        assert_eq!(result.columns[1][0], ArkFr::from_u64(11));
+        assert_eq!(result.columns[2][0], ArkFr::from_u64(101));
+        let mut vt = transcript();
+        verify_left_anti_join_with_keys(
+            &left.view(),
+            &right.view(),
+            &keys,
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut vt,
+        )
+        .unwrap();
+
+        let swapped = [keys[1], keys[0]];
+        let mut vt = transcript();
+        assert!(verify_left_anti_join_with_keys(
+            &left.view(),
+            &right.view(),
+            &swapped,
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut vt,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn global_not_is_exactly_the_authenticated_right_nonempty_gate() {
+        let left = relation(&[&[1, 2], &[10, 20]]);
+        let empty = relation(&[&[], &[]]);
+        let (commitments, _, log_domain, n) = prove_global_not(&left, &empty).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(commitments, left.commitments);
+        verify_global_not(&left.view(), &empty.view(), &commitments, n, log_domain).unwrap();
+
+        let nonempty = relation(&[&[9], &[90]]);
+        let (empty_commitments, _, log_domain, n) =
+            prove_global_not(&left, &nonempty).unwrap();
+        assert_eq!(n, 0);
+        verify_global_not(
+            &left.view(),
+            &nonempty.view(),
+            &empty_commitments,
+            n,
+            log_domain,
+        )
+        .unwrap();
+        assert!(verify_global_not(
+            &left.view(),
+            &nonempty.view(),
+            &left.commitments,
+            left.n,
+            left.log_domain,
+        )
+        .is_err());
+        assert!(verify_global_not(
+            &left.view(),
+            &empty.view(),
+            &empty_commitments,
+            0,
+            left.log_domain,
+        )
+        .is_err());
     }
 }

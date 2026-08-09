@@ -8,7 +8,7 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::transcript::Transcript;
 use sha2::{Digest, Sha256};
 
-use super::anti::{verify_left_anti_join, LeftAntiJoinProof};
+use super::anti::{verify_global_not, verify_left_anti_join_with_keys, LeftAntiJoinProof};
 use super::argument::{ColumnOpening, SumcheckProof};
 use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit};
 use super::commitment::LayerCommitment;
@@ -41,7 +41,7 @@ const ANTI_MAGIC: &[u8; 12] = b"TDBWQANTI\0\0\0";
 // explicitly; v2 had already bound the deterministic Dory parameter-set identity.
 const VERSION: u32 = 3;
 const UNION_VERSION: u32 = 1;
-const ANTI_VERSION: u32 = 1;
+const ANTI_VERSION: u32 = 3;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -964,13 +964,13 @@ pub struct LeftAntiJoinEnvelope {
     pub query_digest: ProofHash,
     pub left: LayerBgpEnvelope,
     pub right: LayerBgpEnvelope,
-    pub left_key: usize,
-    pub right_key: usize,
-    pub anti_proof: LeftAntiJoinProof,
+    pub key_pairs: Vec<(usize, usize)>,
+    pub anti_proof: Option<LeftAntiJoinProof>,
     pub result_commitments: Vec<ArkGT>,
     pub result_columns: Vec<Vec<ArkFr>>,
     pub result_log_domain: usize,
     pub result_len: usize,
+    pub ground_result: bool,
     pub result_objects: Vec<Vec<CanonicalObject>>,
 }
 
@@ -979,13 +979,13 @@ wire_struct!(LeftAntiJoinEnvelope {
     query_digest,
     left,
     right,
-    left_key,
-    right_key,
+    key_pairs,
     anti_proof,
     result_commitments,
     result_columns,
     result_log_domain,
     result_len,
+    ground_result,
     result_objects
 });
 
@@ -999,57 +999,62 @@ impl LeftAntiJoinEnvelope {
         query_digest: ProofHash,
         left: LayerBgpEnvelope,
         right: LayerBgpEnvelope,
-        left_key: usize,
-        right_key: usize,
-        anti_proof: LeftAntiJoinProof,
+        key_pairs: Vec<(usize, usize)>,
+        anti_proof: Option<LeftAntiJoinProof>,
         result_commitments: Vec<ArkGT>,
         result_columns: Vec<Vec<ArkFr>>,
         result_log_domain: usize,
         result_len: usize,
+        ground_result: bool,
     ) -> io::Result<Self> {
         left.verify(layer, expected_root, left_plan, query_digest)?;
         right.verify(layer, expected_root, right_plan, query_digest)?;
         let mut transcript = super::argument::Transcript254::new(b"parture-left-anti-envelope");
         transcript.append_bytes(b"pow/anti-envelope/root", &expected_root);
         transcript.append_bytes(b"pow/anti-envelope/query", &query_digest);
-        verify_left_anti_join(
-            &RelationCommit {
+        let left_commit = RelationCommit {
                 commitments: left.result_commitments.clone(),
                 log_domain: left.result_log_domain,
                 n: left.result_len,
-            },
-            &RelationCommit {
+            };
+        let right_commit = RelationCommit {
                 commitments: right.result_commitments.clone(),
                 log_domain: right.result_log_domain,
                 n: right.result_len,
-            },
-            left_key,
-            right_key,
-            &result_commitments,
-            result_len,
-            result_log_domain,
-            &anti_proof,
-            &mut transcript,
-        )?;
+            };
+        match (key_pairs.is_empty(), anti_proof.as_ref()) {
+            (true, None) => verify_global_not(
+                &left_commit, &right_commit, &result_commitments, result_len, result_log_domain,
+            )?,
+            (false, Some(proof)) => verify_left_anti_join_with_keys(
+                &left_commit, &right_commit, &key_pairs, &result_commitments, result_len,
+                result_log_domain, proof, &mut transcript,
+            )?,
+            _ => return Err(invalid("left-anti envelope key/proof variant mismatch")),
+        }
         verify_result_columns(
             &result_commitments,
             &result_columns,
             result_len,
             result_log_domain,
         )?;
-        let result_objects = resolve_result_objects(layer, expected_root, &result_columns)?;
+        let result_objects = if ground_result {
+            Vec::new()
+        } else {
+            resolve_result_objects(layer, expected_root, &result_columns)?
+        };
         Ok(Self {
             layer_root: expected_root,
             query_digest,
             left,
             right,
-            left_key,
-            right_key,
+            key_pairs,
             anti_proof,
             result_commitments,
             result_columns,
             result_log_domain,
             result_len,
+            ground_result,
             result_objects,
         })
     }
@@ -1061,8 +1066,8 @@ impl LeftAntiJoinEnvelope {
         left_plan: &LayerBgpPlan,
         right_plan: &LayerBgpPlan,
         query_digest: ProofHash,
-        left_key: usize,
-        right_key: usize,
+        key_pairs: &[(usize, usize)],
+        expected_ground_result: bool,
     ) -> io::Result<()> {
         if self.layer_root != expected_root {
             return Err(invalid(
@@ -1072,8 +1077,11 @@ impl LeftAntiJoinEnvelope {
         if self.query_digest != query_digest {
             return Err(invalid("left-anti public-query identity mismatch"));
         }
-        if self.left_key != left_key || self.right_key != right_key {
+        if self.key_pairs != key_pairs {
             return Err(invalid("left-anti correlation key mismatch"));
+        }
+        if self.ground_result != expected_ground_result {
+            return Err(invalid("left-anti ground-result interpretation mismatch"));
         }
         self.left
             .verify(layer, expected_root, left_plan, query_digest)?;
@@ -1082,37 +1090,45 @@ impl LeftAntiJoinEnvelope {
         let mut transcript = super::argument::Transcript254::new(b"parture-left-anti-envelope");
         transcript.append_bytes(b"pow/anti-envelope/root", &expected_root);
         transcript.append_bytes(b"pow/anti-envelope/query", &query_digest);
-        verify_left_anti_join(
-            &RelationCommit {
+        let left_commit = RelationCommit {
                 commitments: self.left.result_commitments.clone(),
                 log_domain: self.left.result_log_domain,
                 n: self.left.result_len,
-            },
-            &RelationCommit {
+            };
+        let right_commit = RelationCommit {
                 commitments: self.right.result_commitments.clone(),
                 log_domain: self.right.result_log_domain,
                 n: self.right.result_len,
-            },
-            left_key,
-            right_key,
-            &self.result_commitments,
-            self.result_len,
-            self.result_log_domain,
-            &self.anti_proof,
-            &mut transcript,
-        )?;
+            };
+        match (key_pairs.is_empty(), self.anti_proof.as_ref()) {
+            (true, None) => verify_global_not(
+                &left_commit, &right_commit, &self.result_commitments, self.result_len,
+                self.result_log_domain,
+            )?,
+            (false, Some(proof)) => verify_left_anti_join_with_keys(
+                &left_commit, &right_commit, key_pairs, &self.result_commitments,
+                self.result_len, self.result_log_domain, proof, &mut transcript,
+            )?,
+            _ => return Err(invalid("left-anti envelope key/proof variant mismatch")),
+        }
         verify_result_columns(
             &self.result_commitments,
             &self.result_columns,
             self.result_len,
             self.result_log_domain,
         )?;
-        verify_result_objects(
-            layer,
-            expected_root,
-            &self.result_columns,
-            &self.result_objects,
-        )
+        if self.ground_result {
+            if self.result_commitments.len() != 1 || self.result_columns.len() != 1
+                || !self.result_objects.is_empty()
+            {
+                return Err(invalid("invalid ground left-anti envelope shape"));
+            }
+            Ok(())
+        } else {
+            verify_result_objects(
+                layer, expected_root, &self.result_columns, &self.result_objects,
+            )
+        }
     }
 
     pub fn encode(&self) -> io::Result<Vec<u8>> {
