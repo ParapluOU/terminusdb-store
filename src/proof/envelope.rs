@@ -85,8 +85,9 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v9 adds exact unordered recursive distinct projection (wire tag 11).
-const RECURSIVE_VERSION: u32 = 9;
+// v10 adds the root-derived visible triple-count source (wire tag 12) and generated
+// nonnegative xsd:decimal result descriptor.
+const RECURSIVE_VERSION: u32 = 10;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -745,12 +746,14 @@ impl Wire for ResultIdNamespace {
         match self {
             Self::NodeValue => 0u8.put(out),
             Self::Predicate => 1u8.put(out),
+            Self::GeneratedDecimalU64 => 2u8.put(out),
         }
     }
     fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
         match u8::get(reader)? {
             0 => Ok(Self::NodeValue),
             1 => Ok(Self::Predicate),
+            2 => Ok(Self::GeneratedDecimalU64),
             _ => Err(invalid("invalid result namespace tag")),
         }
     }
@@ -767,12 +770,17 @@ impl Wire for CanonicalResultValue {
                 object.put(out)
             }
             Self::Null => 1u8.put(out),
+            Self::GeneratedDecimalU64(value) => {
+                2u8.put(out)?;
+                value.put(out)
+            }
         }
     }
     fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
         match u8::get(reader)? {
             0 => Ok(Self::Object(Wire::get(reader)?)),
             1 => Ok(Self::Null),
+            2 => Ok(Self::GeneratedDecimalU64(u64::get(reader)?)),
             _ => Err(invalid("invalid canonical result value tag")),
         }
     }
@@ -1704,6 +1712,9 @@ pub struct RelationProofPlan {
 #[derive(Clone, Debug)]
 pub enum RelationProofPlanKind {
     Bgp(LayerBgpPlan),
+    /// One generated nonnegative xsd:decimal equal to the complete logical triple set
+    /// visible at this immutable layer head. The trusted root binds materialized_count.
+    LayerTripleCount,
     BagUnion {
         branches: Vec<RelationProofPlan>,
         /// Parent output column -> child output column, once per ordered branch.
@@ -1951,6 +1962,13 @@ impl RelationProofPlan {
                 super::query::result_column_descriptors(plan)?,
                 has_ground_result_unit(plan),
             )),
+            RelationProofPlanKind::LayerTripleCount => Ok((
+                vec![ResultColumnDescriptor {
+                    namespace: ResultIdNamespace::GeneratedDecimalU64,
+                    nullable: false,
+                }],
+                false,
+            )),
             RelationProofPlanKind::BagUnion { branches, mappings } => {
                 if branches.len() < 2
                     || branches.len() != mappings.len()
@@ -2196,6 +2214,7 @@ pub struct RecursiveRelationEnvelope {
 #[derive(Clone, Debug)]
 pub enum RecursiveRelationProof {
     Bgp(Box<LayerBgpEnvelope>),
+    LayerTripleCount,
     BagUnion {
         branches: Vec<RecursiveRelationEnvelope>,
         proof: Box<BagUnionProof>,
@@ -2387,6 +2406,20 @@ impl RecursiveRelationEnvelope {
                     leaf.result_len,
                 )
             }
+            RelationProofPlanKind::LayerTripleCount => {
+                let mut column = vec![ArkFr::zero(); 2];
+                column[0] = ArkFr::from_u64(layer.state.materialized_count);
+                let commitment = context.commit_column(&column)?;
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::LayerTripleCount,
+                    vec![commitment],
+                    vec![column],
+                    1,
+                    1,
+                )
+            }
             RelationProofPlanKind::Distinct { input, key_columns } => {
                 let input_envelope =
                     Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
@@ -2404,6 +2437,7 @@ impl RecursiveRelationEnvelope {
                             .iter()
                             .find(|record| ArkFr::from_u64(record.object_id) == field)
                             .map(|record| record.object_id),
+                        ResultIdNamespace::GeneratedDecimalU64 => None,
                     }
                     .ok_or_else(|| invalid("distinct input id absent from planned namespace"))
                 };
@@ -2653,6 +2687,7 @@ impl RecursiveRelationEnvelope {
                     let id = match namespace {
                         ResultIdNamespace::Predicate => view.predicate_catalog.iter().find_map(|record| (ArkFr::from_u64(record.predicate_id) == field).then_some(record.predicate_id)),
                         ResultIdNamespace::NodeValue => view.node_value_catalog.iter().find_map(|record| (ArkFr::from_u64(record.object_id) == field).then_some(record.object_id)),
+                        ResultIdNamespace::GeneratedDecimalU64 => None,
                     };
                     id.ok_or_else(|| invalid("group-extrema input id absent from planned namespace"))
                 };
@@ -2707,6 +2742,23 @@ impl RecursiveRelationEnvelope {
         }
 
         match (&self.proof, &plan.kind) {
+            (
+                RecursiveRelationProof::LayerTripleCount,
+                RelationProofPlanKind::LayerTripleCount,
+            ) => {
+                let count = layer.verifier_view().state.materialized_count;
+                let mut column = vec![ArkFr::zero(); 2];
+                column[0] = ArkFr::from_u64(count);
+                if self.result_len != 1
+                    || self.result_log_domain != 1
+                    || self.result_columns != vec![vec![column[0]]]
+                    || self.result_commitments != vec![commit_column(&column)?]
+                    || self.result_values
+                        != vec![vec![CanonicalResultValue::GeneratedDecimalU64(count)]]
+                {
+                    return Err(invalid("layer triple-count result does not match trusted root"));
+                }
+            }
             (RecursiveRelationProof::Bgp(envelope), RelationProofPlanKind::Bgp(bgp)) => {
                 envelope.verify(layer, expected_root, bgp, plan.query_digest)?;
                 if self.result_commitments != envelope.result_commitments
@@ -2840,6 +2892,7 @@ impl RecursiveRelationEnvelope {
                             .iter()
                             .find(|record| ArkFr::from_u64(record.object_id) == field)
                             .map(|record| record.object_id),
+                        ResultIdNamespace::GeneratedDecimalU64 => None,
                     }
                     .ok_or_else(|| invalid("distinct output id absent from planned namespace"))
                 };
@@ -3109,6 +3162,7 @@ impl RecursiveRelationEnvelope {
                             .find(|r| ArkFr::from_u64(r.predicate_id) == field).map(|r| r.predicate_id),
                         ResultIdNamespace::NodeValue => view.node_value_catalog.iter()
                             .find(|r| ArkFr::from_u64(r.object_id) == field).map(|r| r.object_id),
+                        ResultIdNamespace::GeneratedDecimalU64 => None,
                     }.ok_or_else(|| invalid("group-extrema output id absent from planned namespace"))
                 };
                 let rows = (0..self.result_len).map(|i| Ok((
@@ -3177,6 +3231,9 @@ impl RecursiveRelationEnvelope {
         self.layer_root.put(out)?;
         self.query_digest.put(out)?;
         match &self.proof {
+            RecursiveRelationProof::LayerTripleCount => {
+                12u8.put(out)?;
+            }
             RecursiveRelationProof::Bgp(envelope) => {
                 0u8.put(out)?;
                 envelope.put(out)?;
@@ -3265,6 +3322,7 @@ impl RecursiveRelationEnvelope {
         let layer_root = ProofHash::get(reader)?;
         let query_digest = ProofHash::get(reader)?;
         let proof = match u8::get(reader)? {
+            12 => RecursiveRelationProof::LayerTripleCount,
             0 => RecursiveRelationProof::Bgp(Box::<LayerBgpEnvelope>::get(reader)?),
             1 => {
                 let len = usize::get(reader)?;
@@ -3768,6 +3826,79 @@ mod tests {
         assert!(empty.ground_result);
         assert_eq!(empty.result_len, 0);
         assert_eq!(empty.result_columns, vec![Vec::new()]);
+    }
+
+    #[test]
+    fn recursive_layer_triple_count_tracks_logical_stack_and_rejects_tamper() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        let empty_layer = builder.commit().unwrap();
+        let plan = RelationProofPlan {
+            query_digest: [95u8; 32],
+            kind: RelationProofPlanKind::LayerTripleCount,
+        };
+        let empty_commitment = empty_layer.proof_commitment().unwrap();
+        let empty = RecursiveRelationEnvelope::prove(&empty_commitment, &plan).unwrap();
+        empty
+            .verify(&empty_commitment, empty_commitment.state.commitment_root, &plan)
+            .unwrap();
+        assert_eq!(empty.result_len, 1);
+        assert_eq!(empty.result_columns, vec![vec![ArkFr::zero()]]);
+        assert_eq!(
+            empty.result_values,
+            vec![vec![CanonicalResultValue::GeneratedDecimalU64(0)]]
+        );
+
+        let builder = empty_layer.open_write().unwrap();
+        for object in ["x", "y", "z"] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri("a"),
+                    &iri("p"),
+                    &iri(object),
+                ))
+                .unwrap();
+        }
+        let parent = builder.commit().unwrap();
+        let builder = parent.open_write().unwrap();
+        builder
+            .remove_value_triple(ValueTriple::new_node(&iri("a"), &iri("p"), &iri("y")))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node(&iri("b"), &iri("q"), &iri("w")))
+            .unwrap();
+        let head = builder.commit().unwrap().proof_commitment().unwrap();
+        assert_eq!(head.state.materialized_count, 3);
+
+        let envelope = RecursiveRelationEnvelope::prove(&head, &plan).unwrap();
+        envelope
+            .verify(&head, head.state.commitment_root, &plan)
+            .unwrap();
+        assert_eq!(envelope.result_columns, vec![vec![ArkFr::from_u64(3)]]);
+        assert_eq!(
+            envelope.result_values,
+            vec![vec![CanonicalResultValue::GeneratedDecimalU64(3)]]
+        );
+        let bytes = envelope.encode().unwrap();
+        let decoded = RecursiveRelationEnvelope::decode(&bytes).unwrap();
+        decoded
+            .verify(&head, head.state.commitment_root, &plan)
+            .unwrap();
+
+        let mut changed = decoded.clone();
+        changed.result_columns[0][0] = ArkFr::from_u64(4);
+        let padded = vec![ArkFr::from_u64(4), ArkFr::zero()];
+        changed.result_commitments[0] = commit_column(&padded).unwrap();
+        changed.result_values = vec![vec![CanonicalResultValue::GeneratedDecimalU64(4)]];
+        assert!(changed.verify(&head, head.state.commitment_root, &plan).is_err());
+
+        let wrong_plan = RelationProofPlan {
+            query_digest: [96u8; 32],
+            kind: RelationProofPlanKind::LayerTripleCount,
+        };
+        assert!(decoded
+            .verify(&head, head.state.commitment_root, &wrong_plan)
+            .is_err());
     }
 
     #[test]
