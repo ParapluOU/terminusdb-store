@@ -8,7 +8,10 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::transcript::Transcript;
 use sha2::{Digest, Sha256};
 
-use super::anti::{verify_global_not, verify_left_anti_join_with_keys, LeftAntiJoinProof};
+use super::anti::{
+    verify_global_not, verify_left_anti_join_with_keys, verify_left_outer_join_with_keys,
+    LeftAntiJoinProof, LeftOuterJoinProof,
+};
 use super::argument::{ColumnOpening, SumcheckProof};
 use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit};
 use super::commitment::LayerCommitment;
@@ -22,9 +25,10 @@ use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
 use super::query::{
     has_ground_result_unit, resolve_typed_result_objects, result_id_namespaces,
-    verify_layer_bgp, verify_layer_bgp_result_log_domain, verify_result_columns, AtomTerm,
-    GroundAbsence, LayerBgpAtom, LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof,
-    ObjectRangeBound, ObjectRangeSpec, RangeAtomSubproof, SecondRangeSubproof,
+    resolve_result_values, verify_layer_bgp, verify_layer_bgp_result_log_domain,
+    verify_result_columns, AtomTerm, CanonicalResultValue, GroundAbsence, LayerBgpAtom,
+    LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectRangeBound, ObjectRangeSpec,
+    RangeAtomSubproof, ResultColumnDescriptor, ResultIdNamespace, SecondRangeSubproof,
 };
 use super::range::{
     DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp, RangeSelectProof,
@@ -37,11 +41,13 @@ use super::{CanonicalDatatype, CanonicalObject, ProofHash};
 const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
 const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
 const ANTI_MAGIC: &[u8; 12] = b"TDBWQANTI\0\0\0";
+const OUTER_MAGIC: &[u8; 12] = b"TDBWQOUTER\0\0";
 // v3 adds the root-authenticated ground dictionary-absence branch. Older envelopes fail
 // explicitly; v2 had already bound the deterministic Dory parameter-set identity.
 const VERSION: u32 = 4;
 const UNION_VERSION: u32 = 2;
 const ANTI_VERSION: u32 = 4;
+const OUTER_VERSION: u32 = 1;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -292,6 +298,12 @@ wire_struct!(LeftAntiJoinProof {
     zero_selection_commitment,
     zero_inverse_commitment,
     compaction
+});
+wire_struct!(LeftOuterJoinProof {
+    anti,
+    unmatched_left_commitments,
+    unmatched_len,
+    union
 });
 wire_struct!(SortedProof {
     sumcheck,
@@ -548,6 +560,43 @@ impl Wire for CanonicalObject {
                 lexical: Wire::get(reader)?,
             }),
             _ => Err(invalid("invalid canonical-object tag")),
+        }
+    }
+}
+impl Wire for ResultIdNamespace {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::NodeValue => 0u8.put(out),
+            Self::Predicate => 1u8.put(out),
+        }
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        match u8::get(reader)? {
+            0 => Ok(Self::NodeValue),
+            1 => Ok(Self::Predicate),
+            _ => Err(invalid("invalid result namespace tag")),
+        }
+    }
+}
+wire_struct!(ResultColumnDescriptor {
+    namespace,
+    nullable
+});
+impl Wire for CanonicalResultValue {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Object(object) => {
+                0u8.put(out)?;
+                object.put(out)
+            }
+            Self::Null => 1u8.put(out),
+        }
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        match u8::get(reader)? {
+            0 => Ok(Self::Object(Wire::get(reader)?)),
+            1 => Ok(Self::Null),
+            _ => Err(invalid("invalid canonical result value tag")),
         }
     }
 }
@@ -1213,6 +1262,243 @@ impl LeftAntiJoinEnvelope {
         let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
         if version != ANTI_VERSION {
             return Err(invalid("unsupported left-anti envelope version"));
+        }
+        let envelope = Self::get(&mut reader)?;
+        reader.finish()?;
+        Ok(envelope)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LeftOuterJoinEnvelope {
+    pub layer_root: ProofHash,
+    pub query_digest: ProofHash,
+    pub left: LayerBgpEnvelope,
+    pub right: LayerBgpEnvelope,
+    pub key_pairs: Vec<(usize, usize)>,
+    pub outer_proof: LeftOuterJoinProof,
+    pub result_commitments: Vec<ArkGT>,
+    pub result_columns: Vec<Vec<ArkFr>>,
+    pub result_log_domain: usize,
+    pub result_len: usize,
+    pub result_descriptors: Vec<ResultColumnDescriptor>,
+    pub result_values: Vec<Vec<CanonicalResultValue>>,
+}
+
+wire_struct!(LeftOuterJoinEnvelope {
+    layer_root,
+    query_digest,
+    left,
+    right,
+    key_pairs,
+    outer_proof,
+    result_commitments,
+    result_columns,
+    result_log_domain,
+    result_len,
+    result_descriptors,
+    result_values
+});
+
+fn outer_descriptors(
+    left_plan: &LayerBgpPlan,
+    right_plan: &LayerBgpPlan,
+    key_pairs: &[(usize, usize)],
+) -> io::Result<Vec<ResultColumnDescriptor>> {
+    let left = result_id_namespaces(left_plan)?;
+    let right = result_id_namespaces(right_plan)?;
+    if !(1..=2).contains(&key_pairs.len()) {
+        return Err(invalid("left-outer envelope needs one or two shared keys"));
+    }
+    let mut shared_right = Vec::with_capacity(key_pairs.len());
+    for (left_index, right_index) in key_pairs {
+        if *left_index >= left.len() || *right_index >= right.len() {
+            return Err(invalid("left-outer envelope key index out of range"));
+        }
+        if left[*left_index] != right[*right_index] {
+            return Err(invalid("left-outer envelope key namespace mismatch"));
+        }
+        if shared_right.contains(right_index) {
+            return Err(invalid("left-outer envelope repeats a right key"));
+        }
+        shared_right.push(*right_index);
+    }
+    let mut descriptors: Vec<_> = left
+        .into_iter()
+        .map(|namespace| ResultColumnDescriptor {
+            namespace,
+            nullable: false,
+        })
+        .collect();
+    descriptors.extend(right.into_iter().enumerate().filter_map(|(index, namespace)| {
+        (!shared_right.contains(&index)).then_some(ResultColumnDescriptor {
+            namespace,
+            nullable: true,
+        })
+    }));
+    Ok(descriptors)
+}
+
+impl LeftOuterJoinEnvelope {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_verified(
+        layer: &LayerCommitment,
+        expected_root: ProofHash,
+        left_plan: &LayerBgpPlan,
+        right_plan: &LayerBgpPlan,
+        query_digest: ProofHash,
+        left: LayerBgpEnvelope,
+        right: LayerBgpEnvelope,
+        key_pairs: Vec<(usize, usize)>,
+        outer_proof: LeftOuterJoinProof,
+        result_commitments: Vec<ArkGT>,
+        result_columns: Vec<Vec<ArkFr>>,
+        result_log_domain: usize,
+        result_len: usize,
+    ) -> io::Result<Self> {
+        left.verify(layer, expected_root, left_plan, query_digest)?;
+        right.verify(layer, expected_root, right_plan, query_digest)?;
+        let mut transcript = super::argument::Transcript254::new(b"parture-left-outer-envelope");
+        transcript.append_bytes(b"pow/outer-envelope/root", &expected_root);
+        transcript.append_bytes(b"pow/outer-envelope/query", &query_digest);
+        verify_left_outer_join_with_keys(
+            &RelationCommit {
+                commitments: left.result_commitments.clone(),
+                log_domain: left.result_log_domain,
+                n: left.result_len,
+            },
+            &RelationCommit {
+                commitments: right.result_commitments.clone(),
+                log_domain: right.result_log_domain,
+                n: right.result_len,
+            },
+            &key_pairs,
+            &result_commitments,
+            result_len,
+            result_log_domain,
+            &outer_proof,
+            &mut transcript,
+        )?;
+        verify_result_columns(
+            &result_commitments,
+            &result_columns,
+            result_len,
+            result_log_domain,
+        )?;
+        let result_descriptors = outer_descriptors(left_plan, right_plan, &key_pairs)?;
+        let result_values = resolve_result_values(
+            layer,
+            expected_root,
+            &result_columns,
+            &result_descriptors,
+        )?;
+        Ok(Self {
+            layer_root: expected_root,
+            query_digest,
+            left,
+            right,
+            key_pairs,
+            outer_proof,
+            result_commitments,
+            result_columns,
+            result_log_domain,
+            result_len,
+            result_descriptors,
+            result_values,
+        })
+    }
+
+    pub fn verify(
+        &self,
+        layer: &LayerCommitment,
+        expected_root: ProofHash,
+        left_plan: &LayerBgpPlan,
+        right_plan: &LayerBgpPlan,
+        query_digest: ProofHash,
+        key_pairs: &[(usize, usize)],
+    ) -> io::Result<()> {
+        if self.layer_root != expected_root || self.query_digest != query_digest {
+            return Err(invalid("left-outer envelope identity mismatch"));
+        }
+        if self.key_pairs != key_pairs {
+            return Err(invalid("left-outer envelope key mismatch"));
+        }
+        self.left.verify(layer, expected_root, left_plan, query_digest)?;
+        self.right.verify(layer, expected_root, right_plan, query_digest)?;
+        let expected_descriptors = outer_descriptors(left_plan, right_plan, key_pairs)?;
+        if self.result_descriptors != expected_descriptors {
+            return Err(invalid("left-outer result descriptor mismatch"));
+        }
+        let mut transcript = super::argument::Transcript254::new(b"parture-left-outer-envelope");
+        transcript.append_bytes(b"pow/outer-envelope/root", &expected_root);
+        transcript.append_bytes(b"pow/outer-envelope/query", &query_digest);
+        verify_left_outer_join_with_keys(
+            &RelationCommit {
+                commitments: self.left.result_commitments.clone(),
+                log_domain: self.left.result_log_domain,
+                n: self.left.result_len,
+            },
+            &RelationCommit {
+                commitments: self.right.result_commitments.clone(),
+                log_domain: self.right.result_log_domain,
+                n: self.right.result_len,
+            },
+            key_pairs,
+            &self.result_commitments,
+            self.result_len,
+            self.result_log_domain,
+            &self.outer_proof,
+            &mut transcript,
+        )?;
+        verify_result_columns(
+            &self.result_commitments,
+            &self.result_columns,
+            self.result_len,
+            self.result_log_domain,
+        )?;
+        let values = resolve_result_values(
+            layer,
+            expected_root,
+            &self.result_columns,
+            &expected_descriptors,
+        )?;
+        if values != self.result_values {
+            return Err(invalid("left-outer canonical result mismatch"));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(OUTER_MAGIC);
+        out.extend_from_slice(&OUTER_VERSION.to_le_bytes());
+        self.put(&mut out)?;
+        if out.len().checked_add(CHECKSUM_BYTES).map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES) {
+            return Err(invalid("left-outer envelope too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < OUTER_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid left-outer envelope size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("left-outer envelope checksum mismatch"));
+        }
+        let mut reader = Reader { bytes: body, pos: 0 };
+        if reader.take(OUTER_MAGIC.len())? != OUTER_MAGIC {
+            return Err(invalid("unknown left-outer envelope magic"));
+        }
+        let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if version != OUTER_VERSION {
+            return Err(invalid("unsupported left-outer envelope version"));
         }
         let envelope = Self::get(&mut reader)?;
         reader.finish()?;
