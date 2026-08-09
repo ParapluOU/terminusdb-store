@@ -2011,6 +2011,7 @@ impl RelationProofPlan {
                 if !matches!(
                     input.kind,
                     RelationProofPlanKind::ExactScalarOrder { .. }
+                        | RelationProofPlanKind::ExactMultiOrder { .. }
                         | RelationProofPlanKind::ExactOrderedSlice { .. }
                 ) {
                     return Err(invalid("ordered slice requires an authenticated ordered child"));
