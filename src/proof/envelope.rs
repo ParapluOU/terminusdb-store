@@ -33,10 +33,7 @@ use super::filter::{
     AtomFilterProof, BooleanProductProof, CompactionOnlyProof, FilterProof, FullFilterProof,
     SelectionOnlyProof,
 };
-use super::group::{
-    prove_group_extrema_with_context, verify_group_extrema, GroupExtremaEntryProof,
-    GroupExtremaKind, GroupExtremaProof,
-};
+use super::group::{GroupExtremaEntryProof, GroupExtremaKind, GroupExtremaProof};
 use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
 use super::multiorder::{prove_exact_multi_order_with_context, verify_exact_multi_order, ExactMultiOrderProof};
@@ -85,8 +82,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v20 adds exact private Collect-list integral extrema.
-const RECURSIVE_VERSION: u32 = 20;
+// v21 generalizes grouped extrema to zero through two canonical node keys.
+const RECURSIVE_VERSION: u32 = 21;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1844,11 +1841,12 @@ pub enum RelationProofPlanKind {
         offset: u64,
         limit: Option<u64>,
     },
-    /// Scalar-key `GroupBy`, with its private bag consumed immediately by
-    /// `RangeMin`/`RangeMax`; output is exactly `[key, original-value-id]`.
+    /// Exact zero-/one-/two-node-key `GroupBy`, with its private bag consumed
+    /// immediately by `RangeMin`/`RangeMax`. Declared key priority determines
+    /// canonical expanded-IRI tuple order; the value remains an original Store ID.
     GroupExtrema {
         input: Box<RelationProofPlan>,
-        key_column: usize,
+        key_columns: Vec<usize>,
         value_column: usize,
         datatype: CanonicalDatatype,
         kind: GroupExtremaKind,
@@ -2493,20 +2491,40 @@ impl RelationProofPlan {
                 }
                 Ok((descriptors, false))
             }
-            RelationProofPlanKind::GroupExtrema { input, key_column, value_column, datatype, .. } => {
+            RelationProofPlanKind::GroupExtrema { input, key_columns, value_column, datatype, .. } => {
                 let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
-                if ground || *key_column == *value_column {
+                if ground
+                    || key_columns.len() > 2
+                    || key_columns.iter().any(|key| *key == *value_column)
+                    || (key_columns.len() == 2 && key_columns[0] == key_columns[1])
+                {
                     return Err(invalid("invalid group-extrema child shape"));
                 }
-                let key = descriptors.get(*key_column).copied().ok_or_else(|| invalid("group-extrema key column out of range"))?;
                 let value = descriptors.get(*value_column).copied().ok_or_else(|| invalid("group-extrema value column out of range"))?;
-                if key.nullable || value.nullable || value.namespace != ResultIdNamespace::NodeValue {
-                    return Err(invalid("group-extrema requires nonnullable Store-id columns"));
+                if value.nullable || value.namespace != ResultIdNamespace::NodeValue {
+                    return Err(invalid("group-extrema requires a nonnullable Store value"));
                 }
-                if !numeric_datatype(*datatype) || matches!(datatype, CanonicalDatatype::Decimal | CanonicalDatatype::BigInt | CanonicalDatatype::PositiveInteger | CanonicalDatatype::NonNegativeInteger | CanonicalDatatype::NonPositiveInteger | CanonicalDatatype::NegativeInteger) {
-                    return Err(invalid("group-extrema datatype is not fixed-width order-preserving"));
+                if !matches!(datatype,
+                    CanonicalDatatype::UInt8 | CanonicalDatatype::UInt16
+                    | CanonicalDatatype::UInt32 | CanonicalDatatype::UInt64
+                    | CanonicalDatatype::Int8 | CanonicalDatatype::Int16
+                    | CanonicalDatatype::Int32 | CanonicalDatatype::Int64)
+                {
+                    return Err(invalid("group-extrema datatype is outside the exact integral subset"));
                 }
-                Ok((vec![key, ResultColumnDescriptor { namespace: ResultIdNamespace::NodeValue, nullable: false }], false))
+                let mut result = key_columns.iter().map(|key_column| {
+                    let key = descriptors.get(*key_column).copied()
+                        .ok_or_else(|| invalid("group-extrema key column out of range"))?;
+                    if key.nullable || key.namespace != ResultIdNamespace::NodeValue {
+                        return Err(invalid("group-extrema keys must be nonnullable nodes"));
+                    }
+                    Ok(key)
+                }).collect::<io::Result<Vec<_>>>()?;
+                result.push(ResultColumnDescriptor {
+                    namespace: ResultIdNamespace::NodeValue,
+                    nullable: false,
+                });
+                Ok((result, false))
             }
         }
     }
@@ -2599,7 +2617,6 @@ pub enum RecursiveRelationProof {
     },
     GroupExtrema {
         input: Box<RecursiveRelationEnvelope>,
-        proof: Box<GroupExtremaProof>,
     },
 }
 
@@ -3064,6 +3081,68 @@ fn derived_collection_extrema_column(
         }
     }
     Ok(vec![selected.map(|(field, _)| vec![field]).unwrap_or_default()])
+}
+
+fn derived_group_extrema_columns(
+    layer: &impl VerifierLayer,
+    input: &RecursiveRelationEnvelope,
+    key_columns: &[usize],
+    value_column: usize,
+    datatype: CanonicalDatatype,
+    kind: GroupExtremaKind,
+) -> io::Result<Vec<Vec<ArkFr>>> {
+    let values = input
+        .result_columns
+        .get(value_column)
+        .ok_or_else(|| invalid("group-extrema value column out of range"))?;
+    if values.len() != input.result_len || key_columns.iter().any(|key| *key == value_column) {
+        return Err(invalid("group-extrema input shape mismatch"));
+    }
+    let view = layer.verifier_view();
+    view.validate()?;
+    let resolve = |field: ArkFr| -> io::Result<ark_bn254::Fr> {
+        let record = view
+            .node_value_catalog
+            .iter()
+            .find(|record| ArkFr::from_u64(record.object_id) == field)
+            .ok_or_else(|| invalid("group-extrema value is absent from the catalog"))?;
+        // This enforces both the exact integral datatype and its canonical width.
+        integral_catalog_value(&record.triple.object, datatype)?;
+        Ok(super::commitment::node_value_op_value(&record.triple.object)?.0)
+    };
+    let choose = |rows: &[usize]| -> io::Result<Option<ArkFr>> {
+        let mut selected: Option<(ArkFr, ark_bn254::Fr)> = None;
+        for row in rows {
+            let field = values[*row];
+            let encoding = resolve(field)?;
+            let replace = match selected.as_ref() {
+                None => true,
+                Some((_, current)) => match kind {
+                    GroupExtremaKind::Min => encoding.into_bigint() < current.into_bigint(),
+                    GroupExtremaKind::Max => encoding.into_bigint() > current.into_bigint(),
+                },
+            };
+            if replace {
+                selected = Some((field, encoding));
+            }
+        }
+        Ok(selected.map(|(field, _)| field))
+    };
+    if key_columns.is_empty() {
+        let rows = (0..input.result_len).collect::<Vec<_>>();
+        return Ok(vec![choose(&rows)?.into_iter().collect()]);
+    }
+    let groups = grouped_node_rows(layer, input, key_columns)?;
+    let mut output = vec![Vec::with_capacity(groups.len()); key_columns.len() + 1];
+    for (key_ids, rows) in groups.values() {
+        let selected = choose(rows)?
+            .ok_or_else(|| invalid("group-extrema canonical group is unexpectedly empty"))?;
+        for (column, key_id) in output.iter_mut().zip(key_ids) {
+            column.push(ArkFr::from_u64(*key_id));
+        }
+        output[key_columns.len()].push(selected);
+    }
+    Ok(output)
 }
 
 impl RecursiveRelationEnvelope {
@@ -3705,41 +3784,23 @@ impl RecursiveRelationEnvelope {
                     take,
                 )
             }
-            RelationProofPlanKind::GroupExtrema { input, key_column, value_column, datatype, kind } => {
+            RelationProofPlanKind::GroupExtrema { input, key_columns, value_column, datatype, kind } => {
                 let input_envelope = Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
-                let witness = input_envelope.relation_witness(None)?;
-                let key_namespace = input_envelope.result_descriptors[*key_column].namespace;
-                let view = layer.verifier_view();
-                let resolve_id = |field: ArkFr, namespace: ResultIdNamespace| -> io::Result<u64> {
-                    let id = match namespace {
-                        ResultIdNamespace::Predicate => view.predicate_catalog.iter().find_map(|record| (ArkFr::from_u64(record.predicate_id) == field).then_some(record.predicate_id)),
-                        ResultIdNamespace::NodeValue => view.node_value_catalog.iter().find_map(|record| (ArkFr::from_u64(record.object_id) == field).then_some(record.object_id)),
-                        ResultIdNamespace::GeneratedDecimalU64
-                        | ResultIdNamespace::GeneratedDecimalI64 => None,
-                    };
-                    id.ok_or_else(|| invalid("group-extrema input id absent from planned namespace"))
-                };
-                let mut groups = std::collections::BTreeMap::<u64, (u64, ark_bn254::Fr)>::new();
-                for row in 0..witness.n {
-                    let key = resolve_id(witness.columns[*key_column][row], key_namespace)?;
-                    let value = resolve_id(witness.columns[*value_column][row], ResultIdNamespace::NodeValue)?;
-                    let encoding = super::commitment::node_value_op_value(
-                        &view.node_value_catalog.iter().find(|record| record.object_id == value)
-                            .ok_or_else(|| invalid("group-extrema value id absent from catalog"))?.triple.object,
-                    )?.0;
-                    groups.entry(key).and_modify(|current| {
-                        let replace = match kind { GroupExtremaKind::Min => encoding.into_bigint() < current.1.into_bigint(), GroupExtremaKind::Max => encoding.into_bigint() > current.1.into_bigint() };
-                        if replace { *current = (value, encoding); }
-                    }).or_insert((value, encoding));
+                let mut columns = derived_group_extrema_columns(
+                    layer, &input_envelope, key_columns, *value_column, *datatype, *kind,
+                )?;
+                let n = columns.first().map_or(0, Vec::len);
+                let log_domain = n.max(1).next_power_of_two().max(2).trailing_zeros() as usize;
+                let domain = 1usize << log_domain;
+                for column in &mut columns {
+                    column.resize(domain, ArkFr::zero());
                 }
-                let rows = groups.into_iter().map(|(key, (value, _))| (key, value)).collect::<Vec<_>>();
-                let mut transcript = Transcript254::new(b"parture-group-extrema-envelope");
-                transcript.append_bytes(b"pow/group-envelope/root", &layer.state.commitment_root);
-                transcript.append_bytes(b"pow/group-envelope/query", &plan.query_digest);
-                let result = prove_group_extrema_with_context(context, &witness, *key_column, *value_column, *datatype, *kind, &rows, layer, &mut transcript)?;
+                let commitments = columns.iter()
+                    .map(|column| context.commit_column(column))
+                    .collect::<io::Result<Vec<_>>>()?;
                 Self::finish_proved(layer, plan, RecursiveRelationProof::GroupExtrema {
-                    input: Box::new(input_envelope), proof: Box::new(result.proof),
-                }, result.commitments, result.columns, result.log_domain, result.n)
+                    input: Box::new(input_envelope),
+                }, commitments, columns, log_domain, n)
             }
         }
     }
@@ -4462,33 +4523,33 @@ impl RecursiveRelationEnvelope {
                 }
             }
             (
-                RecursiveRelationProof::GroupExtrema { input, proof },
-                RelationProofPlanKind::GroupExtrema { input: input_plan, key_column, value_column, datatype, kind },
+                RecursiveRelationProof::GroupExtrema { input },
+                RelationProofPlanKind::GroupExtrema { input: input_plan, key_columns, value_column, datatype, kind },
             ) => {
                 input.verify_bounded(layer, expected_root, input_plan, depth + 1, nodes)?;
-                if self.result_columns.len() != 2 || self.result_len > self.result_columns[0].len() || self.result_len > self.result_columns[1].len() {
-                    return Err(invalid("group-extrema result column shape mismatch"));
+                let expected_columns = derived_group_extrema_columns(
+                    layer, input, key_columns, *value_column, *datatype, *kind,
+                )?;
+                let expected_len = expected_columns.first().map_or(0, Vec::len);
+                let expected_log = expected_len.max(1).next_power_of_two().max(2)
+                    .trailing_zeros() as usize;
+                if self.result_len != expected_len
+                    || self.result_log_domain != expected_log
+                    || self.result_columns.len() != expected_columns.len()
+                    || self.result_columns.iter().zip(&expected_columns)
+                        .any(|(actual, expected)| actual.get(..expected_len) != Some(expected.as_slice()))
+                {
+                    return Err(invalid("group-extrema result is not the exact canonical aggregate"));
                 }
-                let key_namespace = expected_descriptors[0].namespace;
-                let view = layer.verifier_view();
-                let resolve_id = |field: ArkFr, namespace: ResultIdNamespace| -> io::Result<u64> {
-                    match namespace {
-                        ResultIdNamespace::Predicate => view.predicate_catalog.iter()
-                            .find(|r| ArkFr::from_u64(r.predicate_id) == field).map(|r| r.predicate_id),
-                        ResultIdNamespace::NodeValue => view.node_value_catalog.iter()
-                            .find(|r| ArkFr::from_u64(r.object_id) == field).map(|r| r.object_id),
-                        ResultIdNamespace::GeneratedDecimalU64
-                        | ResultIdNamespace::GeneratedDecimalI64 => None,
-                    }.ok_or_else(|| invalid("group-extrema output id absent from planned namespace"))
-                };
-                let rows = (0..self.result_len).map(|i| Ok((
-                    resolve_id(self.result_columns[0][i], key_namespace)?,
-                    resolve_id(self.result_columns[1][i], ResultIdNamespace::NodeValue)?,
-                ))).collect::<io::Result<Vec<_>>>()?;
-                let mut transcript = super::argument::Transcript254::new(b"parture-group-extrema-envelope");
-                transcript.append_bytes(b"pow/group-envelope/root", &expected_root);
-                transcript.append_bytes(b"pow/group-envelope/query", &plan.query_digest);
-                verify_group_extrema(&input.relation_commit(None)?, *key_column, *value_column, *datatype, *kind, &rows, layer, proof, &mut transcript)?;
+                let domain = 1usize << expected_log;
+                let expected_commitments = expected_columns.iter().map(|column| {
+                    let mut padded = column.clone();
+                    padded.resize(domain, ArkFr::zero());
+                    commit_column(&padded)
+                }).collect::<io::Result<Vec<_>>>()?;
+                if self.result_commitments != expected_commitments {
+                    return Err(invalid("group-extrema commitment mismatch"));
+                }
             }
             _ => return Err(invalid("recursive relation proof variant mismatch")),
         }
@@ -4639,10 +4700,9 @@ impl RecursiveRelationEnvelope {
                 input.put_bounded(out, depth + 1, nodes)?;
                 proof.put(out)?;
             }
-            RecursiveRelationProof::GroupExtrema { input, proof } => {
+            RecursiveRelationProof::GroupExtrema { input } => {
                 5u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
-                proof.put(out)?;
             }
         }
         self.result_commitments.put(out)?;
@@ -4719,7 +4779,6 @@ impl RecursiveRelationEnvelope {
             },
             5 => RecursiveRelationProof::GroupExtrema {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
-                proof: Box::<GroupExtremaProof>::get(reader)?,
             },
             6 => RecursiveRelationProof::ExactScalarOrder {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
@@ -5654,6 +5713,206 @@ mod tests {
         assert!(tampered
             .verify(&layer, layer.state.commitment_root, &plan)
             .is_err());
+    }
+
+    fn assert_recursive_two_key_group_extrema_uses_declared_node_tuple_order() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node(&iri("z"), &iri("link"), &iri("z")))
+            .unwrap();
+        for value in [1u32, 2] {
+            builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("z"), &iri("score"), u32::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let builder = base.open_write().unwrap();
+        for (left, right) in [("a", "a"), ("a", "z"), ("z", "a")] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(left), &iri("link"), &iri(right),
+                ))
+                .unwrap();
+        }
+        for value in [3u32, 4, 5] {
+            builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("a"), &iri("score"), u32::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let source = RelationProofPlan {
+            query_digest: [131u8; 32],
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                atoms: vec![
+                    LayerBgpAtom::all_variables(iri("link").into_bytes()),
+                    LayerBgpAtom::all_variables(iri("score").into_bytes()),
+                ],
+                joins: vec![JoinStep {
+                    acc_key: 1,
+                    rel_key: 0,
+                    additional_keys: Vec::new(),
+                }],
+            }),
+        };
+        let plan = RelationProofPlan {
+            query_digest: [132u8; 32],
+            kind: RelationProofPlanKind::GroupExtrema {
+                input: Box::new(source.clone()),
+                key_columns: vec![1, 0],
+                value_column: 2,
+                datatype: CanonicalDatatype::UInt32,
+                kind: GroupExtremaKind::Min,
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+        let node = |name: &str| {
+            CanonicalResultValue::Object(CanonicalObject::Node(iri(name).into_bytes()))
+        };
+        let value = |value: u32| {
+            CanonicalResultValue::Object(CanonicalObject::from_store_object(
+                &ValueTriple::new_value("", "", u32::make_entry(&value)).object,
+            ))
+        };
+        assert_eq!(envelope.result_len, 4);
+        assert_eq!(envelope.result_values[0], vec![node("a"), node("a"), node("z"), node("z")]);
+        assert_eq!(envelope.result_values[1], vec![node("a"), node("z"), node("a"), node("z")]);
+        assert_eq!(envelope.result_values[2], vec![value(3), value(3), value(1), value(1)]);
+        let decoded = RecursiveRelationEnvelope::decode(&envelope.encode().unwrap()).unwrap();
+        decoded.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+
+        let reordered = RelationProofPlan {
+            query_digest: [132u8; 32],
+            kind: RelationProofPlanKind::GroupExtrema {
+                input: Box::new(source.clone()),
+                key_columns: vec![0, 1],
+                value_column: 2,
+                datatype: CanonicalDatatype::UInt32,
+                kind: GroupExtremaKind::Min,
+            },
+        };
+        assert!(decoded.verify(&layer, layer.state.commitment_root, &reordered).is_err());
+        let max_plan = RelationProofPlan {
+            query_digest: [132u8; 32],
+            kind: RelationProofPlanKind::GroupExtrema {
+                input: Box::new(source.clone()),
+                key_columns: vec![1, 0],
+                value_column: 2,
+                datatype: CanonicalDatatype::UInt32,
+                kind: GroupExtremaKind::Max,
+            },
+        };
+        assert!(decoded.verify(&layer, layer.state.commitment_root, &max_plan).is_err());
+        for key_columns in [vec![0, 0], vec![0, 3], vec![0, 1, 2]] {
+            let invalid = RelationProofPlan {
+                query_digest: [133u8; 32],
+                kind: RelationProofPlanKind::GroupExtrema {
+                    input: Box::new(source.clone()),
+                    key_columns,
+                    value_column: 2,
+                    datatype: CanonicalDatatype::UInt32,
+                    kind: GroupExtremaKind::Min,
+                },
+            };
+            assert!(invalid.result_shape().is_err());
+        }
+        let RecursiveRelationProof::GroupExtrema { input } = &decoded.proof else {
+            unreachable!()
+        };
+        assert!(derived_group_extrema_columns(
+            &layer,
+            input,
+            &[2],
+            0,
+            CanonicalDatatype::UInt32,
+            GroupExtremaKind::Min,
+        )
+        .is_err());
+        let non_extreme_row = input.result_values[2]
+            .iter().position(|candidate| candidate == &value(4)).unwrap();
+        let mut tampered = decoded.clone();
+        tampered.result_columns[2][0] = input.result_columns[2][non_extreme_row];
+        tampered.result_values[2][0] = input.result_values[2][non_extreme_row].clone();
+        tampered.result_commitments[2] = commit_column(&tampered.result_columns[2]).unwrap();
+        assert!(tampered.verify(&layer, layer.state.commitment_root, &plan).is_err());
+    }
+
+    #[test]
+    fn recursive_two_key_group_extrema_uses_declared_node_tuple_order() {
+        std::thread::Builder::new()
+            .name("recursive-two-key-group-extrema".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(assert_recursive_two_key_group_extrema_uses_declared_node_tuple_order)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn assert_recursive_zero_key_group_extrema_emits_only_for_nonempty_input() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (subject, value) in [("a", i64::MIN), ("b", -3), ("c", -3), ("d", i64::MAX)] {
+            builder.add_value_triple(ValueTriple::new_value(
+                &iri(subject), &iri("score"), i64::make_entry(&value),
+            )).unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let source = |predicate: &str, digest| RelationProofPlan {
+            query_digest: digest,
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
+                joins: Vec::new(),
+            }),
+        };
+        let plan = RelationProofPlan {
+            query_digest: [134u8; 32],
+            kind: RelationProofPlanKind::GroupExtrema {
+                input: Box::new(source("score", [135u8; 32])),
+                key_columns: Vec::new(),
+                value_column: 1,
+                datatype: CanonicalDatatype::Int64,
+                kind: GroupExtremaKind::Max,
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+        assert_eq!(envelope.result_len, 1);
+        let expected = CanonicalResultValue::Object(CanonicalObject::from_store_object(
+            &ValueTriple::new_value("", "", i64::make_entry(&i64::MAX)).object,
+        ));
+        assert_eq!(envelope.result_values, vec![vec![expected]]);
+
+        let empty_plan = RelationProofPlan {
+            query_digest: [136u8; 32],
+            kind: RelationProofPlanKind::GroupExtrema {
+                input: Box::new(source("missing", [137u8; 32])),
+                key_columns: Vec::new(),
+                value_column: 1,
+                datatype: CanonicalDatatype::Int64,
+                kind: GroupExtremaKind::Min,
+            },
+        };
+        let empty = RecursiveRelationEnvelope::prove(&layer, &empty_plan).unwrap();
+        empty.verify(&layer, layer.state.commitment_root, &empty_plan).unwrap();
+        assert_eq!(empty.result_len, 0);
+        assert_eq!(empty.result_values, vec![Vec::new()]);
+    }
+
+
+    #[test]
+    fn recursive_zero_key_group_extrema_emits_only_for_nonempty_input() {
+        std::thread::Builder::new()
+            .name("recursive-zero-key-group-extrema".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(assert_recursive_zero_key_group_extrema_emits_only_for_nonempty_input)
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
