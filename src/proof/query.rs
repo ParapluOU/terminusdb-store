@@ -824,35 +824,23 @@ pub fn resolve_typed_result_objects(
     columns: &[Vec<ArkFr>],
     namespaces: &[ResultIdNamespace],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
-    if columns.len() != namespaces.len() {
-        return Err(invalid("result column namespace shape mismatch"));
-    }
-    if layer.state.commitment_root != expected_root {
-        return Err(invalid(
-            "layer commitment_root does not match the externally-trusted expected root",
-        ));
-    }
-    layer.validate()?;
-
-    columns
+    let descriptors: Vec<_> = namespaces
         .iter()
-        .zip(namespaces)
-        .map(|(column, namespace)| {
+        .map(|namespace| ResultColumnDescriptor {
+            namespace: *namespace,
+            nullable: false,
+        })
+        .collect();
+    resolve_result_values(layer, expected_root, columns, &descriptors)?
+        .into_iter()
+        .map(|column| {
             column
-                .iter()
-                .map(|id| match namespace {
-                    ResultIdNamespace::NodeValue => layer
-                        .node_value_catalog
-                        .iter()
-                        .find(|record| ArkFr::from_u64(record.object_id) == *id)
-                        .map(|record| record.triple.object.clone())
-                        .ok_or_else(|| invalid("result id is absent from the node/value dictionary")),
-                    ResultIdNamespace::Predicate => layer
-                        .predicate_catalog
-                        .iter()
-                        .find(|record| ArkFr::from_u64(record.predicate_id) == *id)
-                        .map(|record| CanonicalObject::Node(record.triple.predicate.clone()))
-                        .ok_or_else(|| invalid("result id is absent from the predicate dictionary")),
+                .into_iter()
+                .map(|value| match value {
+                    CanonicalResultValue::Object(object) => Ok(object),
+                    CanonicalResultValue::Null => {
+                        Err(invalid("null in a nonnullable result column"))
+                    }
                 })
                 .collect()
         })

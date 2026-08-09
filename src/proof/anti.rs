@@ -26,6 +26,7 @@ use super::join2::{
     BinaryJoinCommitments, BinaryJoinProof,
 };
 use super::relocate::{prove_column_relocation, verify_column_relocation, RelocationProof};
+use super::union::{prove_bag_union, verify_bag_union, BagUnionProof};
 
 const ANTI_DOMAIN: &[u8] = b"parture/proof-of-woql/left-anti-join/v0";
 
@@ -210,6 +211,84 @@ pub struct LeftAntiJoinResult {
     pub columns: Vec<Vec<ArkFr>>,
     pub log_domain: usize,
     pub n: usize,
+    /// Complete matched inner-join relation in schema `[left.., right-only..]`.
+    pub matched_commitments: Vec<ArkGT>,
+    pub matched_columns: Vec<Vec<ArkFr>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LeftOuterJoinProof {
+    pub anti: LeftAntiJoinProof,
+    pub unmatched_left_commitments: Vec<ArkGT>,
+    pub unmatched_len: usize,
+    pub union: BagUnionProof,
+}
+
+pub struct LeftOuterJoinResult {
+    pub proof: LeftOuterJoinProof,
+    pub commitments: Vec<ArkGT>,
+    pub columns: Vec<Vec<ArkFr>>,
+    pub log_domain: usize,
+    pub n: usize,
+}
+
+fn matched_projection(
+    left_arity: usize,
+    right_arity: usize,
+    key_pairs: &[(usize, usize)],
+    commitments: &BinaryJoinCommitments,
+    witness: Option<&super::join2::BinaryJoinWitness>,
+) -> io::Result<(Vec<ArkGT>, Option<Vec<Vec<ArkFr>>>)> {
+    let composite = key_pairs.len() == 2;
+    let right_keys: Vec<usize> = key_pairs.iter().map(|pair| pair.1).collect();
+    let mut output_commitments = Vec::with_capacity(left_arity + right_arity - key_pairs.len());
+    let mut output_columns = witness.map(|_| Vec::with_capacity(output_commitments.capacity()));
+
+    if composite {
+        for index in 0..left_arity {
+            output_commitments.push(commitments.r_other_out[index]);
+            if let (Some(witness), Some(columns)) = (witness, output_columns.as_mut()) {
+                columns.push(witness.r_other_out[index].clone());
+            }
+        }
+        for index in 0..right_arity {
+            if !right_keys.contains(&index) {
+                output_commitments.push(commitments.s_other_out[index]);
+                if let (Some(witness), Some(columns)) = (witness, output_columns.as_mut()) {
+                    columns.push(witness.s_other_out[index].clone());
+                }
+            }
+        }
+    } else {
+        let (left_key, right_key) = key_pairs[0];
+        let mut left_other = 0;
+        for index in 0..left_arity {
+            if index == left_key {
+                output_commitments.push(commitments.key);
+                if let (Some(witness), Some(columns)) = (witness, output_columns.as_mut()) {
+                    columns.push(witness.key.clone());
+                }
+            } else {
+                output_commitments.push(commitments.r_other_out[left_other]);
+                if let (Some(witness), Some(columns)) = (witness, output_columns.as_mut()) {
+                    columns.push(witness.r_other_out[left_other].clone());
+                }
+                left_other += 1;
+            }
+        }
+        let mut right_other = 0;
+        for index in 0..right_arity {
+            if index == right_key {
+                continue;
+            }
+            output_commitments.push(commitments.s_other_out[right_other]);
+            if let (Some(witness), Some(columns)) = (witness, output_columns.as_mut()) {
+                columns.push(witness.s_other_out[right_other].clone());
+            }
+            right_other += 1;
+        }
+    }
+    Ok((output_commitments, output_columns))
 }
 
 /// Authenticated global negation needs no additional argument beyond the two input
@@ -461,6 +540,13 @@ pub fn prove_left_anti_join_with_keys(
         &zero_selection_commitment,
         transcript,
     )?;
+    let (matched_commitments, matched_columns) = matched_projection(
+        left.columns.len(),
+        right.columns.len(),
+        key_pairs,
+        &join_commitments,
+        Some(&witness),
+    )?;
 
     Ok(LeftAntiJoinResult {
         proof: LeftAntiJoinProof {
@@ -478,6 +564,8 @@ pub fn prove_left_anti_join_with_keys(
         columns,
         log_domain,
         n,
+        matched_commitments,
+        matched_columns: matched_columns.expect("prover supplied a join witness"),
     })
 }
 
@@ -622,9 +710,119 @@ pub fn verify_left_anti_join_with_keys(
     )
 }
 
+/// Prove a correlated left outer join over one or two shared key columns. The matched
+/// branch is the complete authenticated inner join. The unmatched branch is the exact
+/// anti-join result with verifier-known zero columns appended for right-only variables.
+pub fn prove_left_outer_join_with_keys(
+    left: &RelationWitness,
+    right: &RelationWitness,
+    key_pairs: &[(usize, usize)],
+    transcript: &mut Transcript254,
+) -> io::Result<LeftOuterJoinResult> {
+    let anti = prove_left_anti_join_with_keys(left, right, key_pairs, transcript)?;
+    let size = 1usize << anti.log_domain;
+    let right_only = right.columns.len() - key_pairs.len();
+    let matched_columns: Vec<Vec<ArkFr>> = anti
+        .matched_columns
+        .iter()
+        .map(|column| pad(column, size))
+        .collect();
+    let matched = RelationWitness {
+        columns: matched_columns,
+        commitments: anti.matched_commitments.clone(),
+        log_domain: anti.log_domain,
+        n: anti.proof.join_len,
+    };
+    let zero = vec![f0(); size];
+    let zero_commitment = commit_column(&zero)?;
+    let mut unmatched_columns = anti.columns.clone();
+    unmatched_columns.extend((0..right_only).map(|_| zero.clone()));
+    let mut unmatched_commitments = anti.commitments.clone();
+    unmatched_commitments.extend((0..right_only).map(|_| zero_commitment));
+    let unmatched = RelationWitness {
+        columns: unmatched_columns,
+        commitments: unmatched_commitments,
+        log_domain: anti.log_domain,
+        n: anti.n,
+    };
+    let union = prove_bag_union(&[matched, unmatched], transcript)?;
+    Ok(LeftOuterJoinResult {
+        proof: LeftOuterJoinProof {
+            anti: anti.proof,
+            unmatched_left_commitments: anti.commitments,
+            unmatched_len: anti.n,
+            union: union.proof,
+        },
+        commitments: union.commitments,
+        columns: union.columns,
+        log_domain: union.log_domain,
+        n: union.n,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_left_outer_join_with_keys(
+    left: &RelationCommit,
+    right: &RelationCommit,
+    key_pairs: &[(usize, usize)],
+    output_commitments: &[ArkGT],
+    output_len: usize,
+    output_log_domain: usize,
+    proof: &LeftOuterJoinProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    let join_log_domain = proof.anti.join.num_vars();
+    verify_left_anti_join_with_keys(
+        left,
+        right,
+        key_pairs,
+        &proof.unmatched_left_commitments,
+        proof.unmatched_len,
+        join_log_domain,
+        &proof.anti,
+        transcript,
+    )?;
+    let (matched_commitments, _) = matched_projection(
+        left.commitments.len(),
+        right.commitments.len(),
+        key_pairs,
+        &proof.anti.join_commitments,
+        None,
+    )?;
+    let right_only = right.commitments.len() - key_pairs.len();
+    let zero = vec![f0(); 1usize << join_log_domain];
+    let zero_commitment = commit_column(&zero)?;
+    let mut unmatched_commitments = proof.unmatched_left_commitments.clone();
+    unmatched_commitments.extend((0..right_only).map(|_| zero_commitment));
+    let branches = [
+        RelationCommit {
+            commitments: matched_commitments,
+            log_domain: join_log_domain,
+            n: proof.anti.join_len,
+        },
+        RelationCommit {
+            commitments: unmatched_commitments,
+            log_domain: join_log_domain,
+            n: proof.unmatched_len,
+        },
+    ];
+    verify_bag_union(
+        &branches,
+        output_commitments,
+        output_len,
+        output_log_domain,
+        &proof.union,
+        transcript,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fr(value: u64) -> ArkFr {
+        ArkFr::from_u64(value)
+    }
 
     fn relation(columns: &[&[u64]]) -> RelationWitness {
         let n = columns[0].len();
@@ -636,6 +834,49 @@ mod tests {
             n,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn left_outer_join_preserves_all_matches_and_null_extends_once() {
+        let left = relation(&[&[1, 2, 3], &[10, 20, 30]]);
+        let right = relation(&[&[1, 1, 2], &[100, 101, 200]]);
+        let mut prover = Transcript254::new(b"left-outer-test");
+        let result =
+            prove_left_outer_join_with_keys(&left, &right, &[(0, 0)], &mut prover).unwrap();
+        assert_eq!(result.n, 4);
+        assert_eq!(&result.columns[0][..4], &[fr(1), fr(1), fr(2), fr(3)]);
+        assert_eq!(&result.columns[1][..4], &[fr(10), fr(10), fr(20), fr(30)]);
+        assert_eq!(
+            &result.columns[2][..4],
+            &[fr(100), fr(101), fr(200), f0()]
+        );
+        let mut verifier = Transcript254::new(b"left-outer-test");
+        verify_left_outer_join_with_keys(
+            &left.view(),
+            &right.view(),
+            &[(0, 0)],
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut verifier,
+        )
+        .unwrap();
+
+        let mut forged = result.commitments.clone();
+        forged[2] = commit_column(&vec![f0(); 1usize << result.log_domain]).unwrap();
+        let mut verifier = Transcript254::new(b"left-outer-test");
+        assert!(verify_left_outer_join_with_keys(
+            &left.view(),
+            &right.view(),
+            &[(0, 0)],
+            &forged,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut verifier,
+        )
+        .is_err());
     }
 
     fn transcript() -> Transcript254 {
