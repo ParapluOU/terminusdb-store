@@ -12,9 +12,9 @@ use sha2::{Digest, Sha256};
 
 use super::anti::{
     prove_global_left_outer_join_with_context, prove_global_not_with_context,
-    prove_left_anti_join_with_keys_and_context, prove_left_outer_join_with_keys_and_context,
+    prove_inner_join_with_keys_and_context, prove_left_anti_join_with_keys_and_context, prove_left_outer_join_with_keys_and_context,
     verify_global_left_outer_join, verify_global_not, verify_left_anti_join_with_keys,
-    verify_left_outer_join_with_keys, LeftAntiJoinProof, LeftOuterJoinProof,
+    verify_inner_join_with_keys, verify_left_outer_join_with_keys, InnerJoinProof, LeftAntiJoinProof, LeftOuterJoinProof,
 };
 use super::argument::{commit_column, ColumnOpening, StoreProverContext, SumcheckProof, Transcript254};
 use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit, RelationWitness};
@@ -72,7 +72,7 @@ const UNION_VERSION: u32 = 2;
 const ANTI_VERSION: u32 = 4;
 const OUTER_VERSION: u32 = 1;
 // v4 adds exact ordered Start/Limit slices (wire tag 7).
-const RECURSIVE_VERSION: u32 = 5;
+const RECURSIVE_VERSION: u32 = 6;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -431,6 +431,7 @@ wire_struct!(LeftAntiJoinProof {
     zero_inverse_commitment,
     compaction
 });
+wire_struct!(InnerJoinProof { anti, unmatched_left_commitments, unmatched_len });
 wire_struct!(LeftOuterJoinProof {
     anti,
     unmatched_left_commitments,
@@ -1674,6 +1675,11 @@ pub enum RelationProofPlanKind {
         right: Box<RelationProofPlan>,
         key_pairs: Vec<(usize, usize)>,
     },
+    InnerJoin {
+        left: Box<RelationProofPlan>,
+        right: Box<RelationProofPlan>,
+        key_pairs: Vec<(usize, usize)>,
+    },
     LeftOuter {
         left: Box<RelationProofPlan>,
         right: Box<RelationProofPlan>,
@@ -1945,6 +1951,28 @@ impl RelationProofPlan {
                 }
                 Ok(left_shape)
             }
+            RelationProofPlanKind::InnerJoin { left, right, key_pairs } => {
+                let (mut descriptors, left_ground) = left.shape_bounded(depth + 1, nodes)?;
+                let (right_descriptors, right_ground) = right.shape_bounded(depth + 1, nodes)?;
+                if left_ground || right_ground || !(1..=2).contains(&key_pairs.len()) {
+                    return Err(invalid("invalid recursive inner-join child shape"));
+                }
+                let mut shared_left = Vec::new();
+                let mut shared_right = Vec::new();
+                for (left_index, right_index) in key_pairs {
+                    let l = descriptors.get(*left_index).ok_or_else(|| invalid("inner left key out of range"))?;
+                    let r = right_descriptors.get(*right_index).ok_or_else(|| invalid("inner right key out of range"))?;
+                    if l.namespace != r.namespace || l.nullable || r.nullable
+                        || shared_left.contains(left_index) || shared_right.contains(right_index) {
+                        return Err(invalid("inner correlation key descriptor mismatch"));
+                    }
+                    shared_left.push(*left_index); shared_right.push(*right_index);
+                }
+                descriptors.extend(right_descriptors.into_iter().enumerate().filter_map(
+                    |(index, descriptor)| (!shared_right.contains(&index)).then_some(descriptor)
+                ));
+                Ok((descriptors, false))
+            }
             RelationProofPlanKind::LeftOuter { left, right, key_pairs } => {
                 let (mut descriptors, left_ground) = left.shape_bounded(depth + 1, nodes)?;
                 let (right_descriptors, right_ground) = right.shape_bounded(depth + 1, nodes)?;
@@ -2073,6 +2101,11 @@ pub enum RecursiveRelationProof {
         left: Box<RecursiveRelationEnvelope>,
         right: Box<RecursiveRelationEnvelope>,
         proof: Option<Box<LeftAntiJoinProof>>,
+    },
+    InnerJoin {
+        left: Box<RecursiveRelationEnvelope>,
+        right: Box<RecursiveRelationEnvelope>,
+        proof: Box<InnerJoinProof>,
     },
     LeftOuter {
         left: Box<RecursiveRelationEnvelope>,
@@ -2283,6 +2316,21 @@ impl RecursiveRelationEnvelope {
                 Self::finish_proved(layer, plan, RecursiveRelationProof::LeftAnti {
                     left: Box::new(left_envelope), right: Box::new(right_envelope), proof,
                 }, commitments, columns, log_domain, n)
+            }
+            RelationProofPlanKind::InnerJoin { left, right, key_pairs } => {
+                let left_envelope = Self::prove_bounded(context, layer, left, depth + 1, nodes)?;
+                let right_envelope = Self::prove_bounded(context, layer, right, depth + 1, nodes)?;
+                let mut transcript = Transcript254::new(b"parture-inner-join-envelope");
+                transcript.append_bytes(b"pow/inner-envelope/root", &layer.state.commitment_root);
+                transcript.append_bytes(b"pow/inner-envelope/query", &plan.query_digest);
+                let result = prove_inner_join_with_keys_and_context(
+                    context, &left_envelope.relation_witness(None)?,
+                    &right_envelope.relation_witness(None)?, key_pairs, &mut transcript,
+                )?;
+                Self::finish_proved(layer, plan, RecursiveRelationProof::InnerJoin {
+                    left: Box::new(left_envelope), right: Box::new(right_envelope),
+                    proof: Box::new(result.proof),
+                }, result.commitments, result.columns, result.log_domain, result.n)
             }
             RelationProofPlanKind::LeftOuter { left, right, key_pairs } => {
                 let left_envelope = Self::prove_bounded(context, layer, left, depth + 1, nodes)?;
@@ -2605,6 +2653,21 @@ impl RecursiveRelationEnvelope {
                 }
             }
             (
+                RecursiveRelationProof::InnerJoin { left, right, proof },
+                RelationProofPlanKind::InnerJoin { left: left_plan, right: right_plan, key_pairs },
+            ) => {
+                left.verify_bounded(layer, expected_root, left_plan, depth + 1, nodes)?;
+                right.verify_bounded(layer, expected_root, right_plan, depth + 1, nodes)?;
+                let mut transcript = Transcript254::new(b"parture-inner-join-envelope");
+                transcript.append_bytes(b"pow/inner-envelope/root", &expected_root);
+                transcript.append_bytes(b"pow/inner-envelope/query", &plan.query_digest);
+                verify_inner_join_with_keys(
+                    &left.relation_commit(None)?, &right.relation_commit(None)?, key_pairs,
+                    &self.result_commitments, self.result_len, self.result_log_domain,
+                    proof, &mut transcript,
+                )?;
+            }
+            (
                 RecursiveRelationProof::Equality { input, proof },
                 RelationProofPlanKind::Equality {
                     input: input_plan,
@@ -2826,6 +2889,12 @@ impl RecursiveRelationEnvelope {
                 right.put_bounded(out, depth + 1, nodes)?;
                 proof.put(out)?;
             }
+            RecursiveRelationProof::InnerJoin { left, right, proof } => {
+                9u8.put(out)?;
+                left.put_bounded(out, depth + 1, nodes)?;
+                right.put_bounded(out, depth + 1, nodes)?;
+                proof.put(out)?;
+            }
             RecursiveRelationProof::Equality { input, proof } => {
                 4u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
@@ -2915,6 +2984,11 @@ impl RecursiveRelationEnvelope {
             8 => RecursiveRelationProof::ExactMultiOrder {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 proof: Box::<ExactMultiOrderProof>::get(reader)?,
+            },
+            9 => RecursiveRelationProof::InnerJoin {
+                left: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                right: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                proof: Box::<InnerJoinProof>::get(reader)?,
             },
             _ => return Err(invalid("invalid recursive relation proof tag")),
         };
@@ -3169,6 +3243,46 @@ mod tests {
         assert!(decoded
             .verify(&layer, layer.state.commitment_root, &wrong_plan)
             .is_err());
+    }
+
+    fn assert_recursive_inner_join_roundtrips_and_rejects_tamper() {
+        let (layer, bgp) = fixture();
+        let leaf = || RelationProofPlan {
+            query_digest: plan_digest(&bgp).unwrap(),
+            kind: RelationProofPlanKind::Bgp(bgp.clone()),
+        };
+        let plan = RelationProofPlan {
+            query_digest: [73u8; 32],
+            kind: RelationProofPlanKind::InnerJoin {
+                left: Box::new(leaf()), right: Box::new(leaf()),
+                key_pairs: vec![(0, 0), (1, 1)],
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+        assert_eq!(envelope.result_len, 2);
+        assert_eq!(envelope.result_columns.len(), 2);
+        let bytes = envelope.encode().unwrap();
+        let decoded = RecursiveRelationEnvelope::decode(&bytes).unwrap();
+        decoded.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+
+        let mut wrong_keys = plan.clone();
+        if let RelationProofPlanKind::InnerJoin { key_pairs, .. } = &mut wrong_keys.kind {
+            key_pairs[1] = (0, 1);
+        }
+        assert!(decoded.verify(&layer, layer.state.commitment_root, &wrong_keys).is_err());
+        let mut changed = RecursiveRelationEnvelope::decode(&bytes).unwrap();
+        changed.result_columns[0].swap(0, 1);
+        for (commitment, column) in changed.result_commitments.iter_mut().zip(&changed.result_columns) {
+            *commitment = commit_column(column).unwrap();
+        }
+        assert!(changed.verify(&layer, layer.state.commitment_root, &plan).is_err());
+    }
+
+    #[test]
+    fn recursive_inner_join_roundtrips_and_rejects_tamper() {
+        std::thread::Builder::new().name("inner-join-proof".into()).stack_size(32 * 1024 * 1024)
+            .spawn(assert_recursive_inner_join_roundtrips_and_rejects_tamper).unwrap().join().unwrap();
     }
 
     #[test]

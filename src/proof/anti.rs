@@ -31,6 +31,7 @@ use super::relocate::{
 use super::union::{prove_bag_union_with_context, verify_bag_union, BagUnionProof};
 
 const ANTI_DOMAIN: &[u8] = b"parture/proof-of-woql/left-anti-join/v0";
+const INNER_DOMAIN: &[u8] = b"parture/proof-of-woql/inner-join/v0";
 
 fn f0() -> ArkFr {
     ArkFr::zero()
@@ -216,6 +217,25 @@ pub struct LeftAntiJoinResult {
     /// Complete matched inner-join relation in schema `[left.., right-only..]`.
     pub matched_commitments: Vec<ArkGT>,
     pub matched_columns: Vec<Vec<ArkFr>>,
+}
+
+/// Complete authenticated matched projection of a natural inner join. The anti
+/// proof already authenticates the complete binary join; its unmatched result is
+/// retained privately so the verifier can replay that argument before accepting
+/// the public matched projection.
+#[derive(Clone, Debug)]
+pub struct InnerJoinProof {
+    pub anti: LeftAntiJoinProof,
+    pub unmatched_left_commitments: Vec<ArkGT>,
+    pub unmatched_len: usize,
+}
+
+pub struct InnerJoinResult {
+    pub proof: InnerJoinProof,
+    pub commitments: Vec<ArkGT>,
+    pub columns: Vec<Vec<ArkFr>>,
+    pub log_domain: usize,
+    pub n: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -745,6 +765,72 @@ pub fn verify_left_anti_join_with_keys(
         &proof.compaction,
         transcript,
     )
+}
+
+pub fn prove_inner_join_with_keys(
+    left: &RelationWitness,
+    right: &RelationWitness,
+    key_pairs: &[(usize, usize)],
+    transcript: &mut Transcript254,
+) -> io::Result<InnerJoinResult> {
+    prove_inner_join_with_keys_and_context(
+        &StoreProverContext::cpu(), left, right, key_pairs, transcript,
+    )
+}
+
+pub fn prove_inner_join_with_keys_and_context(
+    context: &StoreProverContext<'_>,
+    left: &RelationWitness,
+    right: &RelationWitness,
+    key_pairs: &[(usize, usize)],
+    transcript: &mut Transcript254,
+) -> io::Result<InnerJoinResult> {
+    transcript.append_bytes(b"pow/inner/domain", INNER_DOMAIN);
+    let anti = prove_left_anti_join_with_keys_and_context(context, left, right, key_pairs, transcript)?;
+    let size = 1usize << anti.log_domain;
+    let join_len = anti.proof.join_len;
+    let columns = anti.matched_columns.iter().map(|column| pad(column, size)).collect();
+    Ok(InnerJoinResult {
+        proof: InnerJoinProof {
+            anti: anti.proof,
+            unmatched_left_commitments: anti.commitments,
+            unmatched_len: anti.n,
+        },
+        commitments: anti.matched_commitments,
+        columns,
+        log_domain: anti.log_domain,
+        n: join_len,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_inner_join_with_keys(
+    left: &RelationCommit,
+    right: &RelationCommit,
+    key_pairs: &[(usize, usize)],
+    output_commitments: &[ArkGT],
+    output_len: usize,
+    output_log_domain: usize,
+    proof: &InnerJoinProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    transcript.append_bytes(b"pow/inner/domain", INNER_DOMAIN);
+    let join_log_domain = proof.anti.join.num_vars();
+    verify_left_anti_join_with_keys(
+        left, right, key_pairs, &proof.unmatched_left_commitments,
+        proof.unmatched_len, join_log_domain, &proof.anti, transcript,
+    )?;
+    let (expected, _) = matched_projection(
+        left.commitments.len(), right.commitments.len(), key_pairs,
+        &proof.anti.join_commitments, None,
+    )?;
+    if output_log_domain != join_log_domain
+        || output_len != proof.anti.join_len
+        || output_commitments != expected
+    {
+        return Err(invalid("inner-join matched projection mismatch"));
+    }
+    Ok(())
 }
 
 /// Prove a correlated left outer join over one or two shared key columns. The matched
@@ -1312,6 +1398,38 @@ mod tests {
             &mut vt,
         )
         .is_err());
+    }
+
+    #[test]
+    fn inner_join_exposes_all_matches_with_multiplicity_and_rejects_tamper() {
+        let left = relation(&[&[1, 2], &[10, 20]]);
+        let right = relation(&[&[1, 1, 2]]);
+        let keys = [(0usize, 0usize)];
+        let mut pt = transcript();
+        let result = prove_inner_join_with_keys(&left, &right, &keys, &mut pt).unwrap();
+        assert_eq!(result.n, 3);
+        assert_eq!(&result.columns[0][..3], &[ArkFr::from_u64(1), ArkFr::from_u64(1), ArkFr::from_u64(2)]);
+        assert_eq!(&result.columns[1][..3], &[ArkFr::from_u64(10), ArkFr::from_u64(10), ArkFr::from_u64(20)]);
+        verify_inner_join_with_keys(
+            &left.view(), &right.view(), &keys, &result.commitments, result.n,
+            result.log_domain, &result.proof, &mut transcript(),
+        ).unwrap();
+        assert!(verify_inner_join_with_keys(
+            &left.view(), &right.view(), &[(1, 0)], &result.commitments, result.n,
+            result.log_domain, &result.proof, &mut transcript(),
+        ).is_err());
+        assert!(verify_inner_join_with_keys(
+            &left.view(), &right.view(), &keys, &result.commitments, result.n - 1,
+            result.log_domain, &result.proof, &mut transcript(),
+        ).is_err());
+
+        let empty = relation(&[&[9]]);
+        let empty_result = prove_inner_join_with_keys(&left, &empty, &keys, &mut transcript()).unwrap();
+        assert_eq!(empty_result.n, 0);
+        verify_inner_join_with_keys(
+            &left.view(), &empty.view(), &keys, &empty_result.commitments, 0,
+            empty_result.log_domain, &empty_result.proof, &mut transcript(),
+        ).unwrap();
     }
 
     #[test]
