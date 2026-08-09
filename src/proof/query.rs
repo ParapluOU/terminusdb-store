@@ -587,6 +587,20 @@ pub fn generated_decimal_i64_field(value: i64) -> ArkFr {
     }
 }
 
+/// Decode the exact field image used by generated nonnegative decimal outputs.
+/// Reject field elements outside the canonical u64 image instead of truncating.
+pub fn generated_decimal_u64_value(field: ArkFr) -> io::Result<u64> {
+    let value = field.0.into_bigint();
+    let limbs = value.as_ref();
+    if limbs[1..].iter().any(|limb| *limb != 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "generated decimal is outside canonical u64 range",
+        ));
+    }
+    Ok(limbs[0])
+}
+
 pub fn generated_decimal_i64_value(field: ArkFr) -> io::Result<i64> {
     if field.is_zero() {
         return Ok(0);

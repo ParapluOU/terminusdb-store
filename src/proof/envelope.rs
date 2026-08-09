@@ -85,8 +85,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v16 extends GroupSum from zero/one key to an ordered zero-to-two-key tuple.
-const RECURSIVE_VERSION: u32 = 16;
+// v17 adds exact private GroupBy-list cardinality for zero-to-two node keys.
+const RECURSIVE_VERSION: u32 = 17;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1759,6 +1759,13 @@ pub enum RelationProofPlanKind {
         value_column: usize,
         datatype: CanonicalDatatype,
     },
+    /// Exact zero-/one-/two-node-key grouping with the private bag consumed by
+    /// Prolog `length/2`. The generated nonnegative decimal is the number of
+    /// authenticated child solutions in each group, including duplicates.
+    GroupCount {
+        input: Box<RelationProofPlan>,
+        key_columns: Vec<usize>,
+    },
     BagUnion {
         branches: Vec<RelationProofPlan>,
         /// Parent output column -> child output column, once per ordered branch.
@@ -2118,6 +2125,33 @@ impl RelationProofPlan {
                 result.push(generated);
                 Ok((result, false))
             }
+            RelationProofPlanKind::GroupCount { input, key_columns } => {
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                if ground
+                    || key_columns.len() > 2
+                    || (key_columns.len() == 2 && key_columns[0] == key_columns[1])
+                {
+                    return Err(invalid("group-count requires zero to two unique key columns"));
+                }
+                let mut result = key_columns
+                    .iter()
+                    .map(|key_column| {
+                        let key = descriptors
+                            .get(*key_column)
+                            .copied()
+                            .ok_or_else(|| invalid("group-count key column out of range"))?;
+                        if key.nullable || key.namespace != ResultIdNamespace::NodeValue {
+                            return Err(invalid("group-count keys must be nonnullable nodes"));
+                        }
+                        Ok(key)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                result.push(ResultColumnDescriptor {
+                    namespace: ResultIdNamespace::GeneratedDecimalU64,
+                    nullable: false,
+                });
+                Ok((result, false))
+            }
             RelationProofPlanKind::BagUnion { branches, mappings } => {
                 if branches.len() < 2
                     || branches.len() != mappings.len()
@@ -2371,6 +2405,9 @@ pub enum RecursiveRelationProof {
         input: Box<RecursiveRelationEnvelope>,
     },
     GroupSum {
+        input: Box<RecursiveRelationEnvelope>,
+    },
+    GroupCount {
         input: Box<RecursiveRelationEnvelope>,
     },
     BagUnion {
@@ -2643,6 +2680,73 @@ fn integral_catalog_value(
     })
 }
 
+fn grouped_node_rows(
+    layer: &impl VerifierLayer,
+    input: &RecursiveRelationEnvelope,
+    key_columns: &[usize],
+) -> io::Result<std::collections::BTreeMap<Vec<Vec<u8>>, (Vec<u64>, Vec<usize>)>> {
+    if key_columns.is_empty()
+        || key_columns.len() > 2
+        || (key_columns.len() == 2 && key_columns[0] == key_columns[1])
+    {
+        return Err(invalid("group key tuple is invalid"));
+    }
+    let view = layer.verifier_view();
+    view.validate()?;
+    let keys = key_columns
+        .iter()
+        .map(|key_column| {
+            let descriptor = input
+                .result_descriptors
+                .get(*key_column)
+                .copied()
+                .ok_or_else(|| invalid("group key descriptor out of range"))?;
+            if descriptor.nullable || descriptor.namespace != ResultIdNamespace::NodeValue {
+                return Err(invalid("group key is not a nonnullable node"));
+            }
+            let column = input
+                .result_columns
+                .get(*key_column)
+                .ok_or_else(|| invalid("group key column out of range"))?;
+            if column.len() != input.result_len {
+                return Err(invalid("group key length mismatch"));
+            }
+            Ok(column)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut groups = std::collections::BTreeMap::<
+        Vec<Vec<u8>>,
+        (Vec<u64>, Vec<usize>),
+    >::new();
+    for row in 0..input.result_len {
+        let resolved = keys
+            .iter()
+            .map(|column| {
+                let field = column[row];
+                let record = view
+                    .node_value_catalog
+                    .iter()
+                    .find(|record| ArkFr::from_u64(record.object_id) == field)
+                    .ok_or_else(|| invalid("group key is absent from the node dictionary"))?;
+                let CanonicalObject::Node(iri) = &record.triple.object else {
+                    return Err(invalid("group key is not a node IRI"));
+                };
+                Ok((iri.clone(), record.object_id))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let canonical_key = resolved.iter().map(|(iri, _)| iri.clone()).collect::<Vec<_>>();
+        let key_ids = resolved.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+        let entry = groups
+            .entry(canonical_key)
+            .or_insert((key_ids.clone(), Vec::new()));
+        if entry.0 != key_ids {
+            return Err(invalid("canonical node tuple maps to multiple Store IDs"));
+        }
+        entry.1.push(row);
+    }
+    Ok(groups)
+}
+
 fn derived_group_sum_columns(
     layer: &impl VerifierLayer,
     input: &RecursiveRelationEnvelope,
@@ -2659,17 +2763,6 @@ fn derived_group_sum_columns(
     }
     let view = layer.verifier_view();
     view.validate()?;
-    let resolve_key = |field: ArkFr| -> io::Result<(Vec<u8>, u64)> {
-        let record = view
-            .node_value_catalog
-            .iter()
-            .find(|record| ArkFr::from_u64(record.object_id) == field)
-            .ok_or_else(|| invalid("group-sum key is absent from the node dictionary"))?;
-        let CanonicalObject::Node(iri) = &record.triple.object else {
-            return Err(invalid("group-sum key is not a node IRI"));
-        };
-        Ok((iri.clone(), record.object_id))
-    };
     let resolve_value = |field: ArkFr| -> io::Result<GroupSumValue> {
         let record = view
             .node_value_catalog
@@ -2688,59 +2781,52 @@ fn derived_group_sum_columns(
         }
         return Ok(vec![vec![sum.field()?]]);
     }
-    if key_columns.len() > 2
-        || key_columns.iter().any(|key| *key == value_column)
-        || (key_columns.len() == 2 && key_columns[0] == key_columns[1])
-    {
+    if key_columns.iter().any(|key| *key == value_column) {
         return Err(invalid("group-sum key tuple is invalid"));
     }
-    let keys = key_columns
-        .iter()
-        .map(|key_column| {
-            let descriptor = input
-                .result_descriptors
-                .get(*key_column)
-                .copied()
-                .ok_or_else(|| invalid("group-sum key descriptor out of range"))?;
-            if descriptor.nullable || descriptor.namespace != ResultIdNamespace::NodeValue {
-                return Err(invalid("group-sum key is not a nonnullable node"));
-            }
-            let keys = input
-                .result_columns
-                .get(*key_column)
-                .ok_or_else(|| invalid("group-sum key column out of range"))?;
-            if keys.len() != input.result_len {
-                return Err(invalid("group-sum key length mismatch"));
-            }
-            Ok(keys)
-        })
-        .collect::<io::Result<Vec<_>>>()?;
     // SWI bagof orders free-variable tuples lexicographically in the declared
     // `group_by` variable order. Resolve authenticated expanded IRI bytes for every
     // component; never sort by child-schema position or append-order Store IDs.
-    let mut sums = std::collections::BTreeMap::<Vec<Vec<u8>>, (Vec<u64>, GroupSumValue)>::new();
-    for row in 0..input.result_len {
-        let resolved = keys
-            .iter()
-            .map(|column| resolve_key(column[row]))
-            .collect::<io::Result<Vec<_>>>()?;
-        let canonical_key = resolved.iter().map(|(iri, _)| iri.clone()).collect::<Vec<_>>();
-        let key_ids = resolved.iter().map(|(_, id)| *id).collect::<Vec<_>>();
-        let value = resolve_value(values[row])?;
-        let entry = sums
-            .entry(canonical_key)
-            .or_insert((key_ids.clone(), GroupSumValue::zero(datatype)?));
-        if entry.0 != key_ids {
-            return Err(invalid("group-sum canonical node tuple maps to multiple Store IDs"));
+    let groups = grouped_node_rows(layer, input, key_columns)?;
+    let mut output = vec![Vec::with_capacity(groups.len()); key_columns.len() + 1];
+    for (key_ids, rows) in groups.values() {
+        let mut sum = GroupSumValue::zero(datatype)?;
+        for row in rows {
+            sum = sum.checked_add(resolve_value(values[*row])?)?;
         }
-        entry.1 = entry.1.checked_add(value)?;
-    }
-    let mut output = vec![Vec::with_capacity(sums.len()); key_columns.len() + 1];
-    for (key_ids, sum) in sums.values() {
         for (column, key_id) in output.iter_mut().zip(key_ids) {
             column.push(ArkFr::from_u64(*key_id));
         }
         output[key_columns.len()].push(sum.field()?);
+    }
+    Ok(output)
+}
+
+fn derived_group_count_columns(
+    layer: &impl VerifierLayer,
+    input: &RecursiveRelationEnvelope,
+    key_columns: &[usize],
+) -> io::Result<Vec<Vec<ArkFr>>> {
+    if key_columns.is_empty() {
+        return if input.result_len == 0 {
+            Ok(vec![Vec::new()])
+        } else {
+            Ok(vec![vec![ArkFr::from_u64(
+                u64::try_from(input.result_len)
+                    .map_err(|_| invalid("group-count cardinality exceeds u64"))?,
+            )]])
+        };
+    }
+    let groups = grouped_node_rows(layer, input, key_columns)?;
+    let mut output = vec![Vec::with_capacity(groups.len()); key_columns.len() + 1];
+    for (key_ids, rows) in groups.values() {
+        for (column, key_id) in output.iter_mut().zip(key_ids) {
+            column.push(ArkFr::from_u64(*key_id));
+        }
+        output[key_columns.len()].push(ArkFr::from_u64(
+            u64::try_from(rows.len())
+                .map_err(|_| invalid("group-count cardinality exceeds u64"))?,
+        ));
     }
     Ok(output)
 }
@@ -3008,6 +3094,33 @@ impl RecursiveRelationEnvelope {
                     layer,
                     plan,
                     RecursiveRelationProof::GroupSum {
+                        input: Box::new(input_envelope),
+                    },
+                    commitments,
+                    columns,
+                    log_domain,
+                    n,
+                )
+            }
+            RelationProofPlanKind::GroupCount { input, key_columns } => {
+                let input_envelope =
+                    Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let mut columns =
+                    derived_group_count_columns(layer, &input_envelope, key_columns)?;
+                let n = columns.first().map_or(0, Vec::len);
+                let log_domain = n.max(1).next_power_of_two().max(2).trailing_zeros() as usize;
+                let domain = 1usize << log_domain;
+                for column in &mut columns {
+                    column.resize(domain, ArkFr::zero());
+                }
+                let commitments = columns
+                    .iter()
+                    .map(|column| context.commit_column(column))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::GroupCount {
                         input: Box::new(input_envelope),
                     },
                     commitments,
@@ -3507,6 +3620,47 @@ impl RecursiveRelationEnvelope {
                     return Err(invalid("group-sum commitment mismatch"));
                 }
             }
+            (
+                RecursiveRelationProof::GroupCount { input },
+                RelationProofPlanKind::GroupCount {
+                    input: input_plan,
+                    key_columns,
+                },
+            ) => {
+                input.verify_bounded(
+                    layer,
+                    expected_root,
+                    input_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let expected_columns =
+                    derived_group_count_columns(layer, input, key_columns)?;
+                let expected_len = expected_columns.first().map_or(0, Vec::len);
+                let expected_log = expected_len
+                    .max(1)
+                    .next_power_of_two()
+                    .max(2)
+                    .trailing_zeros() as usize;
+                if self.result_len != expected_len
+                    || self.result_log_domain != expected_log
+                    || self.result_columns != expected_columns
+                {
+                    return Err(invalid("group-count result is not the exact derived aggregate"));
+                }
+                let domain = 1usize << expected_log;
+                let expected_commitments = expected_columns
+                    .iter()
+                    .map(|column| {
+                        let mut padded = column.clone();
+                        padded.resize(domain, ArkFr::zero());
+                        commit_column(&padded)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                if self.result_commitments != expected_commitments {
+                    return Err(invalid("group-count commitment mismatch"));
+                }
+            }
             (RecursiveRelationProof::Bgp(envelope), RelationProofPlanKind::Bgp(bgp)) => {
                 envelope.verify(layer, expected_root, bgp, plan.query_digest)?;
                 if self.result_commitments != envelope.result_commitments
@@ -3996,6 +4150,10 @@ impl RecursiveRelationEnvelope {
                 14u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
             }
+            RecursiveRelationProof::GroupCount { input } => {
+                16u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+            }
             RecursiveRelationProof::Bgp(envelope) => {
                 0u8.put(out)?;
                 envelope.put(out)?;
@@ -4092,6 +4250,9 @@ impl RecursiveRelationEnvelope {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             14 => RecursiveRelationProof::GroupSum {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+            },
+            16 => RecursiveRelationProof::GroupCount {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             0 => RecursiveRelationProof::Bgp(Box::<LayerBgpEnvelope>::get(reader)?),
@@ -5056,6 +5217,117 @@ mod tests {
         let mut tampered = decoded;
         tampered.result_columns[2][2] = ArkFr::from_u64(8);
         tampered.result_values[2][2] = CanonicalResultValue::GeneratedDecimalU64(8);
+        tampered.result_commitments[2] = commit_column(&tampered.result_columns[2]).unwrap();
+        assert!(tampered
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .is_err());
+    }
+
+    #[test]
+    fn recursive_two_key_group_count_preserves_bag_cardinality_and_tuple_order() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node(&iri("z"), &iri("link"), &iri("z")))
+            .unwrap();
+        for value in [1u32, 2] {
+            builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("z"),
+                    &iri("score"),
+                    u32::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let builder = base.open_write().unwrap();
+        for (left, right) in [("a", "a"), ("a", "z"), ("z", "a")] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(left),
+                    &iri("link"),
+                    &iri(right),
+                ))
+                .unwrap();
+        }
+        for value in [3u32, 4, 5] {
+            builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("a"),
+                    &iri("score"),
+                    u32::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let source = RelationProofPlan {
+            query_digest: [117u8; 32],
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                atoms: vec![
+                    LayerBgpAtom::all_variables(iri("link").into_bytes()),
+                    LayerBgpAtom::all_variables(iri("score").into_bytes()),
+                ],
+                joins: vec![JoinStep {
+                    acc_key: 1,
+                    rel_key: 0,
+                    additional_keys: Vec::new(),
+                }],
+            }),
+        };
+        let plan = RelationProofPlan {
+            query_digest: [118u8; 32],
+            kind: RelationProofPlanKind::GroupCount {
+                input: Box::new(source.clone()),
+                key_columns: vec![1, 0],
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+        let node = |name: &str| {
+            CanonicalResultValue::Object(CanonicalObject::Node(iri(name).into_bytes()))
+        };
+        assert_eq!(envelope.result_len, 4);
+        assert_eq!(envelope.result_values[0], vec![node("a"), node("a"), node("z"), node("z")]);
+        assert_eq!(envelope.result_values[1], vec![node("a"), node("z"), node("a"), node("z")]);
+        assert_eq!(
+            envelope.result_values[2],
+            vec![
+                CanonicalResultValue::GeneratedDecimalU64(3),
+                CanonicalResultValue::GeneratedDecimalU64(3),
+                CanonicalResultValue::GeneratedDecimalU64(2),
+                CanonicalResultValue::GeneratedDecimalU64(2),
+            ]
+        );
+        let decoded = RecursiveRelationEnvelope::decode(&envelope.encode().unwrap()).unwrap();
+        decoded
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+
+        let reordered = RelationProofPlan {
+            query_digest: [118u8; 32],
+            kind: RelationProofPlanKind::GroupCount {
+                input: Box::new(source.clone()),
+                key_columns: vec![0, 1],
+            },
+        };
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &reordered)
+            .is_err());
+        for key_columns in [vec![0, 0], vec![0, 3], vec![0, 1, 2]] {
+            let invalid = RelationProofPlan {
+                query_digest: [119u8; 32],
+                kind: RelationProofPlanKind::GroupCount {
+                    input: Box::new(source.clone()),
+                    key_columns,
+                },
+            };
+            assert!(invalid.result_shape().is_err());
+        }
+        let mut tampered = decoded;
+        tampered.result_columns[2][0] = ArkFr::from_u64(4);
+        tampered.result_values[2][0] = CanonicalResultValue::GeneratedDecimalU64(4);
         tampered.result_commitments[2] = commit_column(&tampered.result_columns[2]).unwrap();
         assert!(tampered
             .verify(&layer, layer.state.commitment_root, &plan)
