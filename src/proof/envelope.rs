@@ -48,8 +48,9 @@ use super::query::{
     resolve_result_values, verify_layer_bgp, verify_layer_bgp_result_log_domain,
     verify_result_columns, AtomTerm, CanonicalResultValue, DictionaryAbsence,
     DictionaryAbsencePosition, LayerBgpAtom,
-    LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectRangeBound, ObjectRangeSpec,
-    RangeAtomSubproof, ResultColumnDescriptor, ResultIdNamespace, SecondRangeSubproof,
+    LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectKindFilter, ObjectRangeBound,
+    ObjectRangeSpec, RangeAtomSubproof, ResultColumnDescriptor, ResultIdNamespace,
+    SecondRangeSubproof,
 };
 use super::range::{
     DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp, RangeSelectProof,
@@ -65,14 +66,15 @@ const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
 const ANTI_MAGIC: &[u8; 12] = b"TDBWQANTI\0\0\0";
 const OUTER_MAGIC: &[u8; 12] = b"TDBWQOUTER\0\0";
 const RECURSIVE_MAGIC: &[u8; 12] = b"TDBWQTREE\0\0\0";
-// v3 adds the root-authenticated ground dictionary-absence branch. Older envelopes fail
-// explicitly; v2 had already bound the deterministic Dory parameter-set identity.
-const VERSION: u32 = 4;
-const UNION_VERSION: u32 = 2;
-const ANTI_VERSION: u32 = 4;
-const OUTER_VERSION: u32 = 1;
-// v4 adds exact ordered Start/Limit slices (wire tag 7).
-const RECURSIVE_VERSION: u32 = 6;
+// v5 adds the explicit transcript/wire-bound object-kind filter. Older envelopes fail
+// explicitly rather than guessing whether a variable object meant any value, a node,
+// or a literal.
+const VERSION: u32 = 5;
+const UNION_VERSION: u32 = 3;
+const ANTI_VERSION: u32 = 5;
+const OUTER_VERSION: u32 = 2;
+// v7 carries v5 leaf plans and their explicit object-kind filter.
+const RECURSIVE_VERSION: u32 = 7;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -582,6 +584,7 @@ wire_struct!(LayerBgpAtom {
     predicate_variable,
     object,
     object_range,
+    object_kind,
     subject_object_equal
 });
 wire_struct!(LayerBgpPlan { atoms, joins });
@@ -646,6 +649,24 @@ impl Wire for RangeOp {
             2 => Ok(Self::Gt),
             3 => Ok(Self::Ge),
             _ => Err(invalid("invalid range-op tag")),
+        }
+    }
+}
+impl Wire for ObjectKindFilter {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Any => 0u8,
+            Self::Node => 1,
+            Self::Literal => 2,
+        }
+        .put(out)
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        match u8::get(reader)? {
+            0 => Ok(Self::Any),
+            1 => Ok(Self::Node),
+            2 => Ok(Self::Literal),
+            _ => Err(invalid("invalid object-kind filter tag")),
         }
     }
 }
@@ -3098,6 +3119,7 @@ mod tests {
                 predicate_variable: false,
                 object: AtomTerm::Variable,
                 object_range: None,
+                object_kind: ObjectKindFilter::Any,
                 subject_object_equal: false,
             }],
             joins: Vec::new(),
@@ -3121,8 +3143,12 @@ mod tests {
         let layer = builder.commit().unwrap().proof_commitment().unwrap();
         let atom = |subject: &str, predicate: &str| LayerBgpAtom {
             subject: AtomTerm::NodeConstant(iri(subject).into_bytes()),
-            predicate_term: iri(predicate).into_bytes(), predicate_variable: false,
-            object: AtomTerm::Variable, object_range: None, subject_object_equal: false,
+            predicate_term: iri(predicate).into_bytes(),
+            predicate_variable: false,
+            object: AtomTerm::Variable,
+            object_range: None,
+            object_kind: ObjectKindFilter::Any,
+            subject_object_equal: false,
         };
         ((*layer).clone(), LayerBgpPlan {
             atoms: vec![atom("left", "x"), atom("right", "y")],
@@ -3477,6 +3503,7 @@ mod tests {
                 predicate_variable: false,
                 object: AtomTerm::NodeConstant(iri("b").into_bytes()),
                 object_range: None,
+                object_kind: ObjectKindFilter::Any,
                 subject_object_equal: false,
             }],
             joins: Vec::new(),
@@ -3539,7 +3566,7 @@ mod tests {
         assert!(LayerBgpEnvelope::decode(&corrupt).is_err());
 
         let mut wrong_version = encoded.clone();
-        wrong_version[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&5u32.to_le_bytes());
+        wrong_version[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&6u32.to_le_bytes());
         refresh_checksum(&mut wrong_version);
         assert!(LayerBgpEnvelope::decode(&wrong_version).is_err());
 

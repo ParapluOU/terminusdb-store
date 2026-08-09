@@ -495,6 +495,15 @@ fn selection_claims(spec: &AtomFilterSpec, beta_c: ArkFr) -> (SumcheckClaim, Sum
         });
         power = power * beta_c;
     }
+    // Keep the generic sumcheck shape non-empty for the unconstrained identity case.
+    // Claim B still pins `sel = chi_n`; this zero term only represents the vacuous
+    // residual claim A in the proof system's required non-empty expression form.
+    if a_terms.is_empty() {
+        a_terms.push(Term {
+            coeff: f0(),
+            operands: vec![Operand::Chi(CHI_N)],
+        });
+    }
     (
         SumcheckClaim {
             shape: ClaimShape::Identity,
@@ -1170,7 +1179,8 @@ fn selection_only_shape(
 
 /// Prove that `Com(sel)` (returned) commits EXACTLY the constant-equality indicator of
 /// `spec` over the first `real_rows` rows: `sel[i] = 1` iff `i < real_rows` and every
-/// constant position of `spec` matches, else `0`. Requires at least one constant. Also
+/// constant/equality constraint of `spec` matches, else `0`. With no constraints this
+/// authenticates the real-row prefix mask `chi_n`. Also
 /// returns the `sel` column itself so a composing layer can reuse the very column this
 /// proof committed (e.g. as a factor of a combined selection).
 #[allow(clippy::too_many_arguments)]
@@ -1204,9 +1214,6 @@ pub fn prove_selection_only_with_context(
     transcript: &mut Transcript254,
 ) -> io::Result<(SelectionOnlyProof, ArkGT, Vec<ArkFr>)> {
     spec.validate()?;
-    if spec.constants.is_empty() {
-        return Err(invalid("selection-only requires at least one constant position"));
-    }
     let size = s.len();
     if !size.is_power_of_two() || size < 2 {
         return Err(invalid("selection-only column length must be a power of two >= 2"));
@@ -1264,9 +1271,6 @@ pub fn verify_selection_only(
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
     spec.validate()?;
-    if spec.constants.is_empty() {
-        return Err(invalid("selection-only requires at least one constant position"));
-    }
     let num_vars = proof.sumcheck.round_polys.len();
     if num_vars == 0 || num_vars >= usize::BITS as usize {
         return Err(invalid("selection-only proof has an implausible variable count"));

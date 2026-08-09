@@ -56,6 +56,7 @@ use super::ProofHash;
 use super::{CanonicalDatatype, CanonicalObject};
 
 const QUERY_DOMAIN: &[u8] = b"parture/proof-of-woql/q1-query-by-iri/v0";
+const NODE_DATATYPE_TAG: u64 = 255;
 
 #[inline]
 fn f0() -> ArkFr {
@@ -591,6 +592,16 @@ pub struct ObjectRangeSpec {
     pub second: Option<ObjectRangeBound>,
 }
 
+/// Public object-kind constraint for a layer BGP atom. Store node IRIs and literal
+/// values share the object dictionary, so this constraint is authenticated against
+/// the dictionary datatype tag while preserving the original Store object ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectKindFilter {
+    Any,
+    Node,
+    Literal,
+}
+
 /// One atom of a layer BGP. A constant predicate IRI is authenticated by the layer's
 /// predicate dictionary; a predicate variable retains the root-bound materialized P
 /// column directly. The subject/object may each be a
@@ -611,6 +622,8 @@ pub struct LayerBgpAtom {
     pub predicate_variable: bool,
     pub object: AtomTerm,
     pub object_range: Option<ObjectRangeSpec>,
+    /// Restrict a variable object to nodes, literals, or leave it unconstrained.
+    pub object_kind: ObjectKindFilter,
     /// Require the subject and object variables to be equal within each selected row.
     pub subject_object_equal: bool,
 }
@@ -625,6 +638,7 @@ impl LayerBgpAtom {
             predicate_variable: false,
             object: AtomTerm::Variable,
             object_range: None,
+            object_kind: ObjectKindFilter::Any,
             subject_object_equal: false,
         }
     }
@@ -633,6 +647,11 @@ impl LayerBgpAtom {
     /// `Variable`; enforced at prove/verify by [`validate_atom`]).
     pub fn with_object_range(mut self, range: ObjectRangeSpec) -> Self {
         self.object_range = Some(range);
+        self
+    }
+
+    pub fn with_object_kind(mut self, kind: ObjectKindFilter) -> Self {
+        self.object_kind = kind;
         self
     }
 }
@@ -1105,6 +1124,13 @@ fn validate_atom(atom: &LayerBgpAtom) -> io::Result<()> {
             ));
         }
     }
+    if atom.object_kind != ObjectKindFilter::Any {
+        if !matches!(atom.object, AtomTerm::Variable) || atom.object_range.is_some() {
+            return Err(invalid(
+                "object-kind filter requires an unconstrained variable object",
+            ));
+        }
+    }
     if atom.subject_object_equal
         && (!matches!(atom.subject, AtomTerm::Variable)
             || !matches!(atom.object, AtomTerm::Variable))
@@ -1256,6 +1282,12 @@ fn bind_layer_bgp_statement(
                 }
             }
         }
+        let object_kind_tag = match atom.object_kind {
+            ObjectKindFilter::Any => 0,
+            ObjectKindFilter::Node => 1,
+            ObjectKindFilter::Literal => 2,
+        };
+        transcript.append_bytes(b"pow/bgp-layer/object-kind", &[object_kind_tag]);
     }
     for step in &plan.joins {
         transcript.append_bytes(
@@ -1460,6 +1492,7 @@ fn prove_ranged_atom(
     context: &StoreProverContext<'_>,
     spec: &AtomFilterSpec,
     range: &ObjectRangeSpec,
+    complement_range: bool,
     s: &[ArkFr],
     p: &[ArkFr],
     o: &[ArkFr],
@@ -1557,16 +1590,30 @@ fn prove_ranged_atom(
         range.b_bits,
         n,
     );
+    let (selected_sel_at_d, com_selected_sel_at_d) = if complement_range {
+        if range.second.is_some() { return Err(invalid("complemented object range cannot have a second bound")); }
+        let selected = range_sel_at_d.iter().enumerate().map(|(index, value)| {
+            if index < n { ArkFr::one() - *value } else { ArkFr::zero() }
+        }).collect::<Vec<_>>();
+        let mut chi = vec![ArkFr::zero(); d]; chi[..n].fill(ArkFr::one());
+        let derived = context.commit_column(&chi)? - com_range_sel_at_d;
+        if context.commit_column(&selected)? != derived {
+            return Err(invalid("literal complement commitment mismatch"));
+        }
+        (selected, derived)
+    } else {
+        (range_sel_at_d.clone(), com_range_sel_at_d)
+    };
 
     // (c) Relocate range_sel from D back to the table domain (its support is [0, n) ⊆
     // [0, 2^a), so truncating to the table domain is lossless; the relocation ties the
     // table copy to the authoritative Com(range_sel) at D).
     let table = 1usize << a;
-    let range_sel_at_table = range_sel_at_d[..table].to_vec();
+    let range_sel_at_table = selected_sel_at_d[..table].to_vec();
     let com_range_sel_at_table = context.commit_column(&range_sel_at_table)?;
     let relocate_range_sel = prove_column_relocation_with_context(
-        context, &range_sel_at_d,
-        &com_range_sel_at_d,
+        context, &selected_sel_at_d,
+        &com_selected_sel_at_d,
         &range_sel_at_table,
         &com_range_sel_at_table,
         transcript,
@@ -1720,6 +1767,7 @@ fn prove_ranged_atom(
 fn verify_ranged_atom(
     spec: &AtomFilterSpec,
     range: &ObjectRangeSpec,
+    complement_range: bool,
     n: usize,
     a: usize,
     com_s: &ArkGT,
@@ -1832,8 +1880,15 @@ fn verify_ranged_atom(
     )?;
 
     // (c) Verify range_sel relocated from D back to the table domain.
+    let com_selected_sel_at_d = if complement_range {
+        if range.second.is_some() { return Err(invalid("complemented object range cannot have a second bound")); }
+        let mut chi = vec![ArkFr::zero(); 1usize << d_log]; chi[..n].fill(ArkFr::one());
+        commit_column(&chi)? - sub.com_range_sel_at_d
+    } else {
+        sub.com_range_sel_at_d
+    };
     verify_column_relocation(
-        &sub.com_range_sel_at_d,
+        &com_selected_sel_at_d,
         d_log,
         &sub.com_range_sel_at_table,
         a,
@@ -2077,7 +2132,16 @@ pub fn prove_layer_bgp_with_result_and_context(
         // authenticated object-value range (relocations + object-range + combine +
         // compaction). Both yield the same shape of result: kept commitments + columns + m.
         let spec = atom_filter_spec(atom, ids);
-        let (filter, range, kept_commitments, kept_columns, m) = match &atom.object_range {
+        let node_kind_range = ObjectRangeSpec {
+            op: RangeOp::Ge, datatype: ArkFr::from_u64(NODE_DATATYPE_TAG),
+            c: ArkFr::zero(), b_bits: 64, second: None,
+        };
+        let (effective_range, complement_range) = match atom.object_kind {
+            ObjectKindFilter::Any => (atom.object_range.as_ref(), false),
+            ObjectKindFilter::Node => (Some(&node_kind_range), false),
+            ObjectKindFilter::Literal => (Some(&node_kind_range), true),
+        };
+        let (filter, range, kept_commitments, kept_columns, m) = match effective_range {
             None => {
                 let (filter, kept_commitments, m) = prove_atom_filter_with_context(
                     context, &spec,
@@ -2100,6 +2164,7 @@ pub fn prove_layer_bgp_with_result_and_context(
                 let (sub, kept_commitments, kept_columns, m) = prove_ranged_atom(
                     context, &spec,
                     object_range,
+                    complement_range,
                     &s,
                     &p,
                     &o,
@@ -2372,7 +2437,16 @@ pub fn verify_layer_bgp(
         // prover-supplied proof — a plain atom must carry a `filter`, a ranged atom a
         // `range`. The spec reuses the SAME ids the memberships authenticated.
         let spec = atom_filter_spec(atom, ids);
-        match &atom.object_range {
+        let node_kind_range = ObjectRangeSpec {
+            op: RangeOp::Ge, datatype: ArkFr::from_u64(NODE_DATATYPE_TAG),
+            c: ArkFr::zero(), b_bits: 64, second: None,
+        };
+        let (effective_range, complement_range) = match atom.object_kind {
+            ObjectKindFilter::Any => (atom.object_range.as_ref(), false),
+            ObjectKindFilter::Node => (Some(&node_kind_range), false),
+            ObjectKindFilter::Literal => (Some(&node_kind_range), true),
+        };
+        match effective_range {
             None => {
                 if ap.range.is_some() {
                     return Err(invalid("plain layer BGP atom carries a range subproof"));
@@ -2406,6 +2480,7 @@ pub fn verify_layer_bgp(
                 verify_ranged_atom(
                     &spec,
                     object_range,
+                    complement_range,
                     n,
                     a,
                     &com_s,
@@ -3340,6 +3415,7 @@ mod tests {
                 predicate_variable: true,
                 object: AtomTerm::Variable,
                 object_range: None,
+                object_kind: ObjectKindFilter::Any,
                 subject_object_equal: false,
             }],
             joins: vec![],
@@ -3389,6 +3465,7 @@ mod tests {
             predicate_variable: true,
             object: node_const("b"),
             object_range: None,
+            object_kind: ObjectKindFilter::Any,
             subject_object_equal: false,
         };
         let plan = LayerBgpPlan {
@@ -3648,6 +3725,7 @@ mod tests {
                     predicate_variable: false,
                     object: node_const("b"),
                     object_range: None,
+                    object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
                 },
             ],
@@ -3713,6 +3791,7 @@ mod tests {
                     predicate_variable: false,
                     object: AtomTerm::ValueConstant(dt, lex),
                     object_range: None,
+                    object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
                 },
                 LayerBgpAtom::all_variables(KNOWS.to_vec()),
@@ -3751,6 +3830,7 @@ mod tests {
                     predicate_variable: false,
                     object: AtomTerm::Variable,
                     object_range: None,
+                    object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
@@ -3792,6 +3872,7 @@ mod tests {
                     predicate_variable: false,
                     object: node_const("g"),
                     object_range: None,
+                    object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
                 },
             ],
@@ -3862,6 +3943,7 @@ mod tests {
                     predicate_variable: false,
                     object: node_const("absent"),
                     object_range: None,
+                    object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
                 },
             ],
@@ -3936,6 +4018,7 @@ mod tests {
                 predicate_variable: false,
                 object: node_const(object),
                 object_range: None,
+                object_kind: ObjectKindFilter::Any,
                 subject_object_equal: false,
             }],
             joins: Vec::new(),
@@ -4020,6 +4103,7 @@ mod tests {
             predicate_variable: false,
             object: node_const(object),
             object_range: None,
+            object_kind: ObjectKindFilter::Any,
             subject_object_equal: false,
         };
         for (plan, expected_len) in [
@@ -4095,6 +4179,7 @@ mod tests {
                     predicate_variable: false,
                     object: node_const("b"),
                     object_range: None,
+                    object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
                 },
                 1,
@@ -4106,6 +4191,7 @@ mod tests {
                     predicate_variable: false,
                     object: node_const("c"),
                     object_range: None,
+                    object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
                 },
                 0,
@@ -4154,6 +4240,7 @@ mod tests {
                     predicate_variable: false,
                     object: AtomTerm::Variable,
                     object_range: None,
+                    object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
@@ -4218,6 +4305,215 @@ mod tests {
         }
         let layer = builder.commit().unwrap();
         layer.proof_commitment().unwrap()
+    }
+
+    fn build_mixed_object_kind_layer() -> std::sync::Arc<LayerCommitment> {
+        use tdb_succinct::TdbDataType;
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        let data = iri("data");
+        let label = iri("label");
+        let flag = iri("flag");
+        builder
+            .add_value_triple(ValueTriple::new_value(
+                &iri("alice"),
+                &data,
+                u32::make_entry(&42),
+            ))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_value(
+                &iri("bob"),
+                &data,
+                bool::make_entry(&true),
+            ))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node(
+                &iri("carol"),
+                &data,
+                &iri("node-object"),
+            ))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_value(
+                &iri("alice"),
+                &flag,
+                bool::make_entry(&false),
+            ))
+            .unwrap();
+        for person in ["alice", "bob", "carol"] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(person),
+                    &label,
+                    &iri(&format!("{person}-label")),
+                ))
+                .unwrap();
+        }
+        builder.commit().unwrap().proof_commitment().unwrap()
+    }
+
+    #[test]
+    fn layer_bgp_object_kind_filters_are_exact_and_transcript_bound() {
+        let lc = build_mixed_object_kind_layer();
+        let literal_plan = LayerBgpPlan {
+            atoms: vec![LayerBgpAtom::all_variables(iri("data").into_bytes())
+                .with_object_kind(ObjectKindFilter::Literal)],
+            joins: vec![],
+        };
+        let result = prove_layer_bgp_with_result(&lc, &literal_plan).unwrap();
+        assert_eq!(result.result_len, 2);
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &literal_plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
+        let real = result.real_columns();
+        let resolved = resolve_typed_result_objects(
+            &lc,
+            lc.state.commitment_root,
+            &real,
+            &result_id_namespaces(&literal_plan).unwrap(),
+        )
+        .unwrap();
+        assert!(resolved[1]
+            .iter()
+            .all(|object| matches!(object, CanonicalObject::Value { .. })));
+        assert!(resolved[1].iter().any(|object| matches!(
+            object,
+            CanonicalObject::Value { datatype: CanonicalDatatype::UInt32, .. }
+        )));
+        assert!(resolved[1].iter().any(|object| matches!(
+            object,
+            CanonicalObject::Value { datatype: CanonicalDatatype::Boolean, .. }
+        )));
+
+        let node_plan = LayerBgpPlan {
+            atoms: vec![LayerBgpAtom::all_variables(iri("data").into_bytes())
+                .with_object_kind(ObjectKindFilter::Node)],
+            joins: vec![],
+        };
+        let node_result = prove_layer_bgp_with_result(&lc, &node_plan).unwrap();
+        assert_eq!(node_result.result_len, 1);
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &node_plan,
+            &node_result.predicate_ids,
+            &node_result.result_commitments,
+            node_result.result_len,
+            &node_result.proof,
+        )
+        .unwrap();
+
+        // The public kind is part of the statement; a literal proof cannot be replayed
+        // as a node or unconstrained proof even though all three use the same Store IDs.
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &node_plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .is_err());
+        let any_plan = LayerBgpPlan {
+            atoms: vec![LayerBgpAtom::all_variables(iri("data").into_bytes())],
+            joins: vec![],
+        };
+        assert!(verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &any_plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn layer_bgp_literal_kind_supports_empty_predicate_variables_and_joins() {
+        let lc = build_mixed_object_kind_layer();
+
+        let empty_plan = LayerBgpPlan {
+            atoms: vec![LayerBgpAtom::all_variables(iri("label").into_bytes())
+                .with_object_kind(ObjectKindFilter::Literal)],
+            joins: vec![],
+        };
+        let empty = prove_layer_bgp_with_result(&lc, &empty_plan).unwrap();
+        assert_eq!(empty.result_len, 0);
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &empty_plan,
+            &empty.predicate_ids,
+            &empty.result_commitments,
+            0,
+            &empty.proof,
+        )
+        .unwrap();
+
+        let predicate_variable = LayerBgpAtom {
+            subject: AtomTerm::Variable,
+            predicate_term: Vec::new(),
+            predicate_variable: true,
+            object: AtomTerm::Variable,
+            object_range: None,
+            object_kind: ObjectKindFilter::Literal,
+            subject_object_equal: false,
+        };
+        let predicate_plan = LayerBgpPlan {
+            atoms: vec![predicate_variable],
+            joins: vec![],
+        };
+        let all_literals = prove_layer_bgp_with_result(&lc, &predicate_plan).unwrap();
+        assert_eq!(all_literals.result_len, 3);
+        assert_eq!(all_literals.result_commitments.len(), 3);
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &predicate_plan,
+            &all_literals.predicate_ids,
+            &all_literals.result_commitments,
+            all_literals.result_len,
+            &all_literals.proof,
+        )
+        .unwrap();
+
+        let join_plan = LayerBgpPlan {
+            atoms: vec![
+                LayerBgpAtom::all_variables(iri("data").into_bytes())
+                    .with_object_kind(ObjectKindFilter::Literal),
+                LayerBgpAtom::all_variables(iri("label").into_bytes()),
+            ],
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+                additional_keys: vec![],
+            }],
+        };
+        let joined = prove_layer_bgp_with_result(&lc, &join_plan).unwrap();
+        assert_eq!(joined.result_len, 2);
+        assert_eq!(joined.result_commitments.len(), 3);
+        verify_layer_bgp(
+            &lc,
+            lc.state.commitment_root,
+            &join_plan,
+            &joined.predicate_ids,
+            &joined.result_commitments,
+            joined.result_len,
+            &joined.proof,
+        )
+        .unwrap();
     }
 
     // A layer with FEW triples but MANY distinct node/values: 3 people, each with a
@@ -4585,6 +4881,7 @@ mod tests {
                         b_bits: 64,
                         second: None,
                     }),
+                    object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
                 },
                 LayerBgpAtom::all_variables(NAME.to_vec()),
