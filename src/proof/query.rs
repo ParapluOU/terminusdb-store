@@ -28,7 +28,7 @@ use super::bgp::{
     prove_bgp_chain_with_result, verify_bgp_chain, BgpChainProof, JoinStep, RelationCommit,
     RelationWitness,
 };
-use super::commitment::LayerCommitment;
+use super::commitment::{LayerCommitment, VerifierCommitmentRef, VerifierLayer};
 use super::dict::{
     hash_object, hash_term, prove_dict_membership, verify_dict_membership, DictProof,
 };
@@ -118,10 +118,11 @@ fn resolve_predicate_id(layer: &LayerCommitment, predicate_term: &[u8]) -> io::R
 /// commitments), the public predicate IRI bytes, and the revealed id.
 fn bind_statement(
     transcript: &mut Transcript254,
-    layer: &LayerCommitment,
+    source: &impl VerifierLayer,
     predicate_term: &[u8],
     predicate_id: u64,
 ) {
+    let layer = source.verifier_view();
     transcript.append_bytes(b"pow/q1-iri/commitment-root", &layer.state.commitment_root);
     transcript.append_bytes(b"pow/q1-iri/predicate-term", predicate_term);
     transcript.append_bytes(b"pow/q1-iri/predicate-id", &predicate_id.to_le_bytes());
@@ -181,7 +182,7 @@ pub fn prove_layer_filter(
 /// result for that id (filter) — all under the shared transcript. The verifier
 /// never trusts the id out of band and never rescans the table.
 pub fn verify_layer_filter(
-    layer: &LayerCommitment,
+    source: &impl VerifierLayer,
     expected_root: ProofHash,
     predicate_term: &[u8],
     predicate_id: u64,
@@ -190,6 +191,7 @@ pub fn verify_layer_filter(
     m: usize,
     proof: &CombinedFilterProof,
 ) -> io::Result<()> {
+    let layer = source.verifier_view();
     // FIX 4: pin to an EXTERNALLY-trusted root FIRST (mirroring import_pack's
     // external-root check), so the proof is bound to a root the verifier already
     // trusts rather than whatever LayerCommitment the prover supplied.
@@ -213,7 +215,7 @@ pub fn verify_layer_filter(
     }
 
     let mut transcript = Transcript254::new(QUERY_DOMAIN);
-    bind_statement(&mut transcript, layer, predicate_term, predicate_id);
+    bind_statement(&mut transcript, &layer, predicate_term, predicate_id);
 
     // Membership: the revealed id is authentic for this IRI.
     let q_hash = hash_term(predicate_term);
@@ -385,7 +387,7 @@ pub fn prove_layer_graph_pattern2(
 /// the complete result of `t(?x, <IRI>, ?y), t(?y, <IRI>, ?z)`, without rerunning it.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_layer_graph_pattern2(
-    layer: &LayerCommitment,
+    source: &impl VerifierLayer,
     expected_root: ProofHash,
     predicate_term: &[u8],
     predicate_id: u64,
@@ -395,6 +397,7 @@ pub fn verify_layer_graph_pattern2(
     m_j: usize,
     proof: &GraphPattern2Proof,
 ) -> io::Result<()> {
+    let layer = source.verifier_view();
     // FIX 4: pin to an EXTERNALLY-trusted root FIRST.
     if layer.state.commitment_root != expected_root {
         return Err(invalid(
@@ -435,7 +438,7 @@ pub fn verify_layer_graph_pattern2(
     let b = n_join.trailing_zeros() as usize;
 
     let mut transcript = Transcript254::new(GRAPH2_DOMAIN);
-    bind_statement(&mut transcript, layer, predicate_term, predicate_id);
+    bind_statement(&mut transcript, &layer, predicate_term, predicate_id);
 
     // (1) Membership: the revealed id is authentic for this IRI.
     let q_hash = hash_term(predicate_term);
@@ -775,10 +778,11 @@ pub fn verify_result_columns(
 /// the root-bound dictionary commitments, so it is not trusted until both its `(hash,
 /// id)` columns have been rebuilt and recommitted here.
 pub fn resolve_node_value_result_objects(
-    layer: &LayerCommitment,
+    source: &impl VerifierLayer,
     expected_root: ProofHash,
     columns: &[Vec<ArkFr>],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    let layer = source.verifier_view();
     if layer.state.commitment_root != expected_root {
         return Err(invalid(
             "layer commitment_root does not match the externally-trusted expected root",
@@ -819,7 +823,7 @@ pub fn resolve_node_value_result_objects(
 /// namespaces. Predicate IDs are opened only against the root-bound predicate catalog;
 /// subject/object IDs only against the node/value catalog.
 pub fn resolve_typed_result_objects(
-    layer: &LayerCommitment,
+    layer: &impl VerifierLayer,
     expected_root: ProofHash,
     columns: &[Vec<ArkFr>],
     namespaces: &[ResultIdNamespace],
@@ -851,11 +855,12 @@ pub fn resolve_typed_result_objects(
 /// nonzero. Zero resolves to `Null` exactly for a descriptor marked nullable; it is an
 /// error in a nonnullable column and is never looked up in either dictionary catalog.
 pub fn resolve_result_values(
-    layer: &LayerCommitment,
+    source: &impl VerifierLayer,
     expected_root: ProofHash,
     columns: &[Vec<ArkFr>],
     descriptors: &[ResultColumnDescriptor],
 ) -> io::Result<Vec<Vec<CanonicalResultValue>>> {
+    let layer = source.verifier_view();
     if columns.len() != descriptors.len() {
         return Err(invalid("result column descriptor shape mismatch"));
     }
@@ -990,7 +995,7 @@ pub fn result_id_namespaces(plan: &LayerBgpPlan) -> io::Result<Vec<ResultIdNames
 /// Verify caller-delivered canonical IRIs/typed literals against proven Store ID
 /// columns and the root-authenticated node/value dictionary.
 pub fn verify_node_value_result_objects(
-    layer: &LayerCommitment,
+    layer: &impl VerifierLayer,
     expected_root: ProofHash,
     columns: &[Vec<ArkFr>],
     objects: &[Vec<CanonicalObject>],
@@ -1159,10 +1164,11 @@ fn bind_atom_term(transcript: &mut Transcript254, term: &AtomTerm, id: Option<u6
 /// constant carrying its revealed id), then the join plan. Identical on both sides.
 fn bind_layer_bgp_statement(
     transcript: &mut Transcript254,
-    layer: &LayerCommitment,
+    source: &impl VerifierLayer,
     plan: &LayerBgpPlan,
     atom_ids: &[AtomIds],
 ) {
+    let layer = source.verifier_view();
     transcript.append_bytes(
         b"pow/bgp-layer/commitment-root",
         &layer.state.commitment_root,
@@ -1303,9 +1309,10 @@ pub(crate) fn has_ground_result_unit(plan: &LayerBgpPlan) -> bool {
 }
 
 fn ground_dictionary_absence(
-    layer: &LayerCommitment,
+    source: &impl VerifierLayer,
     plan: &LayerBgpPlan,
 ) -> Option<GroundAbsence> {
+    let layer = source.verifier_view();
     let [atom] = plan.atoms.as_slice() else {
         return None;
     };
@@ -1386,7 +1393,8 @@ fn range_common_domain(a: usize, n_dict: usize) -> io::Result<(usize, usize)> {
 
 /// The root-bound count of rows in the complete node/value dictionary committed at
 /// this head. The count and the full catalog are both authenticated by the head root.
-fn root_bound_n_dict(layer: &LayerCommitment) -> io::Result<usize> {
+fn root_bound_n_dict(source: &impl VerifierLayer) -> io::Result<usize> {
+    let layer = source.verifier_view();
     let n_dict = layer.state.node_value_count as usize;
     if n_dict != layer.node_value_catalog.len() {
         return Err(invalid(
@@ -1667,13 +1675,13 @@ fn verify_ranged_atom(
     com_s: &ArkGT,
     com_p: &ArkGT,
     com_o: &ArkGT,
-    layer: &LayerCommitment,
+    layer: VerifierCommitmentRef<'_>,
     sub: &RangeAtomSubproof,
     kept_commitments: &[ArkGT],
     m: usize,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    let n_dict = root_bound_n_dict(layer)?;
+    let n_dict = root_bound_n_dict(&layer)?;
     let (d_log, dict_log) = range_common_domain(a, n_dict)?;
     let com_dict_id = layer.node_value_dict_commitments.1;
     let com_dict_value = layer.node_value_dict_range_commitments.0;
@@ -2138,7 +2146,7 @@ pub fn prove_layer_bgp_with_result(
 /// Concludes `result_coms[0..m]` is EXACTLY the complete BGP result, without rerunning it.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_layer_bgp(
-    layer: &LayerCommitment,
+    source: &impl VerifierLayer,
     expected_root: ProofHash,
     plan: &LayerBgpPlan,
     predicate_ids: &[u64],
@@ -2146,6 +2154,7 @@ pub fn verify_layer_bgp(
     m: usize,
     proof: &LayerBgpProof,
 ) -> io::Result<()> {
+    let layer = source.verifier_view();
     // Anchor to an EXTERNALLY-trusted root FIRST (FIX 4), before any sub-proof.
     if layer.state.commitment_root != expected_root {
         return Err(invalid(
@@ -2168,7 +2177,7 @@ pub fn verify_layer_bgp(
         // turns the scan below into an opening of the externally trusted layer root,
         // rather than trusting an unauthenticated convenience catalog.
         layer.validate()?;
-        if ground_dictionary_absence(layer, plan) != Some(claimed_absence) {
+        if ground_dictionary_absence(&layer, plan) != Some(claimed_absence) {
             return Err(invalid(
                 "claimed ground dictionary absence is not authentic",
             ));
@@ -2229,7 +2238,7 @@ pub fn verify_layer_bgp(
     }
 
     let mut transcript = Transcript254::new(LAYER_BGP_DOMAIN);
-    bind_layer_bgp_statement(&mut transcript, layer, plan, &atom_ids);
+    bind_layer_bgp_statement(&mut transcript, &layer, plan, &atom_ids);
 
     let com_pred_hash = layer.predicate_dict_commitments.0;
     let com_pred_id = layer.predicate_dict_commitments.1;
@@ -2426,11 +2435,12 @@ pub fn verify_layer_bgp(
 /// and proof shape. This is especially important for a false mixed-arity gate, whose
 /// all-zero commitments are group identities and therefore do not encode a domain size.
 pub fn verify_layer_bgp_result_log_domain(
-    layer: &LayerCommitment,
+    source: &impl VerifierLayer,
     plan: &LayerBgpPlan,
     proof: &LayerBgpProof,
     actual: usize,
 ) -> io::Result<()> {
+    let layer = source.verifier_view();
     validate_bgp_plan(plan)?;
     let relational_count = relational_atom_count(plan);
     let expected = if relational_count <= 1 {

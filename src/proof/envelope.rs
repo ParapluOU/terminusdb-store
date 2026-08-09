@@ -15,7 +15,7 @@ use super::anti::{
 };
 use super::argument::{ColumnOpening, SumcheckProof};
 use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit};
-use super::commitment::LayerCommitment;
+use super::commitment::{LayerCommitment, VerifierLayer};
 use super::count::CountProof;
 use super::dict::DictProof;
 use super::equality::{verify_relation_equality, RelationEqualityConstraint, RelationEqualityProof};
@@ -730,7 +730,7 @@ impl LayerBgpEnvelope {
 
     pub fn verify(
         &self,
-        layer: &LayerCommitment,
+        layer: &impl VerifierLayer,
         expected_root: ProofHash,
         plan: &LayerBgpPlan,
         query_digest: ProofHash,
@@ -936,7 +936,7 @@ impl BagUnionEnvelope {
 
     pub fn verify(
         &self,
-        layer: &LayerCommitment,
+        layer: &impl VerifierLayer,
         expected_root: ProofHash,
         branch_plans: &[LayerBgpPlan],
         query_digest: ProofHash,
@@ -1171,7 +1171,7 @@ impl LeftAntiJoinEnvelope {
 
     pub fn verify(
         &self,
-        layer: &LayerCommitment,
+        layer: &impl VerifierLayer,
         expected_root: ProofHash,
         left_plan: &LayerBgpPlan,
         right_plan: &LayerBgpPlan,
@@ -1439,7 +1439,7 @@ impl LeftOuterJoinEnvelope {
 
     pub fn verify(
         &self,
-        layer: &LayerCommitment,
+        layer: &impl VerifierLayer,
         expected_root: ProofHash,
         left_plan: &LayerBgpPlan,
         right_plan: &LayerBgpPlan,
@@ -1690,9 +1690,10 @@ fn validate_equality_plan(
 }
 
 pub fn resolve_relation_equality_constraint(
-    layer: &LayerCommitment,
+    source: &impl VerifierLayer,
     constraint: &RelationEqualityPlan,
 ) -> io::Result<RelationEqualityConstraint> {
+    let layer = source.verifier_view();
     match constraint {
         RelationEqualityPlan::ColumnConstant { column, value, .. } => {
             layer.validate()?;
@@ -1891,7 +1892,7 @@ impl RecursiveRelationEnvelope {
 
     fn verify_bounded(
         &self,
-        layer: &LayerCommitment,
+        layer: &impl VerifierLayer,
         expected_root: ProofHash,
         plan: &RelationProofPlan,
         depth: usize,
@@ -2134,7 +2135,7 @@ impl RecursiveRelationEnvelope {
 
     pub fn verify(
         &self,
-        layer: &LayerCommitment,
+        layer: &impl VerifierLayer,
         expected_root: ProofHash,
         plan: &RelationProofPlan,
     ) -> io::Result<()> {

@@ -801,7 +801,9 @@ fn validate_construction_heap_budget(
 }
 
 pub(crate) use commitment::decode_legacy_v3;
-pub use commitment::{CommitmentState, LayerCommitment};
+pub use commitment::{
+    CommitmentState, LayerCommitment, VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
+};
 
 pub mod anti;
 pub mod argument;
@@ -854,6 +856,8 @@ pub mod commitment {
 
     const COMMITMENT_MAGIC: &[u8; 8] = b"TSPCW0\0\0";
     pub const COMMITMENT_FORMAT_VERSION: u32 = 4;
+    const VERIFIER_COMMITMENT_MAGIC: &[u8; 8] = b"TSPCV0\0\0";
+    pub const VERIFIER_COMMITMENT_FORMAT_VERSION: u32 = 1;
 
     /// Number of committed columns per layer: additions (S,P,O) then removals
     /// (S,P,O), in that fixed order.
@@ -1459,6 +1463,135 @@ pub mod commitment {
         pub node_value_dict_range_commitments: (ArkGT, ArkGT),
     }
 
+    /// Compact, verifier-only projection of a validated PF4 v4 layer commitment.
+    ///
+    /// It deliberately omits the native addition/removal tables and the complete
+    /// materialized triple table. Those are prover witnesses. The retained state,
+    /// column commitments and complete clear dictionary catalogs are exactly the
+    /// public inputs needed to recompute the trusted layer root, authenticate
+    /// constants and render typed result ids. This type exposes no conversion back
+    /// to [`LayerCommitment`], because the omitted witness tables cannot be
+    /// reconstructed from commitments.
+    #[derive(Clone, Debug)]
+    pub struct VerifierCommitment {
+        pub state: CommitmentState,
+        pub predicate_catalog: Vec<ProofRecord>,
+        pub node_value_catalog: Vec<ProofRecord>,
+        pub column_commitments: [ArkGT; COLUMN_COUNT],
+        pub materialized_column_commitments: [ArkGT; MATERIALIZED_COLUMN_COUNT],
+        pub predicate_dict_commitments: (ArkGT, ArkGT),
+        pub node_value_dict_commitments: (ArkGT, ArkGT),
+        pub node_value_dict_range_commitments: (ArkGT, ArkGT),
+    }
+
+    /// Borrowed verifier view shared by full PF4 sidecars and compact artifacts.
+    #[derive(Clone, Copy)]
+    pub struct VerifierCommitmentRef<'a> {
+        pub state: &'a CommitmentState,
+        pub predicate_catalog: &'a [ProofRecord],
+        pub node_value_catalog: &'a [ProofRecord],
+        pub column_commitments: &'a [ArkGT; COLUMN_COUNT],
+        pub materialized_column_commitments: &'a [ArkGT; MATERIALIZED_COLUMN_COUNT],
+        pub predicate_dict_commitments: &'a (ArkGT, ArkGT),
+        pub node_value_dict_commitments: &'a (ArkGT, ArkGT),
+        pub node_value_dict_range_commitments: &'a (ArkGT, ArkGT),
+    }
+
+    /// Common verifier-facing interface. It intentionally contains no raw-table
+    /// accessors, keeping prover witness data outside verification APIs.
+    pub trait VerifierLayer {
+        fn verifier_view(&self) -> VerifierCommitmentRef<'_>;
+    }
+
+    impl VerifierLayer for LayerCommitment {
+        fn verifier_view(&self) -> VerifierCommitmentRef<'_> {
+            VerifierCommitmentRef {
+                state: &self.state,
+                predicate_catalog: &self.predicate_catalog,
+                node_value_catalog: &self.node_value_catalog,
+                column_commitments: &self.column_commitments,
+                materialized_column_commitments: &self.materialized_column_commitments,
+                predicate_dict_commitments: &self.predicate_dict_commitments,
+                node_value_dict_commitments: &self.node_value_dict_commitments,
+                node_value_dict_range_commitments: &self.node_value_dict_range_commitments,
+            }
+        }
+    }
+
+    impl VerifierLayer for VerifierCommitment {
+        fn verifier_view(&self) -> VerifierCommitmentRef<'_> {
+            VerifierCommitmentRef {
+                state: &self.state,
+                predicate_catalog: &self.predicate_catalog,
+                node_value_catalog: &self.node_value_catalog,
+                column_commitments: &self.column_commitments,
+                materialized_column_commitments: &self.materialized_column_commitments,
+                predicate_dict_commitments: &self.predicate_dict_commitments,
+                node_value_dict_commitments: &self.node_value_dict_commitments,
+                node_value_dict_range_commitments: &self.node_value_dict_range_commitments,
+            }
+        }
+    }
+
+    impl VerifierLayer for VerifierCommitmentRef<'_> {
+        fn verifier_view(&self) -> VerifierCommitmentRef<'_> {
+            *self
+        }
+    }
+
+    impl<T: VerifierLayer + ?Sized> VerifierLayer for std::sync::Arc<T> {
+        fn verifier_view(&self) -> VerifierCommitmentRef<'_> {
+            (**self).verifier_view()
+        }
+    }
+
+    impl VerifierCommitmentRef<'_> {
+        pub fn validate(self) -> io::Result<()> {
+            self.state.validate()?;
+            let subject_catalog = subject_catalog_from_objects(self.node_value_catalog)?;
+            validate_complete_catalog(
+                &[],
+                &[],
+                &[],
+                &[
+                    subject_catalog,
+                    self.predicate_catalog.to_vec(),
+                    self.node_value_catalog.to_vec(),
+                ],
+                self.state.node_value_count,
+                self.state.predicate_count,
+            )?;
+            if commit_predicate_dictionary(self.predicate_catalog)?
+                != *self.predicate_dict_commitments
+                || commit_node_value_dictionary(self.node_value_catalog)?
+                    != *self.node_value_dict_commitments
+                || commit_node_value_dict_range(self.node_value_catalog)?
+                    != *self.node_value_dict_range_commitments
+            {
+                return Err(invalid("verifier catalog commitment mismatch"));
+            }
+            if self.recomputed_commitment_root()? != self.state.commitment_root {
+                return Err(invalid("verifier commitment root mismatch"));
+            }
+            Ok(())
+        }
+
+        pub fn recomputed_commitment_root(self) -> io::Result<ProofHash> {
+            compute_commitment_root_from_parts(
+                self.state,
+                self.column_commitments,
+                self.materialized_column_commitments,
+                self.predicate_dict_commitments,
+                self.node_value_dict_commitments,
+                self.node_value_dict_range_commitments,
+            )
+        }
+
+        pub fn node_value_dictionary_columns(self) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>)> {
+            node_value_dict_columns_from_catalog(self.node_value_catalog)
+        }
+    }
+
     impl PartialEq for LayerCommitment {
         fn eq(&self, other: &Self) -> bool {
             // A validated commitment's state summarizes every column table; two
@@ -1471,6 +1604,24 @@ pub mod commitment {
     impl Eq for LayerCommitment {}
 
     impl LayerCommitment {
+        /// Deterministically project this fully validated PF4 v4 sidecar into the
+        /// bounded public artifact needed by a remote verifier.
+        pub fn verifier_commitment(&self) -> io::Result<VerifierCommitment> {
+            self.validate()?;
+            let artifact = VerifierCommitment {
+                state: self.state.clone(),
+                predicate_catalog: self.predicate_catalog.clone(),
+                node_value_catalog: self.node_value_catalog.clone(),
+                column_commitments: self.column_commitments,
+                materialized_column_commitments: self.materialized_column_commitments,
+                predicate_dict_commitments: self.predicate_dict_commitments,
+                node_value_dict_commitments: self.node_value_dict_commitments,
+                node_value_dict_range_commitments: self.node_value_dict_range_commitments,
+            };
+            artifact.validate()?;
+            Ok(artifact)
+        }
+
         /// Build a production sidecar from the complete native dictionary delta.
         /// Replaces `ProofLayer::new_native_with_catalog`. The supplied mappings
         /// contain only ids introduced by this layer; inherited mappings are
@@ -2019,33 +2170,14 @@ pub mod commitment {
         /// commitments bind the IRI->id and constant->id maps and the value/datatype
         /// encodings.
         fn compute_commitment_root(&self) -> io::Result<ProofHash> {
-            let mut hasher = Sha256::new();
-            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v4");
-            match self.state.parent_state_root {
-                Some(root) => {
-                    hasher.update([1u8]);
-                    hasher.update(root);
-                }
-                None => hasher.update([0u8]),
-            }
-            hasher.update(self.state.addition_count.to_be_bytes());
-            hasher.update(self.state.removal_count.to_be_bytes());
-            hasher.update(self.state.materialized_count.to_be_bytes());
-            hasher.update(self.state.parent_node_value_count.to_be_bytes());
-            hasher.update(self.state.parent_predicate_count.to_be_bytes());
-            hasher.update(self.state.node_value_count.to_be_bytes());
-            hasher.update(self.state.predicate_count.to_be_bytes());
-            for commitment in self
-                .column_commitments
-                .iter()
-                .chain(self.materialized_column_commitments.iter())
-                .chain(self.dictionary_commitments())
-            {
-                let bytes = serialize_commitment(commitment)?;
-                hasher.update((bytes.len() as u64).to_be_bytes());
-                hasher.update(&bytes);
-            }
-            Ok(hasher.finalize().into())
+            compute_commitment_root_from_parts(
+                &self.state,
+                &self.column_commitments,
+                &self.materialized_column_commitments,
+                &self.predicate_dict_commitments,
+                &self.node_value_dict_commitments,
+                &self.node_value_dict_range_commitments,
+            )
         }
 
         fn encode_body(&self) -> io::Result<Vec<u8>> {
@@ -2127,6 +2259,226 @@ pub mod commitment {
             // commitment_root + file checksum
             total = checked_proof_encoded_growth(total, 32)?;
             checked_proof_encoded_growth(total, 32)
+        }
+    }
+
+    fn compute_commitment_root_from_parts(
+        state: &CommitmentState,
+        column_commitments: &[ArkGT; COLUMN_COUNT],
+        materialized_column_commitments: &[ArkGT; MATERIALIZED_COLUMN_COUNT],
+        predicate_dict_commitments: &(ArkGT, ArkGT),
+        node_value_dict_commitments: &(ArkGT, ArkGT),
+        node_value_dict_range_commitments: &(ArkGT, ArkGT),
+    ) -> io::Result<ProofHash> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"terminus-store/proof-of-woql/commitment-root/v4");
+        match state.parent_state_root {
+            Some(root) => {
+                hasher.update([1u8]);
+                hasher.update(root);
+            }
+            None => hasher.update([0u8]),
+        }
+        for count in [
+            state.addition_count,
+            state.removal_count,
+            state.materialized_count,
+            state.parent_node_value_count,
+            state.parent_predicate_count,
+            state.node_value_count,
+            state.predicate_count,
+        ] {
+            hasher.update(count.to_be_bytes());
+        }
+        for commitment in column_commitments
+            .iter()
+            .chain(materialized_column_commitments.iter())
+            .chain([
+                &predicate_dict_commitments.0,
+                &predicate_dict_commitments.1,
+                &node_value_dict_commitments.0,
+                &node_value_dict_commitments.1,
+                &node_value_dict_range_commitments.0,
+                &node_value_dict_range_commitments.1,
+            ])
+        {
+            let bytes = serialize_commitment(commitment)?;
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(&bytes);
+        }
+        Ok(hasher.finalize().into())
+    }
+
+    impl VerifierCommitment {
+        /// Validate the complete clear catalogs against their Dory commitments,
+        /// then recompute the PF4 v4 root from all retained public commitments.
+        pub fn validate(&self) -> io::Result<()> {
+            self.state.validate()?;
+            if self.state.addition_count as usize > MAX_RECORDS
+                || self.state.removal_count as usize > MAX_RECORDS
+                || self.state.materialized_count as usize > MAX_RECORDS
+            {
+                return Err(invalid("verifier commitment count exceeds PF4 limit"));
+            }
+            let subject_catalog = subject_catalog_from_objects(&self.node_value_catalog)?;
+            validate_complete_catalog(
+                &[],
+                &[],
+                &[],
+                &[
+                    subject_catalog,
+                    self.predicate_catalog.clone(),
+                    self.node_value_catalog.clone(),
+                ],
+                self.state.node_value_count,
+                self.state.predicate_count,
+            )?;
+            if commit_predicate_dictionary(&self.predicate_catalog)?
+                != self.predicate_dict_commitments
+            {
+                return Err(invalid("verifier predicate catalog commitment mismatch"));
+            }
+            if commit_node_value_dictionary(&self.node_value_catalog)?
+                != self.node_value_dict_commitments
+            {
+                return Err(invalid("verifier node/value catalog commitment mismatch"));
+            }
+            if commit_node_value_dict_range(&self.node_value_catalog)?
+                != self.node_value_dict_range_commitments
+            {
+                return Err(invalid("verifier range catalog commitment mismatch"));
+            }
+            if self.recomputed_commitment_root()? != self.state.commitment_root {
+                return Err(invalid("verifier commitment root mismatch"));
+            }
+            Ok(())
+        }
+
+        pub fn recomputed_commitment_root(&self) -> io::Result<ProofHash> {
+            compute_commitment_root_from_parts(
+                &self.state,
+                &self.column_commitments,
+                &self.materialized_column_commitments,
+                &self.predicate_dict_commitments,
+                &self.node_value_dict_commitments,
+                &self.node_value_dict_range_commitments,
+            )
+        }
+
+        pub fn encode(&self) -> io::Result<Vec<u8>> {
+            self.validate()?;
+            let mut out = Vec::new();
+            out.extend_from_slice(VERIFIER_COMMITMENT_MAGIC);
+            put_u32(&mut out, VERIFIER_COMMITMENT_FORMAT_VERSION);
+            out.push(self.state.parent_state_root.is_some() as u8);
+            if let Some(root) = self.state.parent_state_root {
+                put_hash(&mut out, &root);
+            }
+            for count in [
+                self.state.addition_count,
+                self.state.removal_count,
+                self.state.materialized_count,
+                self.state.parent_node_value_count,
+                self.state.parent_predicate_count,
+                self.state.node_value_count,
+                self.state.predicate_count,
+            ] {
+                put_u64(&mut out, count);
+            }
+            put_records(&mut out, &self.predicate_catalog);
+            put_records(&mut out, &self.node_value_catalog);
+            for commitment in self.column_commitments.iter().chain(
+                self.materialized_column_commitments.iter(),
+            ).chain([
+                &self.predicate_dict_commitments.0,
+                &self.predicate_dict_commitments.1,
+                &self.node_value_dict_commitments.0,
+                &self.node_value_dict_commitments.1,
+                &self.node_value_dict_range_commitments.0,
+                &self.node_value_dict_range_commitments.1,
+            ]) {
+                put_bytes(&mut out, &serialize_commitment(commitment)?);
+            }
+            put_hash(&mut out, &self.state.commitment_root);
+            let checksum = file_checksum(&out);
+            out.extend_from_slice(&checksum);
+            if out.len() > MAX_PROOF_LAYER_BYTES {
+                return Err(invalid("encoded verifier commitment exceeds file budget"));
+            }
+            Ok(out)
+        }
+
+        pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+            if bytes.len() < VERIFIER_COMMITMENT_MAGIC.len() + 4 + 64
+                || bytes.len() > MAX_PROOF_LAYER_BYTES
+            {
+                return Err(invalid("truncated verifier commitment"));
+            }
+            let (payload, checksum) = bytes.split_at(bytes.len() - 32);
+            if file_checksum(payload).as_slice() != checksum {
+                return Err(invalid("verifier commitment checksum mismatch"));
+            }
+            let (body, root_bytes) = payload.split_at(payload.len() - 32);
+            let commitment_root: ProofHash = root_bytes.try_into().unwrap();
+            let mut r = Reader::new(body);
+            if r.take(VERIFIER_COMMITMENT_MAGIC.len())? != VERIFIER_COMMITMENT_MAGIC {
+                return Err(invalid("bad verifier commitment magic"));
+            }
+            if r.u32()? != VERIFIER_COMMITMENT_FORMAT_VERSION {
+                return Err(invalid("unsupported verifier commitment version"));
+            }
+            let parent_state_root = match r.u8()? {
+                0 => None,
+                1 => Some(r.hash()?),
+                _ => return Err(invalid("bad verifier parent root tag")),
+            };
+            let state = CommitmentState {
+                parent_state_root,
+                addition_count: r.u64()?,
+                removal_count: r.u64()?,
+                materialized_count: r.u64()?,
+                parent_node_value_count: r.u64()?,
+                parent_predicate_count: r.u64()?,
+                node_value_count: r.u64()?,
+                predicate_count: r.u64()?,
+                commitment_root,
+            };
+            let predicate_catalog = read_records(&mut r, PersistedTableKind::PredicateCatalog)?;
+            let node_value_catalog = read_records(&mut r, PersistedTableKind::ObjectCatalog)?;
+            validate_decoded_heap_budget(&[], &[], &[], &predicate_catalog, &node_value_catalog)?;
+            let mut column_commitments = [<ArkGT as Group>::identity(); COLUMN_COUNT];
+            for value in &mut column_commitments {
+                *value = deserialize_commitment(&r.bytes()?)?;
+            }
+            let mut materialized_column_commitments =
+                [<ArkGT as Group>::identity(); MATERIALIZED_COLUMN_COUNT];
+            for value in &mut materialized_column_commitments {
+                *value = deserialize_commitment(&r.bytes()?)?;
+            }
+            let mut next_pair = || -> io::Result<(ArkGT, ArkGT)> {
+                Ok((
+                    deserialize_commitment(&r.bytes()?)?,
+                    deserialize_commitment(&r.bytes()?)?,
+                ))
+            };
+            let predicate_dict_commitments = next_pair()?;
+            let node_value_dict_commitments = next_pair()?;
+            let node_value_dict_range_commitments = next_pair()?;
+            if !r.done() {
+                return Err(invalid("trailing verifier commitment bytes"));
+            }
+            let artifact = Self {
+                state,
+                predicate_catalog,
+                node_value_catalog,
+                column_commitments,
+                materialized_column_commitments,
+                predicate_dict_commitments,
+                node_value_dict_commitments,
+                node_value_dict_range_commitments,
+            };
+            artifact.validate()?;
+            Ok(artifact)
         }
     }
 
@@ -2622,6 +2974,56 @@ pub mod commitment {
                 vec![(b"p".to_vec(), 1)],
             )
             .unwrap()
+        }
+
+        #[test]
+        fn compact_verifier_commitment_roundtrips_and_omits_witness_tables() {
+            let layer = sample();
+            let full = layer.encode().unwrap();
+            let artifact = layer.verifier_commitment().unwrap();
+            let compact = artifact.encode().unwrap();
+            let decoded = VerifierCommitment::decode(&compact).unwrap();
+
+            assert_eq!(decoded.state, layer.state);
+            assert_eq!(decoded.predicate_catalog, layer.predicate_catalog);
+            assert_eq!(decoded.node_value_catalog, layer.node_value_catalog);
+            assert!(compact.len() < full.len());
+            assert_eq!(decoded.recomputed_commitment_root().unwrap(), layer.state.commitment_root);
+        }
+
+        #[test]
+        fn compact_verifier_commitment_rejects_root_catalog_commitment_and_count_tampering() {
+            let artifact = sample().verifier_commitment().unwrap();
+
+            let mut wrong_root = artifact.clone();
+            wrong_root.state.commitment_root[0] ^= 1;
+            assert!(wrong_root.validate().is_err());
+
+            let mut wrong_catalog = artifact.clone();
+            wrong_catalog.node_value_catalog[0].triple.object =
+                CanonicalObject::Node(b"forged".to_vec());
+            assert!(wrong_catalog.validate().is_err());
+
+            let mut wrong_commitment = artifact.clone();
+            wrong_commitment.materialized_column_commitments[0] =
+                <ArkGT as Group>::identity();
+            assert!(wrong_commitment.validate().is_err());
+
+            let mut wrong_count = artifact.clone();
+            wrong_count.state.node_value_count += 1;
+            assert!(wrong_count.validate().is_err());
+        }
+
+        #[test]
+        fn compact_verifier_commitment_decode_rejects_checksum_and_version_tampering() {
+            let mut bytes = sample().verifier_commitment().unwrap().encode().unwrap();
+            bytes[VERIFIER_COMMITMENT_MAGIC.len()] ^= 1;
+            assert!(VerifierCommitment::decode(&bytes).is_err());
+
+            let mut bytes = sample().verifier_commitment().unwrap().encode().unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            assert!(VerifierCommitment::decode(&bytes).is_err());
         }
 
         // Same two-node/one-predicate dictionary {a:1, b:2}, {p:1}, but the caller
