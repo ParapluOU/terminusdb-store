@@ -73,8 +73,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v7 carries v5 leaf plans and their explicit object-kind filter.
-const RECURSIVE_VERSION: u32 = 7;
+// v8 adds exact recursive bag projection (wire tag 10).
+const RECURSIVE_VERSION: u32 = 8;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1691,6 +1691,12 @@ pub enum RelationProofPlanKind {
         /// Parent output column -> child output column, once per ordered branch.
         mappings: Vec<Vec<usize>>,
     },
+    /// Exact bag projection/reorder. Rows, domain, order, and multiplicity are inherited
+    /// unchanged from the authenticated child; only a unique subset of columns is kept.
+    BagProjection {
+        input: Box<RelationProofPlan>,
+        indices: Vec<usize>,
+    },
     LeftAnti {
         left: Box<RelationProofPlan>,
         right: Box<RelationProofPlan>,
@@ -1953,6 +1959,27 @@ impl RelationProofPlan {
                 }
                 Ok(expected.expect("at least two branches"))
             }
+            RelationProofPlanKind::BagProjection { input, indices } => {
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                let mut seen = Vec::with_capacity(indices.len());
+                if ground || indices.is_empty() {
+                    return Err(invalid("bag projection requires a non-ground child and output"));
+                }
+                let projected = indices
+                    .iter()
+                    .map(|index| {
+                        if seen.contains(index) {
+                            return Err(invalid("bag projection indices must be unique"));
+                        }
+                        seen.push(*index);
+                        descriptors
+                            .get(*index)
+                            .copied()
+                            .ok_or_else(|| invalid("bag projection index out of range"))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                Ok((projected, false))
+            }
             RelationProofPlanKind::LeftAnti { left, right, key_pairs } => {
                 let left_shape = left.shape_bounded(depth + 1, nodes)?;
                 let (right_descriptors, right_ground) =
@@ -2117,6 +2144,9 @@ pub enum RecursiveRelationProof {
     BagUnion {
         branches: Vec<RecursiveRelationEnvelope>,
         proof: Box<BagUnionProof>,
+    },
+    BagProjection {
+        input: Box<RecursiveRelationEnvelope>,
     },
     LeftAnti {
         left: Box<RecursiveRelationEnvelope>,
@@ -2315,6 +2345,43 @@ impl RecursiveRelationEnvelope {
                     branches: child_envelopes,
                     proof: Box::new(result.proof),
                 }, result.commitments, result.columns, result.log_domain, result.n)
+            }
+            RelationProofPlanKind::BagProjection { input, indices } => {
+                let input_envelope =
+                    Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let commitments = indices
+                    .iter()
+                    .map(|index| {
+                        input_envelope
+                            .result_commitments
+                            .get(*index)
+                            .copied()
+                            .ok_or_else(|| invalid("bag projection index out of range"))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                let columns = indices
+                    .iter()
+                    .map(|index| {
+                        input_envelope
+                            .result_columns
+                            .get(*index)
+                            .cloned()
+                            .ok_or_else(|| invalid("bag projection index out of range"))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                let log_domain = input_envelope.result_log_domain;
+                let n = input_envelope.result_len;
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::BagProjection {
+                        input: Box::new(input_envelope),
+                    },
+                    commitments,
+                    columns,
+                    log_domain,
+                    n,
+                )
             }
             RelationProofPlanKind::LeftAnti { left, right, key_pairs } => {
                 let left_envelope = Self::prove_bounded(context, layer, left, depth + 1, nodes)?;
@@ -2568,6 +2635,48 @@ impl RecursiveRelationEnvelope {
                     proof,
                     &mut transcript,
                 )?;
+            }
+            (
+                RecursiveRelationProof::BagProjection { input },
+                RelationProofPlanKind::BagProjection {
+                    input: input_plan,
+                    indices,
+                },
+            ) => {
+                input.verify_bounded(
+                    layer,
+                    expected_root,
+                    input_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let expected_commitments = indices
+                    .iter()
+                    .map(|index| {
+                        input
+                            .result_commitments
+                            .get(*index)
+                            .copied()
+                            .ok_or_else(|| invalid("bag projection index out of range"))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                let expected_columns = indices
+                    .iter()
+                    .map(|index| {
+                        input
+                            .result_columns
+                            .get(*index)
+                            .cloned()
+                            .ok_or_else(|| invalid("bag projection index out of range"))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                if self.result_commitments != expected_commitments
+                    || self.result_columns != expected_columns
+                    || self.result_log_domain != input.result_log_domain
+                    || self.result_len != input.result_len
+                {
+                    return Err(invalid("bag projection changed rows, domain, or multiplicity"));
+                }
             }
             (
                 RecursiveRelationProof::LeftAnti { left, right, proof },
@@ -2898,6 +3007,10 @@ impl RecursiveRelationEnvelope {
                 }
                 proof.put(out)?;
             }
+            RecursiveRelationProof::BagProjection { input } => {
+                10u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+            }
             RecursiveRelationProof::LeftAnti { left, right, proof } => {
                 2u8.put(out)?;
                 left.put_bounded(out, depth + 1, nodes)?;
@@ -3010,6 +3123,9 @@ impl RecursiveRelationEnvelope {
                 left: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 right: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 proof: Box::<InnerJoinProof>::get(reader)?,
+            },
+            10 => RecursiveRelationProof::BagProjection {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             _ => return Err(invalid("invalid recursive relation proof tag")),
         };
@@ -3309,6 +3425,80 @@ mod tests {
     fn recursive_inner_join_roundtrips_and_rejects_tamper() {
         std::thread::Builder::new().name("inner-join-proof".into()).stack_size(32 * 1024 * 1024)
             .spawn(assert_recursive_inner_join_roundtrips_and_rejects_tamper).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn recursive_bag_projection_preserves_duplicate_rows_and_rejects_tamper() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for object in ["x", "y"] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri("a"),
+                    &iri("p"),
+                    &iri(object),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let bgp = LayerBgpPlan {
+            atoms: vec![LayerBgpAtom::all_variables(iri("p").into_bytes())],
+            joins: Vec::new(),
+        };
+        let leaf = RelationProofPlan {
+            query_digest: plan_digest(&bgp).unwrap(),
+            kind: RelationProofPlanKind::Bgp(bgp),
+        };
+        let plan = RelationProofPlan {
+            query_digest: [91u8; 32],
+            kind: RelationProofPlanKind::BagProjection {
+                input: Box::new(leaf),
+                indices: vec![0],
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+        assert_eq!(envelope.result_len, 2);
+        assert_eq!(envelope.result_columns.len(), 1);
+        assert_eq!(envelope.result_columns[0][0], envelope.result_columns[0][1]);
+
+        let encoded = envelope.encode().unwrap();
+        let decoded = RecursiveRelationEnvelope::decode(&encoded).unwrap();
+        decoded
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+
+        let mut wrong_index = plan.clone();
+        if let RelationProofPlanKind::BagProjection { indices, .. } = &mut wrong_index.kind {
+            indices[0] = 1;
+        }
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &wrong_index)
+            .is_err());
+
+        let mut changed = decoded.clone();
+        changed.result_columns[0][0] = match &changed.proof {
+            RecursiveRelationProof::BagProjection { input } => input.result_columns[1][0],
+            _ => unreachable!(),
+        };
+        changed.result_commitments[0] = commit_column(&changed.result_columns[0]).unwrap();
+        assert!(changed
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .is_err());
+
+        let duplicate_indices = RelationProofPlan {
+            query_digest: [92u8; 32],
+            kind: RelationProofPlanKind::BagProjection {
+                input: match &plan.kind {
+                    RelationProofPlanKind::BagProjection { input, .. } => input.clone(),
+                    _ => unreachable!(),
+                },
+                indices: vec![0, 0],
+            },
+        };
+        assert!(duplicate_indices.result_shape().is_err());
     }
 
     #[test]
