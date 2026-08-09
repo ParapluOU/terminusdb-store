@@ -1041,22 +1041,36 @@ fn validate_bgp_plan(plan: &LayerBgpPlan) -> io::Result<usize> {
         if !plan.joins.is_empty() {
             return Err(invalid("all-ground BGP must not carry keyed join steps"));
         }
-    } else if ground_count != 0 {
-        return Err(invalid(
-            "mixing ground and variable BGP atoms requires authenticated boolean composition",
-        ));
-    } else if plan.joins.len() != k - 1 {
-        return Err(invalid(
-            "relational BGP plan must have exactly k-1 join steps",
-        ));
+    } else {
+        let relational_count = k - ground_count;
+        if plan.atoms[..relational_count].iter().any(atom_is_ground)
+            || plan.atoms[relational_count..]
+                .iter()
+                .any(|atom| !atom_is_ground(atom))
+        {
+            return Err(invalid(
+                "mixed BGP must place every ground atom after relational atoms",
+            ));
+        }
+        if plan.joins.len() != relational_count - 1 {
+            return Err(invalid(
+                "relational BGP prefix must have exactly k-1 join steps",
+            ));
+        }
     }
     Ok(k)
 }
 
+fn atom_is_ground(atom: &LayerBgpAtom) -> bool {
+    !matches!(atom.subject, AtomTerm::Variable) && !matches!(atom.object, AtomTerm::Variable)
+}
+
+fn relational_atom_count(plan: &LayerBgpPlan) -> usize {
+    plan.atoms.iter().take_while(|atom| !atom_is_ground(atom)).count()
+}
+
 fn is_all_ground(plan: &LayerBgpPlan) -> bool {
-    plan.atoms.iter().all(|atom| {
-        !matches!(atom.subject, AtomTerm::Variable) && !matches!(atom.object, AtomTerm::Variable)
-    })
+    !plan.atoms.is_empty() && relational_atom_count(plan) == 0
 }
 
 /// Whether the plan's sole result column is the filter gadget's internal UNIT column.
@@ -1818,32 +1832,54 @@ pub fn prove_layer_bgp_with_result(
 
     // (5) The left-deep chain over the filtered relations, when there is something to
     // join. For k=1 the complete atom filter result is already the query result.
-    let (chain, result_coms, result_columns, result_log_domain, result_m) = if is_all_ground(plan) {
-        let result_m = usize::from(relations.iter().all(|relation| relation.n == 1));
-        let mut unit = vec![f0(); 1usize << a];
-        if result_m == 1 {
-            unit[0] = ArkFr::one();
-        }
-        (None, vec![commit_column(&unit)?], vec![unit], a, result_m)
-    } else if k == 1 {
-        let relation = &relations[0];
-        (
-            None,
-            relation.commitments.clone(),
-            relation.columns.clone(),
-            relation.log_domain,
-            relation.n,
-        )
-    } else {
-        let result = prove_bgp_chain_with_result(&relations, &plan.joins, &mut transcript)?;
-        (
-            Some(result.proof),
-            result.commitments,
-            result.columns,
-            result.log_domain,
-            result.n,
-        )
-    };
+    let relational_count = relational_atom_count(plan);
+    let (chain, mut result_coms, mut result_columns, result_log_domain, mut result_m) =
+        if is_all_ground(plan) {
+            let result_m = usize::from(relations.iter().all(|relation| relation.n == 1));
+            let mut unit = vec![f0(); 1usize << a];
+            if result_m == 1 {
+                unit[0] = ArkFr::one();
+            }
+            (None, vec![commit_column(&unit)?], vec![unit], a, result_m)
+        } else if relational_count == 1 {
+            let relation = &relations[0];
+            (
+                None,
+                relation.commitments.clone(),
+                relation.columns.clone(),
+                relation.log_domain,
+                relation.n,
+            )
+        } else {
+            let result = prove_bgp_chain_with_result(
+                &relations[..relational_count],
+                &plan.joins,
+                &mut transcript,
+            )?;
+            (
+                Some(result.proof),
+                result.commitments,
+                result.columns,
+                result.log_domain,
+                result.n,
+            )
+        };
+
+    if relational_count != 0
+        && relations[relational_count..]
+            .iter()
+            .any(|relation| relation.n == 0)
+    {
+        result_m = 0;
+        result_columns = result_columns
+            .iter()
+            .map(|_| vec![f0(); 1usize << result_log_domain])
+            .collect();
+        result_coms = result_columns
+            .iter()
+            .map(|column| commit_column(column))
+            .collect::<io::Result<_>>()?;
+    }
 
     Ok(LayerBgpResult {
         proof: LayerBgpProof {
@@ -2076,12 +2112,16 @@ pub fn verify_layer_bgp(
     // (4) The left-deep chain over the filtered relations, when k >= 2. A k=1 proof
     // must not smuggle in an unrelated chain: its public result is exactly the verified
     // atom-filter output.
-    let (chain_coms, chain_m) = if is_all_ground(plan) {
-        if proof.chain.is_some()
-            || relations
-                .iter()
-                .any(|relation| relation.commitments.len() != 1 || relation.n > 1)
-        {
+    let relational_count = relational_atom_count(plan);
+    let ground_relations = &relations[relational_count..];
+    if ground_relations
+        .iter()
+        .any(|relation| relation.commitments.len() != 1 || relation.n > 1)
+    {
+        return Err(invalid("invalid ground BGP relation shape"));
+    }
+    let (mut chain_coms, mut chain_m) = if is_all_ground(plan) {
+        if proof.chain.is_some() {
             return Err(invalid("invalid all-ground BGP relation shape"));
         }
         let result_m = usize::from(relations.iter().all(|relation| relation.n == 1));
@@ -2090,9 +2130,9 @@ pub fn verify_layer_bgp(
             unit[0] = ArkFr::one();
         }
         (vec![commit_column(&unit)?], result_m)
-    } else if k == 1 {
+    } else if relational_count == 1 {
         if proof.chain.is_some() {
-            return Err(invalid("single-atom layer BGP carries a join-chain proof"));
+            return Err(invalid("single relational atom carries a join-chain proof"));
         }
         (relations[0].commitments.clone(), relations[0].n)
     } else {
@@ -2100,12 +2140,62 @@ pub fn verify_layer_bgp(
             .chain
             .as_ref()
             .ok_or_else(|| invalid("multi-atom layer BGP is missing its join-chain proof"))?;
-        verify_bgp_chain(&relations, &plan.joins, chain, &mut transcript)?
+        verify_bgp_chain(
+            &relations[..relational_count],
+            &plan.joins,
+            chain,
+            &mut transcript,
+        )?
     };
+    if relational_count != 0 && ground_relations.iter().any(|relation| relation.n == 0) {
+        let result_log_domain = if relational_count == 1 {
+            relations[0].log_domain
+        } else {
+            proof
+                .chain
+                .as_ref()
+                .and_then(|chain| chain.stages.last())
+                .ok_or_else(|| invalid("mixed BGP is missing its final join stage"))?
+                .join
+                .num_vars()
+        };
+        let zero = vec![f0(); 1usize << result_log_domain];
+        let zero_commitment = commit_column(&zero)?;
+        chain_coms.fill(zero_commitment);
+        chain_m = 0;
+    }
     if chain_m != m || chain_coms.as_slice() != result_coms {
         return Err(invalid(
             "layer BGP result does not match the proof's chain output",
         ));
+    }
+    Ok(())
+}
+
+/// Re-derive the only valid public result commitment domain from the authenticated plan
+/// and proof shape. This is especially important for a false mixed-arity gate, whose
+/// all-zero commitments are group identities and therefore do not encode a domain size.
+pub fn verify_layer_bgp_result_log_domain(
+    layer: &LayerCommitment,
+    plan: &LayerBgpPlan,
+    proof: &LayerBgpProof,
+    actual: usize,
+) -> io::Result<()> {
+    validate_bgp_plan(plan)?;
+    let relational_count = relational_atom_count(plan);
+    let expected = if relational_count <= 1 {
+        padded_len(layer.state.materialized_count as usize)?.trailing_zeros() as usize
+    } else {
+        proof
+            .chain
+            .as_ref()
+            .and_then(|chain| chain.stages.last())
+            .ok_or_else(|| invalid("BGP result domain is missing its final join stage"))?
+            .join
+            .num_vars()
+    };
+    if actual != expected {
+        return Err(invalid("BGP result commitment domain mismatch"));
     }
     Ok(())
 }
@@ -3444,10 +3534,10 @@ mod tests {
     }
 
     #[test]
-    fn layer_bgp_ground_atom_composition_and_value_subject_are_rejected() {
+    fn layer_bgp_ground_atoms_gate_relational_results() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
-        let ground_composition = LayerBgpPlan {
-            atoms: vec![
+        for (ground, expected_len) in [
+            (
                 LayerBgpAtom {
                     subject: node_const("a"),
                     predicate_term: KNOWS.to_vec(),
@@ -3455,15 +3545,53 @@ mod tests {
                     object_range: None,
                     subject_object_equal: false,
                 },
-                LayerBgpAtom::all_variables(LIKES.to_vec()),
-            ],
-            joins: vec![JoinStep {
-                acc_key: 0,
-                rel_key: 0,
-                additional_keys: Vec::new(),
-            }],
-        };
-        assert!(prove_layer_bgp(&lc, &ground_composition).is_err());
+                1,
+            ),
+            (
+                LayerBgpAtom {
+                    subject: node_const("a"),
+                    predicate_term: LIKES.to_vec(),
+                    object: node_const("c"),
+                    object_range: None,
+                    subject_object_equal: false,
+                },
+                0,
+            ),
+        ] {
+            let plan = LayerBgpPlan {
+                atoms: vec![LayerBgpAtom::all_variables(LIKES.to_vec()), ground],
+                joins: Vec::new(),
+            };
+            let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+            assert_eq!(result.result_len, expected_len);
+            verify_layer_bgp(
+                &lc,
+                lc.state.commitment_root,
+                &plan,
+                &result.predicate_ids,
+                &result.result_commitments,
+                result.result_len,
+                &result.proof,
+            )
+            .unwrap();
+            let mut forged = result.proof.clone();
+            forged.atoms[1].m = 1 - forged.atoms[1].m;
+            assert!(verify_layer_bgp(
+                &lc,
+                lc.state.commitment_root,
+                &plan,
+                &result.predicate_ids,
+                &result.result_commitments,
+                result.result_len,
+                &forged,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn layer_bgp_value_subject_is_rejected() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
         // A value literal in the SUBJECT position is rejected.
         let value_subject = LayerBgpPlan {
             atoms: vec![

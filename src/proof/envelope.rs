@@ -19,9 +19,10 @@ use super::filter::{
 use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
 use super::query::{
-    has_ground_result_unit, resolve_result_objects, verify_layer_bgp, verify_result_columns,
-    verify_result_objects, AtomTerm, GroundAbsence, LayerBgpAtom, LayerBgpAtomProof, LayerBgpPlan,
-    LayerBgpProof, ObjectRangeBound, ObjectRangeSpec, RangeAtomSubproof, SecondRangeSubproof,
+    has_ground_result_unit, resolve_result_objects, verify_layer_bgp,
+    verify_layer_bgp_result_log_domain, verify_result_columns, verify_result_objects, AtomTerm,
+    GroundAbsence, LayerBgpAtom, LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectRangeBound,
+    ObjectRangeSpec, RangeAtomSubproof, SecondRangeSubproof,
 };
 use super::range::{
     DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp, RangeSelectProof,
@@ -590,6 +591,7 @@ impl LayerBgpEnvelope {
             result_len,
             &proof,
         )?;
+        verify_layer_bgp_result_log_domain(layer, plan, &proof, result_log_domain)?;
         verify_result_columns(
             &result_commitments,
             &result_columns,
@@ -644,6 +646,12 @@ impl LayerBgpEnvelope {
             &self.result_commitments,
             self.result_len,
             &self.proof,
+        )?;
+        verify_layer_bgp_result_log_domain(
+            layer,
+            plan,
+            &self.proof,
+            self.result_log_domain,
         )?;
         verify_result_columns(
             &self.result_commitments,
@@ -789,7 +797,7 @@ mod tests {
         assert_eq!(result.result_len, 1);
         let result_columns = result.real_columns();
         let query_digest = plan_digest(&plan).unwrap();
-        let envelope = LayerBgpEnvelope::new_verified(
+        let mut envelope = LayerBgpEnvelope::new_verified(
             &layer,
             layer.state.commitment_root,
             &plan,
@@ -806,6 +814,10 @@ mod tests {
         envelope
             .verify(&layer, layer.state.commitment_root, &plan, query_digest)
             .unwrap();
+        envelope.result_log_domain += 1;
+        assert!(envelope
+            .verify(&layer, layer.state.commitment_root, &plan, query_digest)
+            .is_err());
     }
 
     #[test]
