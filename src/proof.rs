@@ -3806,6 +3806,63 @@ pub mod commitment {
         }
 
         #[test]
+        fn every_fixed_width_integer_family_has_exact_monotone_edge_encodings() {
+            use crate::layer::ValueTriple;
+            use dory_pcs::primitives::arithmetic::Field;
+            use tdb_succinct::TdbDataType;
+
+            let encoded = |entry| {
+                let object = CanonicalObject::from_store_object(
+                    &ValueTriple::new_value("", "", entry).object,
+                );
+                let datatype = match &object {
+                    CanonicalObject::Value { datatype, .. } => *datatype,
+                    CanonicalObject::Node(_) => unreachable!(),
+                };
+                let value = node_value_op_value(&object)
+                    .unwrap_or_else(|error| panic!("{:?}: {}; object={:?}", datatype, error, object));
+                (datatype, value)
+            };
+
+            let unsigned = [
+                (encoded(u8::make_entry(&u8::MIN)), CanonicalDatatype::UInt8, 0),
+                (encoded(u8::make_entry(&u8::MAX)), CanonicalDatatype::UInt8, u8::MAX as u64),
+                (encoded(u16::make_entry(&u16::MIN)), CanonicalDatatype::UInt16, 0),
+                (encoded(u16::make_entry(&u16::MAX)), CanonicalDatatype::UInt16, u16::MAX as u64),
+                (encoded(u32::make_entry(&u32::MIN)), CanonicalDatatype::UInt32, 0),
+                (encoded(u32::make_entry(&u32::MAX)), CanonicalDatatype::UInt32, u32::MAX as u64),
+                (encoded(u64::make_entry(&u64::MIN)), CanonicalDatatype::UInt64, 0),
+                (encoded(u64::make_entry(&u64::MAX)), CanonicalDatatype::UInt64, u64::MAX),
+            ];
+            for ((actual_datatype, actual), expected_datatype, expected) in unsigned {
+                assert_eq!(actual_datatype, expected_datatype);
+                assert_eq!(actual, ArkFr::from_u64(expected));
+            }
+
+            macro_rules! signed_edges {
+                ($ty:ty, $datatype:expr, $sign:expr) => {{
+                    let min = encoded(<$ty>::make_entry(&<$ty>::MIN));
+                    let zero_value: $ty = 0;
+                    let zero = encoded(<$ty>::make_entry(&zero_value));
+                    let max = encoded(<$ty>::make_entry(&<$ty>::MAX));
+                    assert_eq!(min.0, $datatype);
+                    assert_eq!(zero.0, $datatype);
+                    assert_eq!(max.0, $datatype);
+                    assert_eq!(min.1, ArkFr::zero());
+                    assert_eq!(zero.1, ArkFr::from_u64($sign));
+                    assert_eq!(
+                        max.1,
+                        ArkFr::from_u64($sign.wrapping_mul(2).wrapping_sub(1)),
+                    );
+                }};
+            }
+            signed_edges!(i8, CanonicalDatatype::Int8, 1u64 << 7);
+            signed_edges!(i16, CanonicalDatatype::Int16, 1u64 << 15);
+            signed_edges!(i32, CanonicalDatatype::Int32, 1u64 << 31);
+            signed_edges!(i64, CanonicalDatatype::Int64, 1u64 << 63);
+        }
+
+        #[test]
         fn node_value_dictionary_opens_for_node_and_value_entries() {
             use crate::proof::argument::{commit_column, Transcript254};
             use crate::proof::dict::{hash_object, prove_dict_membership, verify_dict_membership};
