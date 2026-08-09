@@ -24,6 +24,8 @@
 //! and that swapping the `[col-bits | row-bits]` halves makes verification FAIL.
 
 use std::io;
+#[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+use std::sync::Arc;
 
 use dory_pcs::backends::arkworks::{
     ArkFr, ArkG1, ArkG2, ArkGT, ArkworksPolynomial, Blake2bTranscript, G1Routines, G2Routines,
@@ -153,6 +155,26 @@ impl StoreProverContext<'static> {
             accelerated_tier: None,
         }
     }
+
+    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+    pub fn blitzar(runtime: &Arc<BlitzarRuntime>, tier: ProverSetupTier) -> io::Result<Self> {
+        let setup = prover_setup(tier.log_domain())?;
+        Ok(Self {
+            inner: ProverContext::new(
+                StoreG1Backend::Blitzar(BlitzarG1Backend::new(
+                    Arc::clone(runtime),
+                    &setup.g1_vec,
+                )),
+                RoutineBackend::new(),
+            ),
+            accelerated_tier: Some(tier),
+        })
+    }
+
+    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+    pub fn initialize_blitzar(config: BlitzarRuntimeConfig) -> Arc<BlitzarRuntime> {
+        Arc::new(BlitzarRuntime::initialize(config))
+    }
 }
 
 impl<'runtime> StoreProverContext<'runtime> {
@@ -176,22 +198,6 @@ impl<'runtime> StoreProverContext<'runtime> {
         prove_column_openings_with_context(self, column_tables, r, transcript)
     }
 
-    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
-    pub fn blitzar(runtime: &'runtime BlitzarRuntime, tier: ProverSetupTier) -> io::Result<Self> {
-        let setup = prover_setup(tier.log_domain())?;
-        Ok(Self {
-            inner: ProverContext::new(
-                StoreG1Backend::Blitzar(BlitzarG1Backend::new(runtime, &setup.g1_vec)),
-                RoutineBackend::new(),
-            ),
-            accelerated_tier: Some(tier),
-        })
-    }
-
-    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
-    pub fn initialize_blitzar(config: BlitzarRuntimeConfig) -> BlitzarRuntime {
-        BlitzarRuntime::initialize(config)
-    }
 }
 
 const LABEL_DOMAIN: &[u8] = b"pow/sumcheck/domain";
@@ -1179,6 +1185,7 @@ mod tests {
             num_precomputed_generators: 0,
         });
         let accelerated = StoreProverContext::blitzar(&runtime, ProverSetupTier::Log20).unwrap();
+        drop(runtime);
         let cpu = StoreProverContext::cpu();
         assert_eq!(cpu.accelerated_tier(), None);
         assert_eq!(accelerated.accelerated_tier(), Some(ProverSetupTier::Log20));

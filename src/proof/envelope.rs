@@ -2993,6 +2993,7 @@ mod tests {
             super::super::argument::ProverSetupTier::Log20,
         )
         .unwrap();
+        drop(runtime);
 
         let cpu = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
         let with_context =
