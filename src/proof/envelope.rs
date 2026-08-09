@@ -85,9 +85,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v10 adds the root-derived visible triple-count source (wire tag 12) and generated
-// nonnegative xsd:decimal result descriptor.
-const RECURSIVE_VERSION: u32 = 10;
+// v11 adds the verifier-derived generated-u64 comparison filter (wire tag 13).
+const RECURSIVE_VERSION: u32 = 11;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1715,6 +1714,16 @@ pub enum RelationProofPlanKind {
     /// One generated nonnegative xsd:decimal equal to the complete logical triple set
     /// visible at this immutable layer head. The trusted root binds materialized_count.
     LayerTripleCount,
+    /// Exact row filter for a generated nonnegative integral decimal column. The child
+    /// values are already authenticated and public, so the verifier derives the complete
+    /// filtered relation without a separate polynomial proof.
+    GeneratedU64Filter {
+        input: Box<RelationProofPlan>,
+        column: usize,
+        op: GeneratedU64ComparisonOp,
+        constant: u64,
+        constant_on_left: bool,
+    },
     BagUnion {
         branches: Vec<RelationProofPlan>,
         /// Parent output column -> child output column, once per ordered branch.
@@ -1781,6 +1790,15 @@ pub enum RelationProofPlanKind {
         datatype: CanonicalDatatype,
         kind: GroupExtremaKind,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedU64ComparisonOp {
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1969,6 +1987,21 @@ impl RelationProofPlan {
                 }],
                 false,
             )),
+            RelationProofPlanKind::GeneratedU64Filter { input, column, .. } => {
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                let descriptor = descriptors
+                    .get(*column)
+                    .ok_or_else(|| invalid("generated-u64 filter column out of range"))?;
+                if ground
+                    || descriptor.nullable
+                    || descriptor.namespace != ResultIdNamespace::GeneratedDecimalU64
+                {
+                    return Err(invalid(
+                        "generated-u64 filter requires a nonnullable generated decimal column",
+                    ));
+                }
+                Ok((descriptors, false))
+            }
             RelationProofPlanKind::BagUnion { branches, mappings } => {
                 if branches.len() < 2
                     || branches.len() != mappings.len()
@@ -2215,6 +2248,9 @@ pub struct RecursiveRelationEnvelope {
 pub enum RecursiveRelationProof {
     Bgp(Box<LayerBgpEnvelope>),
     LayerTripleCount,
+    GeneratedU64Filter {
+        input: Box<RecursiveRelationEnvelope>,
+    },
     BagUnion {
         branches: Vec<RecursiveRelationEnvelope>,
         proof: Box<BagUnionProof>,
@@ -2260,6 +2296,65 @@ pub enum RecursiveRelationProof {
         input: Box<RecursiveRelationEnvelope>,
         proof: Box<GroupExtremaProof>,
     },
+}
+
+fn generated_u64_comparison(
+    value: u64,
+    op: GeneratedU64ComparisonOp,
+    constant: u64,
+    constant_on_left: bool,
+) -> bool {
+    let (left, right) = if constant_on_left {
+        (constant, value)
+    } else {
+        (value, constant)
+    };
+    match op {
+        GeneratedU64ComparisonOp::Eq => left == right,
+        GeneratedU64ComparisonOp::Lt => left < right,
+        GeneratedU64ComparisonOp::Le => left <= right,
+        GeneratedU64ComparisonOp::Gt => left > right,
+        GeneratedU64ComparisonOp::Ge => left >= right,
+    }
+}
+
+fn generated_u64_filtered_columns(
+    input: &RecursiveRelationEnvelope,
+    column: usize,
+    op: GeneratedU64ComparisonOp,
+    constant: u64,
+    constant_on_left: bool,
+) -> io::Result<Vec<Vec<ArkFr>>> {
+    let values = input
+        .result_values
+        .get(column)
+        .ok_or_else(|| invalid("generated-u64 filter value column out of range"))?;
+    if values.len() != input.result_len {
+        return Err(invalid("generated-u64 filter input value length mismatch"));
+    }
+    let mut keep = Vec::new();
+    for (row, value) in values.iter().enumerate() {
+        let CanonicalResultValue::GeneratedDecimalU64(value) = value else {
+            return Err(invalid("generated-u64 filter input is not a generated decimal"));
+        };
+        if generated_u64_comparison(*value, op, constant, constant_on_left) {
+            keep.push(row);
+        }
+    }
+    input
+        .result_columns
+        .iter()
+        .map(|input_column| {
+            keep.iter()
+                .map(|row| {
+                    input_column
+                        .get(*row)
+                        .copied()
+                        .ok_or_else(|| invalid("generated-u64 filter input column is short"))
+                })
+                .collect()
+        })
+        .collect()
 }
 
 impl RecursiveRelationEnvelope {
@@ -2418,6 +2513,44 @@ impl RecursiveRelationEnvelope {
                     vec![column],
                     1,
                     1,
+                )
+            }
+            RelationProofPlanKind::GeneratedU64Filter {
+                input,
+                column,
+                op,
+                constant,
+                constant_on_left,
+            } => {
+                let input_envelope =
+                    Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let mut columns = generated_u64_filtered_columns(
+                    &input_envelope,
+                    *column,
+                    *op,
+                    *constant,
+                    *constant_on_left,
+                )?;
+                let n = columns.first().map_or(0, Vec::len);
+                let log_domain = n.max(1).next_power_of_two().max(2).trailing_zeros() as usize;
+                let domain = 1usize << log_domain;
+                for column in &mut columns {
+                    column.resize(domain, ArkFr::zero());
+                }
+                let commitments = columns
+                    .iter()
+                    .map(|column| context.commit_column(column))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::GeneratedU64Filter {
+                        input: Box::new(input_envelope),
+                    },
+                    commitments,
+                    columns,
+                    log_domain,
+                    n,
                 )
             }
             RelationProofPlanKind::Distinct { input, key_columns } => {
@@ -2757,6 +2890,57 @@ impl RecursiveRelationEnvelope {
                         != vec![vec![CanonicalResultValue::GeneratedDecimalU64(count)]]
                 {
                     return Err(invalid("layer triple-count result does not match trusted root"));
+                }
+            }
+            (
+                RecursiveRelationProof::GeneratedU64Filter { input },
+                RelationProofPlanKind::GeneratedU64Filter {
+                    input: input_plan,
+                    column,
+                    op,
+                    constant,
+                    constant_on_left,
+                },
+            ) => {
+                input.verify_bounded(
+                    layer,
+                    expected_root,
+                    input_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let expected_columns = generated_u64_filtered_columns(
+                    input,
+                    *column,
+                    *op,
+                    *constant,
+                    *constant_on_left,
+                )?;
+                let expected_len = expected_columns.first().map_or(0, Vec::len);
+                let expected_log = expected_len
+                    .max(1)
+                    .next_power_of_two()
+                    .max(2)
+                    .trailing_zeros() as usize;
+                if self.result_len != expected_len
+                    || self.result_log_domain != expected_log
+                    || self.result_columns != expected_columns
+                {
+                    return Err(invalid(
+                        "generated-u64 filter result is not the exact derived selection",
+                    ));
+                }
+                let domain = 1usize << expected_log;
+                let expected_commitments = expected_columns
+                    .iter()
+                    .map(|column| {
+                        let mut padded = column.clone();
+                        padded.resize(domain, ArkFr::zero());
+                        commit_column(&padded)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                if self.result_commitments != expected_commitments {
+                    return Err(invalid("generated-u64 filter commitment mismatch"));
                 }
             }
             (RecursiveRelationProof::Bgp(envelope), RelationProofPlanKind::Bgp(bgp)) => {
@@ -3234,6 +3418,10 @@ impl RecursiveRelationEnvelope {
             RecursiveRelationProof::LayerTripleCount => {
                 12u8.put(out)?;
             }
+            RecursiveRelationProof::GeneratedU64Filter { input } => {
+                13u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+            }
             RecursiveRelationProof::Bgp(envelope) => {
                 0u8.put(out)?;
                 envelope.put(out)?;
@@ -3323,6 +3511,9 @@ impl RecursiveRelationEnvelope {
         let query_digest = ProofHash::get(reader)?;
         let proof = match u8::get(reader)? {
             12 => RecursiveRelationProof::LayerTripleCount,
+            13 => RecursiveRelationProof::GeneratedU64Filter {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+            },
             0 => RecursiveRelationProof::Bgp(Box::<LayerBgpEnvelope>::get(reader)?),
             1 => {
                 let len = usize::get(reader)?;
@@ -3899,6 +4090,98 @@ mod tests {
         assert!(decoded
             .verify(&head, head.state.commitment_root, &wrong_plan)
             .is_err());
+    }
+
+    #[test]
+    fn recursive_generated_u64_filter_derives_exact_comparison_and_rejects_tamper() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for object in ["x", "y", "z"] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri("a"),
+                    &iri("p"),
+                    &iri(object),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let source = RelationProofPlan {
+            query_digest: [97u8; 32],
+            kind: RelationProofPlanKind::LayerTripleCount,
+        };
+        let plan = |op, constant, constant_on_left| RelationProofPlan {
+            query_digest: [98u8; 32],
+            kind: RelationProofPlanKind::GeneratedU64Filter {
+                input: Box::new(source.clone()),
+                column: 0,
+                op,
+                constant,
+                constant_on_left,
+            },
+        };
+
+        for (op, constant, constant_on_left, expected_len) in [
+            (GeneratedU64ComparisonOp::Eq, 3, false, 1),
+            (GeneratedU64ComparisonOp::Eq, 2, false, 0),
+            (GeneratedU64ComparisonOp::Gt, 0, false, 1),
+            (GeneratedU64ComparisonOp::Ge, 3, false, 1),
+            (GeneratedU64ComparisonOp::Lt, u64::MAX, false, 1),
+            (GeneratedU64ComparisonOp::Le, u64::MAX, false, 1),
+            (GeneratedU64ComparisonOp::Lt, 3, true, 0),
+            (GeneratedU64ComparisonOp::Le, 3, true, 1),
+        ] {
+            let plan = plan(op, constant, constant_on_left);
+            let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+            envelope
+                .verify(&layer, layer.state.commitment_root, &plan)
+                .unwrap();
+            assert_eq!(envelope.result_len, expected_len);
+            let decoded = RecursiveRelationEnvelope::decode(&envelope.encode().unwrap()).unwrap();
+            decoded
+                .verify(&layer, layer.state.commitment_root, &plan)
+                .unwrap();
+        }
+
+        let true_plan = plan(GeneratedU64ComparisonOp::Ge, 3, false);
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &true_plan).unwrap();
+        let wrong_operator = plan(GeneratedU64ComparisonOp::Gt, 3, false);
+        assert!(envelope
+            .verify(&layer, layer.state.commitment_root, &wrong_operator)
+            .is_err());
+        let wrong_operand_order = plan(GeneratedU64ComparisonOp::Lt, 3, true);
+        assert!(envelope
+            .verify(&layer, layer.state.commitment_root, &wrong_operand_order)
+            .is_err());
+
+        let mut tampered = envelope.clone();
+        tampered.result_columns[0][0] = ArkFr::from_u64(4);
+        tampered.result_commitments[0] =
+            commit_column(&[ArkFr::from_u64(4), ArkFr::zero()]).unwrap();
+        tampered.result_values =
+            vec![vec![CanonicalResultValue::GeneratedDecimalU64(4)]];
+        assert!(tampered
+            .verify(&layer, layer.state.commitment_root, &true_plan)
+            .is_err());
+
+        let empty_store = open_sync_memory_store();
+        let empty_layer = empty_store
+            .create_base_layer()
+            .unwrap()
+            .commit()
+            .unwrap()
+            .proof_commitment()
+            .unwrap();
+        let zero = plan(GeneratedU64ComparisonOp::Eq, 0, false);
+        let zero_envelope = RecursiveRelationEnvelope::prove(&empty_layer, &zero).unwrap();
+        zero_envelope
+            .verify(&empty_layer, empty_layer.state.commitment_root, &zero)
+            .unwrap();
+        assert_eq!(zero_envelope.result_len, 1);
+        assert_eq!(
+            zero_envelope.result_values,
+            vec![vec![CanonicalResultValue::GeneratedDecimalU64(0)]]
+        );
     }
 
     #[test]
