@@ -8,7 +8,7 @@
 //! column is dictionary-authenticated and compared against the chosen value; the
 //! resulting range-selection commitment must be the whole real-row prefix.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
@@ -176,6 +176,17 @@ pub fn prove_group_extrema(
     let n_dict = layer.state.node_value_count as usize;
     if n_dict != layer.node_value_catalog.len() || n_dict == 0 { return Err(invalid("group-extrema dictionary count mismatch or empty")); }
     let dict_log = dict_id.len().trailing_zeros() as usize;
+    // Equality compaction preserves the input domain, so every group relocates the
+    // same dictionary columns to the same domain.  Commit those immutable columns
+    // once instead of repeating three full MSMs per group.
+    let d_log = input.log_domain.max(dict_log);
+    let dict_id_at_d = padded(&dict_id, d_log);
+    let dict_value_at_d = padded(&dict_value, d_log);
+    let dict_datatype_at_d = padded(&dict_datatype, d_log);
+    let com_dict_id_at_d = commit_column(&dict_id_at_d)?;
+    let com_dict_value_at_d = commit_column(&dict_value_at_d)?;
+    let com_dict_datatype_at_d = commit_column(&dict_datatype_at_d)?;
+    let mut whole_commitments = BTreeMap::new();
     let mut entries = Vec::with_capacity(result_rows.len());
     for &(key, extremum) in result_rows {
         let group_constraint = RelationEqualityConstraint::ColumnConstant { column: key_column, value: ArkFr::from_u64(key) };
@@ -186,15 +197,11 @@ pub fn prove_group_extrema(
         let membership = prove_relation_equality(&group_witness, &member_constraint, transcript)?;
         if membership.n == 0 { return Err(invalid("group-extrema result is not a member of its group")); }
 
-        let d_log = group.log_domain.max(dict_log);
+        if group.log_domain != input.log_domain {
+            return Err(invalid("group-extrema equality changed the input domain"));
+        }
         let value_at_d = padded(&group.columns[value_column], d_log);
-        let dict_id_at_d = padded(&dict_id, d_log);
-        let dict_value_at_d = padded(&dict_value, d_log);
-        let dict_datatype_at_d = padded(&dict_datatype, d_log);
         let com_value_at_d = commit_column(&value_at_d)?;
-        let com_dict_id_at_d = commit_column(&dict_id_at_d)?;
-        let com_dict_value_at_d = commit_column(&dict_value_at_d)?;
-        let com_dict_datatype_at_d = commit_column(&dict_datatype_at_d)?;
         let relocate_value = prove_column_relocation(&group.columns[value_column], &group.commitments[value_column], &value_at_d, &com_value_at_d, transcript)?;
         let relocate_dict_id = prove_column_relocation(&dict_id, &layer.node_value_dict_commitments.1, &dict_id_at_d, &com_dict_id_at_d, transcript)?;
         let relocate_dict_value = prove_column_relocation(&dict_value, &layer.node_value_dict_range_commitments.0, &dict_value_at_d, &com_dict_value_at_d, transcript)?;
@@ -204,9 +211,16 @@ pub fn prove_group_extrema(
             &value_at_d, &com_value_at_d, &dict_id_at_d, &dict_value_at_d, &dict_datatype_at_d,
             &com_dict_id_at_d, &com_dict_value_at_d, &com_dict_datatype_at_d, n_dict,
             ArkFr::from_u64(datatype as u64), kind.op(), c, OBJECT_RANGE_B_BITS, group.n, transcript)?;
-        let mut whole = vec![ArkFr::zero(); 1usize << d_log];
-        whole[..group.n].fill(ArkFr::one());
-        if com_range_selection != commit_column(&whole)? { return Err(invalid("group-extrema candidate does not dominate its group")); }
+        let expected_whole = if let Some(commitment) = whole_commitments.get(&group.n) {
+            *commitment
+        } else {
+            let mut whole = vec![ArkFr::zero(); 1usize << d_log];
+            whole[..group.n].fill(ArkFr::one());
+            let commitment = commit_column(&whole)?;
+            whole_commitments.insert(group.n, commitment);
+            commitment
+        };
+        if com_range_selection != expected_whole { return Err(invalid("group-extrema candidate does not dominate its group")); }
         entries.push(GroupExtremaEntryProof {
             group: group.proof, group_commitments: group.commitments, group_len: group.n,
             membership: membership.proof, membership_commitments: membership.commitments, membership_len: membership.n,
@@ -244,6 +258,8 @@ pub fn verify_group_extrema(
     if result_rows.is_empty() { return Ok(()); }
     let dict_len = n_dict.next_power_of_two().max(2);
     let dict_log = dict_len.trailing_zeros() as usize;
+    let d_log = input.log_domain.max(dict_log);
+    let mut whole_commitments = BTreeMap::new();
     let mut total = 0usize;
     for (&(key, extremum), entry) in result_rows.iter().zip(&proof.entries) {
         if entry.group_len == 0 { return Err(invalid("group-extrema empty group")); }
@@ -254,7 +270,6 @@ pub fn verify_group_extrema(
         let mc = RelationEqualityConstraint::ColumnConstant { column: value_column, value: ArkFr::from_u64(extremum) };
         if entry.membership_len == 0 { return Err(invalid("group-extrema missing member")); }
         verify_relation_equality(&group, &mc, &entry.membership_commitments, entry.membership_len, input.log_domain, &entry.membership, transcript)?;
-        let d_log = input.log_domain.max(dict_log);
         verify_column_relocation(&entry.group_commitments[value_column], input.log_domain, &entry.com_value_at_d, d_log, &entry.relocate_value, transcript)?;
         verify_column_relocation(&view.node_value_dict_commitments.1, dict_log, &entry.com_dict_id_at_d, d_log, &entry.relocate_dict_id, transcript)?;
         verify_column_relocation(&view.node_value_dict_range_commitments.0, dict_log, &entry.com_dict_value_at_d, d_log, &entry.relocate_dict_value, transcript)?;
@@ -263,8 +278,16 @@ pub fn verify_group_extrema(
         verify_object_range_select(&entry.com_value_at_d, &entry.com_dict_id_at_d, &entry.com_dict_value_at_d, &entry.com_dict_datatype_at_d,
             n_dict, ArkFr::from_u64(datatype as u64), kind.op(), c, OBJECT_RANGE_B_BITS, entry.group_len,
             &entry.com_range_selection, &entry.range, transcript)?;
-        let mut whole = vec![ArkFr::zero(); 1usize << d_log]; whole[..entry.group_len].fill(ArkFr::one());
-        if entry.com_range_selection != commit_column(&whole)? { return Err(invalid("group-extrema candidate does not dominate its group")); }
+        let expected_whole = if let Some(commitment) = whole_commitments.get(&entry.group_len) {
+            *commitment
+        } else {
+            let mut whole = vec![ArkFr::zero(); 1usize << d_log];
+            whole[..entry.group_len].fill(ArkFr::one());
+            let commitment = commit_column(&whole)?;
+            whole_commitments.insert(entry.group_len, commitment);
+            commitment
+        };
+        if entry.com_range_selection != expected_whole { return Err(invalid("group-extrema candidate does not dominate its group")); }
     }
     if total != input.n { return Err(invalid("group-extrema groups do not exactly cover input")); }
     Ok(())
