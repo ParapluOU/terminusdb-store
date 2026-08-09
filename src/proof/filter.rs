@@ -33,9 +33,9 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    commit_column, prove_column_openings, prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ClaimShape, ColumnOpening, Expr, Operand, SumcheckClaim, SumcheckProof, SumcheckShape, Term,
-    Transcript254,
+    commit_column, prove_sumcheck, verify_column_openings, verify_sumcheck,
+    ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
+    SumcheckShape, Term, Transcript254,
 };
 use super::invalid;
 use super::logup::{
@@ -165,7 +165,25 @@ pub(crate) fn honest_witness(
 /// Prove the filter indicator for an EXPLICIT witness `(sel, w)`. The honest
 /// entry point [`prove_filter_indicator`] derives the witness and calls this;
 /// tests use it to inject malicious witnesses.
+#[cfg(test)]
 pub(crate) fn prove_filter_with_witness(
+    predicate_column: &[ArkFr],
+    pred: ArkFr,
+    real_rows: usize,
+    sel: &[ArkFr],
+    w: &[ArkFr],
+    predicate_commitment: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(FilterProof, ArkGT, ArkGT, ArkFr)> {
+    prove_filter_with_witness_and_context(
+        &StoreProverContext::cpu(), predicate_column, pred, real_rows, sel, w,
+        predicate_commitment, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_filter_with_witness_and_context(
+    context: &StoreProverContext<'_>,
     predicate_column: &[ArkFr],
     pred: ArkFr,
     real_rows: usize,
@@ -186,8 +204,8 @@ pub(crate) fn prove_filter_with_witness(
     }
     let k = size.trailing_zeros() as usize;
 
-    let sel_commitment = commit_column(sel)?;
-    let w_commitment = commit_column(w)?;
+    let sel_commitment = context.commit_column(sel)?;
+    let w_commitment = context.commit_column(w)?;
 
     // Bind every column commitment BEFORE the zero-check point is drawn.
     transcript.append_group(b"pow/filter/com-p", predicate_commitment);
@@ -197,7 +215,7 @@ pub(crate) fn prove_filter_with_witness(
     let shape = filter_shape(k, real_rows, pred);
     let columns = vec![predicate_column.to_vec(), sel.to_vec(), w.to_vec()];
     let (sumcheck, r, evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok((
         FilterProof { sumcheck, opening },
@@ -218,9 +236,23 @@ pub fn prove_filter_indicator(
     predicate_commitment: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<(FilterProof, ArkGT, ArkGT, ArkFr)> {
+    prove_filter_indicator_with_context(
+        &StoreProverContext::cpu(), predicate_column, pred, real_rows, predicate_commitment,
+        transcript,
+    )
+}
+
+pub fn prove_filter_indicator_with_context(
+    context: &StoreProverContext<'_>,
+    predicate_column: &[ArkFr],
+    pred: ArkFr,
+    real_rows: usize,
+    predicate_commitment: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(FilterProof, ArkGT, ArkGT, ArkFr)> {
     let (sel, w) = honest_witness(predicate_column, pred, real_rows);
-    prove_filter_with_witness(
-        predicate_column,
+    prove_filter_with_witness_and_context(
+        context, predicate_column,
         pred,
         real_rows,
         &sel,
@@ -702,7 +734,8 @@ pub(crate) fn atom_kept_columns(
 /// kept-source INPUT columns; `w`/`cstar`/`dstar` are always derived honestly (`w`
 /// from the Fiat-Shamir `beta_c`).
 #[allow(clippy::too_many_arguments)]
-fn prove_compacted_with_witness(
+fn prove_compacted_with_witness_and_context(
+    context: &StoreProverContext<'_>,
     spec: &AtomFilterSpec,
     s: &[ArkFr],
     p: &[ArkFr],
@@ -738,13 +771,13 @@ fn prove_compacted_with_witness(
 
     // Round 1: commit the DATA columns (sel + kept outputs + the unit input if a ground
     // atom), bind the spec + all data commitments, then draw the challenges.
-    let com_sel = commit_column(sel)?;
+    let com_sel = context.commit_column(sel)?;
     let mut com_kept = Vec::with_capacity(num_kept);
     for column in kept_out {
-        com_kept.push(commit_column(column)?);
+        com_kept.push(context.commit_column(column)?);
     }
     let com_unit_in = if has_unit {
-        Some(commit_column(&sources[0])?)
+        Some(context.commit_column(&sources[0])?)
     } else {
         None
     };
@@ -769,9 +802,9 @@ fn prove_compacted_with_witness(
     let w = atom_w(spec, s, p, o, real_rows, beta_c);
     let cstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(sources)));
     let dstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(kept_out)));
-    let com_w = commit_column(&w)?;
-    let com_cstar = commit_column(&cstar)?;
-    let com_dstar = commit_column(&dstar)?;
+    let com_w = context.commit_column(&w)?;
+    let com_cstar = context.commit_column(&cstar)?;
+    let com_dstar = context.commit_column(&dstar)?;
     transcript.append_group(b"pow/atom/com-w", &com_w);
     transcript.append_group(b"pow/atom/com-cstar", &com_cstar);
     transcript.append_group(b"pow/atom/com-dstar", &com_dstar);
@@ -787,7 +820,7 @@ fn prove_compacted_with_witness(
         columns.push(sources[0].clone());
     }
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok((
         FullFilterProof {
@@ -803,9 +836,45 @@ fn prove_compacted_with_witness(
     ))
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn prove_compacted_with_witness(
+    spec: &AtomFilterSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    real_rows: usize,
+    sel: &[ArkFr],
+    sources: &[Vec<ArkFr>],
+    kept_out: &[Vec<ArkFr>],
+    output_len: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(FullFilterProof, Vec<ArkGT>, usize)> {
+    prove_compacted_with_witness_and_context(
+        &StoreProverContext::cpu(),
+        spec,
+        s,
+        p,
+        o,
+        real_rows,
+        sel,
+        sources,
+        kept_out,
+        output_len,
+        com_s,
+        com_p,
+        com_o,
+        transcript,
+    )
+}
+
 /// Honest selection + compaction for a spec with at least one constant.
 #[allow(clippy::too_many_arguments)]
 fn prove_compacted(
+    context: &StoreProverContext<'_>,
     spec: &AtomFilterSpec,
     s: &[ArkFr],
     p: &[ArkFr],
@@ -819,8 +888,9 @@ fn prove_compacted(
     let sources = kept_source_columns(spec, s, p, o);
     let sel = atom_sel(spec, s, p, o, real_rows);
     let (kept_out, m) = compact_columns(&sources, &sel);
-    prove_compacted_with_witness(
-        spec, s, p, o, real_rows, &sel, &sources, &kept_out, m, com_s, com_p, com_o, transcript,
+    prove_compacted_with_witness_and_context(
+        context, spec, s, p, o, real_rows, &sel, &sources, &kept_out, m, com_s, com_p, com_o,
+        transcript,
     )
 }
 
@@ -842,6 +912,24 @@ pub fn prove_atom_filter(
     com_o: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<(AtomFilterProof, Vec<ArkGT>, usize)> {
+    prove_atom_filter_with_context(
+        &StoreProverContext::cpu(), spec, s, p, o, real_rows, com_s, com_p, com_o, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_atom_filter_with_context(
+    context: &StoreProverContext<'_>,
+    spec: &AtomFilterSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    real_rows: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(AtomFilterProof, Vec<ArkGT>, usize)> {
     spec.validate()?;
     if spec.constants.is_empty() {
         let com_kept = spec
@@ -852,7 +940,7 @@ pub fn prove_atom_filter(
         return Ok((AtomFilterProof::Identity, com_kept, real_rows));
     }
     let (inner, com_kept, m) =
-        prove_compacted(spec, s, p, o, real_rows, com_s, com_p, com_o, transcript)?;
+        prove_compacted(context, spec, s, p, o, real_rows, com_s, com_p, com_o, transcript)?;
     Ok((AtomFilterProof::Compacted(inner), com_kept, m))
 }
 
@@ -985,9 +1073,27 @@ pub fn prove_filter(
     com_o: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<(FullFilterProof, ArkGT, ArkGT, usize)> {
+    prove_filter_with_context(
+        &StoreProverContext::cpu(), s, p, o, pred, real_rows, com_s, com_p, com_o, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_filter_with_context(
+    context: &StoreProverContext<'_>,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    pred: ArkFr,
+    real_rows: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(FullFilterProof, ArkGT, ArkGT, usize)> {
     let spec = AtomFilterSpec::predicate(pred);
     let (inner, com_kept, m) =
-        prove_compacted(&spec, s, p, o, real_rows, com_s, com_p, com_o, transcript)?;
+        prove_compacted(context, &spec, s, p, o, real_rows, com_s, com_p, com_o, transcript)?;
     Ok((inner, com_kept[0], com_kept[1], m))
 }
 
@@ -1079,6 +1185,24 @@ pub fn prove_selection_only(
     com_o: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<(SelectionOnlyProof, ArkGT, Vec<ArkFr>)> {
+    prove_selection_only_with_context(
+        &StoreProverContext::cpu(), spec, s, p, o, real_rows, com_s, com_p, com_o, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_selection_only_with_context(
+    context: &StoreProverContext<'_>,
+    spec: &AtomFilterSpec,
+    s: &[ArkFr],
+    p: &[ArkFr],
+    o: &[ArkFr],
+    real_rows: usize,
+    com_s: &ArkGT,
+    com_p: &ArkGT,
+    com_o: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(SelectionOnlyProof, ArkGT, Vec<ArkFr>)> {
     spec.validate()?;
     if spec.constants.is_empty() {
         return Err(invalid("selection-only requires at least one constant position"));
@@ -1096,7 +1220,7 @@ pub fn prove_selection_only(
     let num_vars = size.trailing_zeros() as usize;
 
     let sel = atom_sel(spec, s, p, o, real_rows);
-    let com_sel = commit_column(&sel)?;
+    let com_sel = context.commit_column(&sel)?;
 
     bind_spec(transcript, spec);
     transcript.append_bytes(SO_LABEL_DOMAIN, b"parture/proof-of-woql/selection-only/v0");
@@ -1107,13 +1231,13 @@ pub fn prove_selection_only(
     let beta_c = transcript.challenge_scalar(SO_LABEL_BETA_C);
 
     let w = atom_w(spec, s, p, o, real_rows, beta_c);
-    let com_w = commit_column(&w)?;
+    let com_w = context.commit_column(&w)?;
     transcript.append_group(b"pow/so/com-w", &com_w);
 
     let shape = selection_only_shape(spec, num_vars, real_rows, beta_c);
     let columns = vec![s.to_vec(), p.to_vec(), o.to_vec(), sel.clone(), w];
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok((
         SelectionOnlyProof {
@@ -1223,6 +1347,17 @@ pub fn prove_boolean_product(
     com_b: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<(BooleanProductProof, ArkGT)> {
+    prove_boolean_product_with_context(&StoreProverContext::cpu(), a, b, com_a, com_b, transcript)
+}
+
+pub fn prove_boolean_product_with_context(
+    context: &StoreProverContext<'_>,
+    a: &[ArkFr],
+    b: &[ArkFr],
+    com_a: &ArkGT,
+    com_b: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(BooleanProductProof, ArkGT)> {
     let size = a.len();
     if b.len() != size {
         return Err(invalid("boolean-product column length mismatch"));
@@ -1232,7 +1367,7 @@ pub fn prove_boolean_product(
     }
     let num_vars = size.trailing_zeros() as usize;
     let sel: Vec<ArkFr> = a.iter().zip(b.iter()).map(|(x, y)| *x * *y).collect();
-    let com_sel = commit_column(&sel)?;
+    let com_sel = context.commit_column(&sel)?;
 
     transcript.append_bytes(PR_LABEL_DOMAIN, b"parture/proof-of-woql/bool-product/v0");
     transcript.append_group(b"pow/prod/com-a", com_a);
@@ -1242,7 +1377,7 @@ pub fn prove_boolean_product(
     let shape = boolean_product_shape(num_vars);
     let columns = vec![a.to_vec(), b.to_vec(), sel];
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
     Ok((BooleanProductProof { sumcheck, opening }, com_sel))
 }
 
@@ -1378,6 +1513,19 @@ pub fn prove_compaction_only(
     com_sel: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<(CompactionOnlyProof, Vec<ArkGT>, Vec<Vec<ArkFr>>, usize)> {
+    prove_compaction_only_with_context(
+        &StoreProverContext::cpu(), sources, source_commitments, sel, com_sel, transcript,
+    )
+}
+
+pub fn prove_compaction_only_with_context(
+    context: &StoreProverContext<'_>,
+    sources: &[Vec<ArkFr>],
+    source_commitments: &[ArkGT],
+    sel: &[ArkFr],
+    com_sel: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<(CompactionOnlyProof, Vec<ArkGT>, Vec<Vec<ArkFr>>, usize)> {
     let num_kept = sources.len();
     if num_kept == 0 {
         return Err(invalid("compaction-only needs at least one kept column"));
@@ -1398,7 +1546,7 @@ pub fn prove_compaction_only(
     let (kept_out, m) = compact_columns(sources, sel);
     let mut com_kept = Vec::with_capacity(num_kept);
     for col in &kept_out {
-        com_kept.push(commit_column(col)?);
+        com_kept.push(context.commit_column(col)?);
     }
 
     // Round 1: bind the data commitments, then draw the LogUp challenges.
@@ -1409,8 +1557,8 @@ pub fn prove_compaction_only(
     // Round 2: derived reciprocals, bound AFTER the challenges.
     let cstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(sources)));
     let dstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(&kept_out)));
-    let com_cstar = commit_column(&cstar)?;
-    let com_dstar = commit_column(&dstar)?;
+    let com_cstar = context.commit_column(&cstar)?;
+    let com_dstar = context.commit_column(&dstar)?;
     transcript.append_group(b"pow/co/com-cstar", &com_cstar);
     transcript.append_group(b"pow/co/com-dstar", &com_dstar);
 
@@ -1421,7 +1569,7 @@ pub fn prove_compaction_only(
     columns.push(cstar);
     columns.push(dstar);
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok((
         CompactionOnlyProof {

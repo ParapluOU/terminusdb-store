@@ -34,19 +34,22 @@ use dory_pcs::primitives::arithmetic::{Field, Group};
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    commit_column, prove_column_openings, prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ClaimShape, ColumnOpening, Expr, Operand, SumcheckClaim, SumcheckProof, SumcheckShape, Term,
-    Transcript254,
+    prove_sumcheck, verify_column_openings, verify_sumcheck,
+    ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
+    SumcheckShape, Term, Transcript254,
 };
-use super::count::{prove_count_identity, verify_count_identity, CountProof};
+#[cfg(test)]
+use super::argument::commit_column;
+use super::count::{prove_count_identity_with_context, verify_count_identity, CountProof};
 use super::invalid;
 use super::logup::{masked_multiset_link_claim, reciprocal_witness, rlc_fold};
 use super::membership::{
-    prove_membership_with_mult_with_witness, verify_membership_with_mult, MembershipProof,
+    prove_membership_with_mult_with_witness_and_context, verify_membership_with_mult,
+    MembershipProof,
 };
 use super::sort::{
-    prove_strictly_sorted, prove_strictly_sorted_bits, verify_strictly_sorted,
-    verify_strictly_sorted_bits, SortedProof,
+    prove_strictly_sorted_bits_with_context, prove_strictly_sorted_with_context,
+    verify_strictly_sorted, verify_strictly_sorted_bits, SortedProof,
 };
 
 #[inline]
@@ -349,7 +352,8 @@ fn slices(cols: &[Vec<ArkFr>]) -> Vec<&[ArkFr]> {
 
 /// Prove distinct-valid-pairs for EXPLICIT padded columns + multiplicities + radix.
 #[allow(clippy::too_many_arguments)]
-fn prove_binary_pairs(
+fn prove_binary_pairs_with_context(
+    context: &StoreProverContext<'_>,
     cols: &JoinColumns,
     mult_l_in: &[ArkFr],
     mult_r_in: &[ArkFr],
@@ -368,8 +372,8 @@ fn prove_binary_pairs(
     let num_vars = n.trailing_zeros() as usize;
     let idx: Vec<ArkFr> = (0..n).map(fr).collect();
 
-    let mult_l_commitment = commit_column(mult_l_in)?;
-    let mult_r_commitment = commit_column(mult_r_in)?;
+    let mult_l_commitment = context.commit_column(mult_l_in)?;
+    let mult_r_commitment = context.commit_column(mult_r_in)?;
 
     // Round 1: bind the data columns + multiplicities, draw fresh challenges.
     bind_pairs_data(transcript, com);
@@ -398,10 +402,10 @@ fn prove_binary_pairs(
     let rec_cand_l = reciprocal_witness(alpha_l, &rlc_fold(beta_l, &left_cand));
     let rec_src_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &right_src));
     let rec_cand_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &right_cand));
-    let rec_src_l_commitment = commit_column(&rec_src_l)?;
-    let rec_cand_l_commitment = commit_column(&rec_cand_l)?;
-    let rec_src_r_commitment = commit_column(&rec_src_r)?;
-    let rec_cand_r_commitment = commit_column(&rec_cand_r)?;
+    let rec_src_l_commitment = context.commit_column(&rec_src_l)?;
+    let rec_cand_l_commitment = context.commit_column(&rec_cand_l)?;
+    let rec_src_r_commitment = context.commit_column(&rec_src_r)?;
+    let rec_cand_r_commitment = context.commit_column(&rec_cand_r)?;
     transcript.append_group(b"pow/join2/com-rec-src-l", &rec_src_l_commitment);
     transcript.append_group(b"pow/join2/com-rec-cand-l", &rec_cand_l_commitment);
     transcript.append_group(b"pow/join2/com-rec-src-r", &rec_src_r_commitment);
@@ -426,7 +430,7 @@ fn prove_binary_pairs(
     columns.push(rec_src_r);
     columns.push(rec_cand_r);
     let (membership_sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let membership_opening = prove_column_openings(&columns, &r, transcript)?;
+    let membership_opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     // Combined-index strict monotonicity, homomorphic com(i_eval).
     let radix_fr = fr(radix);
@@ -434,7 +438,8 @@ fn prove_binary_pairs(
         .map(|i| radix_fr * cols.rho_l[i] + cols.rho_r[i])
         .collect();
     let com_i_eval = com.rho_l.scale(&radix_fr).add(&com.rho_r);
-    let sorted = prove_strictly_sorted(&i_eval, m_j, &com_i_eval, transcript)?;
+    let sorted =
+        prove_strictly_sorted_with_context(context, &i_eval, m_j, &com_i_eval, transcript)?;
 
     Ok(BinaryPairsProof {
         membership_sumcheck,
@@ -447,6 +452,33 @@ fn prove_binary_pairs(
         rec_cand_r_commitment,
         sorted,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn prove_binary_pairs(
+    cols: &JoinColumns,
+    mult_l_in: &[ArkFr],
+    mult_r_in: &[ArkFr],
+    n_r: usize,
+    n_s: usize,
+    m_j: usize,
+    radix: usize,
+    com: &BinaryJoinCommitments,
+    transcript: &mut Transcript254,
+) -> io::Result<BinaryPairsProof> {
+    prove_binary_pairs_with_context(
+        &StoreProverContext::cpu(),
+        cols,
+        mult_l_in,
+        mult_r_in,
+        n_r,
+        n_s,
+        m_j,
+        radix,
+        com,
+        transcript,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -606,26 +638,39 @@ pub fn binary_join_commitments(
     s_other: &[&[ArkFr]],
     witness: &BinaryJoinWitness,
 ) -> io::Result<BinaryJoinCommitments> {
+    binary_join_commitments_with_context(
+        &StoreProverContext::cpu(), r_key, r_other, s_key, s_other, witness,
+    )
+}
+
+pub fn binary_join_commitments_with_context(
+    context: &StoreProverContext<'_>,
+    r_key: &[ArkFr],
+    r_other: &[&[ArkFr]],
+    s_key: &[ArkFr],
+    s_other: &[&[ArkFr]],
+    witness: &BinaryJoinWitness,
+) -> io::Result<BinaryJoinCommitments> {
     let n = binary_join_domain(r_key.len(), s_key.len(), witness.m_j, witness.n_u)?;
     let commit_vec = |cols: &[Vec<ArkFr>]| -> io::Result<Vec<ArkGT>> {
-        cols.iter().map(|c| commit_column(&padded(c, n))).collect()
+        cols.iter().map(|c| context.commit_column(&padded(c, n))).collect()
     };
     let commit_ref_vec = |cols: &[&[ArkFr]]| -> io::Result<Vec<ArkGT>> {
-        cols.iter().map(|c| commit_column(&padded(c, n))).collect()
+        cols.iter().map(|c| context.commit_column(&padded(c, n))).collect()
     };
     Ok(BinaryJoinCommitments {
-        r_key: commit_column(&padded(r_key, n))?,
+        r_key: context.commit_column(&padded(r_key, n))?,
         r_other: commit_ref_vec(r_other)?,
-        s_key: commit_column(&padded(s_key, n))?,
+        s_key: context.commit_column(&padded(s_key, n))?,
         s_other: commit_ref_vec(s_other)?,
         r_other_out: commit_vec(&witness.r_other_out)?,
-        key: commit_column(&padded(&witness.key, n))?,
+        key: context.commit_column(&padded(&witness.key, n))?,
         s_other_out: commit_vec(&witness.s_other_out)?,
-        rho_l: commit_column(&padded(&witness.rho_l, n))?,
-        rho_r: commit_column(&padded(&witness.rho_r, n))?,
-        u: commit_column(&padded(&witness.u, n))?,
-        w_l: commit_column(&padded(&witness.w_l, n))?,
-        w_r: commit_column(&padded(&witness.w_r, n))?,
+        rho_l: context.commit_column(&padded(&witness.rho_l, n))?,
+        rho_r: context.commit_column(&padded(&witness.rho_r, n))?,
+        u: context.commit_column(&padded(&witness.u, n))?,
+        w_l: context.commit_column(&padded(&witness.w_l, n))?,
+        w_r: context.commit_column(&padded(&witness.w_r, n))?,
     })
 }
 
@@ -685,7 +730,23 @@ pub fn prove_binary_join(
     com: &BinaryJoinCommitments,
     transcript: &mut Transcript254,
 ) -> io::Result<(BinaryJoinProof, Vec<ArkGT>, usize)> {
-    prove_binary_join_with_key_bits(r_key, r_other, s_key, s_other, 64, com, transcript)
+    prove_binary_join_with_context(
+        &StoreProverContext::cpu(), r_key, r_other, s_key, s_other, com, transcript,
+    )
+}
+
+pub fn prove_binary_join_with_context(
+    context: &StoreProverContext<'_>,
+    r_key: &[ArkFr],
+    r_other: &[&[ArkFr]],
+    s_key: &[ArkFr],
+    s_other: &[&[ArkFr]],
+    com: &BinaryJoinCommitments,
+    transcript: &mut Transcript254,
+) -> io::Result<(BinaryJoinProof, Vec<ArkGT>, usize)> {
+    prove_binary_join_with_key_bits_and_context(
+        context, r_key, r_other, s_key, s_other, 64, com, transcript,
+    )
 }
 
 /// Prove a join whose canonical integer key representation has the given bit width.
@@ -698,10 +759,26 @@ pub fn prove_binary_join_with_key_bits(
     com: &BinaryJoinCommitments,
     transcript: &mut Transcript254,
 ) -> io::Result<(BinaryJoinProof, Vec<ArkGT>, usize)> {
+    prove_binary_join_with_key_bits_and_context(
+        &StoreProverContext::cpu(), r_key, r_other, s_key, s_other, key_bits, com, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_binary_join_with_key_bits_and_context(
+    context: &StoreProverContext<'_>,
+    r_key: &[ArkFr],
+    r_other: &[&[ArkFr]],
+    s_key: &[ArkFr],
+    s_other: &[&[ArkFr]],
+    key_bits: usize,
+    com: &BinaryJoinCommitments,
+    transcript: &mut Transcript254,
+) -> io::Result<(BinaryJoinProof, Vec<ArkGT>, usize)> {
     let witness = compute_binary_join(r_key, r_other, s_key, s_other);
     let radix = combined_index_radix(r_key.len(), s_key.len())?;
     let proof = prove_binary_join_with_witness_and_key_bits(
-        r_key, r_other, s_key, s_other, &witness, radix, key_bits, com, transcript,
+        context, r_key, r_other, s_key, s_other, &witness, radix, key_bits, com, transcript,
     )?;
     let mut out = com.r_other_out.clone();
     out.push(com.key);
@@ -725,12 +802,14 @@ pub(crate) fn prove_binary_join_with_witness(
     transcript: &mut Transcript254,
 ) -> io::Result<BinaryJoinProof> {
     prove_binary_join_with_witness_and_key_bits(
-        r_key, r_other, s_key, s_other, witness, radix, 64, com, transcript,
+        &StoreProverContext::cpu(), r_key, r_other, s_key, s_other, witness, radix, 64, com,
+        transcript,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn prove_binary_join_with_witness_and_key_bits(
+    context: &StoreProverContext<'_>,
     r_key: &[ArkFr],
     r_other: &[&[ArkFr]],
     s_key: &[ArkFr],
@@ -762,18 +841,20 @@ fn prove_binary_join_with_witness_and_key_bits(
     let mult_l = source_multiplicities(&cols.rho_l, n_r, m_j, n);
     let mult_r = source_multiplicities(&cols.rho_r, n_s, m_j, n);
 
-    let pairs = prove_binary_pairs(
-        &cols, &mult_l, &mult_r, n_r, n_s, m_j, radix, com, transcript,
+    let pairs = prove_binary_pairs_with_context(
+        context, &cols, &mult_l, &mult_r, n_r, n_s, m_j, radix, com, transcript,
     )?;
 
     // U distinctness over [0, n_U).
     let u_full = padded(&witness.u, n);
-    let sorted_u = prove_strictly_sorted_bits(&u_full, n_u, key_bits, &com.u, transcript)?;
+    let sorted_u = prove_strictly_sorted_bits_with_context(
+        context, &u_full, n_u, key_bits, &com.u, transcript,
+    )?;
     // r_key is the image of U under w_L, s_key the image under w_R (both sides masked).
     let w_l_full = padded(&witness.w_l, n);
     let w_r_full = padded(&witness.w_r, n);
-    let membership_l = prove_membership_with_mult_with_witness(
-        &u_full,
+    let membership_l = prove_membership_with_mult_with_witness_and_context(
+        context, &u_full,
         &cols.r_key,
         &w_l_full,
         n_u,
@@ -783,8 +864,8 @@ fn prove_binary_join_with_witness_and_key_bits(
         &com.w_l,
         transcript,
     )?;
-    let membership_r = prove_membership_with_mult_with_witness(
-        &u_full,
+    let membership_r = prove_membership_with_mult_with_witness_and_context(
+        context, &u_full,
         &cols.s_key,
         &w_r_full,
         n_u,
@@ -795,8 +876,8 @@ fn prove_binary_join_with_witness_and_key_bits(
         transcript,
     )?;
     // Count Σ chi_{n_U} w_L*w_R = m_J (true n_U -- audit fix).
-    let count = prove_count_identity(
-        &w_l_full, &w_r_full, n_u, m_j, &com.w_l, &com.w_r, transcript,
+    let count = prove_count_identity_with_context(
+        context, &w_l_full, &w_r_full, n_u, m_j, &com.w_l, &com.w_r, transcript,
     )?;
 
     Ok(BinaryJoinProof {

@@ -38,16 +38,27 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::{commit_column, Transcript254};
-use super::count::{prove_count_identity, verify_count_identity, CountProof};
+use super::argument::{StoreProverContext, Transcript254};
+#[cfg(test)]
+use super::argument::commit_column;
+use super::count::{prove_count_identity_with_context, verify_count_identity, CountProof};
+#[cfg(test)]
+use super::count::prove_count_identity;
 use super::invalid;
 use super::membership::{
-    prove_membership_with_mult_in_domain, verify_membership_with_mult, MembershipProof,
+    prove_membership_with_mult_in_domain_with_context, verify_membership_with_mult,
+    MembershipProof,
 };
 #[cfg(test)]
 use super::membership::prove_membership_with_mult_with_witness;
-use super::pairs::{prove_distinct_valid_pairs_in_domain, verify_distinct_valid_pairs, PairsProof};
-use super::sort::{prove_strictly_sorted, verify_strictly_sorted, SortedProof};
+use super::pairs::{
+    prove_distinct_valid_pairs_in_domain_with_context, verify_distinct_valid_pairs, PairsProof,
+};
+#[cfg(test)]
+use super::pairs::prove_distinct_valid_pairs_in_domain;
+use super::sort::{prove_strictly_sorted_with_context, verify_strictly_sorted, SortedProof};
+#[cfg(test)]
+use super::sort::prove_strictly_sorted;
 
 #[inline]
 fn f0() -> ArkFr {
@@ -112,18 +123,37 @@ pub fn self_join_commitments(
     w_l: &[ArkFr],
     w_r: &[ArkFr],
 ) -> io::Result<SelfJoinCommitments> {
+    self_join_commitments_with_context(
+        &StoreProverContext::cpu(), sf, of, x, y, z, rho_l, rho_r, u, w_l, w_r,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn self_join_commitments_with_context(
+    context: &StoreProverContext<'_>,
+    sf: &[ArkFr],
+    of: &[ArkFr],
+    x: &[ArkFr],
+    y: &[ArkFr],
+    z: &[ArkFr],
+    rho_l: &[ArkFr],
+    rho_r: &[ArkFr],
+    u: &[ArkFr],
+    w_l: &[ArkFr],
+    w_r: &[ArkFr],
+) -> io::Result<SelfJoinCommitments> {
     let n = self_join_domain(sf.len(), x.len(), u.len())?;
     Ok(SelfJoinCommitments {
-        sf: commit_column(&padded(sf, n))?,
-        of: commit_column(&padded(of, n))?,
-        x: commit_column(&padded(x, n))?,
-        y: commit_column(&padded(y, n))?,
-        z: commit_column(&padded(z, n))?,
-        rho_l: commit_column(&padded(rho_l, n))?,
-        rho_r: commit_column(&padded(rho_r, n))?,
-        u: commit_column(&padded(u, n))?,
-        w_l: commit_column(&padded(w_l, n))?,
-        w_r: commit_column(&padded(w_r, n))?,
+        sf: context.commit_column(&padded(sf, n))?,
+        of: context.commit_column(&padded(of, n))?,
+        x: context.commit_column(&padded(x, n))?,
+        y: context.commit_column(&padded(y, n))?,
+        z: context.commit_column(&padded(z, n))?,
+        rho_l: context.commit_column(&padded(rho_l, n))?,
+        rho_r: context.commit_column(&padded(rho_r, n))?,
+        u: context.commit_column(&padded(u, n))?,
+        w_l: context.commit_column(&padded(w_l, n))?,
+        w_r: context.commit_column(&padded(w_r, n))?,
     })
 }
 
@@ -176,6 +206,29 @@ pub fn prove_self_join_complete(
     com: &SelfJoinCommitments,
     transcript: &mut Transcript254,
 ) -> io::Result<SelfJoinCompleteProof> {
+    prove_self_join_complete_with_context(
+        &StoreProverContext::cpu(), sf, of, x, y, z, rho_l, rho_r, u, w_l, w_r, m_j, com,
+        transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_self_join_complete_with_context(
+    context: &StoreProverContext<'_>,
+    sf: &[ArkFr],
+    of: &[ArkFr],
+    x: &[ArkFr],
+    y: &[ArkFr],
+    z: &[ArkFr],
+    rho_l: &[ArkFr],
+    rho_r: &[ArkFr],
+    u: &[ArkFr],
+    w_l: &[ArkFr],
+    w_r: &[ArkFr],
+    m_j: usize,
+    com: &SelfJoinCommitments,
+    transcript: &mut Transcript254,
+) -> io::Result<SelfJoinCompleteProof> {
     let n_f = sf.len();
     let n_u = u.len();
     if of.len() != n_f {
@@ -197,26 +250,26 @@ pub fn prove_self_join_complete(
     bind_instance(transcript, com, n_f, n_u, m_j);
 
     // (2c-2f) output = m_J DISTINCT genuine key-matching (left, right) F-pairs.
-    let pairs = prove_distinct_valid_pairs_in_domain(
-        sf, of, x, y, z, rho_l, rho_r, &com.sf, &com.of, &com.x, &com.y, &com.z, &com.rho_l,
+    let pairs = prove_distinct_valid_pairs_in_domain_with_context(
+        context, sf, of, x, y, z, rho_l, rho_r, &com.sf, &com.of, &com.x, &com.y, &com.z, &com.rho_l,
         &com.rho_r, domain, transcript,
     )?;
     // (2c-2a) U strictly increasing over [0, n_U): the distinct join-key set.
     let u_padded = padded(u, domain);
-    let sorted_u = prove_strictly_sorted(&u_padded, n_u, &com.u, transcript)?;
+    let sorted_u = prove_strictly_sorted_with_context(context, &u_padded, n_u, &com.u, transcript)?;
     // (2c-2b) Of is the image of U under w_L, and Sf the image of U under w_R:
     // U covers every join key and w_L/w_R are the TRUE per-key group counts.
     let membership_l =
-        prove_membership_with_mult_in_domain(u, of, w_l, &com.u, &com.of, &com.w_l, domain, transcript)?;
+        prove_membership_with_mult_in_domain_with_context(context, u, of, w_l, &com.u, &com.of, &com.w_l, domain, transcript)?;
     let membership_r =
-        prove_membership_with_mult_in_domain(u, sf, w_r, &com.u, &com.sf, &com.w_r, domain, transcript)?;
+        prove_membership_with_mult_in_domain_with_context(context, u, sf, w_r, &com.u, &com.sf, &com.w_r, domain, transcript)?;
     // (2c-2c) Sum_i w_L[i]*w_R[i] = m_J: valid-pair count EQUALS the output count.
     let wl_padded = padded(w_l, domain);
     let wr_padded = padded(w_r, domain);
     // FIX 3: the TRUE n_U (not the padded domain) is the count's chi real length, so a
     // weight stashed in the padding tail [n_U, domain) cannot inflate the count.
     let count =
-        prove_count_identity(&wl_padded, &wr_padded, n_u, m_j, &com.w_l, &com.w_r, transcript)?;
+        prove_count_identity_with_context(context, &wl_padded, &wr_padded, n_u, m_j, &com.w_l, &com.w_r, transcript)?;
 
     Ok(SelfJoinCompleteProof {
         pairs,

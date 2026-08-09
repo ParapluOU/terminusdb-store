@@ -28,9 +28,11 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    commit_column, prove_column_openings, prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ColumnOpening, Operand, SumcheckProof, SumcheckShape, Transcript254,
+    prove_sumcheck, verify_column_openings, verify_sumcheck,
+    ColumnOpening, Operand, StoreProverContext, SumcheckProof, SumcheckShape, Transcript254,
 };
+#[cfg(test)]
+use super::argument::commit_column;
 use super::invalid;
 use super::logup::{masked_multiset_link_claim, reciprocal_claim, reciprocal_witness};
 
@@ -123,8 +125,26 @@ pub fn prove_membership_with_mult(
     com_w: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<MembershipProof> {
+    prove_membership_with_mult_with_context(
+        &StoreProverContext::cpu(), u, of, w, com_u, com_of, com_w, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_membership_with_mult_with_context(
+    context: &StoreProverContext<'_>,
+    u: &[ArkFr],
+    of: &[ArkFr],
+    w: &[ArkFr],
+    com_u: &ArkGT,
+    com_of: &ArkGT,
+    com_w: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<MembershipProof> {
     let domain = membership_domain(u.len(), of.len())?;
-    prove_membership_with_mult_in_domain(u, of, w, com_u, com_of, com_w, domain, transcript)
+    prove_membership_with_mult_in_domain_with_context(
+        context, u, of, w, com_u, com_of, com_w, domain, transcript,
+    )
 }
 
 /// Like [`prove_membership_with_mult`] but pads onto a caller-chosen power-of-two
@@ -134,7 +154,26 @@ pub fn prove_membership_with_mult(
 /// `n_U`/`n_F` still drive the chi mask, so the residue ranges only over the true
 /// `Of` rows (padding poles are excluded).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn prove_membership_with_mult_in_domain(
+    u: &[ArkFr],
+    of: &[ArkFr],
+    w: &[ArkFr],
+    com_u: &ArkGT,
+    com_of: &ArkGT,
+    com_w: &ArkGT,
+    domain: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<MembershipProof> {
+    prove_membership_with_mult_in_domain_with_context(
+        &StoreProverContext::cpu(), u, of, w, com_u, com_of, com_w, domain, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_membership_with_mult_in_domain_with_context(
+    context: &StoreProverContext<'_>,
     u: &[ArkFr],
     of: &[ArkFr],
     w: &[ArkFr],
@@ -158,8 +197,8 @@ pub(crate) fn prove_membership_with_mult_in_domain(
     let u_p = padded(u, domain);
     let of_p = padded(of, domain);
     let w_p = padded(w, domain);
-    prove_membership_with_mult_with_witness(
-        &u_p, &of_p, &w_p, n_u, n_of, com_u, com_of, com_w, transcript,
+    prove_membership_with_mult_with_witness_and_context(
+        context, &u_p, &of_p, &w_p, n_u, n_of, com_u, com_of, com_w, transcript,
     )
 }
 
@@ -169,7 +208,35 @@ pub(crate) fn prove_membership_with_mult_in_domain(
 /// this to stash a duplicate key in U's padding tail `[n_U, domain)` with a claimed
 /// `n_U` smaller than the committed column length.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prove_membership_with_mult_with_witness(
+    u_p: &[ArkFr],
+    of_p: &[ArkFr],
+    w_p: &[ArkFr],
+    n_u: usize,
+    n_of: usize,
+    com_u: &ArkGT,
+    com_of: &ArkGT,
+    com_w: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<MembershipProof> {
+    prove_membership_with_mult_with_witness_and_context(
+        &StoreProverContext::cpu(),
+        u_p,
+        of_p,
+        w_p,
+        n_u,
+        n_of,
+        com_u,
+        com_of,
+        com_w,
+        transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_membership_with_mult_with_witness_and_context(
+    context: &StoreProverContext<'_>,
     u_p: &[ArkFr],
     of_p: &[ArkFr],
     w_p: &[ArkFr],
@@ -202,8 +269,8 @@ pub(crate) fn prove_membership_with_mult_with_witness(
     // Round 2: reciprocal witnesses over the values.
     let rec_u = reciprocal_witness(alpha, u_p);
     let rec_of = reciprocal_witness(alpha, of_p);
-    let rec_u_commitment = commit_column(&rec_u)?;
-    let rec_of_commitment = commit_column(&rec_of)?;
+    let rec_u_commitment = context.commit_column(&rec_u)?;
+    let rec_of_commitment = context.commit_column(&rec_of)?;
     transcript.append_group(b"pow/membership/com-rec-u", &rec_u_commitment);
     transcript.append_group(b"pow/membership/com-rec-of", &rec_of_commitment);
 
@@ -216,7 +283,7 @@ pub(crate) fn prove_membership_with_mult_with_witness(
         rec_of,
     ];
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok(MembershipProof {
         sumcheck,

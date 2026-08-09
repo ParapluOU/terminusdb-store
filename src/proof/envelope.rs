@@ -4,32 +4,40 @@ use std::convert::{TryFrom, TryInto};
 use std::io::{self, Cursor};
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_ff::PrimeField;
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 use sha2::{Digest, Sha256};
 
 use super::anti::{
+    prove_global_left_outer_join_with_context, prove_global_not_with_context,
+    prove_left_anti_join_with_keys_and_context, prove_left_outer_join_with_keys_and_context,
     verify_global_left_outer_join, verify_global_not, verify_left_anti_join_with_keys,
     verify_left_outer_join_with_keys, LeftAntiJoinProof, LeftOuterJoinProof,
 };
-use super::argument::{ColumnOpening, SumcheckProof};
-use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit};
+use super::argument::{ColumnOpening, StoreProverContext, SumcheckProof, Transcript254};
+use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit, RelationWitness};
 use super::commitment::{LayerCommitment, VerifierLayer};
 use super::count::CountProof;
 use super::dict::DictProof;
-use super::equality::{verify_relation_equality, RelationEqualityConstraint, RelationEqualityProof};
+use super::equality::{
+    prove_relation_equality_with_context, verify_relation_equality, RelationEqualityConstraint,
+    RelationEqualityProof,
+};
 use super::filter::{
     AtomFilterProof, BooleanProductProof, CompactionOnlyProof, FilterProof, FullFilterProof,
     SelectionOnlyProof,
 };
 use super::group::{
-    verify_group_extrema, GroupExtremaEntryProof, GroupExtremaKind, GroupExtremaProof,
+    prove_group_extrema_with_context, verify_group_extrema, GroupExtremaEntryProof,
+    GroupExtremaKind, GroupExtremaProof,
 };
 use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
 use super::query::{
-    has_ground_result_unit, resolve_typed_result_objects, result_id_namespaces,
+    has_ground_result_unit, prove_layer_bgp_with_result_and_context,
+    resolve_typed_result_objects, result_id_namespaces,
     resolve_result_values, verify_layer_bgp, verify_layer_bgp_result_log_domain,
     verify_result_columns, AtomTerm, CanonicalResultValue, GroundAbsence, LayerBgpAtom,
     LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectRangeBound, ObjectRangeSpec,
@@ -38,6 +46,7 @@ use super::query::{
 use super::range::{
     DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp, RangeSelectProof,
 };
+use super::union::prove_bag_union_with_context;
 use super::relocate::RelocationProof;
 use super::sort::SortedProof;
 use super::union::{verify_bag_union, BagUnionProof};
@@ -1977,6 +1986,227 @@ impl RecursiveRelationEnvelope {
         })
     }
 
+    fn relation_witness(&self, mapping: Option<&[usize]>) -> io::Result<RelationWitness> {
+        let indexes: Vec<usize> = match mapping {
+            Some(mapping) => mapping.to_vec(),
+            None => (0..self.result_columns.len()).collect(),
+        };
+        let columns = indexes
+            .iter()
+            .map(|index| {
+                self.result_columns
+                    .get(*index)
+                    .cloned()
+                    .ok_or_else(|| invalid("recursive relation mapping out of range"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let commitments = indexes
+            .iter()
+            .map(|index| {
+                self.result_commitments
+                    .get(*index)
+                    .copied()
+                    .ok_or_else(|| invalid("recursive relation mapping out of range"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(RelationWitness {
+            columns,
+            commitments,
+            log_domain: self.result_log_domain,
+            n: self.result_len,
+        })
+    }
+
+    fn finish_proved(
+        layer: &LayerCommitment,
+        plan: &RelationProofPlan,
+        proof: RecursiveRelationProof,
+        commitments: Vec<ArkGT>,
+        columns: Vec<Vec<ArkFr>>,
+        log_domain: usize,
+        n: usize,
+    ) -> io::Result<Self> {
+        let (result_descriptors, ground_result) = plan.result_shape()?;
+        let result_values = if ground_result {
+            Vec::new()
+        } else {
+            resolve_result_values(layer, layer.state.commitment_root, &columns, &result_descriptors)?
+        };
+        Ok(Self {
+            layer_root: layer.state.commitment_root,
+            query_digest: plan.query_digest,
+            proof,
+            result_commitments: commitments,
+            result_columns: columns,
+            result_log_domain: log_domain,
+            result_len: n,
+            ground_result,
+            result_descriptors,
+            result_values,
+        })
+    }
+
+    /// Explicitly construct a complete recursive relation proof with caller-owned
+    /// prover arithmetic. Child nodes reuse this exact context.
+    pub fn prove_with_context(
+        context: &StoreProverContext<'_>,
+        layer: &LayerCommitment,
+        plan: &RelationProofPlan,
+    ) -> io::Result<Self> {
+        plan.result_shape()?;
+        let mut nodes = 0;
+        Self::prove_bounded(context, layer, plan, 1, &mut nodes)
+    }
+
+    /// Explicit Arkworks CPU convenience for recursive proving.
+    pub fn prove(layer: &LayerCommitment, plan: &RelationProofPlan) -> io::Result<Self> {
+        Self::prove_with_context(&StoreProverContext::cpu(), layer, plan)
+    }
+
+    fn prove_bounded(
+        context: &StoreProverContext<'_>,
+        layer: &LayerCommitment,
+        plan: &RelationProofPlan,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> io::Result<Self> {
+        if depth > MAX_RELATION_PROOF_DEPTH || *nodes >= MAX_RELATION_PROOF_NODES {
+            return Err(invalid("recursive relation proving exceeds structural limits"));
+        }
+        *nodes += 1;
+        match &plan.kind {
+            RelationProofPlanKind::Bgp(bgp) => {
+                let result = prove_layer_bgp_with_result_and_context(context, layer, bgp)?;
+                let result_columns = result.real_columns();
+                let leaf = LayerBgpEnvelope::new_verified(
+                    layer,
+                    layer.state.commitment_root,
+                    bgp,
+                    plan.query_digest,
+                    result.proof,
+                    result.result_commitments,
+                    result_columns,
+                    result.result_log_domain,
+                    result.result_len,
+                    result.predicate_ids,
+                )?;
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::Bgp(Box::new(leaf.clone())),
+                    leaf.result_commitments,
+                    leaf.result_columns,
+                    leaf.result_log_domain,
+                    leaf.result_len,
+                )
+            }
+            RelationProofPlanKind::BagUnion { branches, mappings } => {
+                let mut child_envelopes = Vec::with_capacity(branches.len());
+                let mut witnesses = Vec::with_capacity(branches.len());
+                let (_, ground) = plan.result_shape()?;
+                for ((branch, mapping), _) in branches.iter().zip(mappings).zip(0..) {
+                    let child = Self::prove_bounded(context, layer, branch, depth + 1, nodes)?;
+                    witnesses.push(child.relation_witness((!ground).then_some(mapping.as_slice()))?);
+                    child_envelopes.push(child);
+                }
+                let mut transcript = Transcript254::new(b"parture-union-envelope");
+                transcript.append_bytes(b"pow/union-envelope/root", &layer.state.commitment_root);
+                transcript.append_bytes(b"pow/union-envelope/query", &plan.query_digest);
+                let result = prove_bag_union_with_context(context, &witnesses, &mut transcript)?;
+                Self::finish_proved(layer, plan, RecursiveRelationProof::BagUnion {
+                    branches: child_envelopes,
+                    proof: Box::new(result.proof),
+                }, result.commitments, result.columns, result.log_domain, result.n)
+            }
+            RelationProofPlanKind::LeftAnti { left, right, key_pairs } => {
+                let left_envelope = Self::prove_bounded(context, layer, left, depth + 1, nodes)?;
+                let right_envelope = Self::prove_bounded(context, layer, right, depth + 1, nodes)?;
+                let left_witness = left_envelope.relation_witness(None)?;
+                let right_witness = right_envelope.relation_witness(None)?;
+                let (proof, commitments, columns, log_domain, n) = if key_pairs.is_empty() {
+                    let (commitments, columns, log_domain, n) =
+                        prove_global_not_with_context(context, &left_witness, &right_witness)?;
+                    (None, commitments, columns, log_domain, n)
+                } else {
+                    let mut transcript = Transcript254::new(b"parture-left-anti-envelope");
+                    transcript.append_bytes(b"pow/anti-envelope/root", &layer.state.commitment_root);
+                    transcript.append_bytes(b"pow/anti-envelope/query", &plan.query_digest);
+                    let result = prove_left_anti_join_with_keys_and_context(
+                        context, &left_witness, &right_witness, key_pairs, &mut transcript,
+                    )?;
+                    (Some(Box::new(result.proof)), result.commitments, result.columns, result.log_domain, result.n)
+                };
+                Self::finish_proved(layer, plan, RecursiveRelationProof::LeftAnti {
+                    left: Box::new(left_envelope), right: Box::new(right_envelope), proof,
+                }, commitments, columns, log_domain, n)
+            }
+            RelationProofPlanKind::LeftOuter { left, right, key_pairs } => {
+                let left_envelope = Self::prove_bounded(context, layer, left, depth + 1, nodes)?;
+                let right_envelope = Self::prove_bounded(context, layer, right, depth + 1, nodes)?;
+                let left_witness = left_envelope.relation_witness(None)?;
+                let right_witness = right_envelope.relation_witness(None)?;
+                let mut transcript = Transcript254::new(b"parture-left-outer-envelope");
+                transcript.append_bytes(b"pow/outer-envelope/root", &layer.state.commitment_root);
+                transcript.append_bytes(b"pow/outer-envelope/query", &plan.query_digest);
+                let result = if key_pairs.is_empty() {
+                    prove_global_left_outer_join_with_context(context, &left_witness, &right_witness, &mut transcript)?
+                } else {
+                    prove_left_outer_join_with_keys_and_context(context, &left_witness, &right_witness, key_pairs, &mut transcript)?
+                };
+                Self::finish_proved(layer, plan, RecursiveRelationProof::LeftOuter {
+                    left: Box::new(left_envelope), right: Box::new(right_envelope), proof: Box::new(result.proof),
+                }, result.commitments, result.columns, result.log_domain, result.n)
+            }
+            RelationProofPlanKind::Equality { input, constraint } => {
+                let input_envelope = Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let resolved = resolve_relation_equality_constraint(layer, constraint)?;
+                let mut transcript = Transcript254::new(b"parture-equality-envelope");
+                transcript.append_bytes(b"pow/equality-envelope/root", &layer.state.commitment_root);
+                transcript.append_bytes(b"pow/equality-envelope/query", &plan.query_digest);
+                let result = prove_relation_equality_with_context(
+                    context, &input_envelope.relation_witness(None)?, &resolved, &mut transcript,
+                )?;
+                Self::finish_proved(layer, plan, RecursiveRelationProof::Equality {
+                    input: Box::new(input_envelope), proof: Box::new(result.proof),
+                }, result.commitments, result.columns, result.log_domain, result.n)
+            }
+            RelationProofPlanKind::GroupExtrema { input, key_column, value_column, datatype, kind } => {
+                let input_envelope = Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let witness = input_envelope.relation_witness(None)?;
+                let key_namespace = input_envelope.result_descriptors[*key_column].namespace;
+                let view = layer.verifier_view();
+                let resolve_id = |field: ArkFr, namespace: ResultIdNamespace| -> io::Result<u64> {
+                    let id = match namespace {
+                        ResultIdNamespace::Predicate => view.predicate_catalog.iter().find_map(|record| (ArkFr::from_u64(record.predicate_id) == field).then_some(record.predicate_id)),
+                        ResultIdNamespace::NodeValue => view.node_value_catalog.iter().find_map(|record| (ArkFr::from_u64(record.object_id) == field).then_some(record.object_id)),
+                    };
+                    id.ok_or_else(|| invalid("group-extrema input id absent from planned namespace"))
+                };
+                let mut groups = std::collections::BTreeMap::<u64, (u64, ark_bn254::Fr)>::new();
+                for row in 0..witness.n {
+                    let key = resolve_id(witness.columns[*key_column][row], key_namespace)?;
+                    let value = resolve_id(witness.columns[*value_column][row], ResultIdNamespace::NodeValue)?;
+                    let encoding = super::commitment::node_value_op_value(
+                        &view.node_value_catalog.iter().find(|record| record.object_id == value)
+                            .ok_or_else(|| invalid("group-extrema value id absent from catalog"))?.triple.object,
+                    )?.0;
+                    groups.entry(key).and_modify(|current| {
+                        let replace = match kind { GroupExtremaKind::Min => encoding.into_bigint() < current.1.into_bigint(), GroupExtremaKind::Max => encoding.into_bigint() > current.1.into_bigint() };
+                        if replace { *current = (value, encoding); }
+                    }).or_insert((value, encoding));
+                }
+                let rows = groups.into_iter().map(|(key, (value, _))| (key, value)).collect::<Vec<_>>();
+                let mut transcript = Transcript254::new(b"parture-group-extrema-envelope");
+                transcript.append_bytes(b"pow/group-envelope/root", &layer.state.commitment_root);
+                transcript.append_bytes(b"pow/group-envelope/query", &plan.query_digest);
+                let result = prove_group_extrema_with_context(context, &witness, *key_column, *value_column, *datatype, *kind, &rows, layer, &mut transcript)?;
+                Self::finish_proved(layer, plan, RecursiveRelationProof::GroupExtrema {
+                    input: Box::new(input_envelope), proof: Box::new(result.proof),
+                }, result.commitments, result.columns, result.log_domain, result.n)
+            }
+        }
+    }
+
     fn verify_bounded(
         &self,
         layer: &impl VerifierLayer,
@@ -2743,6 +2973,34 @@ mod tests {
         assert!(decoded
             .verify(&layer, layer.state.commitment_root, &wrong_variant)
             .is_err());
+    }
+
+    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+    #[test]
+    fn recursive_proving_context_preserves_the_wire_format() {
+        let (layer, bgp) = fixture();
+        let plan = RelationProofPlan {
+            query_digest: plan_digest(&bgp).unwrap(),
+            kind: RelationProofPlanKind::Bgp(bgp),
+        };
+        let runtime = StoreProverContext::initialize_blitzar(
+            dory_pcs::backends::arkworks::BlitzarRuntimeConfig {
+                num_precomputed_generators: 0,
+            },
+        );
+        let accelerated = StoreProverContext::blitzar(
+            &runtime,
+            super::super::argument::ProverSetupTier::Log20,
+        )
+        .unwrap();
+
+        let cpu = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        let with_context =
+            RecursiveRelationEnvelope::prove_with_context(&accelerated, &layer, &plan).unwrap();
+        assert_eq!(cpu.encode().unwrap(), with_context.encode().unwrap());
+        with_context
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
     }
 
     #[test]

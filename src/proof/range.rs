@@ -75,10 +75,12 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    commit_column, prove_column_openings, prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ClaimShape, ColumnOpening, Expr, Operand, SumcheckClaim, SumcheckProof, SumcheckShape, Term,
-    Transcript254,
+    prove_sumcheck, verify_column_openings, verify_sumcheck,
+    ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
+    SumcheckShape, Term, Transcript254,
 };
+#[cfg(test)]
+use super::argument::commit_column;
 use super::filter::{self, FilterProof};
 use super::invalid;
 use super::logup::{masked_multiset_link_claim, reciprocal_claim, reciprocal_witness, rlc_fold};
@@ -324,7 +326,26 @@ fn honest_witness(
 /// inject malicious witnesses. `v` is the full padded value column; `com_v` must
 /// commit `v`. Returns the proof and `Com(sel)`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prove_range_select_with_witness(
+    v: &[ArkFr],
+    com_v: &ArkGT,
+    op: RangeOp,
+    c: ArkFr,
+    b_bits: usize,
+    real_n: usize,
+    bit_columns: &[Vec<ArkFr>],
+    sel: &[ArkFr],
+    transcript: &mut Transcript254,
+) -> io::Result<(RangeSelectProof, ArkGT)> {
+    prove_range_select_with_witness_and_context(
+        &StoreProverContext::cpu(), v, com_v, op, c, b_bits, real_n, bit_columns, sel, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_range_select_with_witness_and_context(
+    context: &StoreProverContext<'_>,
     v: &[ArkFr],
     com_v: &ArkGT,
     op: RangeOp,
@@ -361,9 +382,9 @@ pub(crate) fn prove_range_select_with_witness(
     // (with the given com_v and the public statement) BEFORE drawing tau.
     let mut bit_commitments = Vec::with_capacity(num_bits);
     for col in bit_columns {
-        bit_commitments.push(commit_column(col)?);
+        bit_commitments.push(context.commit_column(col)?);
     }
-    let sel_commitment = commit_column(sel)?;
+    let sel_commitment = context.commit_column(sel)?;
 
     bind_statement(transcript, op, c, b_bits, real_n);
     transcript.append_group(b"pow/range/com-v", com_v);
@@ -380,7 +401,7 @@ pub(crate) fn prove_range_select_with_witness(
     columns.push(sel.to_vec());
 
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok((
         RangeSelectProof {
@@ -408,9 +429,25 @@ pub fn prove_range_select(
     real_n: usize,
     transcript: &mut Transcript254,
 ) -> io::Result<(RangeSelectProof, ArkGT)> {
+    prove_range_select_with_context(
+        &StoreProverContext::cpu(), v, com_v, op, c, b_bits, real_n, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_range_select_with_context(
+    context: &StoreProverContext<'_>,
+    v: &[ArkFr],
+    com_v: &ArkGT,
+    op: RangeOp,
+    c: ArkFr,
+    b_bits: usize,
+    real_n: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<(RangeSelectProof, ArkGT)> {
     let (bit_columns, sel) = honest_witness(v, real_n, op, c, b_bits);
-    prove_range_select_with_witness(
-        v, com_v, op, c, b_bits, real_n, &bit_columns, &sel, transcript,
+    prove_range_select_with_witness_and_context(
+        context, v, com_v, op, c, b_bits, real_n, &bit_columns, &sel, transcript,
     )
 }
 
@@ -626,7 +663,32 @@ pub(crate) fn honest_dict_lookup(
 /// power-of-two domain `2^k` as `obj_id` (the dict columns are pre-padded to it, and
 /// their three commitments commit those padded columns).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prove_dict_value_lookup_with_witness(
+    obj_id: &[ArkFr],
+    com_obj_id: &ArkGT,
+    v_val: &[ArkFr],
+    v_dt: &[ArkFr],
+    w: &[ArkFr],
+    dict_id: &[ArkFr],
+    dict_value: &[ArkFr],
+    dict_datatype: &[ArkFr],
+    com_dict_id: &ArkGT,
+    com_dict_value: &ArkGT,
+    com_dict_datatype: &ArkGT,
+    real_n: usize,
+    n_dict: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<DictLookupProof> {
+    prove_dict_value_lookup_with_witness_and_context(
+        &StoreProverContext::cpu(), obj_id, com_obj_id, v_val, v_dt, w, dict_id, dict_value,
+        dict_datatype, com_dict_id, com_dict_value, com_dict_datatype, real_n, n_dict, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_dict_value_lookup_with_witness_and_context(
+    context: &StoreProverContext<'_>,
     obj_id: &[ArkFr],
     com_obj_id: &ArkGT,
     v_val: &[ArkFr],
@@ -658,9 +720,9 @@ pub(crate) fn prove_dict_value_lookup_with_witness(
 
     // Round 1: commit the witness DATA columns, bind the statement and every data
     // commitment, THEN draw the fold/reciprocal challenges.
-    let com_v_val = commit_column(v_val)?;
-    let com_v_dt = commit_column(v_dt)?;
-    let com_w = commit_column(w)?;
+    let com_v_val = context.commit_column(v_val)?;
+    let com_v_dt = context.commit_column(v_dt)?;
+    let com_w = context.commit_column(w)?;
     bind_lookup_statement(transcript, real_n, n_dict);
     transcript.append_group(b"pow/obj-lookup/com-obj-id", com_obj_id);
     transcript.append_group(b"pow/obj-lookup/com-dict-id", com_dict_id);
@@ -677,8 +739,8 @@ pub(crate) fn prove_dict_value_lookup_with_witness(
     let fold_d = rlc_fold(beta, &[dict_id, dict_value, dict_datatype]);
     let rec_q = reciprocal_witness(alpha, &fold_q);
     let rec_d = reciprocal_witness(alpha, &fold_d);
-    let com_rec_q = commit_column(&rec_q)?;
-    let com_rec_d = commit_column(&rec_d)?;
+    let com_rec_q = context.commit_column(&rec_q)?;
+    let com_rec_d = context.commit_column(&rec_d)?;
     transcript.append_group(b"pow/obj-lookup/com-rec-q", &com_rec_q);
     transcript.append_group(b"pow/obj-lookup/com-rec-d", &com_rec_d);
 
@@ -695,7 +757,7 @@ pub(crate) fn prove_dict_value_lookup_with_witness(
         rec_d,
     ];
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok(DictLookupProof {
         sumcheck,
@@ -725,10 +787,31 @@ pub fn prove_dict_value_lookup(
     n_dict: usize,
     transcript: &mut Transcript254,
 ) -> io::Result<DictLookupProof> {
+    prove_dict_value_lookup_with_context(
+        &StoreProverContext::cpu(), obj_id, com_obj_id, dict_id, dict_value, dict_datatype,
+        com_dict_id, com_dict_value, com_dict_datatype, real_n, n_dict, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_dict_value_lookup_with_context(
+    context: &StoreProverContext<'_>,
+    obj_id: &[ArkFr],
+    com_obj_id: &ArkGT,
+    dict_id: &[ArkFr],
+    dict_value: &[ArkFr],
+    dict_datatype: &[ArkFr],
+    com_dict_id: &ArkGT,
+    com_dict_value: &ArkGT,
+    com_dict_datatype: &ArkGT,
+    real_n: usize,
+    n_dict: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<DictLookupProof> {
     let (v_val, v_dt, w) =
         honest_dict_lookup(obj_id, dict_id, dict_value, dict_datatype, real_n, n_dict);
-    prove_dict_value_lookup_with_witness(
-        obj_id,
+    prove_dict_value_lookup_with_witness_and_context(
+        context, obj_id,
         com_obj_id,
         &v_val,
         &v_dt,
@@ -888,6 +971,7 @@ fn combine_shape(k: usize) -> SumcheckShape {
 /// Commit `sel = dt_match ⊙ range_sel` and prove the combine Identity over
 /// `[dt_match, range_sel, sel]`. Returns the proof and `Com(sel)`.
 fn prove_object_range_combine(
+    context: &StoreProverContext<'_>,
     dt_match: &[ArkFr],
     range_sel: &[ArkFr],
     com_dt_match: &ArkGT,
@@ -903,7 +987,7 @@ fn prove_object_range_combine(
         .zip(range_sel.iter())
         .map(|(a, b)| *a * *b)
         .collect();
-    let com_sel = commit_column(&sel)?;
+    let com_sel = context.commit_column(&sel)?;
     let k = size.trailing_zeros() as usize;
 
     transcript.append_bytes(COMBINE_DOMAIN, b"parture/proof-of-woql/object-range-combine/v0");
@@ -914,7 +998,7 @@ fn prove_object_range_combine(
     let shape = combine_shape(k);
     let columns = vec![dt_match.to_vec(), range_sel.to_vec(), sel];
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
     Ok((ObjectRangeCombineProof { sumcheck, opening }, com_sel))
 }
 
@@ -969,6 +1053,32 @@ pub fn prove_object_range_select(
     real_n: usize,
     transcript: &mut Transcript254,
 ) -> io::Result<(ObjectRangeProof, ArkGT)> {
+    prove_object_range_select_with_context(
+        &StoreProverContext::cpu(), obj_id, com_obj_id, dict_id, dict_value, dict_datatype,
+        com_dict_id, com_dict_value, com_dict_datatype, n_dict, datatype_t, op, c, b_bits, real_n,
+        transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_object_range_select_with_context(
+    context: &StoreProverContext<'_>,
+    obj_id: &[ArkFr],
+    com_obj_id: &ArkGT,
+    dict_id: &[ArkFr],
+    dict_value: &[ArkFr],
+    dict_datatype: &[ArkFr],
+    com_dict_id: &ArkGT,
+    com_dict_value: &ArkGT,
+    com_dict_datatype: &ArkGT,
+    n_dict: usize,
+    datatype_t: ArkFr,
+    op: RangeOp,
+    c: ArkFr,
+    b_bits: usize,
+    real_n: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<(ObjectRangeProof, ArkGT)> {
     // Pin the bit-width: authenticated dict OP values are order-preserving numerics
     // `< 2^64`, so the object-range gadget ALWAYS uses `b_bits = 64`. A too-small
     // `b_bits` cannot forge a sign (the values genuinely fit), but it would make the
@@ -982,8 +1092,8 @@ pub fn prove_object_range_select(
     // 1) Derive + prove the authenticated (v_val, v_dt) for every obj_id row.
     let (v_val, v_dt, w) =
         honest_dict_lookup(obj_id, dict_id, dict_value, dict_datatype, real_n, n_dict);
-    let lookup = prove_dict_value_lookup_with_witness(
-        obj_id,
+    let lookup = prove_dict_value_lookup_with_witness_and_context(
+        context, obj_id,
         com_obj_id,
         &v_val,
         &v_dt,
@@ -1001,18 +1111,24 @@ pub fn prove_object_range_select(
 
     // 2) Datatype mask over the AUTHENTICATED v_dt column (reuse the filter indicator).
     let (datatype, com_dt_match, com_dt_w, _dt_eval) =
-        filter::prove_filter_indicator(&v_dt, datatype_t, real_n, &lookup.com_v_dt, transcript)?;
+        filter::prove_filter_indicator_with_context(
+            context, &v_dt, datatype_t, real_n, &lookup.com_v_dt, transcript,
+        )?;
 
     // 3) Range over the AUTHENTICATED v_val column (reuse CP-B1).
     let (range, com_range_sel) =
-        prove_range_select(&v_val, &lookup.com_v_val, op, c, b_bits, real_n, transcript)?;
+        prove_range_select_with_context(
+            context, &v_val, &lookup.com_v_val, op, c, b_bits, real_n, transcript,
+        )?;
 
     // 4) Combine sel = dt_match · range_sel. Recompute the two boolean columns via the
     // very same honest witnesses the sub-gadgets committed, so they match the openings.
     let (dt_match, _dt_w_col) = filter::honest_witness(&v_dt, datatype_t, real_n);
     let (_bits, range_sel) = honest_witness(&v_val, real_n, op, c, b_bits);
     let (combine, com_sel) =
-        prove_object_range_combine(&dt_match, &range_sel, &com_dt_match, &com_range_sel, transcript)?;
+        prove_object_range_combine(
+            context, &dt_match, &range_sel, &com_dt_match, &com_range_sel, transcript,
+        )?;
 
     Ok((
         ObjectRangeProof {

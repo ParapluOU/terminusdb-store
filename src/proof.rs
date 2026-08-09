@@ -845,12 +845,14 @@ pub mod commitment {
 
     use ark_bn254::{G1Projective, G2Projective};
     use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-    use dory_pcs::backends::arkworks::{
-        ArkFr, ArkG1, ArkG2, ArkGT, ArkworksPolynomial, G1Routines, BN254,
-    };
+    use dory_pcs::backends::arkworks::{ArkFr, ArkG1, ArkG2, ArkGT, BN254};
+    #[cfg(test)]
+    use dory_pcs::backends::arkworks::{ArkworksPolynomial, G1Routines};
     use dory_pcs::primitives::arithmetic::{Field as DoryField, Group, PairingCurve};
+    #[cfg(test)]
     use dory_pcs::primitives::poly::Polynomial;
     use dory_pcs::setup::{ProverSetup, VerifierSetup};
+    #[cfg(test)]
     use dory_pcs::Transparent;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -1084,7 +1086,8 @@ pub mod commitment {
     /// non-square constraint, and `2^sigma <= 2^ceil(SETUP_MAX_LOG_N/2)` fits the
     /// global generator vectors). In Transparent mode the commitment carries no
     /// blinding, so it is a deterministic function of the ids and the setup.
-    fn commit_record_id_column(
+    fn commit_record_id_column_with_context(
+        context: &super::argument::StoreProverContext<'_>,
         records: &[ProofRecord],
         select: fn(&ProofRecord) -> u64,
     ) -> io::Result<ArkGT> {
@@ -1097,32 +1100,24 @@ pub mod commitment {
             .ok_or_else(|| invalid("proof column length overflow"))?;
         let m = padded_len.trailing_zeros() as usize;
         setup_tier_for_num_vars(m)?;
-        let (nu, sigma) = matrix_dims(m);
         let mut coefficients = vec![<ArkFr as DoryField>::zero(); padded_len];
         for (slot, record) in coefficients.iter_mut().zip(records) {
             *slot = <ArkFr as DoryField>::from_u64(select(record));
         }
-        let poly = ArkworksPolynomial::new(coefficients);
-        let (tier_2, _row_commitments, _blind) = poly
-            .commit::<BN254, Transparent, G1Routines>(nu, sigma, dory_prover_setup(m)?)
-            .map_err(|error| invalid(format!("dory column commitment failed: {error}")))?;
-        Ok(tier_2)
+        context.commit_column(&coefficients)
     }
 
-    fn commit_owned_field_column(coefficients: Vec<ArkFr>) -> io::Result<ArkGT> {
+    fn commit_owned_field_column_with_context(
+        context: &super::argument::StoreProverContext<'_>,
+        coefficients: Vec<ArkFr>,
+    ) -> io::Result<ArkGT> {
         if coefficients.is_empty() {
             return Ok(<ArkGT as Group>::identity());
         }
         if !coefficients.len().is_power_of_two() {
             return Err(invalid("committed field column is not power-of-two padded"));
         }
-        let m = coefficients.len().trailing_zeros() as usize;
-        let (nu, sigma) = matrix_dims(m);
-        let poly = ArkworksPolynomial::new(coefficients);
-        let (tier_2, _row_commitments, _blind) = poly
-            .commit::<BN254, Transparent, G1Routines>(nu, sigma, dory_prover_setup(m)?)
-            .map_err(|error| invalid(format!("dory field commitment failed: {error}")))?;
-        Ok(tier_2)
+        context.commit_column(&coefficients)
     }
 
     /// Build the six per-column commitments for a layer delta, in fixed order:
@@ -1135,23 +1130,42 @@ pub mod commitment {
         additions: &[ProofRecord],
         removals: &[ProofRecord],
     ) -> io::Result<[ArkGT; COLUMN_COUNT]> {
+        commit_delta_columns_with_context(
+            &super::argument::StoreProverContext::cpu(), additions, removals,
+        )
+    }
+
+    fn commit_delta_columns_with_context(
+        context: &super::argument::StoreProverContext<'_>,
+        additions: &[ProofRecord],
+        removals: &[ProofRecord],
+    ) -> io::Result<[ArkGT; COLUMN_COUNT]> {
         Ok([
-            commit_record_id_column(additions, |record| record.subject_id)?,
-            commit_record_id_column(additions, |record| record.predicate_id)?,
-            commit_record_id_column(additions, |record| record.object_id)?,
-            commit_record_id_column(removals, |record| record.subject_id)?,
-            commit_record_id_column(removals, |record| record.predicate_id)?,
-            commit_record_id_column(removals, |record| record.object_id)?,
+            commit_record_id_column_with_context(context, additions, |record| record.subject_id)?,
+            commit_record_id_column_with_context(context, additions, |record| record.predicate_id)?,
+            commit_record_id_column_with_context(context, additions, |record| record.object_id)?,
+            commit_record_id_column_with_context(context, removals, |record| record.subject_id)?,
+            commit_record_id_column_with_context(context, removals, |record| record.predicate_id)?,
+            commit_record_id_column_with_context(context, removals, |record| record.object_id)?,
         ])
     }
 
     fn commit_materialized_columns(
         records: &[ProofRecord],
     ) -> io::Result<[ArkGT; MATERIALIZED_COLUMN_COUNT]> {
+        commit_materialized_columns_with_context(
+            &super::argument::StoreProverContext::cpu(), records,
+        )
+    }
+
+    fn commit_materialized_columns_with_context(
+        context: &super::argument::StoreProverContext<'_>,
+        records: &[ProofRecord],
+    ) -> io::Result<[ArkGT; MATERIALIZED_COLUMN_COUNT]> {
         Ok([
-            commit_record_id_column(records, |record| record.subject_id)?,
-            commit_record_id_column(records, |record| record.predicate_id)?,
-            commit_record_id_column(records, |record| record.object_id)?,
+            commit_record_id_column_with_context(context, records, |record| record.subject_id)?,
+            commit_record_id_column_with_context(context, records, |record| record.predicate_id)?,
+            commit_record_id_column_with_context(context, records, |record| record.object_id)?,
         ])
     }
 
@@ -1186,6 +1200,15 @@ pub mod commitment {
     fn commit_predicate_dictionary(
         predicate_catalog: &[ProofRecord],
     ) -> io::Result<(ArkGT, ArkGT)> {
+        commit_predicate_dictionary_with_context(
+            &super::argument::StoreProverContext::cpu(), predicate_catalog,
+        )
+    }
+
+    fn commit_predicate_dictionary_with_context(
+        context: &super::argument::StoreProverContext<'_>,
+        predicate_catalog: &[ProofRecord],
+    ) -> io::Result<(ArkGT, ArkGT)> {
         if predicate_catalog.is_empty() {
             let identity = <ArkGT as Group>::identity();
             return Ok((identity, identity));
@@ -1195,12 +1218,12 @@ pub mod commitment {
         for (slot, record) in hashes.iter_mut().zip(predicate_catalog) {
             *slot = super::dict::hash_term(&record.triple.predicate);
         }
-        let hash_commitment = commit_owned_field_column(hashes)?;
+        let hash_commitment = commit_owned_field_column_with_context(context, hashes)?;
         let mut ids = vec![<ArkFr as DoryField>::zero(); padded];
         for (slot, record) in ids.iter_mut().zip(predicate_catalog) {
             *slot = <ArkFr as DoryField>::from_u64(record.predicate_id);
         }
-        Ok((hash_commitment, commit_owned_field_column(ids)?))
+        Ok((hash_commitment, commit_owned_field_column_with_context(context, ids)?))
     }
 
     /// Build the two node/value-dictionary columns from the node/value catalog
@@ -1236,6 +1259,15 @@ pub mod commitment {
     fn commit_node_value_dictionary(
         node_value_catalog: &[ProofRecord],
     ) -> io::Result<(ArkGT, ArkGT)> {
+        commit_node_value_dictionary_with_context(
+            &super::argument::StoreProverContext::cpu(), node_value_catalog,
+        )
+    }
+
+    fn commit_node_value_dictionary_with_context(
+        context: &super::argument::StoreProverContext<'_>,
+        node_value_catalog: &[ProofRecord],
+    ) -> io::Result<(ArkGT, ArkGT)> {
         let padded = node_value_dict_padded_len(node_value_catalog.len())?;
         if padded == 0 {
             let identity = <ArkGT as Group>::identity();
@@ -1245,12 +1277,12 @@ pub mod commitment {
         for (slot, record) in hashes.iter_mut().zip(node_value_catalog) {
             *slot = super::dict::hash_object(&record.triple.object);
         }
-        let hash_commitment = commit_owned_field_column(hashes)?;
+        let hash_commitment = commit_owned_field_column_with_context(context, hashes)?;
         let mut ids = vec![<ArkFr as DoryField>::zero(); padded];
         for (slot, record) in ids.iter_mut().zip(node_value_catalog) {
             *slot = <ArkFr as DoryField>::from_u64(record.object_id);
         }
-        Ok((hash_commitment, commit_owned_field_column(ids)?))
+        Ok((hash_commitment, commit_owned_field_column_with_context(context, ids)?))
     }
 
     /// Reserved datatype tag for a `Node` entry in the node/value datatype column.
@@ -1425,14 +1457,26 @@ pub mod commitment {
     fn commit_node_value_dict_range(
         node_value_catalog: &[ProofRecord],
     ) -> io::Result<(ArkGT, ArkGT)> {
+        commit_node_value_dict_range_with_context(
+            &super::argument::StoreProverContext::cpu(), node_value_catalog,
+        )
+    }
+
+    fn commit_node_value_dict_range_with_context(
+        context: &super::argument::StoreProverContext<'_>,
+        node_value_catalog: &[ProofRecord],
+    ) -> io::Result<(ArkGT, ArkGT)> {
         let values = node_value_dict_value_column(node_value_catalog)?;
         if values.is_empty() {
             let identity = <ArkGT as Group>::identity();
             return Ok((identity, identity));
         }
-        let value_commitment = commit_owned_field_column(values)?;
+        let value_commitment = commit_owned_field_column_with_context(context, values)?;
         let datatypes = node_value_dict_datatype_column(node_value_catalog)?;
-        Ok((value_commitment, commit_owned_field_column(datatypes)?))
+        Ok((
+            value_commitment,
+            commit_owned_field_column_with_context(context, datatypes)?,
+        ))
     }
 
     fn serialize_commitment(commitment: &ArkGT) -> io::Result<Vec<u8>> {
@@ -1700,6 +1744,38 @@ pub mod commitment {
         #[allow(clippy::too_many_arguments)]
         pub fn from_native_delta(
             parent_state_root: Option<ProofHash>,
+            additions: Vec<ProofRecord>,
+            removals: Vec<ProofRecord>,
+            materialized: Vec<ProofRecord>,
+            parent_node_value_count: u64,
+            parent_predicate_count: u64,
+            node_value_count: u64,
+            predicate_count: u64,
+            node_value_mappings: Vec<(CanonicalObject, u64)>,
+            predicate_mappings: Vec<(Vec<u8>, u64)>,
+        ) -> io::Result<Self> {
+            Self::from_native_delta_with_context(
+                &super::argument::StoreProverContext::cpu(),
+                parent_state_root,
+                additions,
+                removals,
+                materialized,
+                parent_node_value_count,
+                parent_predicate_count,
+                node_value_count,
+                predicate_count,
+                node_value_mappings,
+                predicate_mappings,
+            )
+        }
+
+        /// Build a production sidecar with explicitly selected prover arithmetic.
+        /// The context affects computation only; validation and wire format remain
+        /// identical to [`Self::from_native_delta`].
+        #[allow(clippy::too_many_arguments)]
+        pub fn from_native_delta_with_context(
+            context: &super::argument::StoreProverContext<'_>,
+            parent_state_root: Option<ProofHash>,
             mut additions: Vec<ProofRecord>,
             mut removals: Vec<ProofRecord>,
             mut materialized: Vec<ProofRecord>,
@@ -1764,18 +1840,22 @@ pub mod commitment {
             materialized.sort_by(|a, b| triple_cmp(a, b, ProofIndex::Spo));
 
             // Real per-column Dory commitments over the sorted id columns.
-            let column_commitments = commit_delta_columns(&additions, &removals)?;
-            let materialized_column_commitments = commit_materialized_columns(&materialized)?;
+            let column_commitments =
+                commit_delta_columns_with_context(context, &additions, &removals)?;
+            let materialized_column_commitments =
+                commit_materialized_columns_with_context(context, &materialized)?;
             // Predicate-dictionary commitments (IRI->id binding, authenticated by
             // the root so Q3 membership proofs can trust it).
-            let predicate_dict_commitments = commit_predicate_dictionary(&predicate_catalog)?;
+            let predicate_dict_commitments =
+                commit_predicate_dictionary_with_context(context, &predicate_catalog)?;
             // Node/value-dictionary commitments (subject/object CONSTANT->id
             // binding, authenticated by the root the same way).
-            let node_value_dict_commitments = commit_node_value_dictionary(&node_value_catalog)?;
+            let node_value_dict_commitments =
+                commit_node_value_dictionary_with_context(context, &node_value_catalog)?;
             // Node/value order-preserving VALUE + DATATYPE columns backing the
             // (later) numeric range gadget, authenticated by the root the same way.
             let node_value_dict_range_commitments =
-                commit_node_value_dict_range(&node_value_catalog)?;
+                commit_node_value_dict_range_with_context(context, &node_value_catalog)?;
 
             let state = CommitmentState {
                 parent_state_root,

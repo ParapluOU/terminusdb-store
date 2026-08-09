@@ -260,7 +260,11 @@ fn bgp_chain_bytes(c: &BgpChainProof) -> usize {
 }
 
 fn atom_proof_bytes(a: &LayerBgpAtomProof) -> usize {
-    let mut n = dict_bytes(&a.predicate_membership);
+    let mut n = a
+        .predicate_membership
+        .as_ref()
+        .map(dict_bytes)
+        .unwrap_or(0);
     if let Some(s) = &a.subject_membership {
         n += dict_bytes(s);
     }

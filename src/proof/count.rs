@@ -29,8 +29,9 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    prove_column_openings, prove_sumcheck, verify_column_openings, verify_sumcheck, ClaimShape,
-    ColumnOpening, Expr, Operand, SumcheckClaim, SumcheckProof, SumcheckShape, Term, Transcript254,
+    prove_sumcheck, verify_column_openings, verify_sumcheck, ClaimShape,
+    ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof, SumcheckShape,
+    Term, Transcript254,
 };
 use super::invalid;
 
@@ -108,6 +109,29 @@ pub fn prove_count_identity(
     com_wr: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<CountProof> {
+    prove_count_identity_with_context(
+        &StoreProverContext::cpu(),
+        w_l,
+        w_r,
+        n_u,
+        m_j,
+        com_wl,
+        com_wr,
+        transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_count_identity_with_context(
+    context: &StoreProverContext<'_>,
+    w_l: &[ArkFr],
+    w_r: &[ArkFr],
+    n_u: usize,
+    m_j: usize,
+    com_wl: &ArkGT,
+    com_wr: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<CountProof> {
     if w_r.len() != w_l.len() {
         return Err(invalid("w_L and w_R must have equal length"));
     }
@@ -125,7 +149,7 @@ pub fn prove_count_identity(
     let shape = count_shape(k, n_u, m_j);
     let columns = vec![wl_p, wr_p];
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok(CountProof { sumcheck, opening })
 }

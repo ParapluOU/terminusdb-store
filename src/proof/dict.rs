@@ -36,10 +36,12 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    commit_column, prove_column_openings, prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ClaimShape, ColumnOpening, Expr, Operand, SumcheckClaim, SumcheckProof, SumcheckShape, Term,
-    Transcript254,
+    prove_sumcheck, verify_column_openings, verify_sumcheck,
+    ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
+    SumcheckShape, Term, Transcript254,
 };
+#[cfg(test)]
+use super::argument::{commit_column, prove_column_openings};
 use super::invalid;
 use super::logup::{reciprocal_claim, reciprocal_witness, rlc_fold};
 use super::CanonicalObject;
@@ -171,6 +173,29 @@ pub fn prove_dict_membership(
     id: ArkFr,
     transcript: &mut Transcript254,
 ) -> io::Result<DictProof> {
+    prove_dict_membership_with_context(
+        &StoreProverContext::cpu(),
+        dict_hash,
+        dict_id,
+        com_dict_hash,
+        com_dict_id,
+        q_hash,
+        id,
+        transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_dict_membership_with_context(
+    context: &StoreProverContext<'_>,
+    dict_hash: &[ArkFr],
+    dict_id: &[ArkFr],
+    com_dict_hash: &ArkGT,
+    com_dict_id: &ArkGT,
+    q_hash: ArkFr,
+    id: ArkFr,
+    transcript: &mut Transcript254,
+) -> io::Result<DictProof> {
     let k = check_dimensions(dict_hash, dict_id)?;
     let size = dict_hash.len();
 
@@ -184,7 +209,7 @@ pub fn prove_dict_membership(
             }
         })
         .collect();
-    let mult_commitment = commit_column(&mult)?;
+    let mult_commitment = context.commit_column(&mult)?;
 
     // Round 1: bind the dictionary + multiplicity, then draw beta/alpha.
     transcript.append_group(b"pow/dict/com-hash", com_dict_hash);
@@ -196,7 +221,7 @@ pub fn prove_dict_membership(
     // Reciprocal witness over the beta-fingerprinted dictionary rows.
     let dict_fold = rlc_fold(beta, &[dict_id, dict_hash]);
     let dstar = reciprocal_witness(alpha, &dict_fold);
-    let dstar_commitment = commit_column(&dstar)?;
+    let dstar_commitment = context.commit_column(&dstar)?;
 
     // Round 2: bind the reciprocal commitment, form the public target, run the
     // batched sumcheck, and open all four columns at r.
@@ -205,7 +230,7 @@ pub fn prove_dict_membership(
     let shape = dict_shape(k, alpha, beta, target);
     let columns = vec![dict_hash.to_vec(), dict_id.to_vec(), mult, dstar];
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok(DictProof {
         sumcheck,

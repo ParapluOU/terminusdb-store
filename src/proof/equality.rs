@@ -13,11 +13,11 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::{Field, Group};
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::{commit_column, Transcript254};
+use super::argument::{commit_column, StoreProverContext, Transcript254};
 use super::bgp::{RelationCommit, RelationWitness};
 use super::filter::{
-    prove_compaction_only, prove_filter_indicator, verify_compaction_only,
-    verify_filter_indicator, CompactionOnlyProof, FilterProof,
+    prove_compaction_only_with_context, prove_filter_indicator_with_context,
+    verify_compaction_only, verify_filter_indicator, CompactionOnlyProof, FilterProof,
 };
 use super::invalid;
 
@@ -112,6 +112,7 @@ fn bind_statement(
 }
 
 fn predicate_witness(
+    context: &StoreProverContext<'_>,
     relation: &RelationWitness,
     constraint: &RelationEqualityConstraint,
 ) -> io::Result<(Vec<ArkFr>, ArkGT, ArkFr)> {
@@ -135,7 +136,7 @@ fn predicate_witness(
         RelationEqualityConstraint::Constants { left, right } => {
             let mut column = vec![*left; relation.n];
             column.resize(size, ArkFr::zero());
-            Ok((column.clone(), commit_column(&column)?, *right))
+            Ok((column.clone(), context.commit_column(&column)?, *right))
         }
     }
 }
@@ -167,12 +168,23 @@ pub fn prove_relation_equality(
     constraint: &RelationEqualityConstraint,
     transcript: &mut Transcript254,
 ) -> io::Result<RelationEqualityResult> {
+    prove_relation_equality_with_context(
+        &StoreProverContext::cpu(), relation, constraint, transcript,
+    )
+}
+
+pub fn prove_relation_equality_with_context(
+    context: &StoreProverContext<'_>,
+    relation: &RelationWitness,
+    constraint: &RelationEqualityConstraint,
+    transcript: &mut Transcript254,
+) -> io::Result<RelationEqualityResult> {
     validate_relation(&relation.view())?;
     validate_constraint(constraint, relation.commitments.len())?;
     bind_statement(transcript, &relation.view(), constraint);
-    let (predicate, predicate_commitment, value) = predicate_witness(relation, constraint)?;
-    let (indicator, selection_commitment, inverse_commitment, _) = prove_filter_indicator(
-        &predicate,
+    let (predicate, predicate_commitment, value) = predicate_witness(context, relation, constraint)?;
+    let (indicator, selection_commitment, inverse_commitment, _) = prove_filter_indicator_with_context(
+        context, &predicate,
         value,
         relation.n,
         &predicate_commitment,
@@ -189,8 +201,8 @@ pub fn prove_relation_equality(
             }
         })
         .collect::<Vec<_>>();
-    let (compaction, commitments, columns, n) = prove_compaction_only(
-        &relation.columns,
+    let (compaction, commitments, columns, n) = prove_compaction_only_with_context(
+        context, &relation.columns,
         &relation.commitments,
         &selection,
         &selection_commitment,

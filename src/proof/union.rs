@@ -13,14 +13,18 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    commit_column, prove_column_openings, prove_sumcheck, verify_column_openings,
-    verify_sumcheck, ClaimShape, ColumnOpening, Expr, Operand, SumcheckClaim, SumcheckProof,
-    SumcheckShape, Term, Transcript254,
+    prove_sumcheck, verify_column_openings, verify_sumcheck, ClaimShape, ColumnOpening, Expr,
+    Operand, SumcheckClaim, SumcheckProof,
+    StoreProverContext, SumcheckShape, Term, Transcript254,
 };
+#[cfg(test)]
+use super::argument::commit_column;
 use super::bgp::{RelationCommit, RelationWitness};
 use super::invalid;
 use super::logup::{reciprocal_claim, reciprocal_witness, rlc_fold};
-use super::relocate::{prove_column_relocation, verify_column_relocation, RelocationProof};
+use super::relocate::{
+    prove_column_relocation_with_context, verify_column_relocation, RelocationProof,
+};
 
 const UNION_DOMAIN: &[u8] = b"parture/proof-of-woql/bag-union/v0";
 
@@ -200,6 +204,14 @@ pub fn prove_bag_union(
     inputs: &[RelationWitness],
     transcript: &mut Transcript254,
 ) -> io::Result<BagUnionResult> {
+    prove_bag_union_with_context(&StoreProverContext::cpu(), inputs, transcript)
+}
+
+pub fn prove_bag_union_with_context(
+    context: &StoreProverContext<'_>,
+    inputs: &[RelationWitness],
+    transcript: &mut Transcript254,
+) -> io::Result<BagUnionResult> {
     let views: Vec<RelationCommit> = inputs.iter().map(RelationWitness::view).collect();
     let arity = validate_inputs(&views)?;
     for input in inputs {
@@ -228,7 +240,7 @@ pub fn prove_bag_union(
     }
     let output_commitments: Vec<ArkGT> = output_columns
         .iter()
-        .map(|column| commit_column(column))
+        .map(|column| context.commit_column(column))
         .collect::<io::Result<_>>()?;
 
     bind_statement(
@@ -248,13 +260,9 @@ pub fn prove_bag_union(
         let mut branch_relocations = Vec::with_capacity(arity);
         for (column, source_commitment) in input.columns.iter().zip(&input.commitments) {
             let target = zero_pad(&column[..input.n], domain);
-            let target_commitment = commit_column(&target)?;
-            branch_relocations.push(prove_column_relocation(
-                column,
-                source_commitment,
-                &target,
-                &target_commitment,
-                transcript,
+            let target_commitment = context.commit_column(&target)?;
+            branch_relocations.push(prove_column_relocation_with_context(
+                context, column, source_commitment, &target, &target_commitment, transcript,
             )?);
             branch_columns.push(target);
             branch_commitments.push(target_commitment);
@@ -276,7 +284,7 @@ pub fn prove_bag_union(
     reciprocals.push(reciprocal_witness(alpha, &rlc_fold(beta, &output_slices)));
     let reciprocal_commitments: Vec<ArkGT> = reciprocals
         .iter()
-        .map(|column| commit_column(column))
+        .map(|column| context.commit_column(column))
         .collect::<io::Result<_>>()?;
     for commitment in &reciprocal_commitments {
         transcript.append_group(b"pow/union/reciprocal-com", commitment);
@@ -298,7 +306,7 @@ pub fn prove_bag_union(
     columns.extend(output_columns.iter().cloned());
     columns.extend(reciprocals);
     let (sumcheck, point, _) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &point, transcript)?;
+    let opening = context.prove_column_openings(&columns, &point, transcript)?;
 
     Ok(BagUnionResult {
         proof: BagUnionProof {

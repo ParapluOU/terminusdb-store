@@ -64,6 +64,8 @@ blake2 = "0.10"
 noreadlock = []
 eprint_log = []
 rollup_metadata_experimental = []
+blitzar-cpu = ["dory-pcs/blitzar-cpu"]
+blitzar-gpu = ["dory-pcs/blitzar-gpu"]
 
 [workspace]
 

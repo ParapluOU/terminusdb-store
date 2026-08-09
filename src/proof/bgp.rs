@@ -39,14 +39,16 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::{Field, Group};
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::{commit_column, Transcript254};
+use super::argument::{commit_column, StoreProverContext, Transcript254};
 use super::invalid;
 use super::join2::{
-    binary_join_commitments, binary_join_domain, compute_binary_join, prove_binary_join,
-    prove_binary_join_with_key_bits, verify_binary_join, verify_binary_join_with_key_bits,
-    BinaryJoinCommitments, BinaryJoinProof,
+    binary_join_commitments_with_context, binary_join_domain, compute_binary_join,
+    prove_binary_join_with_context, prove_binary_join_with_key_bits_and_context,
+    verify_binary_join, verify_binary_join_with_key_bits, BinaryJoinCommitments, BinaryJoinProof,
 };
-use super::relocate::{prove_column_relocation, verify_column_relocation, RelocationProof};
+use super::relocate::{
+    prove_column_relocation_with_context, verify_column_relocation, RelocationProof,
+};
 
 const CHAIN_DOMAIN: &[u8] = b"parture/proof-of-woql/bgp-left-deep-chain/v0";
 
@@ -138,6 +140,15 @@ impl RelationWitness {
     /// Commit a relation from its REAL-length columns (each length `n`): pad to the
     /// canonical power-of-two domain (`>= 2`) and Dory-commit every column.
     pub fn commit(real_columns: Vec<Vec<ArkFr>>, n: usize) -> io::Result<Self> {
+        Self::commit_with_context(&StoreProverContext::cpu(), real_columns, n)
+    }
+
+    /// Commit a relation with the caller-owned proving context.
+    pub fn commit_with_context(
+        context: &StoreProverContext<'_>,
+        real_columns: Vec<Vec<ArkFr>>,
+        n: usize,
+    ) -> io::Result<Self> {
         if real_columns.is_empty() {
             return Err(invalid("relation must have at least one column"));
         }
@@ -155,7 +166,7 @@ impl RelationWitness {
         let mut commitments = Vec::with_capacity(real_columns.len());
         for col in &real_columns {
             let padded = zero_pad(col, log_domain);
-            commitments.push(commit_column(&padded)?);
+            commitments.push(context.commit_column(&padded)?);
             columns.push(padded);
         }
         Ok(Self {
@@ -407,7 +418,9 @@ pub fn prove_bgp_chain(
     plan: &[JoinStep],
     transcript: &mut Transcript254,
 ) -> io::Result<(BgpChainProof, Vec<ArkGT>, usize)> {
-    let result = prove_bgp_chain_with_result(relations, plan, transcript)?;
+    let result = prove_bgp_chain_with_result_and_context(
+        &StoreProverContext::cpu(), relations, plan, transcript,
+    )?;
     Ok((result.proof, result.commitments, result.n))
 }
 
@@ -418,8 +431,19 @@ pub fn prove_bgp_chain_with_result(
     plan: &[JoinStep],
     transcript: &mut Transcript254,
 ) -> io::Result<BgpChainResult> {
+    prove_bgp_chain_with_result_and_context(
+        &StoreProverContext::cpu(), relations, plan, transcript,
+    )
+}
+
+pub fn prove_bgp_chain_with_result_and_context(
+    context: &StoreProverContext<'_>,
+    relations: &[RelationWitness],
+    plan: &[JoinStep],
+    transcript: &mut Transcript254,
+) -> io::Result<BgpChainResult> {
     let overrides = vec![None; plan.len()];
-    prove_bgp_chain_inner_with_result(relations, plan, &overrides, transcript)
+    prove_bgp_chain_inner_with_result(context, relations, plan, &overrides, transcript)
 }
 
 /// Prove the chain from EXPLICIT per-stage accumulator lengths (the honest entry passes
@@ -433,11 +457,14 @@ pub(crate) fn prove_bgp_chain_inner(
     transcript: &mut Transcript254,
 ) -> io::Result<(BgpChainProof, Vec<ArkGT>, usize)> {
     let result =
-        prove_bgp_chain_inner_with_result(relations, plan, r_len_overrides, transcript)?;
+        prove_bgp_chain_inner_with_result(
+            &StoreProverContext::cpu(), relations, plan, r_len_overrides, transcript,
+        )?;
     Ok((result.proof, result.commitments, result.n))
 }
 
 fn prove_bgp_chain_inner_with_result(
+    context: &StoreProverContext<'_>,
     relations: &[RelationWitness],
     plan: &[JoinStep],
     r_len_overrides: &[Option<usize>],
@@ -526,7 +553,9 @@ fn prove_bgp_chain_inner_with_result(
 
         let witness = compute_binary_join(r_key, &r_other, s_key, &s_other);
         let m_j = witness.m_j;
-        let com = binary_join_commitments(r_key, &r_other, s_key, &s_other, &witness)?;
+        let com = binary_join_commitments_with_context(
+            context, r_key, &r_other, s_key, &s_other, &witness,
+        )?;
         let d_j = binary_join_domain(r_len, rel.n, m_j, witness.n_u)?;
         let d_j_log = d_j.trailing_zeros() as usize;
 
@@ -547,8 +576,8 @@ fn prove_bgp_chain_inner_with_result(
         let mut acc_relocations = Vec::with_capacity(acc_arity);
         for c in 0..acc_arity {
             let target = zero_pad(&acc_real[c], d_j_log);
-            acc_relocations.push(prove_column_relocation(
-                &acc_cols[c],
+            acc_relocations.push(prove_column_relocation_with_context(
+                context, &acc_cols[c],
                 &acc_coms[c],
                 &target,
                 &acc_targets[c],
@@ -557,10 +586,10 @@ fn prove_bgp_chain_inner_with_result(
         }
         if cross_product {
             let source = unit_column(acc_len, acc_domain_log);
-            let source_commitment = commit_column(&source)?;
+            let source_commitment = context.commit_column(&source)?;
             let target = zero_pad(r_key, d_j_log);
-            acc_relocations.push(prove_column_relocation(
-                &source,
+            acc_relocations.push(prove_column_relocation_with_context(
+                context, &source,
                 &source_commitment,
                 &target,
                 &com.r_key,
@@ -583,8 +612,8 @@ fn prove_bgp_chain_inner_with_result(
         let mut rel_relocations = Vec::with_capacity(rel_arity);
         for c in 0..rel_arity {
             let target = zero_pad(&rel_real[c], d_j_log);
-            rel_relocations.push(prove_column_relocation(
-                &rel.columns[c],
+            rel_relocations.push(prove_column_relocation_with_context(
+                context, &rel.columns[c],
                 &rel.commitments[c],
                 &target,
                 &rel_targets[c],
@@ -593,10 +622,10 @@ fn prove_bgp_chain_inner_with_result(
         }
         if cross_product {
             let source = unit_column(rel.n, rel.log_domain);
-            let source_commitment = commit_column(&source)?;
+            let source_commitment = context.commit_column(&source)?;
             let target = zero_pad(s_key, d_j_log);
-            rel_relocations.push(prove_column_relocation(
-                &source,
+            rel_relocations.push(prove_column_relocation_with_context(
+                context, &source,
                 &source_commitment,
                 &target,
                 &com.s_key,
@@ -606,17 +635,19 @@ fn prove_bgp_chain_inner_with_result(
 
         // (3) The audited binary join over the relocated inputs.
         let (join, out_coms, out_m) = if step.additional_keys.is_empty() {
-            prove_binary_join(r_key, &r_other, s_key, &s_other, &com, transcript)?
+            prove_binary_join_with_context(
+                context, r_key, &r_other, s_key, &s_other, &com, transcript,
+            )?
         } else {
-            prove_binary_join_with_key_bits(
-                r_key, &r_other, s_key, &s_other, 128, &com, transcript,
+            prove_binary_join_with_key_bits_and_context(
+                context, r_key, &r_other, s_key, &s_other, 128, &com, transcript,
             )?
         };
         debug_assert_eq!(out_m, m_j);
 
         // Advance the accumulator to this stage's output (padded at d_j).
         if cross_product {
-            let expected_key = commit_column(&unit_column(m_j, d_j_log))?;
+            let expected_key = context.commit_column(&unit_column(m_j, d_j_log))?;
             if com.key != expected_key {
                 return Err(invalid("Cartesian-product output UNIT commitment mismatch"));
             }

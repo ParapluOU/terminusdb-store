@@ -13,20 +13,22 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::{Field, Group};
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::{commit_column, Transcript254};
+use super::argument::{commit_column, StoreProverContext, Transcript254};
 use super::bgp::{RelationCommit, RelationWitness};
 use super::filter::{
-    prove_compaction_only, prove_filter_indicator, verify_compaction_only, verify_filter_indicator,
-    CompactionOnlyProof, FilterProof,
+    prove_compaction_only_with_context, prove_filter_indicator_with_context,
+    verify_compaction_only, verify_filter_indicator, CompactionOnlyProof, FilterProof,
 };
 use super::invalid;
 use super::join2::{
-    binary_join_commitments, binary_join_domain, compute_binary_join, prove_binary_join,
-    prove_binary_join_with_key_bits, verify_binary_join, verify_binary_join_with_key_bits,
-    BinaryJoinCommitments, BinaryJoinProof,
+    binary_join_commitments_with_context, binary_join_domain, compute_binary_join,
+    prove_binary_join_with_context, prove_binary_join_with_key_bits_and_context,
+    verify_binary_join, verify_binary_join_with_key_bits, BinaryJoinCommitments, BinaryJoinProof,
 };
-use super::relocate::{prove_column_relocation, verify_column_relocation, RelocationProof};
-use super::union::{prove_bag_union, verify_bag_union, BagUnionProof};
+use super::relocate::{
+    prove_column_relocation_with_context, verify_column_relocation, RelocationProof,
+};
+use super::union::{prove_bag_union_with_context, verify_bag_union, BagUnionProof};
 
 const ANTI_DOMAIN: &[u8] = b"parture/proof-of-woql/left-anti-join/v0";
 
@@ -298,6 +300,14 @@ pub fn prove_global_not(
     left: &RelationWitness,
     right: &RelationWitness,
 ) -> io::Result<(Vec<ArkGT>, Vec<Vec<ArkFr>>, usize, usize)> {
+    prove_global_not_with_context(&StoreProverContext::cpu(), left, right)
+}
+
+pub fn prove_global_not_with_context(
+    context: &StoreProverContext<'_>,
+    left: &RelationWitness,
+    right: &RelationWitness,
+) -> io::Result<(Vec<ArkGT>, Vec<Vec<ArkFr>>, usize, usize)> {
     validate_witness(left, "left")?;
     validate_witness(right, "right")?;
     if right.n == 0 {
@@ -312,7 +322,7 @@ pub fn prove_global_not(
     let columns = vec![vec![f0(); size]; left.columns.len()];
     let commitments = columns
         .iter()
-        .map(|column| commit_column(column))
+        .map(|column| context.commit_column(column))
         .collect::<io::Result<_>>()?;
     Ok((commitments, columns, left.log_domain, 0))
 }
@@ -354,11 +364,38 @@ pub fn prove_left_anti_join(
     right_key: usize,
     transcript: &mut Transcript254,
 ) -> io::Result<LeftAntiJoinResult> {
-    prove_left_anti_join_with_keys(left, right, &[(left_key, right_key)], transcript)
+    prove_left_anti_join_with_context(
+        &StoreProverContext::cpu(), left, right, left_key, right_key, transcript,
+    )
+}
+
+pub fn prove_left_anti_join_with_context(
+    context: &StoreProverContext<'_>,
+    left: &RelationWitness,
+    right: &RelationWitness,
+    left_key: usize,
+    right_key: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<LeftAntiJoinResult> {
+    prove_left_anti_join_with_keys_and_context(
+        context, left, right, &[(left_key, right_key)], transcript,
+    )
 }
 
 /// Prove a correlated `Not` over one scalar or two injectively packed Store-ID keys.
 pub fn prove_left_anti_join_with_keys(
+    left: &RelationWitness,
+    right: &RelationWitness,
+    key_pairs: &[(usize, usize)],
+    transcript: &mut Transcript254,
+) -> io::Result<LeftAntiJoinResult> {
+    prove_left_anti_join_with_keys_and_context(
+        &StoreProverContext::cpu(), left, right, key_pairs, transcript,
+    )
+}
+
+pub fn prove_left_anti_join_with_keys_and_context(
+    context: &StoreProverContext<'_>,
     left: &RelationWitness,
     right: &RelationWitness,
     key_pairs: &[(usize, usize)],
@@ -431,8 +468,8 @@ pub fn prove_left_anti_join_with_keys(
     } else {
         split_key(&right_columns, right_key, right.n)
     };
-    let join_commitments = binary_join_commitments(
-        left_join_key,
+    let join_commitments = binary_join_commitments_with_context(
+        context, left_join_key,
         &left_join_other,
         right_join_key,
         &right_join_other,
@@ -472,8 +509,8 @@ pub fn prove_left_anti_join_with_keys(
         .zip(&left.commitments)
         .zip(left_columns.iter().zip(&left_targets))
     {
-        left_relocations.push(prove_column_relocation(
-            source,
+        left_relocations.push(prove_column_relocation_with_context(
+            context, source,
             source_commitment,
             target,
             target_commitment,
@@ -486,8 +523,8 @@ pub fn prove_left_anti_join_with_keys(
         .zip(&right.commitments)
         .zip(right_columns.iter().zip(&right_targets))
     {
-        right_relocations.push(prove_column_relocation(
-            source,
+        right_relocations.push(prove_column_relocation_with_context(
+            context, source,
             source_commitment,
             target,
             target_commitment,
@@ -495,8 +532,8 @@ pub fn prove_left_anti_join_with_keys(
         )?);
     }
     let (join, _, join_len) = if composite {
-        prove_binary_join_with_key_bits(
-            left_join_key,
+        prove_binary_join_with_key_bits_and_context(
+            context, left_join_key,
             &left_join_other,
             right_join_key,
             &right_join_other,
@@ -505,8 +542,8 @@ pub fn prove_left_anti_join_with_keys(
             transcript,
         )?
     } else {
-        prove_binary_join(
-            left_join_key,
+        prove_binary_join_with_context(
+            context, left_join_key,
             &left_join_other,
             right_join_key,
             &right_join_other,
@@ -515,8 +552,8 @@ pub fn prove_left_anti_join_with_keys(
         )?
     };
     let mult = multiplicities(&witness.rho_l, left.n, join_len, size);
-    let (zero, zero_selection_commitment, zero_inverse_commitment, _) = prove_filter_indicator(
-        &mult,
+    let (zero, zero_selection_commitment, zero_inverse_commitment, _) = prove_filter_indicator_with_context(
+        context, &mult,
         f0(),
         left.n,
         &join.pairs.mult_l_commitment,
@@ -533,8 +570,8 @@ pub fn prove_left_anti_join_with_keys(
             }
         })
         .collect();
-    let (compaction, commitments, columns, n) = prove_compaction_only(
-        &left_columns,
+    let (compaction, commitments, columns, n) = prove_compaction_only_with_context(
+        context, &left_columns,
         &left_targets,
         &selection,
         &zero_selection_commitment,
@@ -719,7 +756,19 @@ pub fn prove_left_outer_join_with_keys(
     key_pairs: &[(usize, usize)],
     transcript: &mut Transcript254,
 ) -> io::Result<LeftOuterJoinResult> {
-    let anti = prove_left_anti_join_with_keys(left, right, key_pairs, transcript)?;
+    prove_left_outer_join_with_keys_and_context(
+        &StoreProverContext::cpu(), left, right, key_pairs, transcript,
+    )
+}
+
+pub fn prove_left_outer_join_with_keys_and_context(
+    context: &StoreProverContext<'_>,
+    left: &RelationWitness,
+    right: &RelationWitness,
+    key_pairs: &[(usize, usize)],
+    transcript: &mut Transcript254,
+) -> io::Result<LeftOuterJoinResult> {
+    let anti = prove_left_anti_join_with_keys_and_context(context, left, right, key_pairs, transcript)?;
     let size = 1usize << anti.log_domain;
     let right_only = right.columns.len() - key_pairs.len();
     let matched_columns: Vec<Vec<ArkFr>> = anti
@@ -734,7 +783,7 @@ pub fn prove_left_outer_join_with_keys(
         n: anti.proof.join_len,
     };
     let zero = vec![f0(); size];
-    let zero_commitment = commit_column(&zero)?;
+    let zero_commitment = context.commit_column(&zero)?;
     let mut unmatched_columns = anti.columns.clone();
     unmatched_columns.extend((0..right_only).map(|_| zero.clone()));
     let mut unmatched_commitments = anti.commitments.clone();
@@ -745,7 +794,7 @@ pub fn prove_left_outer_join_with_keys(
         log_domain: anti.log_domain,
         n: anti.n,
     };
-    let union = prove_bag_union(&[matched, unmatched], transcript)?;
+    let union = prove_bag_union_with_context(context, &[matched, unmatched], transcript)?;
     Ok(LeftOuterJoinResult {
         proof: LeftOuterJoinProof {
             anti: anti.proof,
@@ -822,12 +871,15 @@ fn unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
     column
 }
 
-fn augment_with_unit(relation: &RelationWitness) -> io::Result<RelationWitness> {
+fn augment_with_unit(
+    context: &StoreProverContext<'_>,
+    relation: &RelationWitness,
+) -> io::Result<RelationWitness> {
     validate_witness(relation, "global outer")?;
     let mut columns = relation.columns.clone();
     let unit = unit_column(relation.n, relation.log_domain);
     let mut commitments = relation.commitments.clone();
-    commitments.push(commit_column(&unit)?);
+    commitments.push(context.commit_column(&unit)?);
     columns.push(unit);
     Ok(RelationWitness {
         columns,
@@ -858,12 +910,23 @@ pub fn prove_global_left_outer_join(
     right: &RelationWitness,
     transcript: &mut Transcript254,
 ) -> io::Result<LeftOuterJoinResult> {
+    prove_global_left_outer_join_with_context(
+        &StoreProverContext::cpu(), left, right, transcript,
+    )
+}
+
+pub fn prove_global_left_outer_join_with_context(
+    context: &StoreProverContext<'_>,
+    left: &RelationWitness,
+    right: &RelationWitness,
+    transcript: &mut Transcript254,
+) -> io::Result<LeftOuterJoinResult> {
     let left_arity = left.columns.len();
     let right_arity = right.columns.len();
-    let augmented_left = augment_with_unit(left)?;
-    let augmented_right = augment_with_unit(right)?;
-    let mut result = prove_left_outer_join_with_keys(
-        &augmented_left,
+    let augmented_left = augment_with_unit(context, left)?;
+    let augmented_right = augment_with_unit(context, right)?;
+    let mut result = prove_left_outer_join_with_keys_and_context(
+        context, &augmented_left,
         &augmented_right,
         &[(left_arity, right_arity)],
         transcript,

@@ -29,10 +29,12 @@ use dory_pcs::backends::arkworks::{
     ArkFr, ArkG1, ArkG2, ArkGT, ArkworksPolynomial, Blake2bTranscript, G1Routines, G2Routines,
     BN254,
 };
-use dory_pcs::primitives::arithmetic::{Field, Group};
+#[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+use dory_pcs::backends::arkworks::{BlitzarG1Backend, BlitzarRuntime, BlitzarRuntimeConfig};
+use dory_pcs::primitives::arithmetic::{Field, Group, ProverBackend};
 use dory_pcs::primitives::poly::Polynomial;
 use dory_pcs::primitives::transcript::Transcript;
-use dory_pcs::{prove, verify, DoryProof, Transparent};
+use dory_pcs::{prove_with_context, verify, DoryProof, ProverContext, RoutineBackend, Transparent};
 
 use super::commitment::{matrix_dims, prover_setup, setup_parameter_id, verifier_setup};
 use super::invalid;
@@ -43,6 +45,154 @@ pub type Transcript254 = Blake2bTranscript<BN254>;
 
 /// A Dory single-point opening proof over BN254.
 pub type ColumnOpening = DoryProof<ArkG1, ArkG2, ArkGT>;
+
+/// Deterministic Dory parameter tier optionally preprocessed by a prover context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProverSetupTier {
+    Log20,
+    Log22,
+    Log24,
+}
+
+impl ProverSetupTier {
+    pub const fn log_domain(self) -> usize {
+        match self {
+            Self::Log20 => 20,
+            Self::Log22 => 22,
+            Self::Log24 => 24,
+        }
+    }
+}
+
+enum StoreG1Backend<'runtime> {
+    Cpu(
+        RoutineBackend<G1Routines>,
+        std::marker::PhantomData<&'runtime ()>,
+    ),
+    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+    Blitzar(BlitzarG1Backend<'runtime>),
+}
+
+impl ProverBackend<ArkG1> for StoreG1Backend<'_> {
+    fn msm(&self, bases: &[ArkG1], scalars: &[ArkFr]) -> ArkG1 {
+        match self {
+            Self::Cpu(backend, _) => backend.msm(bases, scalars),
+            #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+            Self::Blitzar(backend) => backend.msm(bases, scalars),
+        }
+    }
+
+    fn batch_msm_same_bases(&self, bases: &[ArkG1], batches: &[&[ArkFr]]) -> Vec<ArkG1> {
+        match self {
+            Self::Cpu(backend, _) => backend.batch_msm_same_bases(bases, batches),
+            #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+            Self::Blitzar(backend) => backend.batch_msm_same_bases(bases, batches),
+        }
+    }
+
+    fn fixed_base_vector_scalar_mul(&self, base: &ArkG1, scalars: &[ArkFr]) -> Vec<ArkG1> {
+        match self {
+            Self::Cpu(backend, _) => backend.fixed_base_vector_scalar_mul(base, scalars),
+            #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+            Self::Blitzar(backend) => backend.fixed_base_vector_scalar_mul(base, scalars),
+        }
+    }
+
+    fn fixed_scalar_mul_bases_then_add(
+        &self,
+        bases: &[ArkG1],
+        values: &mut [ArkG1],
+        scalar: &ArkFr,
+    ) {
+        match self {
+            Self::Cpu(backend, _) => backend.fixed_scalar_mul_bases_then_add(bases, values, scalar),
+            #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+            Self::Blitzar(backend) => {
+                backend.fixed_scalar_mul_bases_then_add(bases, values, scalar)
+            }
+        }
+    }
+
+    fn fixed_scalar_mul_vs_then_add(
+        &self,
+        values: &mut [ArkG1],
+        addends: &[ArkG1],
+        scalar: &ArkFr,
+    ) {
+        match self {
+            Self::Cpu(backend, _) => backend.fixed_scalar_mul_vs_then_add(values, addends, scalar),
+            #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+            Self::Blitzar(backend) => backend.fixed_scalar_mul_vs_then_add(values, addends, scalar),
+        }
+    }
+
+    fn fold_field_vectors(&self, left: &mut [ArkFr], right: &[ArkFr], scalar: &ArkFr) {
+        match self {
+            Self::Cpu(backend, _) => backend.fold_field_vectors(left, right, scalar),
+            #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+            Self::Blitzar(backend) => backend.fold_field_vectors(left, right, scalar),
+        }
+    }
+}
+
+/// Caller-created Store proving arithmetic. It is never serialized or consulted
+/// by verification, and selecting it cannot change proof bytes.
+pub struct StoreProverContext<'runtime> {
+    inner: ProverContext<BN254, StoreG1Backend<'runtime>, RoutineBackend<G2Routines>>,
+    accelerated_tier: Option<ProverSetupTier>,
+}
+
+impl StoreProverContext<'static> {
+    /// Explicit stock-Arkworks CPU context used by compatibility conveniences.
+    pub const fn cpu() -> Self {
+        Self {
+            inner: ProverContext::new(
+                StoreG1Backend::Cpu(RoutineBackend::new(), std::marker::PhantomData),
+                RoutineBackend::new(),
+            ),
+            accelerated_tier: None,
+        }
+    }
+}
+
+impl<'runtime> StoreProverContext<'runtime> {
+    /// The single setup tier preprocessed by this context, if any.
+    pub const fn accelerated_tier(&self) -> Option<ProverSetupTier> {
+        self.accelerated_tier
+    }
+
+    /// Commit one proof column using this context.
+    pub fn commit_column(&self, column: &[ArkFr]) -> io::Result<ArkGT> {
+        commit_column_with_context(self, column)
+    }
+
+    /// Open proof columns using this context and the caller's transcript.
+    pub fn prove_column_openings(
+        &self,
+        column_tables: &[Vec<ArkFr>],
+        r: &[ArkFr],
+        transcript: &mut Transcript254,
+    ) -> io::Result<ColumnOpening> {
+        prove_column_openings_with_context(self, column_tables, r, transcript)
+    }
+
+    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+    pub fn blitzar(runtime: &'runtime BlitzarRuntime, tier: ProverSetupTier) -> io::Result<Self> {
+        let setup = prover_setup(tier.log_domain())?;
+        Ok(Self {
+            inner: ProverContext::new(
+                StoreG1Backend::Blitzar(BlitzarG1Backend::new(runtime, &setup.g1_vec)),
+                RoutineBackend::new(),
+            ),
+            accelerated_tier: Some(tier),
+        })
+    }
+
+    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+    pub fn initialize_blitzar(config: BlitzarRuntimeConfig) -> BlitzarRuntime {
+        BlitzarRuntime::initialize(config)
+    }
+}
 
 const LABEL_DOMAIN: &[u8] = b"pow/sumcheck/domain";
 const LABEL_SHAPE: &[u8] = b"pow/sumcheck/shape";
@@ -315,7 +465,9 @@ pub fn chi_n_eval(point: &[ArkFr], n: usize) -> ArkFr {
 /// whose multilinear extension the verifier reproduces closed-form via
 /// [`idx_eval`].
 fn idx_table(k: usize) -> Vec<ArkFr> {
-    (0..(1usize << k)).map(|i| ArkFr::from_u64(i as u64)).collect()
+    (0..(1usize << k))
+        .map(|i| ArkFr::from_u64(i as u64))
+        .collect()
 }
 
 /// Closed-form MLE of the PUBLIC index function `f(i) = i` at `point` (LSB-first):
@@ -421,7 +573,10 @@ fn append_shape(transcript: &mut Transcript254, shape: &SumcheckShape) {
 /// commitments to the transcript: bind the shape (domain tag), then draw the
 /// zero-check point `r_zc` (only if some claim is an identity claim), then the
 /// batching challenge `rho`. Returns `(r_zc, rho_powers)`.
-fn draw_preamble(transcript: &mut Transcript254, shape: &SumcheckShape) -> (Vec<ArkFr>, Vec<ArkFr>) {
+fn draw_preamble(
+    transcript: &mut Transcript254,
+    shape: &SumcheckShape,
+) -> (Vec<ArkFr>, Vec<ArkFr>) {
     append_shape(transcript, shape);
     let r_zc = if shape.has_identity() {
         (0..shape.num_vars)
@@ -487,7 +642,8 @@ pub fn prove_sumcheck(
             let x_field = ArkFr::from_u64(x as u64);
             let one_minus = f1() - x_field;
             // Fold-to-X value of a table at hypercube pair `i`.
-            let at = |table: &[ArkFr], i: usize| table[2 * i] * one_minus + table[2 * i + 1] * x_field;
+            let at =
+                |table: &[ArkFr], i: usize| table[2 * i] * one_minus + table[2 * i + 1] * x_field;
             let mut acc = f0();
             for i in 0..half {
                 for (j, claim) in shape.claims.iter().enumerate() {
@@ -561,7 +717,9 @@ pub fn verify_sumcheck(
         return Err(invalid("sumcheck proof has the wrong number of rounds"));
     }
     if proof.claimed_evals.len() != shape.num_columns {
-        return Err(invalid("sumcheck proof has the wrong number of claimed evals"));
+        return Err(invalid(
+            "sumcheck proof has the wrong number of claimed evals",
+        ));
     }
     let degree = shape.round_degree();
 
@@ -640,11 +798,24 @@ pub fn verify_sumcheck(
 /// end-to-end tests) can INDEPENDENTLY recompute expected result-column
 /// commitments and compare them to a BGP proof's output. Pure and deterministic.
 pub fn commit_column(column: &[ArkFr]) -> io::Result<ArkGT> {
+    commit_column_with_context(&StoreProverContext::cpu(), column)
+}
+
+/// Commit a raw column with explicitly selected prover arithmetic.
+pub fn commit_column_with_context(
+    context: &StoreProverContext<'_>,
+    column: &[ArkFr],
+) -> io::Result<ArkGT> {
     let (nu, sigma) = column_dims(column.len())?;
     let num_vars = column.len().trailing_zeros() as usize;
     let poly = ArkworksPolynomial::new(column.to_vec());
     let (tier_2, _rows, _blind) = poly
-        .commit::<BN254, Transparent, G1Routines>(nu, sigma, prover_setup(num_vars)?)
+        .commit_with_backend::<BN254, Transparent, _>(
+            nu,
+            sigma,
+            prover_setup(num_vars)?,
+            context.inner.g1(),
+        )
         .map_err(|error| invalid(format!("column commitment failed: {error}")))?;
     Ok(tier_2)
 }
@@ -676,6 +847,16 @@ pub fn prove_column_openings(
     r: &[ArkFr],
     transcript: &mut Transcript254,
 ) -> io::Result<ColumnOpening> {
+    prove_column_openings_with_context(&StoreProverContext::cpu(), column_tables, r, transcript)
+}
+
+/// Prove batched column openings with explicitly selected prover arithmetic.
+pub fn prove_column_openings_with_context(
+    context: &StoreProverContext<'_>,
+    column_tables: &[Vec<ArkFr>],
+    r: &[ArkFr],
+    transcript: &mut Transcript254,
+) -> io::Result<ColumnOpening> {
     let size = 1usize << r.len();
     if column_tables.iter().any(|c| c.len() != size) {
         return Err(invalid("column length does not match evaluation point"));
@@ -694,9 +875,14 @@ pub fn prove_column_openings(
 
     let poly = ArkworksPolynomial::new(combined);
     let (_tier_2, row_commitments, blind) = poly
-        .commit::<BN254, Transparent, G1Routines>(nu, sigma, prover_setup(r.len())?)
+        .commit_with_backend::<BN254, Transparent, _>(
+            nu,
+            sigma,
+            prover_setup(r.len())?,
+            context.inner.g1(),
+        )
         .map_err(|error| invalid(format!("batched column commitment failed: {error}")))?;
-    let (proof, _) = prove::<_, BN254, G1Routines, G2Routines, _, _, Transparent>(
+    let (proof, _) = prove_with_context::<_, BN254, _, _, _, _, Transparent>(
         &poly,
         r,
         row_commitments,
@@ -704,6 +890,7 @@ pub fn prove_column_openings(
         nu,
         sigma,
         prover_setup(r.len())?,
+        &context.inner,
         transcript,
     )
     .map_err(|error| invalid(format!("dory opening proof failed: {error}")))?;
@@ -740,6 +927,8 @@ pub fn verify_column_openings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+    use ark_serialize::CanonicalSerialize;
 
     fn fr(v: u64) -> ArkFr {
         ArkFr::from_u64(v)
@@ -817,7 +1006,7 @@ mod tests {
                 claims: vec![
                     SumcheckClaim::product(ClaimShape::ZeroSum, &[0]),
                     SumcheckClaim::product(ClaimShape::ZeroSum, &[3, 1]), // sum_x d*b == 0
-                    SumcheckClaim::product(ClaimShape::Identity, &[4]), // zero column
+                    SumcheckClaim::product(ClaimShape::Identity, &[4]),   // zero column
                 ],
             };
 
@@ -965,7 +1154,9 @@ mod tests {
         let mut pt = transcript();
         let opening = prove_column_openings(&[column.clone()], &r, &mut pt).unwrap();
         let mut vt = transcript();
-        assert!(verify_column_openings(&[commitment], &r, &[honest_eval], &opening, &mut vt).is_ok());
+        assert!(
+            verify_column_openings(&[commitment], &r, &[honest_eval], &opening, &mut vt).is_ok()
+        );
 
         // Same opening + same claimed eval, but the transposed point: rejected.
         let mut pt_bad = transcript();
@@ -979,5 +1170,41 @@ mod tests {
             &mut vt_bad
         )
         .is_err());
+    }
+
+    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+    #[test]
+    fn caller_owned_blitzar_context_preserves_commitments_and_proof_bytes() {
+        let runtime = StoreProverContext::initialize_blitzar(BlitzarRuntimeConfig {
+            num_precomputed_generators: 0,
+        });
+        let accelerated = StoreProverContext::blitzar(&runtime, ProverSetupTier::Log20).unwrap();
+        let cpu = StoreProverContext::cpu();
+        assert_eq!(cpu.accelerated_tier(), None);
+        assert_eq!(accelerated.accelerated_tier(), Some(ProverSetupTier::Log20));
+
+        let column = column(6, 91);
+        let point = (0..6).map(|i| fr(13 * i as u64 + 2)).collect::<Vec<_>>();
+        let cpu_commitment = cpu.commit_column(&column).unwrap();
+        let accelerated_commitment = accelerated.commit_column(&column).unwrap();
+        assert_eq!(cpu_commitment, accelerated_commitment);
+
+        let mut cpu_transcript = Transcript254::new(b"store-context-equivalence");
+        let cpu_proof = cpu
+            .prove_column_openings(&[column.clone()], &point, &mut cpu_transcript)
+            .unwrap();
+        let mut accelerated_transcript = Transcript254::new(b"store-context-equivalence");
+        let accelerated_proof = accelerated
+            .prove_column_openings(&[column], &point, &mut accelerated_transcript)
+            .unwrap();
+        assert_eq!(cpu_proof, accelerated_proof);
+
+        let mut cpu_bytes = Vec::new();
+        cpu_proof.serialize_compressed(&mut cpu_bytes).unwrap();
+        let mut accelerated_bytes = Vec::new();
+        accelerated_proof
+            .serialize_compressed(&mut accelerated_bytes)
+            .unwrap();
+        assert_eq!(cpu_bytes, accelerated_bytes);
     }
 }

@@ -37,10 +37,12 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    commit_column, prove_column_openings, prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ClaimShape, ColumnOpening, Expr, Operand, SumcheckClaim, SumcheckProof, SumcheckShape, Term,
-    Transcript254,
+    prove_sumcheck, verify_column_openings, verify_sumcheck,
+    ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
+    SumcheckShape, Term, Transcript254,
 };
+#[cfg(test)]
+use super::argument::commit_column;
 use super::invalid;
 use super::logup::{multiset_link_claim, reciprocal_witness, rlc_fold};
 
@@ -257,7 +259,31 @@ fn sort_shape(
 /// point and, in tests, to inject a forged shift/multiplicity/bit witness). All
 /// witness columns are length-`n_domain`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prove_strictly_sorted_with_witness(
+    u: &[ArkFr],
+    n: usize,
+    com_u: &ArkGT,
+    u_shift: &[ArkFr],
+    mult_c: &[ArkFr],
+    bit_columns: &[Vec<ArkFr>],
+    transcript: &mut Transcript254,
+) -> io::Result<SortedProof> {
+    prove_strictly_sorted_with_witness_and_context(
+        &StoreProverContext::cpu(),
+        u,
+        n,
+        com_u,
+        u_shift,
+        mult_c,
+        bit_columns,
+        transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_strictly_sorted_with_witness_and_context(
+    context: &StoreProverContext<'_>,
     u: &[ArkFr],
     n: usize,
     com_u: &ArkGT,
@@ -282,11 +308,11 @@ pub(crate) fn prove_strictly_sorted_with_witness(
 
     // Round 1: commit U_shift, mult_c, and the 64 bit columns (raw-data witnesses),
     // bind them (with the given com_u).
-    let u_shift_commitment = commit_column(u_shift)?;
-    let mult_c_commitment = commit_column(mult_c)?;
+    let u_shift_commitment = context.commit_column(u_shift)?;
+    let mult_c_commitment = context.commit_column(mult_c)?;
     let mut bit_commitments = Vec::with_capacity(bits);
     for column in bit_columns {
-        bit_commitments.push(commit_column(column)?);
+        bit_commitments.push(context.commit_column(column)?);
     }
     transcript.append_group(b"pow/sort/com-u", com_u);
     transcript.append_group(b"pow/sort/com-u-shift", &u_shift_commitment);
@@ -305,8 +331,8 @@ pub(crate) fn prove_strictly_sorted_with_witness(
         .collect();
     let rec_c = reciprocal_witness(alpha, &rlc_fold(beta, &[&idx_col, &u_p]));
     let rec_d = reciprocal_witness(alpha, &rlc_fold(beta, &[&idx_plus1, u_shift]));
-    let rec_c_commitment = commit_column(&rec_c)?;
-    let rec_d_commitment = commit_column(&rec_d)?;
+    let rec_c_commitment = context.commit_column(&rec_c)?;
+    let rec_d_commitment = context.commit_column(&rec_d)?;
     transcript.append_group(b"pow/sort/com-rec-c", &rec_c_commitment);
     transcript.append_group(b"pow/sort/com-rec-d", &rec_d_commitment);
 
@@ -315,7 +341,7 @@ pub(crate) fn prove_strictly_sorted_with_witness(
     columns.extend(bit_columns.iter().cloned());
 
     let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = prove_column_openings(&columns, &r, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok(SortedProof {
         sumcheck,
@@ -363,9 +389,21 @@ pub fn prove_strictly_sorted(
     com_u: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<SortedProof> {
+    prove_strictly_sorted_with_context(&StoreProverContext::cpu(), u, n, com_u, transcript)
+}
+
+pub fn prove_strictly_sorted_with_context(
+    context: &StoreProverContext<'_>,
+    u: &[ArkFr],
+    n: usize,
+    com_u: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<SortedProof> {
     let n_domain = column_domain(u.len(), n)?;
     let (u_shift, mult_c, bit_columns) = honest_witness(u, n, n_domain, BITS);
-    prove_strictly_sorted_with_witness(u, n, com_u, &u_shift, &mult_c, &bit_columns, transcript)
+    prove_strictly_sorted_with_witness_and_context(
+        context, u, n, com_u, &u_shift, &mult_c, &bit_columns, transcript,
+    )
 }
 
 /// Prove strict ordering for values whose positive consecutive differences fit in
@@ -377,12 +415,27 @@ pub fn prove_strictly_sorted_bits(
     com_u: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<SortedProof> {
+    prove_strictly_sorted_bits_with_context(
+        &StoreProverContext::cpu(), u, n, bits, com_u, transcript,
+    )
+}
+
+pub fn prove_strictly_sorted_bits_with_context(
+    context: &StoreProverContext<'_>,
+    u: &[ArkFr],
+    n: usize,
+    bits: usize,
+    com_u: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<SortedProof> {
     if bits == 0 || bits > 253 {
         return Err(invalid("sort bit width must be in 1..=253"));
     }
     let n_domain = column_domain(u.len(), n)?;
     let (u_shift, mult_c, bit_columns) = honest_witness(u, n, n_domain, bits);
-    prove_strictly_sorted_with_witness(u, n, com_u, &u_shift, &mult_c, &bit_columns, transcript)
+    prove_strictly_sorted_with_witness_and_context(
+        context, u, n, com_u, &u_shift, &mult_c, &bit_columns, transcript,
+    )
 }
 
 /// Verify a strict-sortedness proof.

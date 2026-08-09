@@ -42,13 +42,15 @@ use dory_pcs::primitives::arithmetic::{Field, Group};
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    commit_column, prove_column_openings, prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ClaimShape, ColumnOpening, Expr, Operand, SumcheckClaim, SumcheckProof, SumcheckShape, Term,
-    Transcript254,
+    prove_sumcheck, verify_column_openings, verify_sumcheck,
+    ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
+    SumcheckShape, Term, Transcript254,
 };
+#[cfg(test)]
+use super::argument::commit_column;
 use super::invalid;
 use super::logup::{masked_multiset_link_claim, reciprocal_witness, rlc_fold};
-use super::sort::{prove_strictly_sorted, verify_strictly_sorted, SortedProof};
+use super::sort::{prove_strictly_sorted_with_context, verify_strictly_sorted, SortedProof};
 
 const COL_SF: usize = 0;
 const COL_OF: usize = 1;
@@ -245,10 +247,35 @@ pub fn prove_distinct_valid_pairs(
     com_rho_r: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<PairsProof> {
+    prove_distinct_valid_pairs_with_context(
+        &StoreProverContext::cpu(), sf, of, x, y, z, rho_l, rho_r, com_sf, com_of, com_x, com_y,
+        com_z, com_rho_l, com_rho_r, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_distinct_valid_pairs_with_context(
+    context: &StoreProverContext<'_>,
+    sf: &[ArkFr],
+    of: &[ArkFr],
+    x: &[ArkFr],
+    y: &[ArkFr],
+    z: &[ArkFr],
+    rho_l: &[ArkFr],
+    rho_r: &[ArkFr],
+    com_sf: &ArkGT,
+    com_of: &ArkGT,
+    com_x: &ArkGT,
+    com_y: &ArkGT,
+    com_z: &ArkGT,
+    com_rho_l: &ArkGT,
+    com_rho_r: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<PairsProof> {
     let domain = pairs_domain(sf.len(), x.len())?;
-    prove_distinct_valid_pairs_in_domain(
-        sf, of, x, y, z, rho_l, rho_r, com_sf, com_of, com_x, com_y, com_z, com_rho_l, com_rho_r,
-        domain, transcript,
+    prove_distinct_valid_pairs_in_domain_with_context(
+        context, sf, of, x, y, z, rho_l, rho_r, com_sf, com_of, com_x, com_y, com_z, com_rho_l,
+        com_rho_r, domain, transcript,
     )
 }
 
@@ -259,7 +286,49 @@ pub fn prove_distinct_valid_pairs(
 /// the whole self-join). Real lengths (`n_F`, `m_J`) still drive the chi mask and
 /// the source multiplicities, so padding rows stay inert.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prove_distinct_valid_pairs_in_domain(
+    sf: &[ArkFr],
+    of: &[ArkFr],
+    x: &[ArkFr],
+    y: &[ArkFr],
+    z: &[ArkFr],
+    rho_l: &[ArkFr],
+    rho_r: &[ArkFr],
+    com_sf: &ArkGT,
+    com_of: &ArkGT,
+    com_x: &ArkGT,
+    com_y: &ArkGT,
+    com_z: &ArkGT,
+    com_rho_l: &ArkGT,
+    com_rho_r: &ArkGT,
+    domain: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<PairsProof> {
+    prove_distinct_valid_pairs_in_domain_with_context(
+        &StoreProverContext::cpu(),
+        sf,
+        of,
+        x,
+        y,
+        z,
+        rho_l,
+        rho_r,
+        com_sf,
+        com_of,
+        com_x,
+        com_y,
+        com_z,
+        com_rho_l,
+        com_rho_r,
+        domain,
+        transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_distinct_valid_pairs_in_domain_with_context(
+    context: &StoreProverContext<'_>,
     sf: &[ArkFr],
     of: &[ArkFr],
     x: &[ArkFr],
@@ -304,9 +373,9 @@ pub(crate) fn prove_distinct_valid_pairs_in_domain(
     let mult_l_in = source_multiplicities(&rho_l_p, n_f, m_j, n);
     let mult_r_in = source_multiplicities(&rho_r_p, n_f, m_j, n);
 
-    prove_distinct_valid_pairs_with_witness(
-        &sf_p, &of_p, &x_p, &y_p, &z_p, &rho_l_p, &rho_r_p, n_f, m_j, &mult_l_in, &mult_r_in,
-        com_sf, com_of, com_x, com_y, com_z, com_rho_l, com_rho_r, transcript,
+    prove_distinct_valid_pairs_with_witness_and_context(
+        context, &sf_p, &of_p, &x_p, &y_p, &z_p, &rho_l_p, &rho_r_p, n_f, m_j, &mult_l_in,
+        &mult_r_in, com_sf, com_of, com_x, com_y, com_z, com_rho_l, com_rho_r, transcript,
     )
 }
 
@@ -317,7 +386,55 @@ pub(crate) fn prove_distinct_valid_pairs_in_domain(
 /// malicious `Sf`/`Of` padding tail, out-of-range `rho`, and a full-domain
 /// multiplicity that lights up padding source rows.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prove_distinct_valid_pairs_with_witness(
+    sf_p: &[ArkFr],
+    of_p: &[ArkFr],
+    x_p: &[ArkFr],
+    y_p: &[ArkFr],
+    z_p: &[ArkFr],
+    rho_l_p: &[ArkFr],
+    rho_r_p: &[ArkFr],
+    n_f: usize,
+    m_j: usize,
+    mult_l_in: &[ArkFr],
+    mult_r_in: &[ArkFr],
+    com_sf: &ArkGT,
+    com_of: &ArkGT,
+    com_x: &ArkGT,
+    com_y: &ArkGT,
+    com_z: &ArkGT,
+    com_rho_l: &ArkGT,
+    com_rho_r: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<PairsProof> {
+    prove_distinct_valid_pairs_with_witness_and_context(
+        &StoreProverContext::cpu(),
+        sf_p,
+        of_p,
+        x_p,
+        y_p,
+        z_p,
+        rho_l_p,
+        rho_r_p,
+        n_f,
+        m_j,
+        mult_l_in,
+        mult_r_in,
+        com_sf,
+        com_of,
+        com_x,
+        com_y,
+        com_z,
+        com_rho_l,
+        com_rho_r,
+        transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_distinct_valid_pairs_with_witness_and_context(
+    context: &StoreProverContext<'_>,
     sf_p: &[ArkFr],
     of_p: &[ArkFr],
     x_p: &[ArkFr],
@@ -355,8 +472,8 @@ pub(crate) fn prove_distinct_valid_pairs_with_witness(
     let k = n.trailing_zeros() as usize;
     let idx_p: Vec<ArkFr> = (0..n).map(|i| ArkFr::from_u64(i as u64)).collect();
 
-    let mult_l_in_commitment = commit_column(mult_l_in)?;
-    let mult_r_in_commitment = commit_column(mult_r_in)?;
+    let mult_l_in_commitment = context.commit_column(mult_l_in)?;
+    let mult_r_in_commitment = context.commit_column(mult_r_in)?;
 
     // Round 1: bind the given columns + multiplicities, draw fresh challenges.
     transcript.append_group(b"pow/pairs/com-sf", com_sf);
@@ -378,10 +495,10 @@ pub(crate) fn prove_distinct_valid_pairs_with_witness(
     let rec_cand_l = reciprocal_witness(alpha_l, &rlc_fold(beta_l, &[x_p, y_p, rho_l_p]));
     let rec_src_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &[sf_p, of_p, &idx_p]));
     let rec_cand_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &[y_p, z_p, rho_r_p]));
-    let rec_src_l_commitment = commit_column(&rec_src_l)?;
-    let rec_cand_l_commitment = commit_column(&rec_cand_l)?;
-    let rec_src_r_commitment = commit_column(&rec_src_r)?;
-    let rec_cand_r_commitment = commit_column(&rec_cand_r)?;
+    let rec_src_l_commitment = context.commit_column(&rec_src_l)?;
+    let rec_cand_l_commitment = context.commit_column(&rec_cand_l)?;
+    let rec_src_r_commitment = context.commit_column(&rec_src_r)?;
+    let rec_cand_r_commitment = context.commit_column(&rec_cand_r)?;
     transcript.append_group(b"pow/pairs/com-rec-src-l", &rec_src_l_commitment);
     transcript.append_group(b"pow/pairs/com-rec-cand-l", &rec_cand_l_commitment);
     transcript.append_group(b"pow/pairs/com-rec-src-r", &rec_src_r_commitment);
@@ -404,7 +521,7 @@ pub(crate) fn prove_distinct_valid_pairs_with_witness(
         rec_cand_r,
     ];
     let (membership_sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let membership_opening = prove_column_openings(&columns, &r, transcript)?;
+    let membership_opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     // Combined-index strict monotonicity: i_eval = C*rho_l + rho_r.
     let radix = ArkFr::from_u64(combined_index_radix(n_f)? as u64);
@@ -412,7 +529,8 @@ pub(crate) fn prove_distinct_valid_pairs_with_witness(
         .map(|i| radix * rho_l_p[i] + rho_r_p[i])
         .collect();
     let com_i_eval = com_rho_l.scale(&radix).add(com_rho_r);
-    let sorted = prove_strictly_sorted(&i_eval, m_j, &com_i_eval, transcript)?;
+    let sorted =
+        prove_strictly_sorted_with_context(context, &i_eval, m_j, &com_i_eval, transcript)?;
 
     Ok(PairsProof {
         membership_sumcheck,

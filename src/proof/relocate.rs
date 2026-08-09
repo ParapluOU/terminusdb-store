@@ -35,7 +35,8 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    mle_full_eval, prove_column_openings, verify_column_openings, ColumnOpening, Transcript254,
+    mle_full_eval, verify_column_openings, ColumnOpening,
+    StoreProverContext, Transcript254,
 };
 use super::invalid;
 
@@ -100,6 +101,24 @@ pub fn prove_column_relocation(
     com_target: &ArkGT,
     transcript: &mut Transcript254,
 ) -> io::Result<RelocationProof> {
+    prove_column_relocation_with_context(
+        &StoreProverContext::cpu(),
+        source,
+        com_source,
+        target,
+        com_target,
+        transcript,
+    )
+}
+
+pub fn prove_column_relocation_with_context(
+    context: &StoreProverContext<'_>,
+    source: &[ArkFr],
+    com_source: &ArkGT,
+    target: &[ArkFr],
+    com_target: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<RelocationProof> {
     let a = domain_log(source.len())?;
     let b = domain_log(target.len())?;
     let max = a.max(b);
@@ -109,8 +128,8 @@ pub fn prove_column_relocation(
 
     let source_eval = mle_full_eval(source, &r[..a]);
     let target_eval = mle_full_eval(target, &r[..b]);
-    let source_opening = prove_column_openings(&[source.to_vec()], &r[..a], transcript)?;
-    let target_opening = prove_column_openings(&[target.to_vec()], &r[..b], transcript)?;
+    let source_opening = context.prove_column_openings(&[source.to_vec()], &r[..a], transcript)?;
+    let target_opening = context.prove_column_openings(&[target.to_vec()], &r[..b], transcript)?;
 
     Ok(RelocationProof {
         source_eval,

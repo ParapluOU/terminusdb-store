@@ -23,32 +23,35 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::{commit_column, Transcript254};
+use super::argument::{commit_column, StoreProverContext, Transcript254};
 use super::bgp::{
-    prove_bgp_chain_with_result, verify_bgp_chain, BgpChainProof, JoinStep, RelationCommit,
-    RelationWitness,
+    prove_bgp_chain_with_result_and_context, verify_bgp_chain, BgpChainProof, JoinStep,
+    RelationCommit, RelationWitness,
 };
 use super::commitment::{LayerCommitment, VerifierCommitmentRef, VerifierLayer};
 use super::dict::{
-    hash_object, hash_term, prove_dict_membership, verify_dict_membership, DictProof,
+    hash_object, hash_term, prove_dict_membership_with_context, verify_dict_membership, DictProof,
 };
 use super::filter::{
-    atom_kept_columns, compact_selected, honest_witness, prove_atom_filter, prove_boolean_product,
-    prove_compaction_only, prove_filter, prove_selection_only, verify_atom_filter,
+    atom_kept_columns, compact_selected, honest_witness, prove_atom_filter_with_context,
+    prove_boolean_product_with_context, prove_compaction_only_with_context,
+    prove_selection_only_with_context, verify_atom_filter,
     verify_boolean_product, verify_compaction_only, verify_filter, verify_selection_only,
     AtomFilterProof, AtomFilterSpec, BooleanProductProof, CompactionOnlyProof, FullFilterProof,
     Position, SelectionOnlyProof,
 };
 use super::invalid;
 use super::join::{
-    compute_self_join, prove_self_join_complete, self_join_commitments, self_join_domain,
-    verify_self_join_complete, SelfJoinCommitments, SelfJoinCompleteProof,
+    compute_self_join, prove_self_join_complete_with_context, self_join_commitments_with_context,
+    self_join_domain, verify_self_join_complete, SelfJoinCommitments, SelfJoinCompleteProof,
 };
 use super::range::{
-    object_range_sel_column, prove_object_range_select, verify_object_range_select,
+    object_range_sel_column, prove_object_range_select_with_context, verify_object_range_select,
     ObjectRangeProof, RangeOp,
 };
-use super::relocate::{prove_column_relocation, verify_column_relocation, RelocationProof};
+use super::relocate::{
+    prove_column_relocation_with_context, verify_column_relocation, RelocationProof,
+};
 use super::ProofHash;
 use super::{CanonicalDatatype, CanonicalObject};
 
@@ -137,6 +140,14 @@ pub fn prove_layer_filter(
     layer: &LayerCommitment,
     predicate_term: &[u8],
 ) -> io::Result<(CombinedFilterProof, ArkGT, ArkGT, usize, u64)> {
+    prove_layer_filter_with_context(&StoreProverContext::cpu(), layer, predicate_term)
+}
+
+pub fn prove_layer_filter_with_context(
+    context: &StoreProverContext<'_>,
+    layer: &LayerCommitment,
+    predicate_term: &[u8],
+) -> io::Result<(CombinedFilterProof, ArkGT, ArkGT, usize, u64)> {
     let (s, p, o, n) = materialized_layer_columns(layer)?;
     let predicate_id = resolve_predicate_id(layer, predicate_term)?;
 
@@ -150,8 +161,8 @@ pub fn prove_layer_filter(
     // Q3 membership: (hash_term(IRI), id) is a genuine dictionary row.
     let q_hash = hash_term(predicate_term);
     let id = ArkFr::from_u64(predicate_id);
-    let membership = prove_dict_membership(
-        &dict_hash,
+    let membership = prove_dict_membership_with_context(
+        context, &dict_hash,
         &dict_id,
         &com_dict_hash,
         &com_dict_id,
@@ -164,7 +175,9 @@ pub fn prove_layer_filter(
     let [com_s, com_p, com_o] = layer.materialized_column_commitments;
     let pred = ArkFr::from_u64(predicate_id);
     let (filter, com_sout, com_oout, m) =
-        prove_filter(&s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript)?;
+        super::filter::prove_filter_with_context(
+            context, &s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript,
+        )?;
 
     Ok((
         CombinedFilterProof { membership, filter },
@@ -296,6 +309,14 @@ pub fn prove_layer_graph_pattern2(
     layer: &LayerCommitment,
     predicate_term: &[u8],
 ) -> io::Result<(GraphPattern2Proof, ArkGT, ArkGT, ArkGT, usize, u64)> {
+    prove_layer_graph_pattern2_with_context(&StoreProverContext::cpu(), layer, predicate_term)
+}
+
+pub fn prove_layer_graph_pattern2_with_context(
+    context: &StoreProverContext<'_>,
+    layer: &LayerCommitment,
+    predicate_term: &[u8],
+) -> io::Result<(GraphPattern2Proof, ArkGT, ArkGT, ArkGT, usize, u64)> {
     let (s, p, o, n) = materialized_layer_columns(layer)?;
     let predicate_id = resolve_predicate_id(layer, predicate_term)?;
 
@@ -309,8 +330,8 @@ pub fn prove_layer_graph_pattern2(
     // (1) Q3 membership: (hash_term(IRI), id) is a genuine dictionary row.
     let q_hash = hash_term(predicate_term);
     let id = ArkFr::from_u64(predicate_id);
-    let membership = prove_dict_membership(
-        &dict_hash,
+    let membership = prove_dict_membership_with_context(
+        context, &dict_hash,
         &dict_id,
         &com_dict_hash,
         &com_dict_id,
@@ -323,7 +344,9 @@ pub fn prove_layer_graph_pattern2(
     let [com_s, com_p, com_o] = layer.materialized_column_commitments;
     let pred = ArkFr::from_u64(predicate_id);
     let (filter, com_sout, com_oout, m) =
-        prove_filter(&s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript)?;
+        super::filter::prove_filter_with_context(
+            context, &s, &p, &o, pred, n, &com_s, &com_p, &com_o, &mut transcript,
+        )?;
     // Recompute the dense filter output (same witness prove_filter used) to obtain the
     // F columns; `s_out`/`o_out` are length `2^a` (table domain), dense in `[0, m)`.
     let (sel, _w) = honest_witness(&p, pred, n);
@@ -335,19 +358,23 @@ pub fn prove_layer_graph_pattern2(
     let (x, y, z, rho_l, rho_r, u, w_l, w_r, m_j) = compute_self_join(sf, of);
     let n_u = u.len();
     let n_join = self_join_domain(m, m_j, n_u)?;
-    let jcom = self_join_commitments(sf, of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r)?;
+    let jcom = self_join_commitments_with_context(
+        context, sf, of, &x, &y, &z, &rho_l, &rho_r, &u, &w_l, &w_r,
+    )?;
 
     // (4) Relocate F from the table domain to the join domain (positional equality).
     let target_sf = pad(sf, n_join);
     let target_of = pad(of, n_join);
-    let relocate_s =
-        prove_column_relocation(&s_out, &com_sout, &target_sf, &jcom.sf, &mut transcript)?;
-    let relocate_o =
-        prove_column_relocation(&o_out, &com_oout, &target_of, &jcom.of, &mut transcript)?;
+    let relocate_s = prove_column_relocation_with_context(
+        context, &s_out, &com_sout, &target_sf, &jcom.sf, &mut transcript,
+    )?;
+    let relocate_o = prove_column_relocation_with_context(
+        context, &o_out, &com_oout, &target_of, &jcom.of, &mut transcript,
+    )?;
 
     // (5) The complete self-join argument over the relocated F.
-    let join = prove_self_join_complete(
-        sf,
+    let join = prove_self_join_complete_with_context(
+        context, sf,
         of,
         &x,
         &y,
@@ -1413,6 +1440,7 @@ fn root_bound_n_dict(source: &impl VerifierLayer) -> io::Result<usize> {
 /// All sub-proofs run on the SHARED `transcript` in this exact order.
 #[allow(clippy::too_many_arguments)]
 fn prove_ranged_atom(
+    context: &StoreProverContext<'_>,
     spec: &AtomFilterSpec,
     range: &ObjectRangeSpec,
     s: &[ArkFr],
@@ -1446,13 +1474,15 @@ fn prove_ranged_atom(
     // each tied to its root-bound original. When a domain already equals D the relocation
     // is same-domain (still authenticates the fresh copy).
     let o_at_d = pad(o, d);
-    let com_object_at_d = commit_column(&o_at_d)?;
-    let relocate_object = prove_column_relocation(o, com_o, &o_at_d, &com_object_at_d, transcript)?;
+    let com_object_at_d = context.commit_column(&o_at_d)?;
+    let relocate_object = prove_column_relocation_with_context(
+        context, o, com_o, &o_at_d, &com_object_at_d, transcript,
+    )?;
 
     let dict_id_at_d = pad(&dict_id, d);
-    let com_dict_id_at_d = commit_column(&dict_id_at_d)?;
-    let relocate_dict_id = prove_column_relocation(
-        &dict_id,
+    let com_dict_id_at_d = context.commit_column(&dict_id_at_d)?;
+    let relocate_dict_id = prove_column_relocation_with_context(
+        context, &dict_id,
         &com_dict_id,
         &dict_id_at_d,
         &com_dict_id_at_d,
@@ -1460,9 +1490,9 @@ fn prove_ranged_atom(
     )?;
 
     let dict_value_at_d = pad(&dict_value, d);
-    let com_dict_value_at_d = commit_column(&dict_value_at_d)?;
-    let relocate_dict_value = prove_column_relocation(
-        &dict_value,
+    let com_dict_value_at_d = context.commit_column(&dict_value_at_d)?;
+    let relocate_dict_value = prove_column_relocation_with_context(
+        context, &dict_value,
         &com_dict_value,
         &dict_value_at_d,
         &com_dict_value_at_d,
@@ -1470,9 +1500,9 @@ fn prove_ranged_atom(
     )?;
 
     let dict_datatype_at_d = pad(&dict_datatype, d);
-    let com_dict_datatype_at_d = commit_column(&dict_datatype_at_d)?;
-    let relocate_dict_datatype = prove_column_relocation(
-        &dict_datatype,
+    let com_dict_datatype_at_d = context.commit_column(&dict_datatype_at_d)?;
+    let relocate_dict_datatype = prove_column_relocation_with_context(
+        context, &dict_datatype,
         &com_dict_datatype,
         &dict_datatype_at_d,
         &com_dict_datatype_at_d,
@@ -1480,8 +1510,8 @@ fn prove_ranged_atom(
     )?;
 
     // (b) Authenticated object-range selection over the relocated columns at D.
-    let (object_range, com_range_sel_at_d) = prove_object_range_select(
-        &o_at_d,
+    let (object_range, com_range_sel_at_d) = prove_object_range_select_with_context(
+        context, &o_at_d,
         &com_object_at_d,
         &dict_id_at_d,
         &dict_value_at_d,
@@ -1516,9 +1546,9 @@ fn prove_ranged_atom(
     // table copy to the authoritative Com(range_sel) at D).
     let table = 1usize << a;
     let range_sel_at_table = range_sel_at_d[..table].to_vec();
-    let com_range_sel_at_table = commit_column(&range_sel_at_table)?;
-    let relocate_range_sel = prove_column_relocation(
-        &range_sel_at_d,
+    let com_range_sel_at_table = context.commit_column(&range_sel_at_table)?;
+    let relocate_range_sel = prove_column_relocation_with_context(
+        context, &range_sel_at_d,
         &com_range_sel_at_d,
         &range_sel_at_table,
         &com_range_sel_at_table,
@@ -1530,8 +1560,8 @@ fn prove_ranged_atom(
     // domain, then authenticate the intersection of both masks.
     let (effective_range_sel, com_effective_range_sel, second) =
         if let Some(second_bound) = &range.second {
-            let (second_object_range, second_com_at_d) = prove_object_range_select(
-                &o_at_d,
+            let (second_object_range, second_com_at_d) = prove_object_range_select_with_context(
+                context, &o_at_d,
                 &com_object_at_d,
                 &dict_id_at_d,
                 &dict_value_at_d,
@@ -1560,16 +1590,16 @@ fn prove_ranged_atom(
                 n,
             );
             let second_sel_at_table = second_sel_at_d[..table].to_vec();
-            let second_com_at_table = commit_column(&second_sel_at_table)?;
-            let second_relocate = prove_column_relocation(
-                &second_sel_at_d,
+            let second_com_at_table = context.commit_column(&second_sel_at_table)?;
+            let second_relocate = prove_column_relocation_with_context(
+                context, &second_sel_at_d,
                 &second_com_at_d,
                 &second_sel_at_table,
                 &second_com_at_table,
                 transcript,
             )?;
-            let (intersect, com_intersection_sel) = prove_boolean_product(
-                &range_sel_at_table,
+            let (intersect, com_intersection_sel) = prove_boolean_product_with_context(
+                context, &range_sel_at_table,
                 &second_sel_at_table,
                 &com_range_sel_at_table,
                 &second_com_at_table,
@@ -1599,11 +1629,13 @@ fn prove_ranged_atom(
     // (d) Constant-equality selection (predicate + any subject constant) at the table
     // domain — pins com_equality_sel to the equality indicator (never touches the object).
     let (equality, com_equality_sel, eq_sel) =
-        prove_selection_only(spec, s, p, o, n, com_s, com_p, com_o, transcript)?;
+        prove_selection_only_with_context(
+            context, spec, s, p, o, n, com_s, com_p, com_o, transcript,
+        )?;
 
     // (e) Combined selection = equality_sel ⊙ range_sel (both boolean + χ_n-masked).
-    let (combine, com_combined_sel) = prove_boolean_product(
-        &eq_sel,
+    let (combine, com_combined_sel) = prove_boolean_product_with_context(
+        context, &eq_sel,
         &effective_range_sel,
         &com_equality_sel,
         &com_effective_range_sel,
@@ -1626,8 +1658,8 @@ fn prove_ranged_atom(
         .iter()
         .map(|pos| kept_base_commitment(*pos, com_s, com_p, com_o))
         .collect();
-    let (compaction, kept_commitments, kept_columns, m) = prove_compaction_only(
-        &sources,
+    let (compaction, kept_commitments, kept_columns, m) = prove_compaction_only_with_context(
+        context, &sources,
         &source_coms,
         &combined_sel,
         &com_combined_sel,
@@ -1886,7 +1918,7 @@ pub fn prove_layer_bgp(
     layer: &LayerCommitment,
     plan: &LayerBgpPlan,
 ) -> io::Result<(LayerBgpProof, Vec<ArkGT>, usize, Vec<u64>)> {
-    let result = prove_layer_bgp_with_result(layer, plan)?;
+    let result = prove_layer_bgp_with_result_and_context(&StoreProverContext::cpu(), layer, plan)?;
     Ok((
         result.proof,
         result.result_commitments,
@@ -1899,6 +1931,14 @@ pub fn prove_layer_bgp(
 /// explicitly invoking caller. The commitment-only [`prove_layer_bgp`] API remains
 /// available for compatibility.
 pub fn prove_layer_bgp_with_result(
+    layer: &LayerCommitment,
+    plan: &LayerBgpPlan,
+) -> io::Result<LayerBgpResult> {
+    prove_layer_bgp_with_result_and_context(&StoreProverContext::cpu(), layer, plan)
+}
+
+pub fn prove_layer_bgp_with_result_and_context(
+    context: &StoreProverContext<'_>,
     layer: &LayerCommitment,
     plan: &LayerBgpPlan,
 ) -> io::Result<LayerBgpResult> {
@@ -1917,7 +1957,7 @@ pub fn prove_layer_bgp_with_result(
                 chain: None,
                 ground_absence: Some(absence),
             },
-            result_commitments: vec![commit_column(&zero_column)?],
+            result_commitments: vec![context.commit_column(&zero_column)?],
             result_columns: vec![zero_column],
             result_log_domain: domain.trailing_zeros() as usize,
             result_len: 0,
@@ -1974,8 +2014,8 @@ pub fn prove_layer_bgp_with_result(
     for (atom, ids) in plan.atoms.iter().zip(atom_ids.iter()) {
         // (1) Predicate IRI -> id, authenticated by the predicate dictionary.
         let predicate_membership = match ids.predicate_id {
-            Some(predicate_id) => Some(prove_dict_membership(
-                &pred_dict_hash,
+            Some(predicate_id) => Some(prove_dict_membership_with_context(
+                context, &pred_dict_hash,
                 &pred_dict_id,
                 &com_pred_hash,
                 &com_pred_id,
@@ -1989,8 +2029,8 @@ pub fn prove_layer_bgp_with_result(
         // The SAME id is folded into the atom filter below, so a prover cannot authenticate
         // one id here and filter on a different one.
         let subject_membership = match (atom_term_object(&atom.subject), ids.subject_id) {
-            (Some(object), Some(subject_id)) => Some(prove_dict_membership(
-                &nv_dict_hash,
+            (Some(object), Some(subject_id)) => Some(prove_dict_membership_with_context(
+                context, &nv_dict_hash,
                 &nv_dict_id,
                 &com_nv_hash,
                 &com_nv_id,
@@ -2001,8 +2041,8 @@ pub fn prove_layer_bgp_with_result(
             _ => None,
         };
         let object_membership = match (atom_term_object(&atom.object), ids.object_id) {
-            (Some(object), Some(object_id)) => Some(prove_dict_membership(
-                &nv_dict_hash,
+            (Some(object), Some(object_id)) => Some(prove_dict_membership_with_context(
+                context, &nv_dict_hash,
                 &nv_dict_id,
                 &com_nv_hash,
                 &com_nv_id,
@@ -2020,8 +2060,8 @@ pub fn prove_layer_bgp_with_result(
         let spec = atom_filter_spec(atom, ids);
         let (filter, range, kept_commitments, kept_columns, m) = match &atom.object_range {
             None => {
-                let (filter, kept_commitments, m) = prove_atom_filter(
-                    &spec,
+                let (filter, kept_commitments, m) = prove_atom_filter_with_context(
+                    context, &spec,
                     &s,
                     &p,
                     &o,
@@ -2039,7 +2079,7 @@ pub fn prove_layer_bgp_with_result(
             }
             Some(object_range) => {
                 let (sub, kept_commitments, kept_columns, m) = prove_ranged_atom(
-                    &spec,
+                    context, &spec,
                     object_range,
                     &s,
                     &p,
@@ -2086,7 +2126,7 @@ pub fn prove_layer_bgp_with_result(
             if result_m == 1 {
                 unit[0] = ArkFr::one();
             }
-            (None, vec![commit_column(&unit)?], vec![unit], a, result_m)
+            (None, vec![context.commit_column(&unit)?], vec![unit], a, result_m)
         } else if relational_count == 1 {
             let relation = &relations[0];
             (
@@ -2097,8 +2137,8 @@ pub fn prove_layer_bgp_with_result(
                 relation.n,
             )
         } else {
-            let result = prove_bgp_chain_with_result(
-                &relations[..relational_count],
+            let result = prove_bgp_chain_with_result_and_context(
+                context, &relations[..relational_count],
                 &plan.joins,
                 &mut transcript,
             )?;
@@ -2123,7 +2163,7 @@ pub fn prove_layer_bgp_with_result(
             .collect();
         result_coms = result_columns
             .iter()
-            .map(|column| commit_column(column))
+            .map(|column| context.commit_column(column))
             .collect::<io::Result<_>>()?;
     }
 

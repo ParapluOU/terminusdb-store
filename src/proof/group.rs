@@ -15,18 +15,20 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::{commit_column, Transcript254};
+use super::argument::{commit_column, StoreProverContext, Transcript254};
 use super::bgp::{RelationCommit, RelationWitness};
 use super::commitment::{LayerCommitment, VerifierLayer};
 use super::equality::{
-    prove_relation_equality, verify_relation_equality, RelationEqualityConstraint,
+    prove_relation_equality_with_context, verify_relation_equality, RelationEqualityConstraint,
     RelationEqualityProof,
 };
 use super::range::{
-    prove_object_range_select, verify_object_range_select, ObjectRangeProof, RangeOp,
+    prove_object_range_select_with_context, verify_object_range_select, ObjectRangeProof, RangeOp,
     OBJECT_RANGE_B_BITS,
 };
-use super::relocate::{prove_column_relocation, verify_column_relocation, RelocationProof};
+use super::relocate::{
+    prove_column_relocation_with_context, verify_column_relocation, RelocationProof,
+};
 use super::{invalid, CanonicalDatatype, CanonicalObject};
 
 const DOMAIN: &[u8] = b"parture/proof-of-woql/group-extrema/v0";
@@ -157,6 +159,24 @@ pub fn prove_group_extrema(
     layer: &LayerCommitment,
     transcript: &mut Transcript254,
 ) -> io::Result<GroupExtremaResult> {
+    prove_group_extrema_with_context(
+        &StoreProverContext::cpu(), input, key_column, value_column, datatype, kind, result_rows,
+        layer, transcript,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_group_extrema_with_context(
+    context: &StoreProverContext<'_>,
+    input: &RelationWitness,
+    key_column: usize,
+    value_column: usize,
+    datatype: CanonicalDatatype,
+    kind: GroupExtremaKind,
+    result_rows: &[(u64, u64)],
+    layer: &LayerCommitment,
+    transcript: &mut Transcript254,
+) -> io::Result<GroupExtremaResult> {
     validate_statement(&input.view(), key_column, value_column, datatype, result_rows)?;
     super::commitment::reject_nan_catalog(
         &layer.node_value_catalog,
@@ -166,7 +186,7 @@ pub fn prove_group_extrema(
     if input.n == 0 {
         let log_domain = 1;
         let columns = vec![vec![ArkFr::zero(); 2], vec![ArkFr::zero(); 2]];
-        let commitments = columns.iter().map(|c| commit_column(c)).collect::<io::Result<Vec<_>>>()?;
+        let commitments = columns.iter().map(|c| context.commit_column(c)).collect::<io::Result<Vec<_>>>()?;
         return Ok(GroupExtremaResult { proof: GroupExtremaProof { entries: Vec::new() }, columns, commitments, log_domain, n: 0 });
     }
     let (dict_id, dict_value, dict_datatype) = {
@@ -183,32 +203,32 @@ pub fn prove_group_extrema(
     let dict_id_at_d = padded(&dict_id, d_log);
     let dict_value_at_d = padded(&dict_value, d_log);
     let dict_datatype_at_d = padded(&dict_datatype, d_log);
-    let com_dict_id_at_d = commit_column(&dict_id_at_d)?;
-    let com_dict_value_at_d = commit_column(&dict_value_at_d)?;
-    let com_dict_datatype_at_d = commit_column(&dict_datatype_at_d)?;
+    let com_dict_id_at_d = context.commit_column(&dict_id_at_d)?;
+    let com_dict_value_at_d = context.commit_column(&dict_value_at_d)?;
+    let com_dict_datatype_at_d = context.commit_column(&dict_datatype_at_d)?;
     let mut whole_commitments = BTreeMap::new();
     let mut entries = Vec::with_capacity(result_rows.len());
     for &(key, extremum) in result_rows {
         let group_constraint = RelationEqualityConstraint::ColumnConstant { column: key_column, value: ArkFr::from_u64(key) };
-        let group = prove_relation_equality(input, &group_constraint, transcript)?;
+        let group = prove_relation_equality_with_context(context, input, &group_constraint, transcript)?;
         if group.n == 0 { return Err(invalid("group-extrema output names an empty group")); }
         let group_witness = RelationWitness { columns: group.columns.clone(), commitments: group.commitments.clone(), log_domain: group.log_domain, n: group.n };
         let member_constraint = RelationEqualityConstraint::ColumnConstant { column: value_column, value: ArkFr::from_u64(extremum) };
-        let membership = prove_relation_equality(&group_witness, &member_constraint, transcript)?;
+        let membership = prove_relation_equality_with_context(context, &group_witness, &member_constraint, transcript)?;
         if membership.n == 0 { return Err(invalid("group-extrema result is not a member of its group")); }
 
         if group.log_domain != input.log_domain {
             return Err(invalid("group-extrema equality changed the input domain"));
         }
         let value_at_d = padded(&group.columns[value_column], d_log);
-        let com_value_at_d = commit_column(&value_at_d)?;
-        let relocate_value = prove_column_relocation(&group.columns[value_column], &group.commitments[value_column], &value_at_d, &com_value_at_d, transcript)?;
-        let relocate_dict_id = prove_column_relocation(&dict_id, &layer.node_value_dict_commitments.1, &dict_id_at_d, &com_dict_id_at_d, transcript)?;
-        let relocate_dict_value = prove_column_relocation(&dict_value, &layer.node_value_dict_range_commitments.0, &dict_value_at_d, &com_dict_value_at_d, transcript)?;
-        let relocate_dict_datatype = prove_column_relocation(&dict_datatype, &layer.node_value_dict_range_commitments.1, &dict_datatype_at_d, &com_dict_datatype_at_d, transcript)?;
+        let com_value_at_d = context.commit_column(&value_at_d)?;
+        let relocate_value = prove_column_relocation_with_context(context, &group.columns[value_column], &group.commitments[value_column], &value_at_d, &com_value_at_d, transcript)?;
+        let relocate_dict_id = prove_column_relocation_with_context(context, &dict_id, &layer.node_value_dict_commitments.1, &dict_id_at_d, &com_dict_id_at_d, transcript)?;
+        let relocate_dict_value = prove_column_relocation_with_context(context, &dict_value, &layer.node_value_dict_range_commitments.0, &dict_value_at_d, &com_dict_value_at_d, transcript)?;
+        let relocate_dict_datatype = prove_column_relocation_with_context(context, &dict_datatype, &layer.node_value_dict_range_commitments.1, &dict_datatype_at_d, &com_dict_datatype_at_d, transcript)?;
         let c = extremum_encoding(layer, extremum, datatype)?;
-        let (range, com_range_selection) = prove_object_range_select(
-            &value_at_d, &com_value_at_d, &dict_id_at_d, &dict_value_at_d, &dict_datatype_at_d,
+        let (range, com_range_selection) = prove_object_range_select_with_context(
+            context, &value_at_d, &com_value_at_d, &dict_id_at_d, &dict_value_at_d, &dict_datatype_at_d,
             &com_dict_id_at_d, &com_dict_value_at_d, &com_dict_datatype_at_d, n_dict,
             ArkFr::from_u64(datatype as u64), kind.op(), c, OBJECT_RANGE_B_BITS, group.n, transcript)?;
         let expected_whole = if let Some(commitment) = whole_commitments.get(&group.n) {
@@ -216,7 +236,7 @@ pub fn prove_group_extrema(
         } else {
             let mut whole = vec![ArkFr::zero(); 1usize << d_log];
             whole[..group.n].fill(ArkFr::one());
-            let commitment = commit_column(&whole)?;
+            let commitment = context.commit_column(&whole)?;
             whole_commitments.insert(group.n, commitment);
             commitment
         };
@@ -234,7 +254,7 @@ pub fn prove_group_extrema(
     }
     let out_log = result_rows.len().max(1).next_power_of_two().max(2).trailing_zeros() as usize;
     let columns = vec![padded(&result_rows.iter().map(|r| ArkFr::from_u64(r.0)).collect::<Vec<_>>(), out_log), padded(&result_rows.iter().map(|r| ArkFr::from_u64(r.1)).collect::<Vec<_>>(), out_log)];
-    let commitments = columns.iter().map(|c| commit_column(c)).collect::<io::Result<Vec<_>>>()?;
+    let commitments = columns.iter().map(|c| context.commit_column(c)).collect::<io::Result<Vec<_>>>()?;
     Ok(GroupExtremaResult { proof: GroupExtremaProof { entries }, columns, commitments, log_domain: out_log, n: result_rows.len() })
 }
 
