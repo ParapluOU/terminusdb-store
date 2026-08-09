@@ -85,8 +85,8 @@ const VERSION: u32 = 5;
 const UNION_VERSION: u32 = 3;
 const ANTI_VERSION: u32 = 5;
 const OUTER_VERSION: u32 = 2;
-// v17 adds exact private GroupBy-list cardinality for zero-to-two node keys.
-const RECURSIVE_VERSION: u32 = 17;
+// v18 adds exact private Collect-list cardinality with findall's empty-list policy.
+const RECURSIVE_VERSION: u32 = 18;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1766,6 +1766,12 @@ pub enum RelationProofPlanKind {
         input: Box<RelationProofPlan>,
         key_columns: Vec<usize>,
     },
+    /// Exact cardinality of the private list produced by Prolog `findall/3` and
+    /// consumed immediately by `length/2`. Unlike zero-key GroupBy, empty input
+    /// emits one generated decimal row containing zero.
+    CollectionCount {
+        input: Box<RelationProofPlan>,
+    },
     BagUnion {
         branches: Vec<RelationProofPlan>,
         /// Parent output column -> child output column, once per ordered branch.
@@ -2152,6 +2158,16 @@ impl RelationProofPlan {
                 });
                 Ok((result, false))
             }
+            RelationProofPlanKind::CollectionCount { input } => {
+                input.shape_bounded(depth + 1, nodes)?;
+                Ok((
+                    vec![ResultColumnDescriptor {
+                        namespace: ResultIdNamespace::GeneratedDecimalU64,
+                        nullable: false,
+                    }],
+                    false,
+                ))
+            }
             RelationProofPlanKind::BagUnion { branches, mappings } => {
                 if branches.len() < 2
                     || branches.len() != mappings.len()
@@ -2408,6 +2424,9 @@ pub enum RecursiveRelationProof {
         input: Box<RecursiveRelationEnvelope>,
     },
     GroupCount {
+        input: Box<RecursiveRelationEnvelope>,
+    },
+    CollectionCount {
         input: Box<RecursiveRelationEnvelope>,
     },
     BagUnion {
@@ -2808,14 +2827,7 @@ fn derived_group_count_columns(
     key_columns: &[usize],
 ) -> io::Result<Vec<Vec<ArkFr>>> {
     if key_columns.is_empty() {
-        return if input.result_len == 0 {
-            Ok(vec![Vec::new()])
-        } else {
-            Ok(vec![vec![ArkFr::from_u64(
-                u64::try_from(input.result_len)
-                    .map_err(|_| invalid("group-count cardinality exceeds u64"))?,
-            )]])
-        };
+        return derived_cardinality_column(input.result_len, false);
     }
     let groups = grouped_node_rows(layer, input, key_columns)?;
     let mut output = vec![Vec::with_capacity(groups.len()); key_columns.len() + 1];
@@ -2829,6 +2841,15 @@ fn derived_group_count_columns(
         ));
     }
     Ok(output)
+}
+
+fn derived_cardinality_column(result_len: usize, emit_zero_for_empty: bool) -> io::Result<Vec<Vec<ArkFr>>> {
+    if result_len == 0 && !emit_zero_for_empty {
+        return Ok(vec![Vec::new()]);
+    }
+    Ok(vec![vec![ArkFr::from_u64(
+        u64::try_from(result_len).map_err(|_| invalid("collection cardinality exceeds u64"))?,
+    )]])
 }
 
 impl RecursiveRelationEnvelope {
@@ -3019,6 +3040,31 @@ impl RecursiveRelationEnvelope {
                     layer,
                     plan,
                     RecursiveRelationProof::GeneratedU64Filter {
+                        input: Box::new(input_envelope),
+                    },
+                    commitments,
+                    columns,
+                    log_domain,
+                    n,
+                )
+            }
+            RelationProofPlanKind::CollectionCount { input } => {
+                let input_envelope =
+                    Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let mut columns = derived_cardinality_column(input_envelope.result_len, true)?;
+                let n = 1;
+                let log_domain = 1;
+                for column in &mut columns {
+                    column.resize(2, ArkFr::zero());
+                }
+                let commitments = columns
+                    .iter()
+                    .map(|column| context.commit_column(column))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::CollectionCount {
                         input: Box::new(input_envelope),
                     },
                     commitments,
@@ -3661,6 +3707,32 @@ impl RecursiveRelationEnvelope {
                     return Err(invalid("group-count commitment mismatch"));
                 }
             }
+            (
+                RecursiveRelationProof::CollectionCount { input },
+                RelationProofPlanKind::CollectionCount { input: input_plan },
+            ) => {
+                input.verify_bounded(
+                    layer,
+                    expected_root,
+                    input_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let expected_columns = derived_cardinality_column(input.result_len, true)?;
+                if self.result_len != 1
+                    || self.result_log_domain != 1
+                    || self.result_columns != expected_columns
+                {
+                    return Err(invalid(
+                        "collection-count result is not the exact derived cardinality",
+                    ));
+                }
+                let mut padded = expected_columns[0].clone();
+                padded.resize(2, ArkFr::zero());
+                if self.result_commitments != vec![commit_column(&padded)?] {
+                    return Err(invalid("collection-count commitment mismatch"));
+                }
+            }
             (RecursiveRelationProof::Bgp(envelope), RelationProofPlanKind::Bgp(bgp)) => {
                 envelope.verify(layer, expected_root, bgp, plan.query_digest)?;
                 if self.result_commitments != envelope.result_commitments
@@ -4154,6 +4226,10 @@ impl RecursiveRelationEnvelope {
                 16u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
             }
+            RecursiveRelationProof::CollectionCount { input } => {
+                17u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+            }
             RecursiveRelationProof::Bgp(envelope) => {
                 0u8.put(out)?;
                 envelope.put(out)?;
@@ -4253,6 +4329,9 @@ impl RecursiveRelationEnvelope {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             16 => RecursiveRelationProof::GroupCount {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+            },
+            17 => RecursiveRelationProof::CollectionCount {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             0 => RecursiveRelationProof::Bgp(Box::<LayerBgpEnvelope>::get(reader)?),
@@ -5332,6 +5411,81 @@ mod tests {
         assert!(tampered
             .verify(&layer, layer.state.commitment_root, &plan)
             .is_err());
+    }
+
+    #[test]
+    fn recursive_collection_count_emits_zero_for_empty_and_rejects_group_substitution() {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for object in ["x", "y", "z"] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri("a"),
+                    &iri("p"),
+                    &iri(object),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let source = |predicate: &str, digest| RelationProofPlan {
+            query_digest: digest,
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
+                joins: Vec::new(),
+            }),
+        };
+        let plan = RelationProofPlan {
+            query_digest: [120u8; 32],
+            kind: RelationProofPlanKind::CollectionCount {
+                input: Box::new(source("p", [121u8; 32])),
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+        assert_eq!(
+            envelope.result_values,
+            vec![vec![CanonicalResultValue::GeneratedDecimalU64(3)]]
+        );
+        let decoded = RecursiveRelationEnvelope::decode(&envelope.encode().unwrap()).unwrap();
+        decoded
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+        let group_plan = RelationProofPlan {
+            query_digest: [120u8; 32],
+            kind: RelationProofPlanKind::GroupCount {
+                input: Box::new(source("p", [121u8; 32])),
+                key_columns: Vec::new(),
+            },
+        };
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &group_plan)
+            .is_err());
+        let mut tampered = decoded;
+        tampered.result_columns[0][0] = ArkFr::from_u64(4);
+        tampered.result_values[0][0] = CanonicalResultValue::GeneratedDecimalU64(4);
+        tampered.result_commitments[0] =
+            commit_column(&[ArkFr::from_u64(4), ArkFr::zero()]).unwrap();
+        assert!(tampered
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .is_err());
+
+        let empty_plan = RelationProofPlan {
+            query_digest: [122u8; 32],
+            kind: RelationProofPlanKind::CollectionCount {
+                input: Box::new(source("missing", [123u8; 32])),
+            },
+        };
+        let empty = RecursiveRelationEnvelope::prove(&layer, &empty_plan).unwrap();
+        empty
+            .verify(&layer, layer.state.commitment_root, &empty_plan)
+            .unwrap();
+        assert_eq!(empty.result_len, 1);
+        assert_eq!(
+            empty.result_values,
+            vec![vec![CanonicalResultValue::GeneratedDecimalU64(0)]]
+        );
     }
 
     #[test]
