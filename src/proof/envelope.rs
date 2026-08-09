@@ -3028,6 +3028,31 @@ mod tests {
         ((*layer).clone(), plan)
     }
 
+    fn multi_order_fixture() -> (LayerCommitment, LayerBgpPlan) {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (subject, predicate, values) in [
+            ("left", "x", vec![1u32, 2]),
+            ("right", "y", vec![3u32, 4]),
+        ] {
+            for value in values {
+                builder.add_value_triple(ValueTriple::new_value(
+                    &iri(subject), &iri(predicate), u32::make_entry(&value),
+                )).unwrap();
+            }
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let atom = |subject: &str, predicate: &str| LayerBgpAtom {
+            subject: AtomTerm::NodeConstant(iri(subject).into_bytes()),
+            predicate_term: iri(predicate).into_bytes(), predicate_variable: false,
+            object: AtomTerm::Variable, object_range: None, subject_object_equal: false,
+        };
+        ((*layer).clone(), LayerBgpPlan {
+            atoms: vec![atom("left", "x"), atom("right", "y")],
+            joins: vec![JoinStep::cross_product()],
+        })
+    }
+
     fn refresh_checksum(bytes: &mut Vec<u8>) {
         let body_len = bytes.len() - CHECKSUM_BYTES;
         let checksum = Sha256::digest(&bytes[..body_len]);
@@ -3229,6 +3254,45 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    fn assert_recursive_multikey_order_roundtrip_and_tamper() {
+        let (layer, bgp) = multi_order_fixture();
+        let child = RelationProofPlan { query_digest: plan_digest(&bgp).unwrap(), kind: RelationProofPlanKind::Bgp(bgp) };
+        let plan = RelationProofPlan { query_digest: [61u8; 32], kind: RelationProofPlanKind::ExactMultiOrder {
+            input: Box::new(child), datatypes: vec![CanonicalDatatype::UInt32; 2],
+            directions: vec![OrderDirection::Ascending, OrderDirection::Descending],
+        }};
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+        assert_eq!(envelope.result_len, 4);
+        let bytes = envelope.encode().unwrap();
+        let decoded = RecursiveRelationEnvelope::decode(&bytes).unwrap();
+        decoded.verify(&layer, layer.state.commitment_root, &plan).unwrap();
+
+        let mut wrong_direction = plan.clone();
+        if let RelationProofPlanKind::ExactMultiOrder { directions, .. } = &mut wrong_direction.kind { directions[1] = OrderDirection::Ascending; }
+        assert!(decoded.verify(&layer, layer.state.commitment_root, &wrong_direction).is_err());
+        let mut wrong_type = plan.clone();
+        if let RelationProofPlanKind::ExactMultiOrder { datatypes, .. } = &mut wrong_type.kind { datatypes[0] = CanonicalDatatype::Int32; }
+        assert!(decoded.verify(&layer, layer.state.commitment_root, &wrong_type).is_err());
+        let mut wrong_key_order = plan.clone();
+        if let RelationProofPlanKind::ExactMultiOrder { directions, datatypes, .. } = &mut wrong_key_order.kind { directions.swap(0, 1); datatypes.swap(0, 1); }
+        assert!(decoded.verify(&layer, layer.state.commitment_root, &wrong_key_order).is_err());
+
+        let mut reordered = RecursiveRelationEnvelope::decode(&bytes).unwrap();
+        for column in &mut reordered.result_columns { column.swap(0, 1); }
+        for (commitment, column) in reordered.result_commitments.iter_mut().zip(&reordered.result_columns) {
+            let mut padded = column.clone(); padded.resize(1usize << reordered.result_log_domain, ArkFr::zero());
+            *commitment = commit_column(&padded).unwrap();
+        }
+        assert!(reordered.verify(&layer, layer.state.commitment_root, &plan).is_err());
+    }
+
+    #[test]
+    fn recursive_multikey_order_roundtrip_and_tamper() {
+        std::thread::Builder::new().name("multi-order-proof".into()).stack_size(24 * 1024 * 1024)
+            .spawn(assert_recursive_multikey_order_roundtrip_and_tamper).unwrap().join().unwrap();
     }
 
     #[test]
