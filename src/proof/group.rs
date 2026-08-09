@@ -158,6 +158,10 @@ pub fn prove_group_extrema(
     transcript: &mut Transcript254,
 ) -> io::Result<GroupExtremaResult> {
     validate_statement(&input.view(), key_column, value_column, datatype, result_rows)?;
+    super::commitment::reject_nan_catalog(
+        &layer.node_value_catalog,
+        ArkFr::from_u64(datatype as u64),
+    )?;
     bind(transcript, &input.view(), key_column, value_column, datatype, kind, result_rows);
     if input.n == 0 {
         let log_domain = 1;
@@ -231,6 +235,10 @@ pub fn verify_group_extrema(
     bind(transcript, input, key_column, value_column, datatype, kind, result_rows);
     let view = layer.verifier_view();
     view.validate()?;
+    super::commitment::reject_nan_catalog(
+        &view.node_value_catalog,
+        ArkFr::from_u64(datatype as u64),
+    )?;
     let n_dict = view.state.node_value_count as usize;
     if n_dict != view.node_value_catalog.len() || (!result_rows.is_empty() && n_dict == 0) { return Err(invalid("group-extrema dictionary count mismatch or empty")); }
     if result_rows.is_empty() { return Ok(()); }

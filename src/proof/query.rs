@@ -1427,6 +1427,7 @@ fn prove_ranged_atom(
     transcript: &mut Transcript254,
 ) -> io::Result<(RangeAtomSubproof, Vec<ArkGT>, Vec<Vec<ArkFr>>, usize)> {
     let n_dict = root_bound_n_dict(layer)?;
+    super::commitment::reject_nan_catalog(&layer.node_value_catalog, range.datatype)?;
     let (d_log, dict_log) = range_common_domain(a, n_dict)?;
     let d = 1usize << d_log;
 
@@ -1682,6 +1683,7 @@ fn verify_ranged_atom(
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
     let n_dict = root_bound_n_dict(&layer)?;
+    super::commitment::reject_nan_catalog(layer.node_value_catalog, range.datatype)?;
     let (d_log, dict_log) = range_common_domain(a, n_dict)?;
     let com_dict_id = layer.node_value_dict_commitments.1;
     let com_dict_value = layer.node_value_dict_range_commitments.0;

@@ -887,24 +887,41 @@ pub mod commitment {
     /// derive byte-identical public parameters so a commitment is reproducible.
     /// `dory_pcs::setup()` samples its generators from `OsRng` (non-deterministic),
     /// so we bypass it and seed a portable `ChaCha20Rng` from a fixed hashed label,
-    /// then sample the G1/G2 generators via arkworks' `UniformRand`. The discrete
-    /// logs of the resulting points remain unknown (the seed only fixes *which*
-    /// random points are chosen, not their DL relations), so this is a valid
-    /// nothing-up-my-sleeve transparent setup.
-    // TODO(proof-of-woql): a production setup should use a standardized
-    // hash-to-curve derivation; a seeded CsPRNG is sufficient for this phase.
+    /// then sample the G1/G2 generators via arkworks' `UniformRand`.
+    ///
+    /// In the resolved ark-ec 0.5 backend, `UniformRand<Projective>` samples a
+    /// base-field x-coordinate and sign, maps them to the curve, and clears the
+    /// cofactor. It does *not* expose a sampled scalar relative to the canonical
+    /// generator. Thus the public seed reveals candidate coordinates, but no known
+    /// discrete-log relation between accepted points. This remains a nonstandard
+    /// seeded sampler rather than an RFC 9380 BN254 G1/G2 suite; ark-bn254 0.5 does
+    /// not provide SWU/WB map configurations for either group. Replacing it requires
+    /// external cryptographic review and a commitment-format migration, not an
+    /// unaudited local G2 map.
     fn deterministic_prover_setup(max_log_n: usize) -> ProverSetup<BN254> {
         use ark_ff::UniformRand;
         let mut rng = ChaCha20Rng::from_seed(setup_seed());
         let n = 1usize << max_log_n.div_ceil(2);
-        let g1_vec: Vec<ArkG1> = (0..n)
-            .map(|_| ArkG1(G1Projective::rand(&mut rng)))
-            .collect();
-        let g2_vec: Vec<ArkG2> = (0..n)
-            .map(|_| ArkG2(G2Projective::rand(&mut rng)))
-            .collect();
-        let h1 = ArkG1(G1Projective::rand(&mut rng));
-        let h2 = ArkG2(G2Projective::rand(&mut rng));
+        fn g1(rng: &mut impl rand::Rng) -> ArkG1 {
+            loop {
+                let point = G1Projective::rand(&mut *rng);
+                if point != G1Projective::default() {
+                    return ArkG1(point);
+                }
+            }
+        }
+        fn g2(rng: &mut impl rand::Rng) -> ArkG2 {
+            loop {
+                let point = G2Projective::rand(&mut *rng);
+                if point != G2Projective::default() {
+                    return ArkG2(point);
+                }
+            }
+        }
+        let g1_vec: Vec<ArkG1> = (0..n).map(|_| g1(&mut rng)).collect();
+        let g2_vec: Vec<ArkG2> = (0..n).map(|_| g2(&mut rng)).collect();
+        let h1 = g1(&mut rng);
+        let h2 = g2(&mut rng);
         let ht = <BN254 as PairingCurve>::pair(&h1, &h2);
         ProverSetup {
             g1_vec,
@@ -1311,6 +1328,57 @@ pub mod commitment {
         let mut buf = [0u8; 8];
         buf[8 - width..].copy_from_slice(lexical);
         Ok(<ArkFr as DoryField>::from_u64(u64::from_be_bytes(buf)))
+    }
+
+    /// Reject IEEE NaNs before using the Store's total-order lexical encoding as
+    /// WOQL numeric comparison order. Prolog's `X < Y` follows IEEE unordered-NaN
+    /// semantics, whereas the storage encoding deliberately assigns every NaN a
+    /// total-order position. A range/group proof over a catalog containing a NaN
+    /// of the selected float datatype would therefore prove different semantics.
+    pub(crate) fn reject_nan_catalog(
+        catalog: &[ProofRecord],
+        datatype_tag: ArkFr,
+    ) -> io::Result<()> {
+        let f32_tag = ArkFr::from_u64(CanonicalDatatype::Float32 as u64);
+        let f64_tag = ArkFr::from_u64(CanonicalDatatype::Float64 as u64);
+        if datatype_tag != f32_tag && datatype_tag != f64_tag {
+            return Ok(());
+        }
+        for record in catalog {
+            let is_nan = match &record.triple.object {
+                CanonicalObject::Value {
+                    datatype: CanonicalDatatype::Float32,
+                    lexical,
+                } if datatype_tag == f32_tag && lexical.len() == 4 => {
+                    let encoded = u32::from_be_bytes(lexical.as_slice().try_into().unwrap());
+                    let bits = if encoded & 0x8000_0000 != 0 {
+                        encoded ^ 0x8000_0000
+                    } else {
+                        encoded ^ 0xffff_ffff
+                    };
+                    f32::from_bits(bits).is_nan()
+                }
+                CanonicalObject::Value {
+                    datatype: CanonicalDatatype::Float64,
+                    lexical,
+                } if datatype_tag == f64_tag && lexical.len() == 8 => {
+                    let encoded = u64::from_be_bytes(lexical.as_slice().try_into().unwrap());
+                    let bits = if encoded & 0x8000_0000_0000_0000 != 0 {
+                        encoded ^ 0x8000_0000_0000_0000
+                    } else {
+                        encoded ^ 0xffff_ffff_ffff_ffff
+                    };
+                    f64::from_bits(bits).is_nan()
+                }
+                _ => false,
+            };
+            if is_nan {
+                return Err(invalid(
+                    "float range/group proof cannot match Prolog semantics in a catalog containing NaN",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Build the node/value-dictionary VALUE column (one entry per catalog row, in
@@ -2980,6 +3048,36 @@ pub mod commitment {
         }
 
         #[test]
+        fn float_range_catalog_rejects_nan_semantic_mismatch() {
+            let encoded_nan = (f64::NAN.to_bits() ^ 0x8000_0000_0000_0000)
+                .to_be_bytes()
+                .to_vec();
+            let catalog = vec![ProofRecord {
+                subject_id: 0,
+                predicate_id: 0,
+                object_id: 1,
+                triple: CanonicalTriple {
+                    subject: Vec::new(),
+                    predicate: Vec::new(),
+                    object: CanonicalObject::Value {
+                        datatype: CanonicalDatatype::Float64,
+                        lexical: encoded_nan,
+                    },
+                },
+            }];
+            assert!(reject_nan_catalog(
+                &catalog,
+                ArkFr::from_u64(CanonicalDatatype::Float64 as u64),
+            )
+            .is_err());
+            assert!(reject_nan_catalog(
+                &catalog,
+                ArkFr::from_u64(CanonicalDatatype::UInt64 as u64),
+            )
+            .is_ok());
+        }
+
+        #[test]
         fn compact_verifier_commitment_roundtrips_and_omits_witness_tables() {
             let layer = sample();
             let full = layer.encode().unwrap();
@@ -3277,6 +3375,8 @@ pub mod commitment {
 
         #[test]
         fn setup_identity_is_deterministic_and_legacy_tier_is_prefix_compatible() {
+            use ark_ec::CurveGroup;
+
             assert_eq!(
                 setup_parameter_id(19).unwrap(),
                 setup_parameter_id(20).unwrap()
@@ -3293,6 +3393,44 @@ pub mod commitment {
             let independently_rebuilt = deterministic_prover_setup(20);
             assert_eq!(selected.g1_vec, independently_rebuilt.g1_vec);
             assert_eq!(selected.g2_vec, independently_rebuilt.g2_vec);
+            assert!(selected
+                .g1_vec
+                .iter()
+                .chain(std::iter::once(&selected.h1))
+                .all(|point| point.0 != G1Projective::default()
+                    && point.0.into_affine().is_on_curve()
+                    && point
+                        .0
+                        .into_affine()
+                        .is_in_correct_subgroup_assuming_on_curve()));
+            assert!(selected
+                .g2_vec
+                .iter()
+                .chain(std::iter::once(&selected.h2))
+                .all(|point| point.0 != G2Projective::default()
+                    && point.0.into_affine().is_on_curve()
+                    && point
+                        .0
+                        .into_affine()
+                        .is_in_correct_subgroup_assuming_on_curve()));
+
+            let vector_hash = |g1: &ArkG1, g2: &ArkG2, h1: &ArkG1, h2: &ArkG2| {
+                let mut bytes = Vec::new();
+                g1.0.serialize_compressed(&mut bytes).unwrap();
+                g2.0.serialize_compressed(&mut bytes).unwrap();
+                h1.0.serialize_compressed(&mut bytes).unwrap();
+                h2.0.serialize_compressed(&mut bytes).unwrap();
+                hex::encode(Sha256::digest(bytes))
+            };
+            assert_eq!(
+                vector_hash(
+                    &selected.g1_vec[0],
+                    &selected.g2_vec[0],
+                    &selected.h1,
+                    &selected.h2,
+                ),
+                "5dc71cb471c168203fe617d7e6fd66786cfce1ea50206c80aea5484079608b24"
+            );
         }
 
         #[test]

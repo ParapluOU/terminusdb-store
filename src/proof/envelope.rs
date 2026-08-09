@@ -74,6 +74,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
+    decoded_items: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -93,6 +94,17 @@ impl<'a> Reader<'a> {
     fn finish(self) -> io::Result<()> {
         if self.pos != self.bytes.len() {
             return Err(invalid("trailing bytes in query-proof envelope"));
+        }
+        Ok(())
+    }
+
+    fn claim_items(&mut self, len: usize) -> io::Result<()> {
+        self.decoded_items = self
+            .decoded_items
+            .checked_add(len)
+            .ok_or_else(|| invalid("decoded envelope item count overflow"))?;
+        if self.decoded_items > MAX_ITEMS {
+            return Err(invalid("decoded envelope exceeds global item budget"));
         }
         Ok(())
     }
@@ -197,6 +209,10 @@ impl<T: Wire> Wire for Vec<T> {
         if len > MAX_ITEMS {
             return Err(invalid("too many envelope items"));
         }
+        // Nested vectors share one budget. Without this, a bounded-size recursive
+        // envelope can force tens of millions of decode iterations by distributing
+        // individually-valid tiny vectors across many relation nodes.
+        reader.claim_items(len)?;
         // `len` is attacker-controlled. Even though it is capped, reserving it up
         // front can allocate far more than the bounded input for a large `T` before
         // the first truncated element is noticed. Grow only after elements decode.
@@ -850,6 +866,7 @@ impl LayerBgpEnvelope {
         let mut reader = Reader {
             bytes: body,
             pos: 0,
+            decoded_items: 0,
         };
         if reader.take(MAGIC.len())? != MAGIC {
             return Err(invalid("unknown query-proof envelope magic"));
@@ -1082,6 +1099,7 @@ impl BagUnionEnvelope {
         let mut reader = Reader {
             bytes: body,
             pos: 0,
+            decoded_items: 0,
         };
         if reader.take(UNION_MAGIC.len())? != UNION_MAGIC {
             return Err(invalid("unknown bag-union envelope magic"));
@@ -1317,6 +1335,7 @@ impl LeftAntiJoinEnvelope {
         let mut reader = Reader {
             bytes: body,
             pos: 0,
+            decoded_items: 0,
         };
         if reader.take(ANTI_MAGIC.len())? != ANTI_MAGIC {
             return Err(invalid("unknown left-anti envelope magic"));
@@ -1560,7 +1579,7 @@ impl LeftOuterJoinEnvelope {
         if Sha256::digest(body).as_slice() != checksum {
             return Err(invalid("left-outer envelope checksum mismatch"));
         }
-        let mut reader = Reader { bytes: body, pos: 0 };
+        let mut reader = Reader { bytes: body, pos: 0, decoded_items: 0 };
         if reader.take(OUTER_MAGIC.len())? != OUTER_MAGIC {
             return Err(invalid("unknown left-outer envelope magic"));
         }
@@ -1832,7 +1851,7 @@ impl RelationProofPlan {
                 for (left_index, right_index) in key_pairs {
                     let l = left_shape.0.get(*left_index).ok_or_else(|| invalid("anti left key out of range"))?;
                     let r = right_descriptors.get(*right_index).ok_or_else(|| invalid("anti right key out of range"))?;
-                    if l.namespace != r.namespace || l.nullable {
+                    if l.namespace != r.namespace || l.nullable || r.nullable {
                         return Err(invalid("anti correlation key descriptor mismatch"));
                     }
                 }
@@ -1848,7 +1867,11 @@ impl RelationProofPlan {
                 for (left_index, right_index) in key_pairs {
                     let l = descriptors.get(*left_index).ok_or_else(|| invalid("outer left key out of range"))?;
                     let r = right_descriptors.get(*right_index).ok_or_else(|| invalid("outer right key out of range"))?;
-                    if l.namespace != r.namespace || l.nullable || shared_right.contains(right_index) {
+                    if l.namespace != r.namespace
+                        || l.nullable
+                        || r.nullable
+                        || shared_right.contains(right_index)
+                    {
                         return Err(invalid("outer correlation key descriptor mismatch"));
                     }
                     shared_right.push(*right_index);
@@ -2383,7 +2406,7 @@ impl RecursiveRelationEnvelope {
         if Sha256::digest(body).as_slice() != checksum {
             return Err(invalid("recursive relation envelope checksum mismatch"));
         }
-        let mut reader = Reader { bytes: body, pos: 0 };
+        let mut reader = Reader { bytes: body, pos: 0, decoded_items: 0 };
         if reader.take(RECURSIVE_MAGIC.len())? != RECURSIVE_MAGIC {
             return Err(invalid("unknown recursive relation envelope magic"));
         }
@@ -2497,6 +2520,7 @@ mod tests {
             let mut reader = Reader {
                 bytes: &[tag],
                 pos: 0,
+                decoded_items: 0,
             };
             assert_eq!(GroundAbsence::get(&mut reader).unwrap(), expected);
             reader.finish().unwrap();
@@ -2504,8 +2528,63 @@ mod tests {
         let mut reader = Reader {
             bytes: &[3],
             pos: 0,
+            decoded_items: 0,
         };
         assert!(GroundAbsence::get(&mut reader).is_err());
+    }
+
+    #[test]
+    fn decoder_item_budget_is_global_across_nested_collections() {
+        let mut reader = Reader {
+            bytes: &[],
+            pos: 0,
+            decoded_items: 0,
+        };
+        reader.claim_items(MAX_ITEMS - 1).unwrap();
+        reader.claim_items(1).unwrap();
+        assert!(reader.claim_items(1).is_err());
+    }
+
+    #[test]
+    fn recursive_plan_rejects_nullable_right_correlation_keys() {
+        let (layer, bgp) = fixture();
+        let digest = [7u8; 32];
+        let leaf = RelationProofPlan {
+            query_digest: digest,
+            kind: RelationProofPlanKind::Bgp(bgp),
+        };
+        let nullable_right = RelationProofPlan {
+            query_digest: digest,
+            kind: RelationProofPlanKind::LeftOuter {
+                left: Box::new(leaf.clone()),
+                right: Box::new(leaf.clone()),
+                key_pairs: Vec::new(),
+            },
+        };
+        let right_shape = nullable_right.result_shape().unwrap().0;
+        let nullable_index = right_shape
+            .iter()
+            .position(|descriptor| descriptor.nullable)
+            .unwrap();
+        for kind in [
+            RelationProofPlanKind::LeftAnti {
+                left: Box::new(leaf.clone()),
+                right: Box::new(nullable_right.clone()),
+                key_pairs: vec![(0, nullable_index)],
+            },
+            RelationProofPlanKind::LeftOuter {
+                left: Box::new(leaf.clone()),
+                right: Box::new(nullable_right.clone()),
+                key_pairs: vec![(0, nullable_index)],
+            },
+        ] {
+            let plan = RelationProofPlan {
+                query_digest: digest,
+                kind,
+            };
+            assert!(plan.result_shape().is_err());
+        }
+        drop(layer);
     }
 
     #[test]
