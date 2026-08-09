@@ -818,6 +818,7 @@ pub mod query;
 pub mod range;
 pub mod relocate;
 pub mod sort;
+pub mod union;
 
 /// Per-layer sidecar payload for the Proof-of-WOQL commitment scheme.
 ///
