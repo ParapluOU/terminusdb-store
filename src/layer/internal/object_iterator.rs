@@ -641,6 +641,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn value_range_child_layer_is_globally_value_ordered_in_both_directions() {
+        let store = MemoryLayerStore::new();
+        let mut builder = store.create_base_layer().await.unwrap();
+        let base_name = builder.name();
+
+        builder.add_value_triple(ValueTriple::new_string_value("parent-z", "label", "zebra"));
+        builder.add_value_triple(ValueTriple::new_string_value("parent-c", "label", "cherry"));
+        builder.commit_boxed().await.unwrap();
+
+        let mut builder = store.create_child_layer(base_name).await.unwrap();
+        let child_name = builder.name();
+        builder.add_value_triple(ValueTriple::new_string_value("child-a", "label", "apple"));
+        builder.add_value_triple(ValueTriple::new_string_value("child-m", "label", "mango"));
+        builder.commit_boxed().await.unwrap();
+
+        let layer = store.get_layer(child_name).await.unwrap().unwrap();
+        let low = String::make_entry(&"a");
+        let high = String::make_entry(&"zz");
+        let values = |triples: Vec<IdTriple>| {
+            triples
+                .into_iter()
+                .map(|triple| {
+                    layer
+                        .id_object_value(triple.object)
+                        .unwrap()
+                        .as_val::<String, String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            vec!["apple", "cherry", "mango", "zebra"],
+            values(layer.triples_value_range(&low, &high).collect())
+        );
+        assert_eq!(
+            vec!["zebra", "mango", "cherry", "apple"],
+            values(layer.triples_value_range_rev(&low, &high).collect())
+        );
+    }
+
+    #[tokio::test]
     async fn value_range_child_layer_with_removal() {
         let store = MemoryLayerStore::new();
         let mut builder = store.create_base_layer().await.unwrap();

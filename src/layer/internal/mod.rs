@@ -943,6 +943,18 @@ impl Layer for InternalLayer {
             parent_count += node_dict_len + value_dict_len;
         }
 
+        // Each layer dictionary is sorted internally, but concatenating those runs is
+        // not value order for a child snapshot (for example a child "banana" follows
+        // its parent's "zebra").  The public range contract is over the logical layer,
+        // so merge the candidate object IDs by their resolved typed value.  An entry
+        // reused by more than one layer can map to the same outer ID; visit it once.
+        object_ids.sort_unstable_by(|left, right| {
+            self.id_object_value(*left)
+                .cmp(&self.id_object_value(*right))
+                .then_with(|| left.cmp(right))
+        });
+        object_ids.dedup();
+
         let layer_clone = self.clone();
         Box::new(object_ids.into_iter().flat_map(move |oid| {
             InternalTripleObjectIterator::from_layer(&layer_clone)
@@ -1000,6 +1012,16 @@ impl Layer for InternalLayer {
 
             parent_count += node_dict_len + value_dict_len;
         }
+
+
+        // Reverse is the exact inverse object-value order of the forward logical
+        // range, not a concatenation of individually reversed layer dictionaries.
+        object_ids.sort_unstable_by(|left, right| {
+            self.id_object_value(*right)
+                .cmp(&self.id_object_value(*left))
+                .then_with(|| right.cmp(left))
+        });
+        object_ids.dedup();
 
         let layer_clone = self.clone();
         Box::new(object_ids.into_iter().flat_map(move |oid| {
