@@ -5,10 +5,11 @@ use std::io::{self, Cursor};
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
+use dory_pcs::primitives::transcript::Transcript;
 use sha2::{Digest, Sha256};
 
 use super::argument::{ColumnOpening, SumcheckProof};
-use super::bgp::{BgpChainProof, BgpStageProof, JoinStep};
+use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit};
 use super::commitment::LayerCommitment;
 use super::count::CountProof;
 use super::dict::DictProof;
@@ -29,12 +30,15 @@ use super::range::{
 };
 use super::relocate::RelocationProof;
 use super::sort::SortedProof;
+use super::union::{verify_bag_union, BagUnionProof};
 use super::{CanonicalDatatype, CanonicalObject, ProofHash};
 
 const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
+const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
 // v3 adds the root-authenticated ground dictionary-absence branch. Older envelopes fail
 // explicitly; v2 had already bound the deterministic Dory parameter-set identity.
 const VERSION: u32 = 3;
+const UNION_VERSION: u32 = 1;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -267,6 +271,13 @@ wire_struct!(RelocationProof {
     target_eval,
     source_opening,
     target_opening
+});
+wire_struct!(BagUnionProof {
+    relocations,
+    relocated_commitments,
+    reciprocal_commitments,
+    sumcheck,
+    opening
 });
 wire_struct!(SortedProof {
     sumcheck,
@@ -714,6 +725,216 @@ impl LayerBgpEnvelope {
         let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
         if version != VERSION {
             return Err(invalid("unsupported query-proof envelope version"));
+        }
+        let envelope = Self::get(&mut reader)?;
+        reader.finish()?;
+        Ok(envelope)
+    }
+}
+
+/// Portable exact-bag-union envelope. Every branch remains a complete independently
+/// verifiable layer envelope against the same root; `union_proof` authenticates their
+/// compatible-schema result multiset as the public output.
+#[derive(Clone, Debug)]
+pub struct BagUnionEnvelope {
+    pub layer_root: ProofHash,
+    pub query_digest: ProofHash,
+    pub branches: Vec<LayerBgpEnvelope>,
+    pub union_proof: BagUnionProof,
+    pub result_commitments: Vec<ArkGT>,
+    pub result_columns: Vec<Vec<ArkFr>>,
+    pub result_log_domain: usize,
+    pub result_len: usize,
+    pub ground_result: bool,
+    pub result_objects: Vec<Vec<CanonicalObject>>,
+}
+
+wire_struct!(BagUnionEnvelope {
+    layer_root,
+    query_digest,
+    branches,
+    union_proof,
+    result_commitments,
+    result_columns,
+    result_log_domain,
+    result_len,
+    ground_result,
+    result_objects
+});
+
+impl BagUnionEnvelope {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_verified(
+        layer: &LayerCommitment,
+        expected_root: ProofHash,
+        branch_plans: &[LayerBgpPlan],
+        query_digest: ProofHash,
+        branches: Vec<LayerBgpEnvelope>,
+        union_proof: BagUnionProof,
+        result_commitments: Vec<ArkGT>,
+        result_columns: Vec<Vec<ArkFr>>,
+        result_log_domain: usize,
+        result_len: usize,
+        ground_result: bool,
+    ) -> io::Result<Self> {
+        if branches.len() != branch_plans.len() || branches.len() < 2 {
+            return Err(invalid("bag-union envelope branch count mismatch"));
+        }
+        for (branch, plan) in branches.iter().zip(branch_plans) {
+            branch.verify(layer, expected_root, plan, query_digest)?;
+        }
+        let inputs: Vec<RelationCommit> = branches
+            .iter()
+            .map(|branch| RelationCommit {
+                commitments: branch.result_commitments.clone(),
+                log_domain: branch.result_log_domain,
+                n: branch.result_len,
+            })
+            .collect();
+        let mut transcript = super::argument::Transcript254::new(b"parture-union-envelope");
+        transcript.append_bytes(b"pow/union-envelope/root", &expected_root);
+        transcript.append_bytes(b"pow/union-envelope/query", &query_digest);
+        verify_bag_union(
+            &inputs,
+            &result_commitments,
+            result_len,
+            result_log_domain,
+            &union_proof,
+            &mut transcript,
+        )?;
+        verify_result_columns(
+            &result_commitments,
+            &result_columns,
+            result_len,
+            result_log_domain,
+        )?;
+        let result_objects = if ground_result {
+            if result_columns.len() != 1 || result_commitments.len() != 1 {
+                return Err(invalid("ground bag union must carry one internal UNIT column"));
+            }
+            Vec::new()
+        } else {
+            resolve_result_objects(layer, expected_root, &result_columns)?
+        };
+        Ok(Self {
+            layer_root: expected_root,
+            query_digest,
+            branches,
+            union_proof,
+            result_commitments,
+            result_columns,
+            result_log_domain,
+            result_len,
+            ground_result,
+            result_objects,
+        })
+    }
+
+    pub fn verify(
+        &self,
+        layer: &LayerCommitment,
+        expected_root: ProofHash,
+        branch_plans: &[LayerBgpPlan],
+        query_digest: ProofHash,
+        expected_ground_result: bool,
+    ) -> io::Result<()> {
+        if self.layer_root != expected_root {
+            return Err(invalid("bag-union envelope root does not match trusted root"));
+        }
+        if self.query_digest != query_digest {
+            return Err(invalid("bag-union public-query identity mismatch"));
+        }
+        if self.ground_result != expected_ground_result {
+            return Err(invalid("bag-union ground-result interpretation mismatch"));
+        }
+        if self.branches.len() != branch_plans.len() || self.branches.len() < 2 {
+            return Err(invalid("bag-union envelope branch count mismatch"));
+        }
+        for (branch, plan) in self.branches.iter().zip(branch_plans) {
+            branch.verify(layer, expected_root, plan, query_digest)?;
+        }
+        let inputs: Vec<RelationCommit> = self
+            .branches
+            .iter()
+            .map(|branch| RelationCommit {
+                commitments: branch.result_commitments.clone(),
+                log_domain: branch.result_log_domain,
+                n: branch.result_len,
+            })
+            .collect();
+        let mut transcript = super::argument::Transcript254::new(b"parture-union-envelope");
+        transcript.append_bytes(b"pow/union-envelope/root", &expected_root);
+        transcript.append_bytes(b"pow/union-envelope/query", &query_digest);
+        verify_bag_union(
+            &inputs,
+            &self.result_commitments,
+            self.result_len,
+            self.result_log_domain,
+            &self.union_proof,
+            &mut transcript,
+        )?;
+        verify_result_columns(
+            &self.result_commitments,
+            &self.result_columns,
+            self.result_len,
+            self.result_log_domain,
+        )?;
+        if self.ground_result {
+            if self.result_columns.len() != 1
+                || self.result_commitments.len() != 1
+                || !self.result_objects.is_empty()
+            {
+                return Err(invalid("invalid ground bag-union envelope shape"));
+            }
+            Ok(())
+        } else {
+            verify_result_objects(
+                layer,
+                expected_root,
+                &self.result_columns,
+                &self.result_objects,
+            )
+        }
+    }
+
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(UNION_MAGIC);
+        out.extend_from_slice(&UNION_VERSION.to_le_bytes());
+        self.put(&mut out)?;
+        if out
+            .len()
+            .checked_add(CHECKSUM_BYTES)
+            .map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES)
+        {
+            return Err(invalid("bag-union envelope too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < UNION_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid bag-union envelope size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("bag-union envelope checksum mismatch"));
+        }
+        let mut reader = Reader {
+            bytes: body,
+            pos: 0,
+        };
+        if reader.take(UNION_MAGIC.len())? != UNION_MAGIC {
+            return Err(invalid("unknown bag-union envelope magic"));
+        }
+        let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if version != UNION_VERSION {
+            return Err(invalid("unsupported bag-union envelope version"));
         }
         let envelope = Self::get(&mut reader)?;
         reader.finish()?;
