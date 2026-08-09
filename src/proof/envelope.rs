@@ -35,6 +35,9 @@ use super::group::{
 };
 use super::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
 use super::membership::MembershipProof;
+use super::order::{
+    prove_exact_scalar_order_with_context, verify_exact_scalar_order, ExactScalarOrderProof,
+};
 use super::permutation::RelationPermutationProof;
 use super::query::{
     has_ground_result_unit, prove_layer_bgp_with_result_and_context,
@@ -65,8 +68,8 @@ const VERSION: u32 = 4;
 const UNION_VERSION: u32 = 2;
 const ANTI_VERSION: u32 = 4;
 const OUTER_VERSION: u32 = 1;
-// v2 adds the scalar-key GroupBy+RangeMin/RangeMax recursive node (wire tag 5).
-const RECURSIVE_VERSION: u32 = 2;
+// v3 adds exact one-column ascending scalar OrderBy (wire tag 6).
+const RECURSIVE_VERSION: u32 = 3;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -337,6 +340,22 @@ wire_struct!(RelationPermutationProof {
     output_reciprocal_commitment,
     sumcheck,
     opening
+});
+wire_struct!(ExactScalarOrderProof {
+    permutation,
+    relocate_output_id,
+    relocate_dict_id,
+    relocate_dict_value,
+    relocate_dict_datatype,
+    com_output_id_at_d,
+    com_dict_id_at_d,
+    com_dict_value_at_d,
+    com_dict_datatype_at_d,
+    lookup,
+    datatype_filter,
+    datatype_selection_commitment,
+    datatype_inverse_commitment,
+    sorted
 });
 wire_struct!(GroupExtremaEntryProof {
     group,
@@ -1646,6 +1665,10 @@ pub enum RelationProofPlanKind {
         input: Box<RelationProofPlan>,
         constraint: RelationEqualityPlan,
     },
+    ExactScalarOrder {
+        input: Box<RelationProofPlan>,
+        datatype: CanonicalDatatype,
+    },
     /// Scalar-key `GroupBy`, with its private bag consumed immediately by
     /// `RangeMin`/`RangeMax`; output is exactly `[key, original-value-id]`.
     GroupExtrema {
@@ -1913,6 +1936,27 @@ impl RelationProofPlan {
                 validate_equality_plan(constraint, &descriptors, ground)?;
                 Ok((descriptors, ground))
             }
+            RelationProofPlanKind::ExactScalarOrder { input, datatype } => {
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                if ground
+                    || descriptors.len() != 1
+                    || descriptors[0].namespace != ResultIdNamespace::NodeValue
+                    || descriptors[0].nullable
+                    || !numeric_datatype(*datatype)
+                    || matches!(
+                        datatype,
+                        CanonicalDatatype::Decimal
+                            | CanonicalDatatype::BigInt
+                            | CanonicalDatatype::PositiveInteger
+                            | CanonicalDatatype::NonNegativeInteger
+                            | CanonicalDatatype::NonPositiveInteger
+                            | CanonicalDatatype::NegativeInteger
+                    )
+                {
+                    return Err(invalid("invalid exact scalar order child shape"));
+                }
+                Ok((descriptors, false))
+            }
             RelationProofPlanKind::GroupExtrema { input, key_column, value_column, datatype, .. } => {
                 let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
                 if ground || *key_column == *value_column {
@@ -1971,6 +2015,10 @@ pub enum RecursiveRelationProof {
     Equality {
         input: Box<RecursiveRelationEnvelope>,
         proof: Box<RelationEqualityProof>,
+    },
+    ExactScalarOrder {
+        input: Box<RecursiveRelationEnvelope>,
+        proof: Box<ExactScalarOrderProof>,
     },
     GroupExtrema {
         input: Box<RecursiveRelationEnvelope>,
@@ -2191,6 +2239,32 @@ impl RecursiveRelationEnvelope {
                 Self::finish_proved(layer, plan, RecursiveRelationProof::Equality {
                     input: Box::new(input_envelope), proof: Box::new(result.proof),
                 }, result.commitments, result.columns, result.log_domain, result.n)
+            }
+            RelationProofPlanKind::ExactScalarOrder { input, datatype } => {
+                let input_envelope =
+                    Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let mut transcript = Transcript254::new(b"parture-order-envelope");
+                transcript.append_bytes(b"pow/order-envelope/root", &layer.state.commitment_root);
+                transcript.append_bytes(b"pow/order-envelope/query", &plan.query_digest);
+                let result = prove_exact_scalar_order_with_context(
+                    context,
+                    layer,
+                    &input_envelope.relation_witness(None)?,
+                    *datatype,
+                    &mut transcript,
+                )?;
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::ExactScalarOrder {
+                        input: Box::new(input_envelope),
+                        proof: Box::new(result.proof),
+                    },
+                    result.commitments,
+                    result.columns,
+                    result.log_domain,
+                    result.n,
+                )
             }
             RelationProofPlanKind::GroupExtrema { input, key_column, value_column, datatype, kind } => {
                 let input_envelope = Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
@@ -2442,6 +2516,34 @@ impl RecursiveRelationEnvelope {
                 )?;
             }
             (
+                RecursiveRelationProof::ExactScalarOrder { input, proof },
+                RelationProofPlanKind::ExactScalarOrder {
+                    input: input_plan,
+                    datatype,
+                },
+            ) => {
+                input.verify_bounded(
+                    layer,
+                    expected_root,
+                    input_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let mut transcript = Transcript254::new(b"parture-order-envelope");
+                transcript.append_bytes(b"pow/order-envelope/root", &expected_root);
+                transcript.append_bytes(b"pow/order-envelope/query", &plan.query_digest);
+                verify_exact_scalar_order(
+                    layer,
+                    &input.relation_commit(None)?,
+                    *datatype,
+                    &self.result_commitments,
+                    self.result_len,
+                    self.result_log_domain,
+                    proof,
+                    &mut transcript,
+                )?;
+            }
+            (
                 RecursiveRelationProof::GroupExtrema { input, proof },
                 RelationProofPlanKind::GroupExtrema { input: input_plan, key_column, value_column, datatype, kind },
             ) => {
@@ -2557,6 +2659,11 @@ impl RecursiveRelationEnvelope {
                 input.put_bounded(out, depth + 1, nodes)?;
                 proof.put(out)?;
             }
+            RecursiveRelationProof::ExactScalarOrder { input, proof } => {
+                6u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+                proof.put(out)?;
+            }
             RecursiveRelationProof::GroupExtrema { input, proof } => {
                 5u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
@@ -2616,6 +2723,10 @@ impl RecursiveRelationEnvelope {
             5 => RecursiveRelationProof::GroupExtrema {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 proof: Box::<GroupExtremaProof>::get(reader)?,
+            },
+            6 => RecursiveRelationProof::ExactScalarOrder {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                proof: Box::<ExactScalarOrderProof>::get(reader)?,
             },
             _ => return Err(invalid("invalid recursive relation proof tag")),
         };
@@ -2678,6 +2789,7 @@ mod tests {
     use super::*;
     use crate::store::sync::open_sync_memory_store;
     use crate::ValueTriple;
+    use tdb_succinct::TdbDataType;
 
     fn iri(value: &str) -> String {
         format!("http://ex/{value}")
@@ -2702,6 +2814,33 @@ mod tests {
             joins: Vec::new(),
         };
         ((*commitment).clone(), plan)
+    }
+
+    fn order_fixture() -> (LayerCommitment, LayerBgpPlan) {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for value in [30u32, 10, 20] {
+            builder
+                .add_value_triple(ValueTriple::new_value(
+                    &iri("metric"),
+                    &iri("score"),
+                    u32::make_entry(&value),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap().proof_commitment().unwrap();
+        let plan = LayerBgpPlan {
+            atoms: vec![LayerBgpAtom {
+                subject: AtomTerm::NodeConstant(iri("metric").into_bytes()),
+                predicate_term: iri("score").into_bytes(),
+                predicate_variable: false,
+                object: AtomTerm::Variable,
+                object_range: None,
+                subject_object_equal: false,
+            }],
+            joins: Vec::new(),
+        };
+        ((*layer).clone(), plan)
     }
 
     fn refresh_checksum(bytes: &mut Vec<u8>) {
@@ -2783,6 +2922,39 @@ mod tests {
             decoded_items: 0,
         };
         assert!(DictionaryAbsencePosition::get(&mut reader).is_err());
+    }
+
+    #[test]
+    fn recursive_exact_scalar_order_roundtrips_and_rejects_plan_tamper() {
+        let (layer, bgp) = order_fixture();
+        let child = RelationProofPlan {
+            query_digest: plan_digest(&bgp).unwrap(),
+            kind: RelationProofPlanKind::Bgp(bgp),
+        };
+        let plan = RelationProofPlan {
+            query_digest: [42u8; 32],
+            kind: RelationProofPlanKind::ExactScalarOrder {
+                input: Box::new(child),
+                datatype: CanonicalDatatype::UInt32,
+            },
+        };
+        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        envelope
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+        let bytes = envelope.encode().unwrap();
+        let decoded = RecursiveRelationEnvelope::decode(&bytes).unwrap();
+        decoded
+            .verify(&layer, layer.state.commitment_root, &plan)
+            .unwrap();
+
+        let mut wrong_plan = plan.clone();
+        if let RelationProofPlanKind::ExactScalarOrder { datatype, .. } = &mut wrong_plan.kind {
+            *datatype = CanonicalDatatype::Int32;
+        }
+        assert!(decoded
+            .verify(&layer, layer.state.commitment_root, &wrong_plan)
+            .is_err());
     }
 
     #[test]

@@ -818,6 +818,7 @@ pub mod join;
 pub mod join2;
 pub mod logup;
 pub mod membership;
+pub mod order;
 pub mod pairs;
 pub mod permutation;
 pub mod query;
