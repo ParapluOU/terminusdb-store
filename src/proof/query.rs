@@ -587,7 +587,7 @@ pub fn generated_decimal_i64_field(value: i64) -> ArkFr {
     }
 }
 
-pub(crate) fn generated_decimal_i64_value(field: ArkFr) -> io::Result<i64> {
+pub fn generated_decimal_i64_value(field: ArkFr) -> io::Result<i64> {
     if field.is_zero() {
         return Ok(0);
     }

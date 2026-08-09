@@ -1740,6 +1740,15 @@ pub enum RelationProofPlanKind {
         constant: u64,
         constant_on_left: bool,
     },
+    /// Exact row filter for a generated signed integral decimal column. Signedness is
+    /// selected by the authenticated result descriptor, never inferred from the field.
+    GeneratedI64Filter {
+        input: Box<RelationProofPlan>,
+        column: usize,
+        op: GeneratedU64ComparisonOp,
+        constant: i64,
+        constant_on_left: bool,
+    },
     /// Exact zero-/one-key grouping and checked u64/i64 sum over fixed-width integral
     /// Store values.
     /// The child rows and root-bound dictionary are public to the verifier, so the
@@ -2024,6 +2033,21 @@ impl RelationProofPlan {
                 {
                     return Err(invalid(
                         "generated-u64 filter requires a nonnullable generated decimal column",
+                    ));
+                }
+                Ok((descriptors, false))
+            }
+            RelationProofPlanKind::GeneratedI64Filter { input, column, .. } => {
+                let (descriptors, ground) = input.shape_bounded(depth + 1, nodes)?;
+                let descriptor = descriptors
+                    .get(*column)
+                    .ok_or_else(|| invalid("generated-i64 filter column out of range"))?;
+                if ground
+                    || descriptor.nullable
+                    || descriptor.namespace != ResultIdNamespace::GeneratedDecimalI64
+                {
+                    return Err(invalid(
+                        "generated-i64 filter requires a nonnullable signed generated decimal column",
                     ));
                 }
                 Ok((descriptors, false))
@@ -2338,6 +2362,9 @@ pub enum RecursiveRelationProof {
     GeneratedU64Filter {
         input: Box<RecursiveRelationEnvelope>,
     },
+    GeneratedI64Filter {
+        input: Box<RecursiveRelationEnvelope>,
+    },
     GroupSum {
         input: Box<RecursiveRelationEnvelope>,
     },
@@ -2408,6 +2435,26 @@ fn generated_u64_comparison(
     }
 }
 
+fn generated_i64_comparison(
+    value: i64,
+    op: GeneratedU64ComparisonOp,
+    constant: i64,
+    constant_on_left: bool,
+) -> bool {
+    let (left, right) = if constant_on_left {
+        (constant, value)
+    } else {
+        (value, constant)
+    };
+    match op {
+        GeneratedU64ComparisonOp::Eq => left == right,
+        GeneratedU64ComparisonOp::Lt => left < right,
+        GeneratedU64ComparisonOp::Le => left <= right,
+        GeneratedU64ComparisonOp::Gt => left > right,
+        GeneratedU64ComparisonOp::Ge => left >= right,
+    }
+}
+
 fn generated_u64_filtered_columns(
     input: &RecursiveRelationEnvelope,
     column: usize,
@@ -2441,6 +2488,47 @@ fn generated_u64_filtered_columns(
                         .get(*row)
                         .copied()
                         .ok_or_else(|| invalid("generated-u64 filter input column is short"))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn generated_i64_filtered_columns(
+    input: &RecursiveRelationEnvelope,
+    column: usize,
+    op: GeneratedU64ComparisonOp,
+    constant: i64,
+    constant_on_left: bool,
+) -> io::Result<Vec<Vec<ArkFr>>> {
+    let values = input
+        .result_values
+        .get(column)
+        .ok_or_else(|| invalid("generated-i64 filter value column out of range"))?;
+    if values.len() != input.result_len {
+        return Err(invalid("generated-i64 filter input value length mismatch"));
+    }
+    let mut keep = Vec::new();
+    for (row, value) in values.iter().enumerate() {
+        let CanonicalResultValue::GeneratedDecimalI64(value) = value else {
+            return Err(invalid(
+                "generated-i64 filter input is not a signed generated decimal",
+            ));
+        };
+        if generated_i64_comparison(*value, op, constant, constant_on_left) {
+            keep.push(row);
+        }
+    }
+    input
+        .result_columns
+        .iter()
+        .map(|input_column| {
+            keep.iter()
+                .map(|row| {
+                    input_column
+                        .get(*row)
+                        .copied()
+                        .ok_or_else(|| invalid("generated-i64 filter input column is short"))
                 })
                 .collect()
         })
@@ -2819,6 +2907,44 @@ impl RecursiveRelationEnvelope {
                     layer,
                     plan,
                     RecursiveRelationProof::GeneratedU64Filter {
+                        input: Box::new(input_envelope),
+                    },
+                    commitments,
+                    columns,
+                    log_domain,
+                    n,
+                )
+            }
+            RelationProofPlanKind::GeneratedI64Filter {
+                input,
+                column,
+                op,
+                constant,
+                constant_on_left,
+            } => {
+                let input_envelope =
+                    Self::prove_bounded(context, layer, input, depth + 1, nodes)?;
+                let mut columns = generated_i64_filtered_columns(
+                    &input_envelope,
+                    *column,
+                    *op,
+                    *constant,
+                    *constant_on_left,
+                )?;
+                let n = columns.first().map_or(0, Vec::len);
+                let log_domain = n.max(1).next_power_of_two().max(2).trailing_zeros() as usize;
+                let domain = 1usize << log_domain;
+                for column in &mut columns {
+                    column.resize(domain, ArkFr::zero());
+                }
+                let commitments = columns
+                    .iter()
+                    .map(|column| context.commit_column(column))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Self::finish_proved(
+                    layer,
+                    plan,
+                    RecursiveRelationProof::GeneratedI64Filter {
                         input: Box::new(input_envelope),
                     },
                     commitments,
@@ -3254,6 +3380,57 @@ impl RecursiveRelationEnvelope {
                     .collect::<io::Result<Vec<_>>>()?;
                 if self.result_commitments != expected_commitments {
                     return Err(invalid("generated-u64 filter commitment mismatch"));
+                }
+            }
+            (
+                RecursiveRelationProof::GeneratedI64Filter { input },
+                RelationProofPlanKind::GeneratedI64Filter {
+                    input: input_plan,
+                    column,
+                    op,
+                    constant,
+                    constant_on_left,
+                },
+            ) => {
+                input.verify_bounded(
+                    layer,
+                    expected_root,
+                    input_plan,
+                    depth + 1,
+                    nodes,
+                )?;
+                let expected_columns = generated_i64_filtered_columns(
+                    input,
+                    *column,
+                    *op,
+                    *constant,
+                    *constant_on_left,
+                )?;
+                let expected_len = expected_columns.first().map_or(0, Vec::len);
+                let expected_log = expected_len
+                    .max(1)
+                    .next_power_of_two()
+                    .max(2)
+                    .trailing_zeros() as usize;
+                if self.result_len != expected_len
+                    || self.result_log_domain != expected_log
+                    || self.result_columns != expected_columns
+                {
+                    return Err(invalid(
+                        "generated-i64 filter result is not the exact derived selection",
+                    ));
+                }
+                let domain = 1usize << expected_log;
+                let expected_commitments = expected_columns
+                    .iter()
+                    .map(|column| {
+                        let mut padded = column.clone();
+                        padded.resize(domain, ArkFr::zero());
+                        commit_column(&padded)
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                if self.result_commitments != expected_commitments {
+                    return Err(invalid("generated-i64 filter commitment mismatch"));
                 }
             }
             (
@@ -3785,6 +3962,10 @@ impl RecursiveRelationEnvelope {
                 13u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
             }
+            RecursiveRelationProof::GeneratedI64Filter { input } => {
+                15u8.put(out)?;
+                input.put_bounded(out, depth + 1, nodes)?;
+            }
             RecursiveRelationProof::GroupSum { input } => {
                 14u8.put(out)?;
                 input.put_bounded(out, depth + 1, nodes)?;
@@ -3879,6 +4060,9 @@ impl RecursiveRelationEnvelope {
         let proof = match u8::get(reader)? {
             12 => RecursiveRelationProof::LayerTripleCount,
             13 => RecursiveRelationProof::GeneratedU64Filter {
+                input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+            },
+            15 => RecursiveRelationProof::GeneratedI64Filter {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
             },
             14 => RecursiveRelationProof::GroupSum {
@@ -4833,8 +5017,7 @@ mod tests {
         .is_err());
     }
 
-    #[test]
-    fn recursive_group_sum_authenticates_signed_values_domains_and_overflow() {
+    fn assert_recursive_group_sum_authenticates_signed_values_domains_and_overflow() {
         for value in [i64::MIN, -1, 0, 1, i64::MAX] {
             assert_eq!(
                 super::super::query::generated_decimal_i64_value(
@@ -4948,6 +5131,83 @@ mod tests {
             .verify(&layer, layer.state.commitment_root, &keyed_plan)
             .unwrap();
 
+        let filter = |op, constant, constant_on_left| RelationProofPlan {
+            query_digest: [111u8; 32],
+            kind: RelationProofPlanKind::GeneratedI64Filter {
+                input: Box::new(keyed_plan.clone()),
+                column: 1,
+                op,
+                constant,
+                constant_on_left,
+            },
+        };
+        for (op, constant, constant_on_left, expected_len) in [
+            (GeneratedU64ComparisonOp::Eq, -1, false, 1),
+            (GeneratedU64ComparisonOp::Eq, 1, false, 0),
+            (GeneratedU64ComparisonOp::Lt, 0, false, 1),
+            (GeneratedU64ComparisonOp::Le, 0, false, 2),
+            (GeneratedU64ComparisonOp::Gt, -1, false, 1),
+            (GeneratedU64ComparisonOp::Ge, -1, false, 2),
+            (GeneratedU64ComparisonOp::Lt, -1, true, 1),
+            (GeneratedU64ComparisonOp::Le, -1, true, 2),
+            (GeneratedU64ComparisonOp::Ge, i64::MIN, false, 2),
+            (GeneratedU64ComparisonOp::Le, i64::MAX, false, 2),
+        ] {
+            let plan = filter(op, constant, constant_on_left);
+            let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+            envelope
+                .verify(&layer, layer.state.commitment_root, &plan)
+                .unwrap();
+            assert_eq!(envelope.result_len, expected_len);
+            RecursiveRelationEnvelope::decode(&envelope.encode().unwrap())
+                .unwrap()
+                .verify(&layer, layer.state.commitment_root, &plan)
+                .unwrap();
+        }
+
+        let retained_plan = filter(GeneratedU64ComparisonOp::Lt, 0, false);
+        let retained = RecursiveRelationEnvelope::prove(&layer, &retained_plan).unwrap();
+        assert_eq!(
+            retained.result_values[1],
+            vec![CanonicalResultValue::GeneratedDecimalI64(-1)]
+        );
+        assert!(retained
+            .verify(
+                &layer,
+                layer.state.commitment_root,
+                &filter(GeneratedU64ComparisonOp::Le, 0, false),
+            )
+            .is_err());
+        assert!(retained
+            .verify(
+                &layer,
+                layer.state.commitment_root,
+                &filter(GeneratedU64ComparisonOp::Lt, 0, true),
+            )
+            .is_err());
+        let wrong_unsigned_domain = RelationProofPlan {
+            query_digest: [111u8; 32],
+            kind: RelationProofPlanKind::GeneratedU64Filter {
+                input: Box::new(keyed_plan.clone()),
+                column: 1,
+                op: GeneratedU64ComparisonOp::Lt,
+                constant: 0,
+                constant_on_left: false,
+            },
+        };
+        assert!(wrong_unsigned_domain.result_shape().is_err());
+        let mut filtered_tamper = retained;
+        filtered_tamper.result_columns[1][0] = generated_decimal_i64_field(1);
+        filtered_tamper.result_values[1][0] = CanonicalResultValue::GeneratedDecimalI64(1);
+        filtered_tamper.result_commitments[1] = commit_column(&[
+            generated_decimal_i64_field(1),
+            ArkFr::zero(),
+        ])
+        .unwrap();
+        assert!(filtered_tamper
+            .verify(&layer, layer.state.commitment_root, &retained_plan)
+            .is_err());
+
         let mut sign_tamper = decoded.clone();
         sign_tamper.result_columns[1][0] = generated_decimal_i64_field(1);
         let mut padded = sign_tamper.result_columns[1].clone();
@@ -5011,6 +5271,17 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn recursive_group_sum_authenticates_signed_values_domains_and_overflow() {
+        std::thread::Builder::new()
+            .name("store-generated-i64-filter-proof".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(assert_recursive_group_sum_authenticates_signed_values_domains_and_overflow)
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
