@@ -1917,6 +1917,35 @@ fn numeric_datatype(datatype: CanonicalDatatype) -> bool {
     )
 }
 
+/// The fixed-width integral OP datatypes whose canonical field encoding is a total order
+/// matching Prolog's integer comparison. Floats are deliberately excluded: `node_value_op_value`
+/// accepts `Float32`/`Float64`, but their total-order NaN placement diverges from Prolog's IEEE
+/// semantics, so any extrema derivation must reject them.
+fn integral_op_datatype(datatype: CanonicalDatatype) -> bool {
+    matches!(
+        datatype,
+        CanonicalDatatype::UInt8
+            | CanonicalDatatype::UInt16
+            | CanonicalDatatype::UInt32
+            | CanonicalDatatype::UInt64
+            | CanonicalDatatype::Int8
+            | CanonicalDatatype::Int16
+            | CanonicalDatatype::Int32
+            | CanonicalDatatype::Int64
+    )
+}
+
+/// A Store dictionary ID namespace whose field values are guaranteed `< 2^64`. Composite
+/// two-key joins pack the keys as `col0 + 2^64·col1`, which is injective only for such bounded
+/// keys; a generated-decimal namespace can reach ~2^254 and would collide, so it must never be
+/// packed.
+fn is_store_id_namespace(namespace: ResultIdNamespace) -> bool {
+    matches!(
+        namespace,
+        ResultIdNamespace::NodeValue | ResultIdNamespace::Predicate
+    )
+}
+
 fn ordered_slice_bounds(source_len: usize, offset: u64, limit: Option<u64>) -> (usize, usize) {
     let start = usize::try_from(offset)
         .unwrap_or(usize::MAX)
@@ -2387,6 +2416,15 @@ impl RelationProofPlan {
                     if l.namespace != r.namespace || l.nullable || r.nullable {
                         return Err(invalid("anti correlation key descriptor mismatch"));
                     }
+                    // A composite (two-key) anti-join packs both keys as `col0 + 2^64·col1`,
+                    // injective only for Store dictionary IDs (`< 2^64`). Namespace equality
+                    // does not bound the field width, so require every packed key to be a
+                    // Store-ID namespace; scalar keys use injective equality and are exempt.
+                    if key_pairs.len() == 2
+                        && (!is_store_id_namespace(l.namespace) || !is_store_id_namespace(r.namespace))
+                    {
+                        return Err(invalid("composite anti-join key must be a Store-ID namespace"));
+                    }
                 }
                 Ok(left_shape)
             }
@@ -2404,6 +2442,13 @@ impl RelationProofPlan {
                     if l.namespace != r.namespace || l.nullable || r.nullable
                         || shared_left.contains(left_index) || shared_right.contains(right_index) {
                         return Err(invalid("inner correlation key descriptor mismatch"));
+                    }
+                    // Composite (two-key) inner joins pack `col0 + 2^64·col1`, injective only
+                    // for Store dictionary IDs (`< 2^64`); reject any non-Store-ID packed key.
+                    if key_pairs.len() == 2
+                        && (!is_store_id_namespace(l.namespace) || !is_store_id_namespace(r.namespace))
+                    {
+                        return Err(invalid("composite inner-join key must be a Store-ID namespace"));
                     }
                     shared_left.push(*left_index); shared_right.push(*right_index);
                 }
@@ -2428,6 +2473,13 @@ impl RelationProofPlan {
                         || shared_right.contains(right_index)
                     {
                         return Err(invalid("outer correlation key descriptor mismatch"));
+                    }
+                    // Composite (two-key) left-outer joins pack `col0 + 2^64·col1`, injective
+                    // only for Store dictionary IDs (`< 2^64`); reject any non-Store-ID packed key.
+                    if key_pairs.len() == 2
+                        && (!is_store_id_namespace(l.namespace) || !is_store_id_namespace(r.namespace))
+                    {
+                        return Err(invalid("composite left-outer key must be a Store-ID namespace"));
                     }
                     shared_right.push(*right_index);
                 }
@@ -3046,6 +3098,14 @@ fn derived_collection_extrema_column(
     datatype: CanonicalDatatype,
     kind: GroupExtremaKind,
 ) -> io::Result<Vec<Vec<ArkFr>>> {
+    // Defense-in-depth: `node_value_op_value` also encodes Float32/64, whose total-order NaN
+    // placement diverges from Prolog's IEEE comparison. Assert the integral OP subset here so a
+    // future loosening of the `shape_bounded` gate cannot silently admit floating extrema.
+    if !integral_op_datatype(datatype) {
+        return Err(invalid(
+            "collection-extrema datatype must be a fixed-width integral OP type",
+        ));
+    }
     let values = input
         .result_columns
         .get(value_column)
@@ -3091,6 +3151,13 @@ fn derived_group_extrema_columns(
     datatype: CanonicalDatatype,
     kind: GroupExtremaKind,
 ) -> io::Result<Vec<Vec<ArkFr>>> {
+    // Defense-in-depth: reject floating (NaN-divergent) extrema at derivation time, independent
+    // of the `shape_bounded` integral gate. `integral_catalog_value` also enforces this per value.
+    if !integral_op_datatype(datatype) {
+        return Err(invalid(
+            "group-extrema datatype must be a fixed-width integral OP type",
+        ));
+    }
     let values = input
         .result_columns
         .get(value_column)
@@ -4952,6 +5019,86 @@ mod tests {
         let body_len = bytes.len() - CHECKSUM_BYTES;
         let checksum = Sha256::digest(&bytes[..body_len]);
         bytes[body_len..].copy_from_slice(&checksum);
+    }
+
+    #[test]
+    fn composite_join_rejects_non_store_id_key_namespace() {
+        // The fixture BGP exposes two nonnullable NodeValue (Store-ID) columns.
+        let (_commitment, bgp) = fixture();
+        let leaf = || RelationProofPlan {
+            query_digest: [0u8; 32],
+            kind: RelationProofPlanKind::Bgp(bgp.clone()),
+        };
+        // GroupCount yields [NodeValue key, GeneratedDecimalU64 count]; the count column is
+        // NOT a bounded Store dictionary ID, so it must never reach the composite key packing.
+        let group_count = || RelationProofPlan {
+            query_digest: [0u8; 32],
+            kind: RelationProofPlanKind::GroupCount {
+                input: Box::new(leaf()),
+                key_columns: vec![0],
+            },
+        };
+        let composite = |kind| RelationProofPlan {
+            query_digest: [0u8; 32],
+            kind,
+        };
+        // Each packed join variant must reject a composite key touching the generated column.
+        for kind in [
+            RelationProofPlanKind::LeftAnti {
+                left: Box::new(group_count()),
+                right: Box::new(group_count()),
+                key_pairs: vec![(0, 0), (1, 1)],
+            },
+            RelationProofPlanKind::InnerJoin {
+                left: Box::new(group_count()),
+                right: Box::new(group_count()),
+                key_pairs: vec![(0, 0), (1, 1)],
+            },
+            RelationProofPlanKind::LeftOuter {
+                left: Box::new(group_count()),
+                right: Box::new(group_count()),
+                key_pairs: vec![(0, 0), (1, 1)],
+            },
+        ] {
+            assert!(
+                composite(kind).shape_bounded(0, &mut 0).is_err(),
+                "composite join over a generated-decimal key must reject"
+            );
+        }
+        // Positive control: a composite join over two Store-ID (NodeValue) keys still passes.
+        let ok = RelationProofPlan {
+            query_digest: [0u8; 32],
+            kind: RelationProofPlanKind::InnerJoin {
+                left: Box::new(leaf()),
+                right: Box::new(leaf()),
+                key_pairs: vec![(0, 0), (1, 1)],
+            },
+        };
+        assert!(ok.shape_bounded(0, &mut 0).is_ok());
+    }
+
+    #[test]
+    fn integral_op_datatype_excludes_floats_for_extrema() {
+        for datatype in [
+            CanonicalDatatype::UInt8,
+            CanonicalDatatype::UInt16,
+            CanonicalDatatype::UInt32,
+            CanonicalDatatype::UInt64,
+            CanonicalDatatype::Int8,
+            CanonicalDatatype::Int16,
+            CanonicalDatatype::Int32,
+            CanonicalDatatype::Int64,
+        ] {
+            assert!(integral_op_datatype(datatype));
+        }
+        for datatype in [
+            CanonicalDatatype::Float32,
+            CanonicalDatatype::Float64,
+            CanonicalDatatype::Decimal,
+            CanonicalDatatype::BigInt,
+        ] {
+            assert!(!integral_op_datatype(datatype));
+        }
     }
 
     fn recursive_leaf(
