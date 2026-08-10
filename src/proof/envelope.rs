@@ -47,7 +47,8 @@ use super::query::{
     has_ground_result_unit, prove_layer_bgp_with_result_and_context,
     resolve_typed_result_objects, result_id_namespaces,
     resolve_result_values, verify_layer_bgp, verify_layer_bgp_result_log_domain,
-    verify_result_columns, generated_decimal_i64_field, AtomTerm, CanonicalResultValue, DictionaryAbsence,
+    verify_result_columns, generated_decimal_i64_field, AtomTerm, CanonicalResultValue, ColumnSource,
+    DictionaryAbsence,
     DictionaryAbsencePosition, LayerBgpAtom,
     LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectKindFilter, ObjectRangeBound,
     ObjectRangeSpec, RangeAtomSubproof, ResultColumnDescriptor, ResultIdNamespace,
@@ -611,7 +612,27 @@ wire_struct!(LayerBgpAtom {
     object_kind,
     subject_object_equal
 });
-wire_struct!(LayerBgpPlan { atoms, joins });
+impl Wire for ColumnSource {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Materialized => 0u8,
+            Self::Additions => 1,
+            Self::Removals => 2,
+        }
+        .put(out)
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        match u8::get(reader)? {
+            0 => Ok(Self::Materialized),
+            1 => Ok(Self::Additions),
+            2 => Ok(Self::Removals),
+            _ => Err(invalid("invalid column-source tag")),
+        }
+    }
+}
+// `source` is part of the plan's wire image, so `plan_digest` (and therefore the envelope
+// anti-substitution check) binds which columns the proof read.
+wire_struct!(LayerBgpPlan { atoms, joins, source });
 
 wire_struct!(DictionaryAbsence {
     atom_index,
@@ -4952,6 +4973,7 @@ mod tests {
         let layer = builder.commit().unwrap();
         let commitment = layer.proof_commitment().unwrap();
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom::all_variables(iri("knows").into_bytes())],
             joins: Vec::new(),
         };
@@ -4972,6 +4994,7 @@ mod tests {
         }
         let layer = builder.commit().unwrap().proof_commitment().unwrap();
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom {
                 subject: AtomTerm::NodeConstant(iri("metric").into_bytes()),
                 predicate_term: iri("score").into_bytes(),
@@ -5010,6 +5033,7 @@ mod tests {
             subject_object_equal: false,
         };
         ((*layer).clone(), LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![atom("left", "x"), atom("right", "y")],
             joins: vec![JoinStep::cross_product()],
         })
@@ -5265,6 +5289,7 @@ mod tests {
         }
         let layer = builder.commit().unwrap().proof_commitment().unwrap();
         let bgp = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom::all_variables(iri("p").into_bytes())],
             joins: Vec::new(),
         };
@@ -5351,6 +5376,7 @@ mod tests {
 
         let present = project(
             LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom::all_variables(iri("p").into_bytes())],
                 joins: Vec::new(),
             },
@@ -5377,6 +5403,7 @@ mod tests {
 
         let absent = project(
             LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom {
                     subject: AtomTerm::NodeConstant(iri("missing").into_bytes()),
                     predicate_term: iri("p").into_bytes(),
@@ -5594,6 +5621,7 @@ mod tests {
         let source = RelationProofPlan {
             query_digest: [99u8; 32],
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom {
                     subject: AtomTerm::Variable,
                     predicate_term: Vec::new(),
@@ -5706,6 +5734,7 @@ mod tests {
         let empty_source = RelationProofPlan {
             query_digest: [102u8; 32],
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom::all_variables(iri("missing").into_bytes())],
                 joins: Vec::new(),
             }),
@@ -5783,6 +5812,7 @@ mod tests {
         let source = RelationProofPlan {
             query_digest: [112u8; 32],
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![
                     LayerBgpAtom::all_variables(iri("link").into_bytes()),
                     LayerBgpAtom::all_variables(iri("score").into_bytes()),
@@ -5895,6 +5925,7 @@ mod tests {
         let source = RelationProofPlan {
             query_digest: [131u8; 32],
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![
                     LayerBgpAtom::all_variables(iri("link").into_bytes()),
                     LayerBgpAtom::all_variables(iri("score").into_bytes()),
@@ -6012,6 +6043,7 @@ mod tests {
         let source = |predicate: &str, digest| RelationProofPlan {
             query_digest: digest,
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
                 joins: Vec::new(),
             }),
@@ -6102,6 +6134,7 @@ mod tests {
         let source = RelationProofPlan {
             query_digest: [117u8; 32],
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![
                     LayerBgpAtom::all_variables(iri("link").into_bytes()),
                     LayerBgpAtom::all_variables(iri("score").into_bytes()),
@@ -6190,6 +6223,7 @@ mod tests {
         let source = |predicate: &str, digest| RelationProofPlan {
             query_digest: digest,
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
                 joins: Vec::new(),
             }),
@@ -6265,6 +6299,7 @@ mod tests {
         let source = RelationProofPlan {
             query_digest: [124u8; 32],
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom::all_variables(iri("p").into_bytes())],
                 joins: Vec::new(),
             }),
@@ -6385,6 +6420,7 @@ mod tests {
         let source = |predicate: &str, digest| RelationProofPlan {
             query_digest: digest,
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
                 joins: Vec::new(),
             }),
@@ -6474,6 +6510,7 @@ mod tests {
         let source = || RelationProofPlan {
             query_digest: [105u8; 32],
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom {
                     subject: AtomTerm::Variable,
                     predicate_term: Vec::new(),
@@ -6621,6 +6658,7 @@ mod tests {
         let source = RelationProofPlan {
             query_digest: [108u8; 32],
             kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom {
                     subject: AtomTerm::Variable,
                     predicate_term: Vec::new(),
@@ -6837,6 +6875,7 @@ mod tests {
         }
         let layer = builder.commit().unwrap().proof_commitment().unwrap();
         let bgp = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom::all_variables(iri("p").into_bytes())],
             joins: Vec::new(),
         };
@@ -7070,6 +7109,7 @@ mod tests {
     fn ground_result_unit_is_authenticated_but_not_dictionary_resolved() {
         let (layer, _) = fixture();
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom {
                 subject: AtomTerm::NodeConstant(iri("a").into_bytes()),
                 predicate_term: iri("knows").into_bytes(),
@@ -7144,6 +7184,7 @@ mod tests {
         assert!(LayerBgpEnvelope::decode(&wrong_version).is_err());
 
         let wrong_plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom::all_variables(iri("likes").into_bytes())],
             joins: Vec::new(),
         };

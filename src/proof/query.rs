@@ -29,7 +29,7 @@ use super::bgp::{
     prove_bgp_chain_with_result_and_context, verify_bgp_chain, BgpChainProof, JoinStep,
     RelationCommit, RelationWitness,
 };
-use super::commitment::{LayerCommitment, VerifierCommitmentRef, VerifierLayer};
+use super::commitment::{CommitmentState, LayerCommitment, VerifierCommitmentRef, VerifierLayer};
 use super::dict::{
     hash_object, hash_term, prove_dict_membership_with_context, verify_dict_membership, DictProof,
 };
@@ -54,6 +54,7 @@ use super::relocate::{
     prove_column_relocation_with_context, verify_column_relocation, RelocationProof,
 };
 use super::ProofHash;
+use super::ProofRecord;
 use super::{CanonicalDatatype, CanonicalObject};
 
 const QUERY_DOMAIN: &[u8] = b"parture/proof-of-woql/q1-query-by-iri/v0";
@@ -88,18 +89,97 @@ fn padded_len(real_rows: usize) -> io::Result<usize> {
     Ok(padded)
 }
 
-/// Extract the `(S, P, O)` `ArkFr` columns and real-row count `n` from a
-/// complete logical view, in the exact deterministic order and padding that
-/// produced `materialized_column_commitments`.
+/// Extract the `(S, P, O)` `ArkFr` columns and real-row count `n` from the complete
+/// materialized head view, in the exact deterministic order and padding that produced
+/// `materialized_column_commitments`. Equivalent to `source_layer_columns(_, Materialized)`;
+/// retained for the commitment-convention test.
+#[cfg(test)]
 fn materialized_layer_columns(
     layer: &LayerCommitment,
 ) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>, Vec<ArkFr>, usize)> {
-    let n = layer.materialized.len();
+    source_layer_columns(layer, ColumnSource::Materialized)
+}
+
+/// Which committed triple-column set a layer query reads. `Materialized` is the complete
+/// logical head view — the ONLY behavior before delta reads existed, and the default. The
+/// two delta sources are the layer's OWN per-commit files: `Additions` backs WOQL
+/// `AddedTriple` (the layer ADDITION file — "this commit, no deeper") and `Removals` backs
+/// WOQL `DeletedTriple` (the layer REMOVAL file). Because these are the layer's own delta,
+/// the proof is FAITHFUL with no parent-chain reasoning: the additions/removals `ProofRecord`
+/// tables and their Dory column commitments (`column_commitments[0..3]` / `[3..6]`) are ALL
+/// bound by the SAME `commitment_root` as the materialized columns.
+///
+/// The source is bound TWO ways, so a prover can neither prove additions and claim
+/// materialized nor swap additions↔removals: (a) it is carried in [`LayerBgpPlan`], which the
+/// verifier reconstructs from its OWN trusted compiled query (the envelope anti-substitution
+/// property) and therefore fixes independently; and (b) it is domain-separated in the
+/// Fiat–Shamir transcript (see [`bind_layer_bgp_statement`]). The `Materialized` tag emits NO
+/// extra transcript bytes, so pre-existing materialized proofs are byte-identical.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColumnSource {
+    #[default]
+    Materialized,
+    Additions,
+    Removals,
+}
+
+/// The prover-side `ProofRecord` rows for `source` (full witness tables, prover-only).
+fn source_records(layer: &LayerCommitment, source: ColumnSource) -> &[ProofRecord] {
+    match source {
+        ColumnSource::Materialized => &layer.materialized,
+        ColumnSource::Additions => &layer.additions,
+        ColumnSource::Removals => &layer.removals,
+    }
+}
+
+/// The three root-bound Dory column commitments `(S, P, O)` for `source`. `column_commitments`
+/// is `additions (S,P,O)` then `removals (S,P,O)`; `materialized_column_commitments` is the
+/// resolved head columns. Verifier-facing (no witness tables), used on both prover and
+/// verifier sides for the exact same selection.
+fn source_column_commitments(
+    layer: VerifierCommitmentRef<'_>,
+    source: ColumnSource,
+) -> [ArkGT; 3] {
+    match source {
+        ColumnSource::Materialized => *layer.materialized_column_commitments,
+        ColumnSource::Additions => [
+            layer.column_commitments[0],
+            layer.column_commitments[1],
+            layer.column_commitments[2],
+        ],
+        ColumnSource::Removals => [
+            layer.column_commitments[3],
+            layer.column_commitments[4],
+            layer.column_commitments[5],
+        ],
+    }
+}
+
+/// The real (unpadded) row count committed for `source`, used as the real-length pin
+/// everywhere the materialized count was. All three counts are bound by `commitment_root`.
+fn source_count(state: &CommitmentState, source: ColumnSource) -> u64 {
+    match source {
+        ColumnSource::Materialized => state.materialized_count,
+        ColumnSource::Additions => state.addition_count,
+        ColumnSource::Removals => state.removal_count,
+    }
+}
+
+/// Extract the `(S, P, O)` `ArkFr` columns and real-row count `n` for `source`, in the exact
+/// deterministic order and power-of-two padding that produced the source's column
+/// commitments (identical convention to `materialized_layer_columns`, which is the
+/// `Materialized` case).
+fn source_layer_columns(
+    layer: &LayerCommitment,
+    source: ColumnSource,
+) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>, Vec<ArkFr>, usize)> {
+    let records = source_records(layer, source);
+    let n = records.len();
     let padded = padded_len(n)?;
     let mut s = vec![f0(); padded];
     let mut p = vec![f0(); padded];
     let mut o = vec![f0(); padded];
-    for (i, record) in layer.materialized.iter().enumerate() {
+    for (i, record) in records.iter().enumerate() {
         s[i] = ArkFr::from_u64(record.subject_id);
         p[i] = ArkFr::from_u64(record.predicate_id);
         o[i] = ArkFr::from_u64(record.object_id);
@@ -124,11 +204,19 @@ fn resolve_predicate_id(layer: &LayerCommitment, predicate_term: &[u8]) -> io::R
 fn bind_statement(
     transcript: &mut Transcript254,
     source: &impl VerifierLayer,
+    column_source: ColumnSource,
     predicate_term: &[u8],
     predicate_id: u64,
 ) {
     let layer = source.verifier_view();
     transcript.append_bytes(b"pow/q1-iri/commitment-root", &layer.state.commitment_root);
+    // Domain-separate the column source. `Materialized` emits NOTHING, so pre-delta
+    // Q1/Q2 transcripts are byte-identical; a delta source emits a distinct tag.
+    match column_source {
+        ColumnSource::Materialized => {}
+        ColumnSource::Additions => transcript.append_bytes(b"pow/q1-iri/source-additions", &[]),
+        ColumnSource::Removals => transcript.append_bytes(b"pow/q1-iri/source-removals", &[]),
+    }
     transcript.append_bytes(b"pow/q1-iri/predicate-term", predicate_term);
     transcript.append_bytes(b"pow/q1-iri/predicate-id", &predicate_id.to_le_bytes());
 }
@@ -150,7 +238,20 @@ pub fn prove_layer_filter_with_context(
     layer: &LayerCommitment,
     predicate_term: &[u8],
 ) -> io::Result<(CombinedFilterProof, ArkGT, ArkGT, usize, u64)> {
-    let (s, p, o, n) = materialized_layer_columns(layer)?;
+    prove_layer_filter_with_source(context, layer, ColumnSource::Materialized, predicate_term)
+}
+
+/// Prove `t(?s, <predicate_term>, ?o)` over the layer columns selected by `column_source`
+/// (materialized head, or the layer's own addition/removal delta files). Materialized is the
+/// byte-identical legacy behavior; a delta source reads the delta rows + delta column
+/// commitments + delta count and adds a source tag to the transcript.
+pub fn prove_layer_filter_with_source(
+    context: &StoreProverContext<'_>,
+    layer: &LayerCommitment,
+    column_source: ColumnSource,
+    predicate_term: &[u8],
+) -> io::Result<(CombinedFilterProof, ArkGT, ArkGT, usize, u64)> {
+    let (s, p, o, n) = source_layer_columns(layer, column_source)?;
     let predicate_id = resolve_predicate_id(layer, predicate_term)?;
 
     let (dict_hash, dict_id) = layer.predicate_dictionary_columns()?;
@@ -158,7 +259,7 @@ pub fn prove_layer_filter_with_context(
     let com_dict_id = layer.predicate_dict_commitments.1;
 
     let mut transcript = Transcript254::new(QUERY_DOMAIN);
-    bind_statement(&mut transcript, layer, predicate_term, predicate_id);
+    bind_statement(&mut transcript, layer, column_source, predicate_term, predicate_id);
 
     // Q3 membership: (hash_term(IRI), id) is a genuine dictionary row.
     let q_hash = hash_term(predicate_term);
@@ -174,7 +275,7 @@ pub fn prove_layer_filter_with_context(
     )?;
 
     // Q1 filter: the result for that id.
-    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
+    let [com_s, com_p, com_o] = source_column_commitments(layer.verifier_view(), column_source);
     let pred = ArkFr::from_u64(predicate_id);
     let (filter, com_sout, com_oout, m) =
         super::filter::prove_filter_with_context(
@@ -206,6 +307,34 @@ pub fn verify_layer_filter(
     m: usize,
     proof: &CombinedFilterProof,
 ) -> io::Result<()> {
+    verify_layer_filter_with_source(
+        source,
+        expected_root,
+        ColumnSource::Materialized,
+        predicate_term,
+        predicate_id,
+        com_sout,
+        com_oout,
+        m,
+        proof,
+    )
+}
+
+/// Verify a query-by-IRI proof over the columns selected by `column_source`. The source is a
+/// PUBLIC input to verification (the verifier chooses it from its own trusted statement), so a
+/// prover cannot prove additions and have the proof accepted as materialized.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_layer_filter_with_source(
+    source: &impl VerifierLayer,
+    expected_root: ProofHash,
+    column_source: ColumnSource,
+    predicate_term: &[u8],
+    predicate_id: u64,
+    com_sout: &ArkGT,
+    com_oout: &ArkGT,
+    m: usize,
+    proof: &CombinedFilterProof,
+) -> io::Result<()> {
     let layer = source.verifier_view();
     // FIX 4: pin to an EXTERNALLY-trusted root FIRST (mirroring import_pack's
     // external-root check), so the proof is bound to a root the verifier already
@@ -220,7 +349,7 @@ pub fn verify_layer_filter(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
-    let n = layer.state.materialized_count as usize;
+    let n = source_count(layer.state, column_source) as usize;
     let padded = padded_len(n)?;
     let expected_k = padded.trailing_zeros() as usize;
     if proof.filter.sumcheck.round_polys.len() != expected_k {
@@ -230,7 +359,7 @@ pub fn verify_layer_filter(
     }
 
     let mut transcript = Transcript254::new(QUERY_DOMAIN);
-    bind_statement(&mut transcript, &layer, predicate_term, predicate_id);
+    bind_statement(&mut transcript, &layer, column_source, predicate_term, predicate_id);
 
     // Membership: the revealed id is authentic for this IRI.
     let q_hash = hash_term(predicate_term);
@@ -245,7 +374,7 @@ pub fn verify_layer_filter(
     )?;
 
     // Filter: the result for that id.
-    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
+    let [com_s, com_p, com_o] = source_column_commitments(layer, column_source);
     let pred = ArkFr::from_u64(predicate_id);
     verify_filter(
         &com_s,
@@ -319,7 +448,24 @@ pub fn prove_layer_graph_pattern2_with_context(
     layer: &LayerCommitment,
     predicate_term: &[u8],
 ) -> io::Result<(GraphPattern2Proof, ArkGT, ArkGT, ArkGT, usize, u64)> {
-    let (s, p, o, n) = materialized_layer_columns(layer)?;
+    prove_layer_graph_pattern2_with_source(
+        context,
+        layer,
+        ColumnSource::Materialized,
+        predicate_term,
+    )
+}
+
+/// Prove the 2-hop self-join over the columns selected by `column_source`. Materialized is
+/// the byte-identical legacy behavior; a delta source reads the layer's own addition/removal
+/// columns (a 2-hop join WITHIN one delta set).
+pub fn prove_layer_graph_pattern2_with_source(
+    context: &StoreProverContext<'_>,
+    layer: &LayerCommitment,
+    column_source: ColumnSource,
+    predicate_term: &[u8],
+) -> io::Result<(GraphPattern2Proof, ArkGT, ArkGT, ArkGT, usize, u64)> {
+    let (s, p, o, n) = source_layer_columns(layer, column_source)?;
     let predicate_id = resolve_predicate_id(layer, predicate_term)?;
 
     let (dict_hash, dict_id) = layer.predicate_dictionary_columns()?;
@@ -327,7 +473,7 @@ pub fn prove_layer_graph_pattern2_with_context(
     let com_dict_id = layer.predicate_dict_commitments.1;
 
     let mut transcript = Transcript254::new(GRAPH2_DOMAIN);
-    bind_statement(&mut transcript, layer, predicate_term, predicate_id);
+    bind_statement(&mut transcript, layer, column_source, predicate_term, predicate_id);
 
     // (1) Q3 membership: (hash_term(IRI), id) is a genuine dictionary row.
     let q_hash = hash_term(predicate_term);
@@ -343,7 +489,7 @@ pub fn prove_layer_graph_pattern2_with_context(
     )?;
 
     // (2) Q1 complete filter: F = (Sf, Of) = the predicate-P (subject, object) pairs.
-    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
+    let [com_s, com_p, com_o] = source_column_commitments(layer.verifier_view(), column_source);
     let pred = ArkFr::from_u64(predicate_id);
     let (filter, com_sout, com_oout, m) =
         super::filter::prove_filter_with_context(
@@ -426,6 +572,34 @@ pub fn verify_layer_graph_pattern2(
     m_j: usize,
     proof: &GraphPattern2Proof,
 ) -> io::Result<()> {
+    verify_layer_graph_pattern2_with_source(
+        source,
+        expected_root,
+        ColumnSource::Materialized,
+        predicate_term,
+        predicate_id,
+        com_x,
+        com_y,
+        com_z,
+        m_j,
+        proof,
+    )
+}
+
+/// Verify a 2-hop self-join proof over the columns selected by `column_source`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_layer_graph_pattern2_with_source(
+    source: &impl VerifierLayer,
+    expected_root: ProofHash,
+    column_source: ColumnSource,
+    predicate_term: &[u8],
+    predicate_id: u64,
+    com_x: &ArkGT,
+    com_y: &ArkGT,
+    com_z: &ArkGT,
+    m_j: usize,
+    proof: &GraphPattern2Proof,
+) -> io::Result<()> {
     let layer = source.verifier_view();
     // FIX 4: pin to an EXTERNALLY-trusted root FIRST.
     if layer.state.commitment_root != expected_root {
@@ -438,7 +612,7 @@ pub fn verify_layer_graph_pattern2(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
-    let n = layer.state.materialized_count as usize;
+    let n = source_count(layer.state, column_source) as usize;
     let padded = padded_len(n)?;
     let a = padded.trailing_zeros() as usize;
     if proof.filter.sumcheck.round_polys.len() != a {
@@ -467,7 +641,7 @@ pub fn verify_layer_graph_pattern2(
     let b = n_join.trailing_zeros() as usize;
 
     let mut transcript = Transcript254::new(GRAPH2_DOMAIN);
-    bind_statement(&mut transcript, &layer, predicate_term, predicate_id);
+    bind_statement(&mut transcript, &layer, column_source, predicate_term, predicate_id);
 
     // (1) Membership: the revealed id is authentic for this IRI.
     let q_hash = hash_term(predicate_term);
@@ -482,7 +656,7 @@ pub fn verify_layer_graph_pattern2(
     )?;
 
     // (2) Filter: F = (S_out, O_out) is the complete predicate-P result (length n_F).
-    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
+    let [com_s, com_p, com_o] = source_column_commitments(layer, column_source);
     let pred = ArkFr::from_u64(predicate_id);
     verify_filter(
         &com_s,
@@ -737,6 +911,28 @@ pub struct SecondRangeSubproof {
 pub struct LayerBgpPlan {
     pub atoms: Vec<LayerBgpAtom>,
     pub joins: Vec<JoinStep>,
+    /// Which committed column set every atom of this plan reads (all atoms share ONE source;
+    /// a cross-source join is unrepresentable, which is the reject-closed guarantee for delta
+    /// reads). Bound by the verifier's trusted plan reconstruction AND the Fiat–Shamir
+    /// transcript. Defaults to [`ColumnSource::Materialized`] so every pre-delta plan is
+    /// byte-identical.
+    pub source: ColumnSource,
+}
+
+impl LayerBgpPlan {
+    /// A plan over the complete materialized head view (the pre-delta default).
+    pub fn materialized(atoms: Vec<LayerBgpAtom>, joins: Vec<JoinStep>) -> Self {
+        Self { atoms, joins, source: ColumnSource::Materialized }
+    }
+
+    /// A plan whose atoms all read `source` (materialized, additions, or removals).
+    pub fn with_source(
+        atoms: Vec<LayerBgpAtom>,
+        joins: Vec<JoinStep>,
+        source: ColumnSource,
+    ) -> Self {
+        Self { atoms, joins, source }
+    }
 }
 
 /// The composed sub-proofs for a RANGED atom `t(?s, <p>, ?a) [?a op c]`: the object
@@ -1315,6 +1511,19 @@ fn bind_layer_bgp_statement(
         b"pow/bgp-layer/commitment-root",
         &layer.state.commitment_root,
     );
+    // Domain-separate the column source so the proof cryptographically commits to which
+    // columns it read. `Materialized` emits NOTHING, so every pre-delta transcript is
+    // byte-for-byte unchanged; a delta source emits a distinct tag, so an additions proof
+    // and a removals proof over the same statement derive DIFFERENT challenges.
+    match plan.source {
+        ColumnSource::Materialized => {}
+        ColumnSource::Additions => {
+            transcript.append_bytes(b"pow/bgp-layer/source-additions", &[])
+        }
+        ColumnSource::Removals => {
+            transcript.append_bytes(b"pow/bgp-layer/source-removals", &[])
+        }
+    }
     transcript.append_bytes(b"pow/bgp-layer/k", &(plan.atoms.len() as u64).to_le_bytes());
     for (atom, ids) in plan.atoms.iter().zip(atom_ids.iter()) {
         bind_atom_term(transcript, &atom.subject, ids.subject_id);
@@ -2097,7 +2306,7 @@ pub fn prove_layer_bgp_with_result_and_context(
     plan: &LayerBgpPlan,
 ) -> io::Result<LayerBgpResult> {
     let k = validate_bgp_plan(plan)?;
-    let (s, p, o, n) = materialized_layer_columns(layer)?;
+    let (s, p, o, n) = source_layer_columns(layer, plan.source)?;
 
     if let Some(absence) = dictionary_absence(layer, plan) {
         // A root-authenticated dictionary omits one public constant, so the atom and the
@@ -2159,7 +2368,7 @@ pub fn prove_layer_bgp_with_result_and_context(
     let (nv_dict_hash, nv_dict_id) = layer.node_value_dictionary_columns()?;
     let com_nv_hash = layer.node_value_dict_commitments.0;
     let com_nv_id = layer.node_value_dict_commitments.1;
-    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
+    let [com_s, com_p, com_o] = source_column_commitments(layer.verifier_view(), plan.source);
     let a = padded_len(n)?.trailing_zeros() as usize;
 
     let mut transcript = Transcript254::new(LAYER_BGP_DOMAIN);
@@ -2394,7 +2603,8 @@ pub fn verify_layer_bgp(
         {
             return Err(invalid("invalid dictionary-absence proof shape"));
         }
-        let zero_column = vec![f0(); padded_len(layer.state.materialized_count as usize)?];
+        let zero_column =
+            vec![f0(); padded_len(source_count(layer.state, plan.source) as usize)?];
         let zero_commitment = commit_column(&zero_column)?;
         if result_coms.iter().any(|commitment| *commitment != zero_commitment) {
             return Err(invalid(
@@ -2406,7 +2616,7 @@ pub fn verify_layer_bgp(
     if proof.atoms.len() != k || predicate_ids.len() != k {
         return Err(invalid("layer BGP proof/atom/id count mismatch"));
     }
-    let n = layer.state.materialized_count as usize;
+    let n = source_count(layer.state, plan.source) as usize;
     let a = padded_len(n)?.trailing_zeros() as usize;
 
     // Reconstruct each atom's resolved ids from the public predicate ids + the
@@ -2449,7 +2659,7 @@ pub fn verify_layer_bgp(
     let com_pred_id = layer.predicate_dict_commitments.1;
     let com_nv_hash = layer.node_value_dict_commitments.0;
     let com_nv_id = layer.node_value_dict_commitments.1;
-    let [com_s, com_p, com_o] = layer.materialized_column_commitments;
+    let [com_s, com_p, com_o] = source_column_commitments(layer, plan.source);
 
     let mut relations: Vec<RelationCommit> = Vec::with_capacity(k);
     for ((atom, ap), ids) in plan
@@ -2659,7 +2869,7 @@ pub fn verify_layer_bgp_result_log_domain(
     validate_bgp_plan(plan)?;
     let relational_count = relational_atom_count(plan);
     let expected = if proof.dictionary_absence.is_some() || relational_count <= 1 {
-        padded_len(layer.state.materialized_count as usize)?.trailing_zeros() as usize
+        padded_len(source_count(layer.state, plan.source) as usize)?.trailing_zeros() as usize
     } else {
         proof
             .chain
@@ -2937,6 +3147,181 @@ mod tests {
         assert_eq!(m, 2);
     }
 
+    // ---- Delta reads: AddedTriple / DeletedTriple over the layer's own delta files ----
+
+    // Base p1 { a1..a4 -> b1..b4 }; child ADDS { a5,a6 } and REMOVES { a1,a2 }, all p1.
+    // So additions == {a5,a6}, removals == {a1,a2}, materialized == {a3,a4,a5,a6}.
+    fn delta_layer() -> std::sync::Arc<LayerCommitment> {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for s in ["a1", "a2", "a3", "a4"] {
+            let o = format!("b{}", &s[1..]);
+            builder
+                .add_value_triple(ValueTriple::new_node(&iri(s), &iri("p1"), &iri(&o)))
+                .unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let child = base.open_write().unwrap();
+        for s in ["a1", "a2"] {
+            let o = format!("b{}", &s[1..]);
+            child
+                .remove_value_triple(ValueTriple::new_node(&iri(s), &iri("p1"), &iri(&o)))
+                .unwrap();
+        }
+        for s in ["a5", "a6"] {
+            let o = format!("b{}", &s[1..]);
+            child
+                .add_value_triple(ValueTriple::new_node(&iri(s), &iri("p1"), &iri(&o)))
+                .unwrap();
+        }
+        let head = child.commit().unwrap();
+        head.proof_commitment().unwrap()
+    }
+
+    // Prove + verify `t(?s, p1, ?o)` over `source`, returning the sorted subject IRIs of the
+    // complete authenticated result (root-bound + re-resolved from the committed dictionary).
+    fn prove_verify_source_subjects(
+        lc: &LayerCommitment,
+        source: ColumnSource,
+    ) -> Vec<String> {
+        let plan = LayerBgpPlan::with_source(
+            vec![LayerBgpAtom::all_variables(P1.to_vec())],
+            Vec::new(),
+            source,
+        );
+        let result = prove_layer_bgp_with_result(lc, &plan).unwrap();
+        verify_layer_bgp(
+            lc,
+            lc.state.commitment_root,
+            &plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
+        let columns = result.real_columns();
+        let objects =
+            resolve_node_value_result_objects(lc, lc.state.commitment_root, &columns).unwrap();
+        let mut subjects: Vec<String> = objects[0]
+            .iter()
+            .map(|object| match object {
+                CanonicalObject::Node(bytes) => String::from_utf8(bytes.clone()).unwrap(),
+                other => panic!("subject must be a node, got {:?}", other),
+            })
+            .collect();
+        subjects.sort();
+        subjects
+    }
+
+    #[test]
+    fn delta_added_and_removed_triples_prove_exactly_their_delta_rows() {
+        let lc = delta_layer();
+        assert!(lc.state.parent_state_root.is_some());
+        assert_eq!(lc.state.addition_count, 2);
+        assert_eq!(lc.state.removal_count, 2);
+        assert_eq!(lc.state.materialized_count, 4);
+
+        // AddedTriple(?s, p1, ?o) proves EXACTLY the child's added rows (count == addition_count).
+        assert_eq!(
+            prove_verify_source_subjects(&lc, ColumnSource::Additions),
+            vec![iri("a5"), iri("a6")]
+        );
+        // DeletedTriple(?s, p1, ?o) proves EXACTLY the child's removed rows.
+        assert_eq!(
+            prove_verify_source_subjects(&lc, ColumnSource::Removals),
+            vec![iri("a1"), iri("a2")]
+        );
+        // The complete head view still proves all live rows (unchanged behavior).
+        assert_eq!(
+            prove_verify_source_subjects(&lc, ColumnSource::Materialized),
+            vec![iri("a3"), iri("a4"), iri("a5"), iri("a6")]
+        );
+    }
+
+    #[test]
+    fn inherited_row_is_not_an_added_or_deleted_triple() {
+        let lc = delta_layer();
+        // a3 is inherited: visible in `materialized`, never added OR removed by this child.
+        let added = prove_verify_source_subjects(&lc, ColumnSource::Additions);
+        assert!(!added.contains(&iri("a3")));
+        let removed = prove_verify_source_subjects(&lc, ColumnSource::Removals);
+        // A still-present row is not a DeletedTriple; a freshly added row is not a removal.
+        assert!(!removed.contains(&iri("a3")));
+        assert!(!removed.contains(&iri("a5")));
+    }
+
+    #[test]
+    fn delta_source_substitution_fails_verification() {
+        let lc = delta_layer();
+        let root = lc.state.commitment_root;
+        let atoms = vec![LayerBgpAtom::all_variables(P1.to_vec())];
+        let additions =
+            LayerBgpPlan::with_source(atoms.clone(), Vec::new(), ColumnSource::Additions);
+        let removals =
+            LayerBgpPlan::with_source(atoms.clone(), Vec::new(), ColumnSource::Removals);
+        let materialized =
+            LayerBgpPlan::with_source(atoms, Vec::new(), ColumnSource::Materialized);
+
+        // A proof produced for Additions is bound to the additions columns + the source tag.
+        let result = prove_layer_bgp_with_result(&lc, &additions).unwrap();
+        verify_layer_bgp(
+            &lc,
+            root,
+            &additions,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
+        // Verifying the SAME proof against a different declared source fails: the column
+        // commitments diverge (additions vs removals) and the transcript source tag diverges;
+        // the materialized substitution also mismatches the committed row count/dimension.
+        for other in [&removals, &materialized] {
+            assert!(verify_layer_bgp(
+                &lc,
+                root,
+                other,
+                &result.predicate_ids,
+                &result.result_commitments,
+                result.result_len,
+                &result.proof,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn delta_filter_entry_proves_additions_and_removals() {
+        // The legacy Q1 filter entry, threaded with a delta source, mirrors the BGP path.
+        let lc = delta_layer();
+        let root = lc.state.commitment_root;
+        for (source, expected) in [
+            (ColumnSource::Additions, 2usize),
+            (ColumnSource::Removals, 2usize),
+            (ColumnSource::Materialized, 4usize),
+        ] {
+            let (proof, com_s, com_o, m, id) =
+                prove_layer_filter_with_source(&StoreProverContext::cpu(), &lc, source, P1)
+                    .unwrap();
+            assert_eq!(m, expected);
+            verify_layer_filter_with_source(
+                &lc, root, source, P1, id, &com_s, &com_o, m, &proof,
+            )
+            .unwrap();
+            // Wrong source rejects (defense in depth beyond the BGP path).
+            let wrong = match source {
+                ColumnSource::Additions => ColumnSource::Removals,
+                _ => ColumnSource::Additions,
+            };
+            assert!(verify_layer_filter_with_source(
+                &lc, root, wrong, P1, id, &com_s, &com_o, m, &proof,
+            )
+            .is_err());
+        }
+    }
+
     // ---- Q2: 2-atom graph-pattern (self-join) end-to-end ----
 
     const KNOWS: &[u8] = b"http://ex/knows";
@@ -3175,6 +3560,7 @@ mod tests {
             ("x", "likes", "y"),
         ]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![atom(KNOWS)],
             joins: Vec::new(),
         };
@@ -3214,6 +3600,7 @@ mod tests {
     fn delivered_lexical_objects_are_bound_to_authenticated_result_ids() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![atom(KNOWS)],
             joins: Vec::new(),
         };
@@ -3379,6 +3766,7 @@ mod tests {
             ("h", "owns", "m"),
         ]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![atom(KNOWS), atom(LIKES), atom(OWNS)],
             joins: vec![
                 JoinStep {
@@ -3444,6 +3832,7 @@ mod tests {
         .unwrap();
 
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![atom(KNOWS), atom(KNOWS)],
             joins: vec![JoinStep {
                 acc_key: 1,
@@ -3466,6 +3855,7 @@ mod tests {
             ("x", "likes", "y"),
         ]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![atom(KNOWS)],
             joins: vec![],
         };
@@ -3491,6 +3881,7 @@ mod tests {
             ("x", "likes", "y"),
         ]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom {
                 subject: AtomTerm::Variable,
                 predicate_term: Vec::new(),
@@ -3551,6 +3942,7 @@ mod tests {
             subject_object_equal: false,
         };
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![variable_predicate, atom(KNOWS)],
             joins: vec![JoinStep {
                 acc_key: 0,
@@ -3565,6 +3957,7 @@ mod tests {
     fn layer_bgp_k2_rejects_a_missing_join_chain() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![atom(KNOWS), atom(KNOWS)],
             joins: vec![JoinStep {
                 acc_key: 1,
@@ -3584,6 +3977,7 @@ mod tests {
     fn layer_bgp_wrong_expected_root_is_rejected() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c"), ("c", "owns", "d")]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![atom(KNOWS), atom(LIKES), atom(OWNS)],
             joins: vec![
                 JoinStep {
@@ -3620,6 +4014,7 @@ mod tests {
     fn layer_bgp_absent_predicate_authenticates_empty_relation() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![atom(KNOWS), atom(b"http://ex/absent")],
             joins: vec![JoinStep {
                 acc_key: 1,
@@ -3799,6 +4194,7 @@ mod tests {
             ("d", "knows", "q"),
         ]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
                 LayerBgpAtom {
@@ -3866,6 +4262,7 @@ mod tests {
             _ => panic!("expected a value literal"),
         };
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![
                 LayerBgpAtom {
                     subject: AtomTerm::Variable,
@@ -3905,6 +4302,7 @@ mod tests {
             ("c", "likes", "n"),
         ]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![
                 LayerBgpAtom {
                     subject: node_const("a"),
@@ -3946,6 +4344,7 @@ mod tests {
             ("f", "likes", "g"),
         ]);
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![
                 LayerBgpAtom::all_variables(KNOWS.to_vec()),
                 LayerBgpAtom {
@@ -4017,6 +4416,7 @@ mod tests {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
         // The object constant <absent> is not in the layer's node/value dictionary.
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![
                 LayerBgpAtom::all_variables(KNOWS.to_vec()),
                 LayerBgpAtom {
@@ -4094,6 +4494,7 @@ mod tests {
     fn layer_bgp_single_ground_atom_proves_presence_and_absence() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
         let atom = |subject: &str, predicate: &[u8], object: &str| LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom {
                 subject: node_const(subject),
                 predicate_term: predicate.to_vec(),
@@ -4191,6 +4592,7 @@ mod tests {
         for (plan, expected_len) in [
             (
                 LayerBgpPlan {
+                    source: ColumnSource::Materialized,
                     atoms: vec![atom("a", KNOWS, "b"), atom("b", LIKES, "c")],
                     joins: Vec::new(),
                 },
@@ -4198,6 +4600,7 @@ mod tests {
             ),
             (
                 LayerBgpPlan {
+                    source: ColumnSource::Materialized,
                     atoms: vec![atom("a", KNOWS, "b"), atom("a", LIKES, "c")],
                     joins: Vec::new(),
                 },
@@ -4205,6 +4608,7 @@ mod tests {
             ),
             (
                 LayerBgpPlan {
+                    source: ColumnSource::Materialized,
                     atoms: vec![atom("a", KNOWS, "b"), atom("a", KNOWS, "b")],
                     joins: Vec::new(),
                 },
@@ -4280,6 +4684,7 @@ mod tests {
             ),
         ] {
             let plan = LayerBgpPlan {
+                source: ColumnSource::Materialized,
                 atoms: vec![LayerBgpAtom::all_variables(LIKES.to_vec()), ground],
                 joins: Vec::new(),
             };
@@ -4315,6 +4720,7 @@ mod tests {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "likes", "c")]);
         // A value literal in the SUBJECT position is rejected.
         let value_subject = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![
                 LayerBgpAtom {
                     subject: AtomTerm::ValueConstant(CanonicalDatatype::String, b"x".to_vec()),
@@ -4440,6 +4846,7 @@ mod tests {
     fn layer_bgp_object_kind_filters_are_exact_and_transcript_bound() {
         let lc = build_mixed_object_kind_layer();
         let literal_plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom::all_variables(iri("data").into_bytes())
                 .with_object_kind(ObjectKindFilter::Literal)],
             joins: vec![],
@@ -4477,6 +4884,7 @@ mod tests {
         )));
 
         let node_plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom::all_variables(iri("data").into_bytes())
                 .with_object_kind(ObjectKindFilter::Node)],
             joins: vec![],
@@ -4507,6 +4915,7 @@ mod tests {
         )
         .is_err());
         let any_plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom::all_variables(iri("data").into_bytes())],
             joins: vec![],
         };
@@ -4527,6 +4936,7 @@ mod tests {
         let lc = build_mixed_object_kind_layer();
 
         let empty_plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom::all_variables(iri("label").into_bytes())
                 .with_object_kind(ObjectKindFilter::Literal)],
             joins: vec![],
@@ -4554,6 +4964,7 @@ mod tests {
             subject_object_equal: false,
         };
         let predicate_plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![predicate_variable],
             joins: vec![],
         };
@@ -4572,6 +4983,7 @@ mod tests {
         .unwrap();
 
         let join_plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![
                 LayerBgpAtom::all_variables(iri("data").into_bytes())
                     .with_object_kind(ObjectKindFilter::Literal),
@@ -4647,6 +5059,7 @@ mod tests {
 
     fn age_range_plan(op: RangeOp, c: u64) -> LayerBgpPlan {
         LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![
                 LayerBgpAtom::all_variables(AGE.to_vec()).with_object_range(ObjectRangeSpec {
                     op,
@@ -4826,6 +5239,7 @@ mod tests {
         let mut atom = LayerBgpAtom::all_variables(KNOWS.to_vec());
         atom.subject_object_equal = true;
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![atom],
             joins: vec![],
         };
@@ -4901,6 +5315,7 @@ mod tests {
 
         // Verifying against a DIFFERENT datatype tag (Boolean instead of UInt32) -> REJECT.
         let plan_wrong_dt = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![
                 LayerBgpAtom::all_variables(AGE.to_vec()).with_object_range(ObjectRangeSpec {
                     op: RangeOp::Gt,
@@ -4950,6 +5365,7 @@ mod tests {
         // A range on a CONSTANT object is out of v1 scope (validate_atom rejects it).
         let lc = build_age_name_layer();
         let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
             atoms: vec![
                 LayerBgpAtom {
                     subject: AtomTerm::Variable,
