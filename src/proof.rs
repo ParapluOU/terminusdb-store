@@ -802,8 +802,8 @@ fn validate_construction_heap_budget(
 
 pub(crate) use commitment::decode_legacy_v3;
 pub use commitment::{
-    node_value_op_value, CommitmentState, LayerCommitment, VerifierCommitment,
-    VerifierCommitmentRef, VerifierLayer,
+    database_root, node_value_op_value, validate_database_root, CommitmentState, LayerCommitment,
+    VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
 };
 
 pub mod anti;
@@ -2824,6 +2824,64 @@ pub mod commitment {
             hasher.update(&bytes);
         }
         Ok(hasher.finalize().into())
+    }
+
+    /// SCHEMA-GRAPH FOUNDATION — the combined `database_root`.
+    ///
+    /// A query-proof database is TWO separately committed triple graphs: the
+    /// instance graph and the schema graph. Each is committed by the SAME per-layer
+    /// commitment machinery (`compute_commitment_root_from_parts`) as its own
+    /// `LayerCommitment` with its own `commitment_root`; the schema graph is NOT
+    /// folded into the instance commitment (that would perturb the v4 instance root
+    /// and break byte-identity of every existing instance-only proof). Instead the
+    /// two per-graph roots are bound into ONE externally-trusted anchor by a plain
+    /// two-hash wrapper — no polynomial machinery, no new committed structure:
+    ///
+    /// `database_root = SHA256("parture/proof-of-woql/db-root/v1" ‖ instance_root ‖ schema_root)`.
+    ///
+    /// The ordering (instance first, then schema) is fixed and domain-separated, so
+    /// the two roots can never be transposed without changing the anchor. An
+    /// instance-only proof never engages the schema root: its trust anchor remains
+    /// the instance `commitment_root`, byte-identically to today. The combined root
+    /// is engaged only when a query reads the schema graph (Subsumption), and only
+    /// to authenticate that BOTH sub-commitments belong to the trusted database.
+    pub fn database_root(instance_root: &ProofHash, schema_root: &ProofHash) -> ProofHash {
+        let mut hasher = Sha256::new();
+        hasher.update(b"parture/proof-of-woql/db-root/v1");
+        hasher.update(instance_root);
+        hasher.update(schema_root);
+        hasher.finalize().into()
+    }
+
+    /// Validate BOTH per-graph verifier views independently (each recomputes its own
+    /// `commitment_root` from its committed parts via `VerifierCommitmentRef::validate`)
+    /// AND confirm the two roots combine to the externally-trusted `database_root`.
+    ///
+    /// This is the soundness gate a schema-reading verifier runs BEFORE trusting either
+    /// per-graph root as a proof anchor: neither sub-root can be swapped, forged, or
+    /// mismatched against the trusted database anchor without rejecting closed. Reusing
+    /// the audited per-commitment `validate` keeps the trust story a strict superset of
+    /// the single-graph case — each graph is authenticated exactly as before, plus the
+    /// combination check.
+    pub fn validate_database_root(
+        instance: &impl VerifierLayer,
+        schema: &impl VerifierLayer,
+        trusted_database_root: &ProofHash,
+    ) -> io::Result<()> {
+        let instance_view = instance.verifier_view();
+        let schema_view = schema.verifier_view();
+        instance_view.validate()?;
+        schema_view.validate()?;
+        if &database_root(
+            &instance_view.state.commitment_root,
+            &schema_view.state.commitment_root,
+        ) != trusted_database_root
+        {
+            return Err(invalid(
+                "database root does not combine the trusted instance and schema commitment roots",
+            ));
+        }
+        Ok(())
     }
 
     impl VerifierCommitment {
