@@ -22,6 +22,12 @@ use super::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit, Relatio
 use super::commitment::{LayerCommitment, VerifierLayer};
 use super::count::CountProof;
 use super::dict::DictProof;
+use super::dicthash::{
+    prove_dict_hash_lookup, verify_dict_hash_lookup, DictHashLookupProof, HashLookupInnerProof,
+};
+use super::semijoin::{
+    prove_hash_semijoin, verify_hash_semijoin, HashSemiJoinProof, SelMaskProof,
+};
 use super::distinct::{
     prove_relation_distinct_with_context, verify_relation_distinct,
     RelationDistinctEntryProof, RelationDistinctProof, RelationDistinctResult,
@@ -64,7 +70,7 @@ use super::range::{
     DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp, RangeSelectProof,
 };
 use super::union::{prove_bag_union_with_context, BagUnionResult};
-use super::relocate::RelocationProof;
+use super::relocate::{prove_column_relocation_with_context, verify_column_relocation, RelocationProof};
 use super::sort::SortedProof;
 use super::union::{verify_bag_union, BagUnionProof};
 use super::{CanonicalDatatype, CanonicalObject, ProofHash};
@@ -599,6 +605,33 @@ wire_struct!(DictLookupProof {
     com_w,
     com_rec_q,
     com_rec_d
+});
+wire_struct!(HashLookupInnerProof {
+    sumcheck,
+    opening,
+    com_v_hash,
+    com_w,
+    com_rec_q,
+    com_rec_d
+});
+wire_struct!(DictHashLookupProof {
+    relocate_dict_hash,
+    relocate_dict_id,
+    com_dict_hash_at_d,
+    com_dict_id_at_d,
+    relocate_obj,
+    com_obj_at_d,
+    lookup
+});
+wire_struct!(SelMaskProof { sumcheck, opening });
+wire_struct!(HashSemiJoinProof {
+    sel_mask,
+    com_sel,
+    compaction,
+    com_x_kept,
+    com_h_kept,
+    com_w,
+    membership
 });
 wire_struct!(ObjectRangeCombineProof { sumcheck, opening });
 wire_struct!(ObjectRangeProof {
@@ -1905,6 +1938,36 @@ pub enum RelationProofPlanKind {
         right: Box<RelationProofPlan>,
         key_pairs: Vec<(usize, usize)>,
     },
+    /// CROSS-DICTIONARY two-root hash join — the ONE plan node that reads TWO committed
+    /// graphs (INSTANCE + SCHEMA) at once. `left` is proven against the SCHEMA root, `right`
+    /// against the INSTANCE root; each side's join-key id column is resolved to an
+    /// authenticated `hash_object(IRI)` column (via [`super::dicthash::prove_dict_hash_lookup`])
+    /// against ITS OWN root, and the two hash columns are joined by the UNCHANGED audited
+    /// [`super::anti::prove_inner_join_with_keys`]. Because `hash_object` is deterministic AND
+    /// dictionary-INDEPENDENT, the SAME IRI hashes identically in both graphs, so the hash join
+    /// reconciles the two separate dictionaries correctly; a schema-dict id and an instance-dict
+    /// id that are equal INTEGERS but different IRIs have DIFFERENT hashes and never match (no
+    /// raw cross-dict id comparison anywhere). Both per-graph roots are bound to the trusted
+    /// [`super::commitment::database_root`] before either is trusted as an anchor.
+    ///
+    /// This node is TOP-LEVEL ONLY: it is proven/verified through the dedicated two-layer entries
+    /// [`RecursiveRelationEnvelope::prove_cross_root`] / [`RecursiveRelationEnvelope::verify_cross_root`];
+    /// the single-layer [`RecursiveRelationEnvelope::prove_bounded`] recursion rejects it closed
+    /// (it has only one layer), so every EXISTING single-root plan is byte-identical. `left` is
+    /// specialized to a SINGLE key column (the class set, `left_key_col == 0`, delivering nothing to
+    /// the output); the output schema is `right`'s columns MINUS `right_key_col` (instance namespace).
+    CrossRootHashJoin {
+        /// The SCHEMA-graph child (e.g. the downward `sys:inherits` subsumption closure of a class):
+        /// a single node/value id column that becomes the join membership set.
+        left: Box<RelationProofPlan>,
+        /// The INSTANCE-graph child (e.g. `Triple(?x, rdf:type, ?class)`): its `right_key_col` is the
+        /// class id column; the OTHER columns (e.g. `?x`) are delivered as the output.
+        right: Box<RelationProofPlan>,
+        /// The single join-key column of `left` (must be `0`; `left` is single-column).
+        left_key_col: usize,
+        /// The join-key (class) column of `right`; dropped from the output.
+        right_key_col: usize,
+    },
     LeftOuter {
         left: Box<RelationProofPlan>,
         right: Box<RelationProofPlan>,
@@ -2689,6 +2752,48 @@ impl RelationProofPlan {
                 ));
                 Ok((descriptors, false))
             }
+            RelationProofPlanKind::CrossRootHashJoin { left, right, left_key_col, right_key_col } => {
+                let (left_descriptors, left_ground) = left.shape_bounded(depth + 1, nodes)?;
+                let (right_descriptors, right_ground) = right.shape_bounded(depth + 1, nodes)?;
+                if left_ground || right_ground {
+                    return Err(invalid("cross-root hash join child is ground"));
+                }
+                // The node is specialized: `left` is the single-column class set (all key), so it
+                // contributes NOTHING to the output — only its membership matters.
+                if left_descriptors.len() != 1 || *left_key_col != 0 {
+                    return Err(invalid(
+                        "cross-root hash join left child must be a single key column (the class set)",
+                    ));
+                }
+                let lk = left_descriptors
+                    .first()
+                    .ok_or_else(|| invalid("cross-root left key out of range"))?;
+                let rk = right_descriptors
+                    .get(*right_key_col)
+                    .ok_or_else(|| invalid("cross-root right key out of range"))?;
+                // Both keys resolve to IRIs whose (dictionary-independent) hashes we join on, so both
+                // must be nonnullable node/value id columns. Their raw ids live in SEPARATE dicts and
+                // are NEVER compared directly — only their authenticated hashes are joined.
+                if lk.nullable
+                    || rk.nullable
+                    || lk.namespace != ResultIdNamespace::NodeValue
+                    || rk.namespace != ResultIdNamespace::NodeValue
+                {
+                    return Err(invalid(
+                        "cross-root hash join keys must be nonnullable node/value (IRI) columns",
+                    ));
+                }
+                // Output = the instance-side (`right`) columns minus the class key column.
+                let descriptors: Vec<ResultColumnDescriptor> = right_descriptors
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, descriptor)| (index != *right_key_col).then_some(descriptor))
+                    .collect();
+                if descriptors.is_empty() {
+                    return Err(invalid("cross-root hash join delivers no output column"));
+                }
+                Ok((descriptors, false))
+            }
             RelationProofPlanKind::LeftOuter { left, right, key_pairs } => {
                 let (mut descriptors, left_ground) = left.shape_bounded(depth + 1, nodes)?;
                 let (right_descriptors, right_ground) = right.shape_bounded(depth + 1, nodes)?;
@@ -2917,6 +3022,28 @@ pub enum RecursiveRelationProof {
         left: Box<RecursiveRelationEnvelope>,
         right: Box<RecursiveRelationEnvelope>,
         proof: Box<InnerJoinProof>,
+    },
+    /// The two-root cross-dictionary hash join proof. `left`/`right` are the two single-root child
+    /// subtrees (schema-rooted and instance-rooted); `left_hash`/`right_hash` authenticate each
+    /// side's class-id column to its true `hash_object(IRI)` column against ITS OWN root; the three
+    /// relocations lift the closure hash SET, the `?x` column and the class-hash column to one working
+    /// domain; `semijoin` is the full-field LogUp SEMI-JOIN whose kept `?x` column is the output.
+    CrossRootHashJoin {
+        left: Box<RecursiveRelationEnvelope>,
+        right: Box<RecursiveRelationEnvelope>,
+        left_hash: Box<DictHashLookupProof>,
+        right_hash: Box<DictHashLookupProof>,
+        /// The three authenticated columns relocated UP to a shared working domain `2^D`: the schema
+        /// closure hash SET, the instance `?x` column, and the instance class-hash column.
+        relocate_closure: RelocationProof,
+        com_closure_at_d: ArkGT,
+        relocate_x: RelocationProof,
+        com_x_at_d: ArkGT,
+        relocate_h: RelocationProof,
+        com_h_at_d: ArkGT,
+        /// The full-field LogUp SEMI-JOIN (no magnitude sort): keeps instance rows whose class-hash is
+        /// a member of the closure hash set. `semijoin.com_x_kept` is the delivered `?x` output.
+        semijoin: Box<HashSemiJoinProof>,
     },
     LeftOuter {
         left: Box<RecursiveRelationEnvelope>,
@@ -3810,6 +3937,145 @@ impl RecursiveRelationEnvelope {
         Self::prove_with_context(&StoreProverContext::cpu(), layer, plan)
     }
 
+    /// TWO-ROOT ENTRY — prove a top-level [`RelationProofPlanKind::CrossRootHashJoin`] over BOTH
+    /// committed graphs. `left` is proven against `schema`, `right` against `instance`; each side's
+    /// join-key id column is authenticated to its true `hash_object(IRI)` column against ITS OWN root;
+    /// the two hash columns are joined by the audited inner join. The delivered relation lives in the
+    /// INSTANCE namespace (its output ids are instance node/value ids), so `layer_root` is the instance
+    /// root and the result resolves against the instance dictionary.
+    ///
+    /// The hash reconciliation is a FULL-FIELD LogUp SEMI-JOIN ([`super::semijoin`]) — NOT the audited
+    /// magnitude-sort inner join, whose key-universe strict-sort caps keys at 64/128 bits (`hash_object`
+    /// keys are ~254-bit and too near the BN254 modulus to soundly bit-reduce). The semi-join is
+    /// field-element-native (reciprocal membership; no sort, no bit decomposition). SOUNDNESS: every
+    /// delivered `?x` is a real instance row whose class-hash is a MEMBER of the closure set — a
+    /// same-integer-id/different-IRI pair (different hashes) never matches. COMPLETENESS CAVEAT: the
+    /// membership direction is `kept ⊆ closure`; the honest prover keeps every member, but a
+    /// cryptographic no-drop guarantee against a malicious prover is a documented follow-up (see
+    /// [`super::semijoin`]).
+    pub fn prove_cross_root(
+        instance: &LayerCommitment,
+        schema: &LayerCommitment,
+        plan: &RelationProofPlan,
+    ) -> io::Result<Self> {
+        Self::prove_cross_root_with_context(&StoreProverContext::cpu(), instance, schema, plan)
+    }
+
+    pub fn prove_cross_root_with_context(
+        context: &StoreProverContext<'_>,
+        instance: &LayerCommitment,
+        schema: &LayerCommitment,
+        plan: &RelationProofPlan,
+    ) -> io::Result<Self> {
+        plan.result_shape()?;
+        let (left_plan, right_plan, left_key_col, right_key_col) = match &plan.kind {
+            RelationProofPlanKind::CrossRootHashJoin { left, right, left_key_col, right_key_col } => {
+                (left.as_ref(), right.as_ref(), *left_key_col, *right_key_col)
+            }
+            _ => return Err(invalid("prove_cross_root requires a CrossRootHashJoin plan")),
+        };
+
+        // (1) Prove each child against ITS OWN root (single-root subtrees, standard recursion).
+        let mut lnodes = 0usize;
+        let left_env = Self::prove_bounded(context, schema, left_plan, 1, &mut lnodes)?;
+        let mut rnodes = 0usize;
+        let right_env = Self::prove_bounded(context, instance, right_plan, 1, &mut rnodes)?;
+
+        if left_env.result_commitments.len() != 1 || left_key_col != 0 {
+            return Err(invalid("cross-root left child must be a single key column (the class set)"));
+        }
+        // The instance child is exactly `[?x, class]`: one output column plus the class key column.
+        if right_env.result_commitments.len() != 2 || right_key_col >= 2 {
+            return Err(invalid("cross-root right child must be exactly [output, class-key]"));
+        }
+        let x_col = 1 - right_key_col;
+
+        let instance_root = instance.state.commitment_root;
+        let schema_root = schema.state.commitment_root;
+        let db_root = super::commitment::database_root(&instance_root, &schema_root);
+        let mut transcript = Transcript254::new(b"parture-cross-root-envelope");
+        transcript.append_bytes(b"pow/cross-root/db-root", &db_root);
+        transcript.append_bytes(b"pow/cross-root/query", &plan.query_digest);
+
+        // (2) Authenticate each side's key id column -> true IRI-hash column, against its OWN root.
+        let leftlog = left_env.result_log_domain;
+        let mut left_key = left_env.result_columns[0].clone();
+        left_key.resize(1usize << leftlog, ArkFr::zero());
+        let (left_hash, v_hash_left) = prove_dict_hash_lookup(
+            context, &left_key, &left_env.result_commitments[0], leftlog, left_env.result_len,
+            schema, &mut transcript,
+        )?;
+
+        let rightlog = right_env.result_log_domain;
+        let mut class_key = right_env.result_columns[right_key_col].clone();
+        class_key.resize(1usize << rightlog, ArkFr::zero());
+        let (right_hash, v_hash_right) = prove_dict_hash_lookup(
+            context, &class_key, &right_env.result_commitments[right_key_col], rightlog,
+            right_env.result_len, instance, &mut transcript,
+        )?;
+
+        // (3) Relocate the three authenticated columns UP to a shared working domain 2^D:
+        // the closure hash SET, the instance ?x column, and the instance class-hash column. Each real
+        // support lives in [0, real_n) so the UP relocation is lossless; each is bound to its
+        // root-authenticated source commitment.
+        let d_left = v_hash_left.len().trailing_zeros() as usize;
+        let d_right = v_hash_right.len().trailing_zeros() as usize;
+        let d_log = d_left.max(d_right);
+        let d_size = 1usize << d_log;
+        let pad_d = |c: &[ArkFr]| -> Vec<ArkFr> {
+            let mut v = c.to_vec();
+            v.resize(d_size, ArkFr::zero());
+            v
+        };
+        let closure_at_d = pad_d(&v_hash_left);
+        let com_closure_at_d = context.commit_column(&closure_at_d)?;
+        let relocate_closure = prove_column_relocation_with_context(
+            context, &v_hash_left, &left_hash.lookup.com_v_hash, &closure_at_d, &com_closure_at_d, &mut transcript,
+        )?;
+        let h_at_d = pad_d(&v_hash_right);
+        let com_h_at_d = context.commit_column(&h_at_d)?;
+        let relocate_h = prove_column_relocation_with_context(
+            context, &v_hash_right, &right_hash.lookup.com_v_hash, &h_at_d, &com_h_at_d, &mut transcript,
+        )?;
+        let mut x_child = right_env.result_columns[x_col].clone();
+        x_child.resize(1usize << rightlog, ArkFr::zero());
+        let x_at_d = pad_d(&x_child);
+        let com_x_at_d = context.commit_column(&x_at_d)?;
+        let relocate_x = prove_column_relocation_with_context(
+            context, &x_child, &right_env.result_commitments[x_col], &x_at_d, &com_x_at_d, &mut transcript,
+        )?;
+
+        // (4) Full-field LogUp SEMI-JOIN (no magnitude sort): keep instance rows whose class-hash is a
+        // member of the closure hash set; deliver the kept ?x column.
+        let (semijoin, x_kept, m) = prove_hash_semijoin(
+            context, &closure_at_d, &com_closure_at_d, left_env.result_len,
+            &x_at_d, &com_x_at_d, &h_at_d, &com_h_at_d, right_env.result_len, &mut transcript,
+        )?;
+
+        let com_x_kept = semijoin.com_x_kept;
+        Self::finish_proved(
+            instance,
+            plan,
+            RecursiveRelationProof::CrossRootHashJoin {
+                left: Box::new(left_env),
+                right: Box::new(right_env),
+                left_hash: Box::new(left_hash),
+                right_hash: Box::new(right_hash),
+                relocate_closure,
+                com_closure_at_d,
+                relocate_x,
+                com_x_at_d,
+                relocate_h,
+                com_h_at_d,
+                semijoin: Box::new(semijoin),
+            },
+            vec![com_x_kept],
+            vec![x_kept],
+            d_log,
+            m,
+        )
+    }
+
     fn prove_bounded(
         context: &StoreProverContext<'_>,
         layer: &LayerCommitment,
@@ -4241,6 +4507,14 @@ impl RecursiveRelationEnvelope {
                     left: Box::new(left_envelope), right: Box::new(right_envelope),
                     proof: Box::new(result.proof),
                 }, result.commitments, result.columns, result.log_domain, result.n)
+            }
+            RelationProofPlanKind::CrossRootHashJoin { .. } => {
+                // The cross-root node reads TWO graphs; the single-layer recursion has only one
+                // layer. It is TOP-LEVEL only, proven via `prove_cross_root` (two-layer). Reject
+                // closed here so it can never be nested inside a single-root subtree.
+                Err(invalid(
+                    "cross-root hash join must be proven via prove_cross_root (two layers), not nested in the single-root recursion",
+                ))
             }
             RelationProofPlanKind::LeftOuter { left, right, key_pairs } => {
                 let left_envelope = Self::prove_bounded(context, layer, left, depth + 1, nodes)?;
@@ -5622,6 +5896,142 @@ impl RecursiveRelationEnvelope {
         self.verify_bounded(layer, expected_root, plan, 1, &mut nodes)
     }
 
+    /// TWO-ROOT ENTRY — verify a top-level [`RelationProofPlanKind::CrossRootHashJoin`]. Validates
+    /// BOTH per-graph commitments against the trusted `database_root`, verifies each child against
+    /// its OWN root (single-root subtrees — the `verify_bounded` single-root invariant is preserved
+    /// WITHIN each child), authenticates each side's key column to its IRI-hash against its own root,
+    /// and verifies the inner join over the two hash columns. `database_root` MUST come from a trusted
+    /// out-of-band pin, never recomputed from the prover's proof bundle or schema view.
+    pub fn verify_cross_root(
+        &self,
+        instance: &impl VerifierLayer,
+        schema: &impl VerifierLayer,
+        database_root: ProofHash,
+        plan: &RelationProofPlan,
+    ) -> io::Result<()> {
+        let (expected_descriptors, expected_ground) = plan.result_shape()?;
+        let (left_plan, right_plan, left_key_col, right_key_col) = match &plan.kind {
+            RelationProofPlanKind::CrossRootHashJoin { left, right, left_key_col, right_key_col } => {
+                (left.as_ref(), right.as_ref(), *left_key_col, *right_key_col)
+            }
+            _ => return Err(invalid("verify_cross_root requires a CrossRootHashJoin plan")),
+        };
+        let (
+            left,
+            right,
+            left_hash,
+            right_hash,
+            relocate_closure,
+            com_closure_at_d,
+            relocate_x,
+            com_x_at_d,
+            relocate_h,
+            com_h_at_d,
+            semijoin,
+        ) = match &self.proof {
+            RecursiveRelationProof::CrossRootHashJoin {
+                left,
+                right,
+                left_hash,
+                right_hash,
+                relocate_closure,
+                com_closure_at_d,
+                relocate_x,
+                com_x_at_d,
+                relocate_h,
+                com_h_at_d,
+                semijoin,
+            } => (
+                left.as_ref(),
+                right.as_ref(),
+                left_hash.as_ref(),
+                right_hash.as_ref(),
+                relocate_closure,
+                com_closure_at_d,
+                relocate_x,
+                com_x_at_d,
+                relocate_h,
+                com_h_at_d,
+                semijoin.as_ref(),
+            ),
+            _ => return Err(invalid("cross-root proof/plan mismatch")),
+        };
+
+        // (1) Both per-graph commitments validated AND combined into the trusted database anchor.
+        super::commitment::validate_database_root(instance, schema, &database_root)?;
+        let instance_view = instance.verifier_view();
+        let schema_view = schema.verifier_view();
+        let instance_root = instance_view.state.commitment_root;
+        let schema_root = schema_view.state.commitment_root;
+
+        // Result identity: the output lives in the INSTANCE namespace.
+        if self.layer_root != instance_root {
+            return Err(invalid("cross-root result is not anchored to the instance root"));
+        }
+        if self.query_digest != plan.query_digest {
+            return Err(invalid("cross-root query identity mismatch"));
+        }
+        if self.ground_result != expected_ground || self.result_descriptors != expected_descriptors {
+            return Err(invalid("cross-root result schema mismatch"));
+        }
+
+        // (2) Verify each child against ITS OWN root (single-root subtrees).
+        let mut lnodes = 0usize;
+        left.verify_bounded(schema, schema_root, left_plan, 1, &mut lnodes)?;
+        let mut rnodes = 0usize;
+        right.verify_bounded(instance, instance_root, right_plan, 1, &mut rnodes)?;
+
+        if left.result_commitments.len() != 1 || left_key_col != 0 {
+            return Err(invalid("cross-root left child must be a single key column"));
+        }
+        if right.result_commitments.len() != 2 || right_key_col >= 2 {
+            return Err(invalid("cross-root right child must be exactly [output, class-key]"));
+        }
+        let x_col = 1 - right_key_col;
+
+        let mut transcript = Transcript254::new(b"parture-cross-root-envelope");
+        transcript.append_bytes(b"pow/cross-root/db-root", &database_root);
+        transcript.append_bytes(b"pow/cross-root/query", &plan.query_digest);
+
+        // (3) Authenticate each side's key id column to its IRI-hash against its OWN root.
+        verify_dict_hash_lookup(
+            &left.result_commitments[0], left.result_log_domain, left.result_len, schema, left_hash, &mut transcript,
+        )?;
+        verify_dict_hash_lookup(
+            &right.result_commitments[right_key_col], right.result_log_domain, right.result_len, instance, right_hash, &mut transcript,
+        )?;
+
+        // (4) Verify the three UP-relocations to the shared working domain 2^D, each bound to its
+        // root-authenticated source commitment.
+        let instance_n_dict = instance_view.state.node_value_count as usize;
+        let schema_n_dict = schema_view.state.node_value_count as usize;
+        let d_left = super::dicthash::working_domain_log(left.result_log_domain, schema_n_dict);
+        let d_right = super::dicthash::working_domain_log(right.result_log_domain, instance_n_dict);
+        let d_log = d_left.max(d_right);
+        verify_column_relocation(
+            &left_hash.lookup.com_v_hash, d_left, com_closure_at_d, d_log, relocate_closure, &mut transcript,
+        )?;
+        verify_column_relocation(
+            &right_hash.lookup.com_v_hash, d_right, com_h_at_d, d_log, relocate_h, &mut transcript,
+        )?;
+        verify_column_relocation(
+            &right.result_commitments[x_col], right.result_log_domain, com_x_at_d, d_log, relocate_x, &mut transcript,
+        )?;
+
+        // (5) Full-field LogUp semi-join: kept ?x rows whose class-hash is in the closure hash set.
+        verify_hash_semijoin(
+            com_closure_at_d, left.result_len, com_x_at_d, com_h_at_d, right.result_len,
+            self.result_len, semijoin, &mut transcript,
+        )?;
+        // The delivered output is the semi-join's kept-?x column at domain 2^D.
+        if self.result_log_domain != d_log
+            || self.result_commitments != vec![semijoin.com_x_kept]
+        {
+            return Err(invalid("cross-root result does not match the semi-join output"));
+        }
+        Ok(())
+    }
+
     fn put_bounded(
         &self,
         out: &mut Vec<u8>,
@@ -5707,6 +6117,32 @@ impl RecursiveRelationEnvelope {
                 left.put_bounded(out, depth + 1, nodes)?;
                 right.put_bounded(out, depth + 1, nodes)?;
                 proof.put(out)?;
+            }
+            RecursiveRelationProof::CrossRootHashJoin {
+                left,
+                right,
+                left_hash,
+                right_hash,
+                relocate_closure,
+                com_closure_at_d,
+                relocate_x,
+                com_x_at_d,
+                relocate_h,
+                com_h_at_d,
+                semijoin,
+            } => {
+                22u8.put(out)?;
+                left.put_bounded(out, depth + 1, nodes)?;
+                right.put_bounded(out, depth + 1, nodes)?;
+                left_hash.put(out)?;
+                right_hash.put(out)?;
+                relocate_closure.put(out)?;
+                com_closure_at_d.put(out)?;
+                relocate_x.put(out)?;
+                com_x_at_d.put(out)?;
+                relocate_h.put(out)?;
+                com_h_at_d.put(out)?;
+                semijoin.put(out)?;
             }
             RecursiveRelationProof::Equality { input, proof } => {
                 4u8.put(out)?;
@@ -5861,6 +6297,19 @@ impl RecursiveRelationEnvelope {
                 left: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 right: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 proof: Box::<InnerJoinProof>::get(reader)?,
+            },
+            22 => RecursiveRelationProof::CrossRootHashJoin {
+                left: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                right: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
+                left_hash: Box::<DictHashLookupProof>::get(reader)?,
+                right_hash: Box::<DictHashLookupProof>::get(reader)?,
+                relocate_closure: RelocationProof::get(reader)?,
+                com_closure_at_d: ArkGT::get(reader)?,
+                relocate_x: RelocationProof::get(reader)?,
+                com_x_at_d: ArkGT::get(reader)?,
+                relocate_h: RelocationProof::get(reader)?,
+                com_h_at_d: ArkGT::get(reader)?,
+                semijoin: Box::<HashSemiJoinProof>::get(reader)?,
             },
             10 => RecursiveRelationProof::BagProjection {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
@@ -6023,6 +6472,196 @@ mod tests {
         let body_len = bytes.len() - CHECKSUM_BYTES;
         let checksum = Sha256::digest(&bytes[..body_len]);
         bytes[body_len..].copy_from_slice(&checksum);
+    }
+
+    // ---------------------------------------------------------------------
+    // CrossRootHashJoin (two-root cross-dictionary hash join) tests.
+    // ---------------------------------------------------------------------
+
+    fn node_layer(triples: &[(&str, &str, &str)]) -> LayerCommitment {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (s, p, o) in triples {
+            builder
+                .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
+                .unwrap();
+        }
+        (*builder.commit().unwrap().proof_commitment().unwrap()).clone()
+    }
+
+    fn subject_bound_atom(subject: &str, predicate: &str) -> LayerBgpAtom {
+        LayerBgpAtom {
+            subject: AtomTerm::NodeConstant(iri(subject).into_bytes()),
+            predicate_term: iri(predicate).into_bytes(),
+            predicate_variable: false,
+            object: AtomTerm::Variable,
+            object_range: None,
+            object_kind: ObjectKindFilter::Any,
+            subject_object_equal: false,
+            source: ColumnSource::Materialized,
+        }
+    }
+
+    fn var_subject_atom(predicate: &str) -> LayerBgpAtom {
+        LayerBgpAtom {
+            subject: AtomTerm::Variable,
+            predicate_term: iri(predicate).into_bytes(),
+            predicate_variable: false,
+            object: AtomTerm::Variable,
+            object_range: None,
+            object_kind: ObjectKindFilter::Any,
+            subject_object_equal: false,
+            source: ColumnSource::Materialized,
+        }
+    }
+
+    fn bgp_leaf(atom: LayerBgpAtom, digest: u8) -> RelationProofPlan {
+        RelationProofPlan {
+            query_digest: [digest; 32],
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
+                atoms: vec![atom],
+                joins: Vec::new(),
+            }),
+        }
+    }
+
+    /// `left` = the SCHEMA class set (single object column of `Triple(<subj>, <p>, ?c)`);
+    /// `right` = the INSTANCE `Triple(?x, <rt>, ?class)` ([x, class], key col 1).
+    fn cross_root_plan(left: RelationProofPlan, right: RelationProofPlan) -> RelationProofPlan {
+        RelationProofPlan {
+            query_digest: [9u8; 32],
+            kind: RelationProofPlanKind::CrossRootHashJoin {
+                left: Box::new(left),
+                right: Box::new(right),
+                left_key_col: 0,
+                right_key_col: 1,
+            },
+        }
+    }
+
+    fn class_object_id(layer: &LayerCommitment, class: &str) -> Option<u64> {
+        layer
+            .node_value_catalog
+            .iter()
+            .find(|r| matches!(&r.triple.object, crate::proof::CanonicalObject::Node(n) if n == iri(class).as_bytes()))
+            .map(|r| r.object_id)
+    }
+
+    // The cross-root node reconciles ~254-bit `hash_object` keys via a FULL-FIELD LogUp semi-join
+    // (`super::semijoin`) — no magnitude sort, so >=2 distinct full-field hash keys are handled.
+    #[test]
+    fn cross_root_matches_same_iri_across_independent_dicts() {
+        // DICT-INDEPENDENCE: the SAME class IRI "Class" appears in BOTH graphs but at DIFFERENT
+        // dict ids (the instance has an extra earlier node that shifts its ids). The hash join
+        // still matches it (hashing the IRI, not the id); the unrelated instance class "Other" is
+        // excluded. This is the completeness half of the cross-dict property.
+        // The class object "Cxxxx" (sorts first, uppercase C) is dict id 1 in the schema. The
+        // instance has two earlier-sorting nodes ("Aearly","Bearly") that push "Cxxxx" to id 3.
+        let schema = node_layer(&[("aaa", "cls", "Cxxxx"), ("aaa", "zzz", "yyy")]);
+        let instance = node_layer(&[
+            ("Aearly", "rt", "Bearly"),
+            ("px", "rt", "Cxxxx"),
+            ("qx", "zzz", "yyy"),
+        ]);
+        let schema_class = class_object_id(&schema, "Cxxxx").unwrap();
+        let inst_class = class_object_id(&instance, "Cxxxx").unwrap();
+        assert_ne!(
+            schema_class, inst_class,
+            "the SAME IRI intentionally has DIFFERENT dict ids across the two graphs"
+        );
+
+        let plan = cross_root_plan(
+            bgp_leaf(subject_bound_atom("aaa", "cls"), 1),
+            bgp_leaf(var_subject_atom("rt"), 2),
+        );
+        let env = RecursiveRelationEnvelope::prove_cross_root(&instance, &schema, &plan).unwrap();
+        let db_root = crate::proof::commitment::database_root(
+            &instance.state.commitment_root,
+            &schema.state.commitment_root,
+        );
+        env.verify_cross_root(&instance, &schema, db_root, &plan).unwrap();
+        assert_eq!(env.result_len, 1, "only px (class Cxxxx) matches; the Aearly row is excluded");
+    }
+
+    #[test]
+    fn cross_root_excludes_same_id_different_iri() {
+        // THE CRUX cross-dict NEGATIVE: two DIFFERENT class IRIs collide on the SAME integer dict id
+        // (identical dictionary structure, only the class IRI differs, so both classes take the same
+        // sorted rank). A raw dict-id join would falsely match; the hash join MUST exclude.
+        // Identical dictionary STRUCTURE (subject "aaa", filler object "yyy"); only the class IRI
+        // differs and both sort FIRST, so schema "Sxxxx" and instance "Ixxxx" take the SAME dict id.
+        let schema = node_layer(&[("aaa", "cls", "Sxxxx"), ("aaa", "zzz", "yyy")]);
+        let instance = node_layer(&[("aaa", "rt", "Ixxxx"), ("aaa", "zzz", "yyy")]);
+        let schema_class = class_object_id(&schema, "Sxxxx").unwrap();
+        let inst_class = class_object_id(&instance, "Ixxxx").unwrap();
+        assert_eq!(
+            schema_class, inst_class,
+            "the two DIFFERENT class IRIs must collide on the SAME integer dict id (the whole point)"
+        );
+
+        let plan = cross_root_plan(
+            bgp_leaf(subject_bound_atom("aaa", "cls"), 1),
+            bgp_leaf(var_subject_atom("rt"), 2),
+        );
+        let env = RecursiveRelationEnvelope::prove_cross_root(&instance, &schema, &plan).unwrap();
+        let db_root = crate::proof::commitment::database_root(
+            &instance.state.commitment_root,
+            &schema.state.commitment_root,
+        );
+        env.verify_cross_root(&instance, &schema, db_root, &plan).unwrap();
+        assert_eq!(
+            env.result_len, 0,
+            "same-integer-id-DIFFERENT-IRI must NOT match: no raw cross-dict id comparison"
+        );
+    }
+
+    // The wrong-root and tamper tests validate the NOVEL two-root soundness (database_root binding,
+    // per-child root authentication, reject paths) of the cross-root envelope.
+    #[test]
+    fn cross_root_rejects_wrong_root_and_swapped_graphs() {
+        let schema = node_layer(&[("aaa", "cls", "Cxxxx"), ("aaa", "zzz", "yyy")]);
+        let instance = node_layer(&[("px", "rt", "Cxxxx"), ("qx", "zzz", "yyy")]);
+        let plan = cross_root_plan(
+            bgp_leaf(subject_bound_atom("aaa", "cls"), 1),
+            bgp_leaf(var_subject_atom("rt"), 2),
+        );
+        let env = RecursiveRelationEnvelope::prove_cross_root(&instance, &schema, &plan).unwrap();
+        let db_root = crate::proof::commitment::database_root(
+            &instance.state.commitment_root,
+            &schema.state.commitment_root,
+        );
+        env.verify_cross_root(&instance, &schema, db_root, &plan).unwrap();
+
+        // A tampered trusted database root rejects.
+        let mut bad = db_root;
+        bad[0] ^= 1;
+        assert!(env.verify_cross_root(&instance, &schema, bad, &plan).is_err());
+
+        // Swapping the two graphs (instance<->schema) under the original root rejects: the ordered
+        // two-hash `database_root(instance, schema)` no longer matches, and each child is anchored to
+        // the wrong root.
+        assert!(env.verify_cross_root(&schema, &instance, db_root, &plan).is_err());
+    }
+
+    #[test]
+    fn cross_root_rejects_tampered_join_key() {
+        let schema = node_layer(&[("aaa", "cls", "Cxxxx"), ("aaa", "zzz", "yyy")]);
+        let instance = node_layer(&[("px", "rt", "Cxxxx"), ("qx", "zzz", "yyy")]);
+        let plan = cross_root_plan(
+            bgp_leaf(subject_bound_atom("aaa", "cls"), 1),
+            bgp_leaf(var_subject_atom("rt"), 2),
+        );
+        let mut env = RecursiveRelationEnvelope::prove_cross_root(&instance, &schema, &plan).unwrap();
+        let db_root = crate::proof::commitment::database_root(
+            &instance.state.commitment_root,
+            &schema.state.commitment_root,
+        );
+        // Corrupt the join's matched key-column commitment: the inner-join projection no longer binds.
+        if let RecursiveRelationProof::CrossRootHashJoin { com_closure_at_d, .. } = &mut env.proof {
+            *com_closure_at_d = commit_column(&vec![ArkFr::from_u64(7); 2]).unwrap();
+        }
+        assert!(env.verify_cross_root(&instance, &schema, db_root, &plan).is_err());
     }
 
     #[test]
