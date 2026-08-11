@@ -860,11 +860,25 @@ pub struct LayerBgpAtom {
     pub object_kind: ObjectKindFilter,
     /// Require the subject and object variables to be equal within each selected row.
     pub subject_object_equal: bool,
+    /// Which committed `(S, P, O)` column set THIS atom reads: the layer's complete
+    /// materialized head view (the pre-delta default, and the value that keeps every legacy
+    /// plan byte-identical), or the layer's own additions / removals delta file. Making the
+    /// source PER-ATOM (rather than one per plan) is what admits a CROSS-SOURCE join, e.g.
+    /// `AddedTriple(?x, p, ?y) & Triple(?y, q, ?z)` (additions ⋈ materialized) or
+    /// additions ⋈ removals: all three sets share the SAME predicate/node-value dictionaries,
+    /// so their dictionary IDs are directly comparable and the audited join gadget joins them
+    /// unchanged. The source is bound TWO ways so a prover cannot relabel it: it is part of the
+    /// plan wire image (hence `plan_digest`) that the verifier reconstructs from its own trusted
+    /// query, AND it is domain-separated in the Fiat–Shamir transcript. `Materialized` emits NO
+    /// extra transcript bytes when it matches the plan default, so pre-delta / uniform proofs
+    /// stay byte-identical.
+    pub source: ColumnSource,
 }
 
 impl LayerBgpAtom {
     /// The classic all-variable atom `t(?s, <predicate_term>, ?o)`: both subject and
-    /// object are query variables (the two kept output columns), no object range.
+    /// object are query variables (the two kept output columns), no object range, reading the
+    /// complete materialized head view.
     pub fn all_variables(predicate_term: Vec<u8>) -> Self {
         Self {
             subject: AtomTerm::Variable,
@@ -874,7 +888,15 @@ impl LayerBgpAtom {
             object_range: None,
             object_kind: ObjectKindFilter::Any,
             subject_object_equal: false,
+            source: ColumnSource::Materialized,
         }
+    }
+
+    /// Point this atom at a specific committed column set (materialized head, or the layer's
+    /// own additions / removals delta file). The default is [`ColumnSource::Materialized`].
+    pub fn with_source(mut self, source: ColumnSource) -> Self {
+        self.source = source;
+        self
     }
 
     /// Attach a numeric object-value range filter to this atom (the object must be a
@@ -911,26 +933,41 @@ pub struct SecondRangeSubproof {
 pub struct LayerBgpPlan {
     pub atoms: Vec<LayerBgpAtom>,
     pub joins: Vec<JoinStep>,
-    /// Which committed column set every atom of this plan reads (all atoms share ONE source;
-    /// a cross-source join is unrepresentable, which is the reject-closed guarantee for delta
-    /// reads). Bound by the verifier's trusted plan reconstruction AND the Fiat–Shamir
-    /// transcript. Defaults to [`ColumnSource::Materialized`] so every pre-delta plan is
-    /// byte-identical.
+    /// The plan DEFAULT column source. Each atom now carries its OWN [`LayerBgpAtom::source`]
+    /// (which drives the columns/commitments/count that atom's filter reads), so this field is
+    /// no longer the single source of every atom. It remains load-bearing in three ways:
+    ///   * the transcript baseline — an atom whose source equals `plan.source` emits NO per-atom
+    ///     source tag, so a UNIFORM plan (every atom == `plan.source`, whether all-Materialized
+    ///     or all-delta) is byte-identical to the pre-per-atom encoding;
+    ///   * the domain of the all-ground UNIT column and the dictionary-absence zero column
+    ///     (neither reads a specific atom's relation);
+    ///   * backward-compat construction ([`LayerBgpPlan::with_source`] / `materialized`).
+    /// The compiler sets it to the uniform source when every atom agrees, else `Materialized`.
+    /// Bound (with every atom's source) by the verifier's trusted plan reconstruction AND the
+    /// Fiat–Shamir transcript. Defaults to [`ColumnSource::Materialized`].
     pub source: ColumnSource,
 }
 
 impl LayerBgpPlan {
     /// A plan over the complete materialized head view (the pre-delta default).
     pub fn materialized(atoms: Vec<LayerBgpAtom>, joins: Vec<JoinStep>) -> Self {
-        Self { atoms, joins, source: ColumnSource::Materialized }
+        Self::with_source(atoms, joins, ColumnSource::Materialized)
     }
 
-    /// A plan whose atoms all read `source` (materialized, additions, or removals).
+    /// A plan whose atoms ALL read one `source` (materialized, additions, or removals). The
+    /// source is propagated to EVERY atom (each atom now carries its own source, which is what
+    /// prove/verify read), so this remains the single-source constructor: an all-atoms-`source`
+    /// plan equals `plan.source == source`, keeping its transcript byte-identical to the
+    /// pre-per-atom encoding. A cross-source plan is built by setting per-atom
+    /// [`LayerBgpAtom::source`] directly (see [`LayerBgpAtom::with_source`]).
     pub fn with_source(
-        atoms: Vec<LayerBgpAtom>,
+        mut atoms: Vec<LayerBgpAtom>,
         joins: Vec<JoinStep>,
         source: ColumnSource,
     ) -> Self {
+        for atom in &mut atoms {
+            atom.source = source;
+        }
         Self { atoms, joins, source }
     }
 }
@@ -1511,10 +1548,11 @@ fn bind_layer_bgp_statement(
         b"pow/bgp-layer/commitment-root",
         &layer.state.commitment_root,
     );
-    // Domain-separate the column source so the proof cryptographically commits to which
-    // columns it read. `Materialized` emits NOTHING, so every pre-delta transcript is
-    // byte-for-byte unchanged; a delta source emits a distinct tag, so an additions proof
-    // and a removals proof over the same statement derive DIFFERENT challenges.
+    // Domain-separate the plan-DEFAULT column source. `Materialized` emits NOTHING, so every
+    // pre-delta transcript is byte-for-byte unchanged; a UNIFORM delta plan emits ONE tag here
+    // (its atoms then match this default and emit nothing per-atom, keeping single-source delta
+    // transcripts byte-identical too). A MIXED plan sets `plan.source = Materialized` (nothing
+    // here) and tags only the atoms that diverge, below.
     match plan.source {
         ColumnSource::Materialized => {}
         ColumnSource::Additions => {
@@ -1526,6 +1564,28 @@ fn bind_layer_bgp_statement(
     }
     transcript.append_bytes(b"pow/bgp-layer/k", &(plan.atoms.len() as u64).to_le_bytes());
     for (atom, ids) in plan.atoms.iter().zip(atom_ids.iter()) {
+        // PER-ATOM source override. Emitted ONLY when this atom reads a source OTHER than the
+        // plan default, so a uniform plan (every atom == `plan.source`) emits nothing here and
+        // its transcript is byte-identical to the pre-per-atom single-source encoding. A
+        // cross-source atom emits a distinct tag (including `Materialized`-as-override, which
+        // means "differs from a non-Materialized default"), domain-separating the mixed
+        // statement so no two source assignments share Fiat–Shamir challenges. Anti-substitution
+        // does NOT rest on this tag alone: the verifier reconstructs `plan.source` AND each
+        // `atom.source` from its own trusted plan (fixed by `plan_digest`) and sources the
+        // columns/count each filter opens against accordingly.
+        if atom.source != plan.source {
+            match atom.source {
+                ColumnSource::Materialized => {
+                    transcript.append_bytes(b"pow/bgp-layer/atom-source-materialized", &[])
+                }
+                ColumnSource::Additions => {
+                    transcript.append_bytes(b"pow/bgp-layer/atom-source-additions", &[])
+                }
+                ColumnSource::Removals => {
+                    transcript.append_bytes(b"pow/bgp-layer/atom-source-removals", &[])
+                }
+            }
+        }
         bind_atom_term(transcript, &atom.subject, ids.subject_id);
         transcript.append_bytes(
             b"pow/bgp-layer/pred-variable",
@@ -2306,13 +2366,17 @@ pub fn prove_layer_bgp_with_result_and_context(
     plan: &LayerBgpPlan,
 ) -> io::Result<LayerBgpResult> {
     let k = validate_bgp_plan(plan)?;
-    let (s, p, o, n) = source_layer_columns(layer, plan.source)?;
+    // Plan-DEFAULT columns/count. Each RELATIONAL atom RE-sources its own `(s, p, o, n)` from
+    // `atom.source` inside the loop below (that is what admits a cross-source join); the
+    // plan default is used only where no single atom relation is read: the all-ground UNIT
+    // column domain and the dictionary-absence zero column.
+    let (_s0, _p0, _o0, n0) = source_layer_columns(layer, plan.source)?;
 
     if let Some(absence) = dictionary_absence(layer, plan) {
         // A root-authenticated dictionary omits one public constant, so the atom and the
         // whole conjunction are empty. Emit canonical zero commitments at the layer table
         // domain, preserving either the public relational arity or the hidden ground UNIT.
-        let domain = padded_len(n)?;
+        let domain = padded_len(n0)?;
         let zero_column = vec![f0(); domain];
         let result_arity = result_id_namespaces(plan)?.len().max(1);
         let zero_commitment = context.commit_column(&zero_column)?;
@@ -2368,8 +2432,9 @@ pub fn prove_layer_bgp_with_result_and_context(
     let (nv_dict_hash, nv_dict_id) = layer.node_value_dictionary_columns()?;
     let com_nv_hash = layer.node_value_dict_commitments.0;
     let com_nv_id = layer.node_value_dict_commitments.1;
-    let [com_s, com_p, com_o] = source_column_commitments(layer.verifier_view(), plan.source);
-    let a = padded_len(n)?.trailing_zeros() as usize;
+    // Plan-default table-domain log, used ONLY for the all-ground UNIT column (no relational
+    // atom is joined there). Relational atoms use their OWN `a` (from their own source) below.
+    let a0 = padded_len(n0)?.trailing_zeros() as usize;
 
     let mut transcript = Transcript254::new(LAYER_BGP_DOMAIN);
     bind_layer_bgp_statement(&mut transcript, layer, plan, &atom_ids);
@@ -2377,6 +2442,16 @@ pub fn prove_layer_bgp_with_result_and_context(
     let mut atom_proofs = Vec::with_capacity(k);
     let mut relations: Vec<RelationWitness> = Vec::with_capacity(k);
     for (atom, ids) in plan.atoms.iter().zip(atom_ids.iter()) {
+        // (0) PER-ATOM column sourcing: this atom's `(s, p, o, n)`, its three root-bound
+        // `(S, P, O)` column commitments, and its table-domain log `a` all come from THIS
+        // atom's `source` — materialized head, or the layer's own additions / removals delta.
+        // Every set is bound by the SAME `commitment_root`, and all sources share the predicate
+        // and node/value dictionaries, so a cross-source atom's filter/join is the audited
+        // gadget unchanged (only which committed columns feed it differs). The real length `n`
+        // is PINNED to this atom's committed `source_count`.
+        let (s, p, o, n) = source_layer_columns(layer, atom.source)?;
+        let [com_s, com_p, com_o] = source_column_commitments(layer.verifier_view(), atom.source);
+        let a = padded_len(n)?.trailing_zeros() as usize;
         // (1) Predicate IRI -> id, authenticated by the predicate dictionary.
         let predicate_membership = match ids.predicate_id {
             Some(predicate_id) => Some(prove_dict_membership_with_context(
@@ -2497,11 +2572,13 @@ pub fn prove_layer_bgp_with_result_and_context(
     let (chain, mut result_coms, mut result_columns, result_log_domain, mut result_m) =
         if is_all_ground(plan) {
             let result_m = usize::from(relations.iter().all(|relation| relation.n == 1));
-            let mut unit = vec![f0(); 1usize << a];
+            // The zero-arity UNIT lives at the PLAN-DEFAULT domain `a0` (no atom relation is
+            // read for the result); the verifier recomputes it from the same `plan.source`.
+            let mut unit = vec![f0(); 1usize << a0];
             if result_m == 1 {
                 unit[0] = ArkFr::one();
             }
-            (None, vec![context.commit_column(&unit)?], vec![unit], a, result_m)
+            (None, vec![context.commit_column(&unit)?], vec![unit], a0, result_m)
         } else if relational_count == 1 {
             let relation = &relations[0];
             (
@@ -2616,8 +2693,10 @@ pub fn verify_layer_bgp(
     if proof.atoms.len() != k || predicate_ids.len() != k {
         return Err(invalid("layer BGP proof/atom/id count mismatch"));
     }
-    let n = source_count(layer.state, plan.source) as usize;
-    let a = padded_len(n)?.trailing_zeros() as usize;
+    // Plan-default domain, used ONLY for the all-ground UNIT (relational atoms use their own
+    // per-atom `a` sourced inside the loop). Mirrors the prover's `a0`.
+    let a0 = padded_len(source_count(layer.state, plan.source) as usize)?
+        .trailing_zeros() as usize;
 
     // Reconstruct each atom's resolved ids from the public predicate ids + the
     // proof-carried subject/object constant ids, checking the id presence matches the
@@ -2659,7 +2738,6 @@ pub fn verify_layer_bgp(
     let com_pred_id = layer.predicate_dict_commitments.1;
     let com_nv_hash = layer.node_value_dict_commitments.0;
     let com_nv_id = layer.node_value_dict_commitments.1;
-    let [com_s, com_p, com_o] = source_column_commitments(layer, plan.source);
 
     let mut relations: Vec<RelationCommit> = Vec::with_capacity(k);
     for ((atom, ap), ids) in plan
@@ -2668,6 +2746,15 @@ pub fn verify_layer_bgp(
         .zip(proof.atoms.iter())
         .zip(atom_ids.iter())
     {
+        // (0) PER-ATOM sourcing, mirroring the prover: this atom's committed row count `n`,
+        // table-domain log `a`, and its three `(S, P, O)` column commitments come from THIS
+        // atom's `source` (all bound by the same trusted root). The source is fixed by the
+        // verifier's trusted plan (part of the plan wire image / `plan_digest`), so a prover
+        // cannot relabel an atom's source: the columns/count it must open against are the ones
+        // this reconstruction selects.
+        let n = source_count(layer.state, atom.source) as usize;
+        let a = padded_len(n)?.trailing_zeros() as usize;
+        let [com_s, com_p, com_o] = source_column_commitments(layer, atom.source);
         // A compacted PLAIN atom filter's dimension must match the layer's committed
         // table columns (defense-in-depth; the Dory openings would also catch a mismatch).
         if let Some(AtomFilterProof::Compacted(inner)) = &ap.filter {
@@ -2809,7 +2896,8 @@ pub fn verify_layer_bgp(
             return Err(invalid("invalid all-ground BGP relation shape"));
         }
         let result_m = usize::from(relations.iter().all(|relation| relation.n == 1));
-        let mut unit = vec![f0(); 1usize << a];
+        // Plan-default domain `a0` for the zero-arity UNIT (matches the prover).
+        let mut unit = vec![f0(); 1usize << a0];
         if result_m == 1 {
             unit[0] = ArkFr::one();
         }
@@ -2868,8 +2956,16 @@ pub fn verify_layer_bgp_result_log_domain(
     let layer = source.verifier_view();
     validate_bgp_plan(plan)?;
     let relational_count = relational_atom_count(plan);
-    let expected = if proof.dictionary_absence.is_some() || relational_count <= 1 {
+    let expected = if proof.dictionary_absence.is_some() || relational_count == 0 {
+        // Dictionary-absence zero column and the all-ground UNIT both live at the PLAN-DEFAULT
+        // source domain (no single atom relation is read for the result).
         padded_len(source_count(layer.state, plan.source) as usize)?.trailing_zeros() as usize
+    } else if relational_count == 1 {
+        // A single relational atom's result IS its own filtered relation, so its domain is that
+        // atom's OWN source domain (== `plan.source` for a uniform plan; `validate_bgp_plan`
+        // places the relational atom first, so `atoms[0]` is it).
+        padded_len(source_count(layer.state, plan.atoms[0].source) as usize)?
+            .trailing_zeros() as usize
     } else {
         proof
             .chain
@@ -3320,6 +3416,284 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    // ---- Cross-source delta joins: one BGP whose atoms read DIFFERENT column sets ----
+
+    const PADD: &[u8] = b"http://ex/padd";
+    const PMAT: &[u8] = b"http://ex/pmat";
+    const PREM: &[u8] = b"http://ex/prem";
+
+    // Resolve every result column through the root-bound node/value dictionary into node IRIs,
+    // returning the sorted rows (one Vec<String> per result row) for exact-content assertions.
+    fn resolve_rows(lc: &LayerCommitment, columns: &[Vec<ArkFr>]) -> Vec<Vec<String>> {
+        let objects =
+            resolve_node_value_result_objects(lc, lc.state.commitment_root, columns).unwrap();
+        let ncols = objects.len();
+        let nrows = objects.first().map_or(0, |col| col.len());
+        let mut rows = Vec::with_capacity(nrows);
+        for r in 0..nrows {
+            let mut row = Vec::with_capacity(ncols);
+            for col in objects.iter() {
+                match &col[r] {
+                    CanonicalObject::Node(bytes) => {
+                        row.push(String::from_utf8(bytes.clone()).unwrap())
+                    }
+                    other => panic!("expected a node result, got {other:?}"),
+                }
+            }
+            rows.push(row);
+        }
+        rows.sort();
+        rows
+    }
+
+    // Base pmat edges y{i}->z{i} (inherited into materialized); child ADDS padd edges
+    // x{i}->y{i} (into BOTH the additions delta AND the materialized head).
+    fn cross_source_add_mat_layer() -> std::sync::Arc<LayerCommitment> {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for i in [1, 2] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(&format!("y{i}")),
+                    &iri("pmat"),
+                    &iri(&format!("z{i}")),
+                ))
+                .unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let child = base.open_write().unwrap();
+        for i in [1, 2] {
+            child
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(&format!("x{i}")),
+                    &iri("padd"),
+                    &iri(&format!("y{i}")),
+                ))
+                .unwrap();
+        }
+        let head = child.commit().unwrap();
+        head.proof_commitment().unwrap()
+    }
+
+    // Base prem edges y{i}->z{i}; child ADDS padd edges x{i}->y{i} and REMOVES the prem edges
+    // (so additions == {x_i->y_i}, removals == {y_i->z_i}).
+    fn cross_source_add_rem_layer() -> std::sync::Arc<LayerCommitment> {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for i in [1, 2] {
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(&format!("y{i}")),
+                    &iri("prem"),
+                    &iri(&format!("z{i}")),
+                ))
+                .unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let child = base.open_write().unwrap();
+        for i in [1, 2] {
+            child
+                .add_value_triple(ValueTriple::new_node(
+                    &iri(&format!("x{i}")),
+                    &iri("padd"),
+                    &iri(&format!("y{i}")),
+                ))
+                .unwrap();
+            child
+                .remove_value_triple(ValueTriple::new_node(
+                    &iri(&format!("y{i}")),
+                    &iri("prem"),
+                    &iri(&format!("z{i}")),
+                ))
+                .unwrap();
+        }
+        let head = child.commit().unwrap();
+        head.proof_commitment().unwrap()
+    }
+
+    // AddedTriple(?x, padd, ?y) [Additions] & Triple(?y, pmat, ?z) [Materialized], joined on ?y
+    // (atom0 object column == atom1 subject column). Note the two atoms have DIFFERENT committed
+    // row counts (additions=2 -> domain 2, materialized=4 -> domain 4), so this also exercises
+    // the join gadget's cross-domain relocation.
+    fn additions_join_materialized_plan() -> LayerBgpPlan {
+        LayerBgpPlan {
+            // Plan default is Materialized (mixed plan); atom0 overrides to Additions.
+            source: ColumnSource::Materialized,
+            atoms: vec![
+                LayerBgpAtom::all_variables(PADD.to_vec()).with_source(ColumnSource::Additions),
+                LayerBgpAtom::all_variables(PMAT.to_vec()).with_source(ColumnSource::Materialized),
+            ],
+            joins: vec![JoinStep {
+                acc_key: 1,
+                rel_key: 0,
+                additional_keys: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn cross_source_additions_join_materialized_proves_exact_rows() {
+        let lc = cross_source_add_mat_layer();
+        assert_eq!(lc.state.addition_count, 2);
+        assert_eq!(lc.state.materialized_count, 4);
+        let root = lc.state.commitment_root;
+        let plan = additions_join_materialized_plan();
+
+        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+        verify_layer_bgp(
+            &lc,
+            root,
+            &plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
+        verify_layer_bgp_result_log_domain(&lc, &plan, &result.proof, result.result_log_domain)
+            .unwrap();
+
+        // Exactly the two joined rows (?x, ?y, ?z): x_i -> y_i (added) then y_i -> z_i (mat).
+        assert_eq!(result.result_len, 2);
+        assert_eq!(
+            resolve_rows(&lc, &result.real_columns()),
+            vec![
+                vec![iri("x1"), iri("y1"), iri("z1")],
+                vec![iri("x2"), iri("y2"), iri("z2")],
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_source_additions_join_removals_proves_exact_rows() {
+        let lc = cross_source_add_rem_layer();
+        assert_eq!(lc.state.addition_count, 2);
+        assert_eq!(lc.state.removal_count, 2);
+        let root = lc.state.commitment_root;
+        let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
+            atoms: vec![
+                LayerBgpAtom::all_variables(PADD.to_vec()).with_source(ColumnSource::Additions),
+                LayerBgpAtom::all_variables(PREM.to_vec()).with_source(ColumnSource::Removals),
+            ],
+            joins: vec![JoinStep {
+                acc_key: 1,
+                rel_key: 0,
+                additional_keys: Vec::new(),
+            }],
+        };
+
+        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+        verify_layer_bgp(
+            &lc,
+            root,
+            &plan,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
+        assert_eq!(result.result_len, 2);
+        // ?x -> ?y is an ADDED edge; ?y -> ?z is a REMOVED edge; joined on ?y.
+        assert_eq!(
+            resolve_rows(&lc, &result.real_columns()),
+            vec![
+                vec![iri("x1"), iri("y1"), iri("z1")],
+                vec![iri("x2"), iri("y2"), iri("z2")],
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_source_atom_source_relabel_fails_verification() {
+        // An honest additions⋈materialized proof, re-verified under a plan whose per-atom
+        // sources were RELABELLED, must fail: the verifier sources each atom's committed
+        // columns/count from ITS trusted per-atom source, and the transcript per-atom override
+        // tags diverge (per-atom source anti-substitution).
+        let lc = cross_source_add_mat_layer();
+        let root = lc.state.commitment_root;
+        let honest = additions_join_materialized_plan();
+        let result = prove_layer_bgp_with_result(&lc, &honest).unwrap();
+        verify_layer_bgp(
+            &lc,
+            root,
+            &honest,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
+
+        // (a) Relabel atom0 Additions -> Materialized (the "claim additions as materialized"
+        // attack). The materialized column set + count + domain differ from what atom0 proved.
+        let mut relabel_atom0 = honest.clone();
+        relabel_atom0.atoms[0].source = ColumnSource::Materialized;
+        assert!(verify_layer_bgp(
+            &lc,
+            root,
+            &relabel_atom0,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .is_err());
+
+        // (b) Relabel atom1 Materialized -> Additions (source swap on the other atom).
+        let mut relabel_atom1 = honest.clone();
+        relabel_atom1.atoms[1].source = ColumnSource::Additions;
+        assert!(verify_layer_bgp(
+            &lc,
+            root,
+            &relabel_atom1,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .is_err());
+
+        // Sanity: the untouched plan still verifies (the relabels, not the proof, broke it).
+        verify_layer_bgp(
+            &lc,
+            root,
+            &honest,
+            &result.predicate_ids,
+            &result.result_commitments,
+            result.result_len,
+            &result.proof,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cross_source_wrong_joined_result_fails_verification() {
+        // A tampered result (columns permuted) is rejected: the chain output the verifier
+        // recomputes no longer equals the claimed result commitments.
+        let lc = cross_source_add_mat_layer();
+        let root = lc.state.commitment_root;
+        let plan = additions_join_materialized_plan();
+        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+
+        // Swap the ?x and ?z result columns: distinct columns -> distinct commitments, so the
+        // claimed result no longer matches the proof's authenticated chain output.
+        let mut wrong = result.result_commitments.clone();
+        wrong.swap(0, 2);
+        assert_ne!(wrong, result.result_commitments);
+        assert!(verify_layer_bgp(
+            &lc,
+            root,
+            &plan,
+            &result.predicate_ids,
+            &wrong,
+            result.result_len,
+            &result.proof,
+        )
+        .is_err());
     }
 
     // ---- Q2: 2-atom graph-pattern (self-join) end-to-end ----
@@ -3890,6 +4264,7 @@ mod tests {
                 object_range: None,
                 object_kind: ObjectKindFilter::Any,
                 subject_object_equal: false,
+                source: ColumnSource::Materialized,
             }],
             joins: vec![],
         };
@@ -3940,6 +4315,7 @@ mod tests {
             object_range: None,
             object_kind: ObjectKindFilter::Any,
             subject_object_equal: false,
+            source: ColumnSource::Materialized,
         };
         let plan = LayerBgpPlan {
             source: ColumnSource::Materialized,
@@ -4205,6 +4581,7 @@ mod tests {
                     object_range: None,
                     object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
+                    source: ColumnSource::Materialized,
                 },
             ],
             joins: vec![JoinStep {
@@ -4272,6 +4649,7 @@ mod tests {
                     object_range: None,
                     object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
+                    source: ColumnSource::Materialized,
                 },
                 LayerBgpAtom::all_variables(KNOWS.to_vec()),
             ],
@@ -4312,6 +4690,7 @@ mod tests {
                     object_range: None,
                     object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
+                    source: ColumnSource::Materialized,
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
@@ -4355,6 +4734,7 @@ mod tests {
                     object_range: None,
                     object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
+                    source: ColumnSource::Materialized,
                 },
             ],
             joins: vec![JoinStep {
@@ -4427,6 +4807,7 @@ mod tests {
                     object_range: None,
                     object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
+                    source: ColumnSource::Materialized,
                 },
             ],
             joins: vec![JoinStep {
@@ -4503,6 +4884,7 @@ mod tests {
                 object_range: None,
                 object_kind: ObjectKindFilter::Any,
                 subject_object_equal: false,
+                source: ColumnSource::Materialized,
             }],
             joins: Vec::new(),
         };
@@ -4588,6 +4970,7 @@ mod tests {
             object_range: None,
             object_kind: ObjectKindFilter::Any,
             subject_object_equal: false,
+            source: ColumnSource::Materialized,
         };
         for (plan, expected_len) in [
             (
@@ -4667,6 +5050,7 @@ mod tests {
                     object_range: None,
                     object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
+                    source: ColumnSource::Materialized,
                 },
                 1,
             ),
@@ -4679,6 +5063,7 @@ mod tests {
                     object_range: None,
                     object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
+                    source: ColumnSource::Materialized,
                 },
                 0,
             ),
@@ -4730,6 +5115,7 @@ mod tests {
                     object_range: None,
                     object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
+                    source: ColumnSource::Materialized,
                 },
                 LayerBgpAtom::all_variables(LIKES.to_vec()),
             ],
@@ -4962,6 +5348,7 @@ mod tests {
             object_range: None,
             object_kind: ObjectKindFilter::Literal,
             subject_object_equal: false,
+            source: ColumnSource::Materialized,
         };
         let predicate_plan = LayerBgpPlan {
             source: ColumnSource::Materialized,
@@ -5381,6 +5768,7 @@ mod tests {
                     }),
                     object_kind: ObjectKindFilter::Any,
                     subject_object_equal: false,
+                    source: ColumnSource::Materialized,
                 },
                 LayerBgpAtom::all_variables(NAME.to_vec()),
             ],
