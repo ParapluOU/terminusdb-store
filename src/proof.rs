@@ -802,7 +802,8 @@ fn validate_construction_heap_budget(
 
 pub(crate) use commitment::decode_legacy_v3;
 pub use commitment::{
-    CommitmentState, LayerCommitment, VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
+    node_value_op_value, CommitmentState, LayerCommitment, VerifierCommitment,
+    VerifierCommitmentRef, VerifierLayer,
 };
 
 pub mod anti;
@@ -863,9 +864,25 @@ pub mod commitment {
     use rand_chacha::ChaCha20Rng;
 
     const COMMITMENT_MAGIC: &[u8; 8] = b"TSPCW0\0\0";
-    pub const COMMITMENT_FORMAT_VERSION: u32 = 4;
+    // Bumped 4 → 5 when `xsd:date`/`xsd:dateTime` dict entries gained a NON-ZERO
+    // order-preserving VALUE (a decoded i64-nanoseconds key; see `node_value_op_value`).
+    // A date-containing layer's `commitment_root` therefore differs from a v4 file's, and
+    // a stale v4 commitment (which committed dates at the `0` sentinel) must NOT be read as
+    // if it used the new semantics — this file-format tag rejects it at decode.
+    //
+    // The root DOMAIN string (`commitment-root/v4`, `compute_commitment_root_from_parts`)
+    // is deliberately NOT bumped: the root's STRUCTURE (which columns/commitments are
+    // hashed, in what order) is unchanged — only the CONTENT of the node/value VALUE column
+    // changed, and only for entries that are dates. So a layer WITHOUT dates commits the
+    // identical `0`-sentinel value column and hashes to a BYTE-IDENTICAL root under v5, and
+    // old v4 anchors for date-free layers stay valid.
+    pub const COMMITMENT_FORMAT_VERSION: u32 = 5;
     const VERIFIER_COMMITMENT_MAGIC: &[u8; 8] = b"TSPCV0\0\0";
-    pub const VERIFIER_COMMITMENT_FORMAT_VERSION: u32 = 1;
+    // Bumped in lockstep (1 → 2): a verifier commitment derived from a v4 prover file
+    // likewise committed dates at the `0` sentinel and must be rejected. Its recomputed
+    // root uses the same unchanged `commitment-root/v4` domain, so a date-free verifier
+    // commitment still recomputes a byte-identical root.
+    pub const VERIFIER_COMMITMENT_FORMAT_VERSION: u32 = 2;
 
     /// Number of committed columns per layer: additions (S,P,O) then removals
     /// (S,P,O), in that fixed order.
@@ -1335,7 +1352,330 @@ pub mod commitment {
             UInt16 | Int16 => 2,
             UInt32 | Int32 | Float32 => 4,
             UInt64 | Int64 | Float64 => 8,
+            // `Date`/`DateTime` are order-preserving at width 8, but — unlike every
+            // entry above — their native `lexical` is NOT the OP encoding (tdb-succinct
+            // stores dateTime as variable-width sign+bigint-seconds+variable-nanos, and
+            // date as a `year:i64,month:u8,day:u8,offset:i16` struct). Their OP value is
+            // DERIVED (decode → chronological key → 8-byte offset-binary) in
+            // `node_value_op_value`, which special-cases these two BEFORE the generic
+            // fixed-width read below. This function reports the OP *width* (8, the range
+            // gadget's `Int64` convention); it does NOT claim the lexical is 8 bytes.
+            // `DateTimeStamp`/`DateTimeInterval`/`Time`/`Duration`/g* temporal types are
+            // deliberately NOT here (they reject-close to the `0` sentinel): the WOQL AST
+            // cannot even name a `DateTimeStamp` constant, and adding them would perturb
+            // the committed OP column of any layer holding such values.
+            Date | DateTime => 8,
             _ => return None,
+        })
+    }
+
+    /// The shared 8-byte OFFSET-BINARY encoding of a signed-integer key `n` as an
+    /// `ArkFr` — the SAME code the store's `Int64` path emits: `to_lexical` writes
+    /// `(1<<63) ^ (n as u64)` big-endian, and a big-endian unsigned read recovers that
+    /// value, mapping `i64::MIN → 0` and `i64::MAX → 2^64-1` monotonically. Routing the
+    /// date keys through this convention lets the AUDITED range gadget (sign-bit
+    /// bit-decomposition, `b_bits = 64`) compare them UNCHANGED. The datatype-tag column
+    /// still carries the `Date`/`DateTime` tag, so the gadget masks date rows to a date
+    /// query only — there is no cross-type comparison with the numeric `Int64` values
+    /// that happen to share this code.
+    fn op_offset_binary_i64(n: i64) -> ArkFr {
+        <ArkFr as DoryField>::from_u64((n as u64) ^ (1u64 << 63))
+    }
+
+    /// Map a decoded UTC `NaiveDateTime` to its i64 nanoseconds-since-epoch key,
+    /// SATURATING outside the representable i64-nanoseconds window (≈ 1677-09-21 ..
+    /// 2262-04-11). Saturating by chronological side keeps EVERY out-of-window date
+    /// correctly ordered against any in-window comparison constant `c`: a far-future date
+    /// (`i64::MAX`) is `> c` and a far-past date (`i64::MIN`) is `< c`. Since a range
+    /// filter only ever compares a data value to `c` (never two data values to each
+    /// other), the fact that two far dates tie is harmless.
+    fn datetime_to_saturating_nanos(ndt: chrono::NaiveDateTime) -> i64 {
+        let utc = ndt.and_utc();
+        // `timestamp()` (seconds) always fits i64 for any `NaiveDateTime`, so its sign is
+        // a safe far-past/far-future discriminator when the nanos overflow i64.
+        utc.timestamp_nanos_opt()
+            .unwrap_or(if utc.timestamp() >= 0 { i64::MAX } else { i64::MIN })
+    }
+
+    // --- Defensive native date/dateTime OP decoding ------------------------------------
+    //
+    // `VerifierCommitmentRef::validate()` recomputes `node_value_op_value` over EVERY
+    // committed catalog row of a self-contained, ADVERSARY-SUPPLIED proof. The native
+    // tdb-succinct decoders (`storage_to_datetime`, `Date::from_lexical`, and the
+    // integer/decimal helpers they call) `.unwrap()`/`.expect()`/index a `Buf`, so a
+    // crafted lexical PANICS them — crashing the honest verifier (a trustless-system
+    // DoS). We therefore decode the storage bytes ourselves so that ANY byte sequence
+    // yields either the correct `i64` OP key (`Ok`) or a clean `io::Error` — never a
+    // panic. For every well-formed, store-produced lexical the key is byte-identical to
+    // the native decoder; only well-formed-but-out-of-window instants saturate (the
+    // audited design) and only MALFORMED/undecodable lexicals become `Err`.
+    //
+    // Size-prefix bit layout of tdb-succinct's `bigint` storage (see integer.rs).
+    const DT_FIRST_SIGN: u8 = 0b1000_0000;
+    const DT_FIRST_CONTINUATION: u8 = 0b0100_0000;
+    const DT_FIRST_MASK: u8 = 0b0011_1111;
+    const DT_CONTINUATION: u8 = 0b1000_0000;
+    const DT_BASE_MASK: u8 = 0b0111_1111;
+
+    /// Consume one byte from `cursor`, or fail closed on a truncated lexical.
+    fn dt_take_u8(cursor: &mut &[u8]) -> io::Result<u8> {
+        match cursor.split_first() {
+            Some((byte, rest)) => {
+                *cursor = rest;
+                Ok(*byte)
+            }
+            None => Err(invalid("truncated date/dateTime lexical")),
+        }
+    }
+
+    /// Defensive re-implementation of tdb-succinct's `size_decode`: read the
+    /// variable-length size prefix, returning `(sign_is_non_negative, magnitude_byte_count)`.
+    /// Uses SATURATING arithmetic so an adversarial run of continuation bytes cannot
+    /// overflow-panic (`size <<= 7` panics on `u32` overflow in a debug build); the
+    /// (possibly saturated) count is only ever an upper bound, since the magnitude read
+    /// below fails closed the moment the buffer runs out.
+    fn dt_decode_size_prefix(cursor: &mut &[u8]) -> io::Result<(bool, u64)> {
+        let mut size: u64 = 0;
+        let mut sign = true;
+        let mut first = true;
+        loop {
+            let raw = dt_take_u8(cursor)?;
+            if first {
+                sign = raw & DT_FIRST_SIGN != 0;
+                let v = if sign { raw } else { !raw };
+                let val = u64::from(v & DT_FIRST_MASK);
+                if v & DT_FIRST_CONTINUATION == 0 {
+                    return Ok((sign, val));
+                }
+                size = size.saturating_add(val);
+                first = false;
+            } else {
+                let v = if sign { raw } else { !raw };
+                let val = u64::from(v & DT_BASE_MASK);
+                if v & DT_CONTINUATION == 0 {
+                    return Ok((sign, size.saturating_add(val)));
+                }
+                size = size.saturating_add(val);
+            }
+            size = size.saturating_mul(128); // `<< 7`, saturating to dodge the debug overflow panic
+        }
+    }
+
+    /// Defensive re-implementation of `storage_to_bigint_and_sign` specialised to the
+    /// dateTime seconds field: decode the signed magnitude, returning the sign and the
+    /// `i64` value, or `None` when the magnitude falls OUTSIDE the `i64` range (an
+    /// out-of-window instant the caller saturates). Fails closed on a truncated magnitude.
+    /// The tdb-succinct original `.expect("…surprisingly large number of seconds")`s here.
+    fn dt_decode_seconds(cursor: &mut &[u8]) -> io::Result<(bool, Option<i64>)> {
+        let (is_pos, size) = dt_decode_size_prefix(cursor)?;
+        if size == 0 {
+            return Ok((is_pos, Some(0)));
+        }
+        // A positive value leaves `i64` once the magnitude exceeds `i64::MAX`; a negative
+        // one once it exceeds `i64::MAX + 1` (`-2^63 == i64::MIN` is representable).
+        let limit: u128 = if is_pos {
+            i64::MAX as u128
+        } else {
+            (i64::MAX as u128) + 1
+        };
+        let mut acc: u128 = 0;
+        let mut overflow = false;
+        for _ in 0..size {
+            let byte = dt_take_u8(cursor)?;
+            let byte = if is_pos { byte } else { !byte };
+            if !overflow {
+                acc = (acc << 8) | u128::from(byte);
+                if acc > limit {
+                    // Stop accumulating (keeping `acc` bounded) but keep consuming the
+                    // remaining magnitude bytes so a truncation is still caught below.
+                    overflow = true;
+                }
+            }
+        }
+        if overflow {
+            return Ok((is_pos, None));
+        }
+        let magnitude = acc as i128;
+        let value = if is_pos { magnitude } else { -magnitude };
+        match i64::try_from(value) {
+            Ok(seconds) => Ok((is_pos, Some(seconds))),
+            // Unreachable given `limit`, but fail safe (never panic) rather than trust it.
+            Err(_) => Ok((is_pos, None)),
+        }
+    }
+
+    /// Decode one centary-BCD value (tdb-succinct `centary_decimal_decode`), failing
+    /// closed on the `0` byte whose native `i - 1` would underflow-panic.
+    fn dt_centary_decode(value: u8) -> io::Result<String> {
+        if value == 0 {
+            return Err(invalid("malformed dateTime fraction byte"));
+        }
+        let j = value - 1;
+        if j % 11 == 0 {
+            Ok(format!("{}", j / 11))
+        } else {
+            // `j >= 1` in this branch, so `j - d - 1 >= 0` (no u8 underflow).
+            let d = j / 11;
+            let num = j - d - 1;
+            Ok(format!("{num:02}"))
+        }
+    }
+
+    /// Defensive re-implementation of `decode_fraction`: read the sub-second fraction
+    /// digits (bit-inverted when the instant is negative). Consumes the WHOLE fraction
+    /// field — its terminal byte clears the continuation bit — so the caller can require
+    /// the lexical to be fully consumed. Fails closed on truncation, a malformed digit, or
+    /// a fraction longer than the 9 digits a nanosecond count can ever need (which would
+    /// underflow the native `9 - fraction.len()`).
+    fn dt_decode_fraction(cursor: &mut &[u8], is_pos: bool) -> io::Result<String> {
+        // The fraction field is ALWAYS at least one byte (a `0x00` "false zero" when there
+        // is no fraction); its absence is a truncated lexical.
+        let mut raw = dt_take_u8(cursor)?;
+        let first = if is_pos { raw } else { !raw };
+        if first == 0x00 {
+            return Ok(String::new());
+        }
+        let mut digits = String::new();
+        loop {
+            let byte = if is_pos { raw } else { !raw };
+            let chunk = dt_centary_decode(byte >> 1)?;
+            let single = chunk.len() == 1;
+            digits.push_str(&chunk);
+            if single || byte & 1 == 0 {
+                break;
+            }
+            if digits.len() > 9 {
+                return Err(invalid("dateTime fraction exceeds 9 digits"));
+            }
+            raw = dt_take_u8(cursor)?;
+        }
+        Ok(digits)
+    }
+
+    /// Convert decoded fraction digits (`<= 9`) to a nanosecond count, mirroring
+    /// `storage_to_datetime`'s right-zero-pad-to-9 then parse. Fails closed on anything
+    /// longer than 9 digits or non-numeric (never for a store-produced fraction).
+    fn dt_fraction_to_nanos(digits: &str) -> io::Result<u32> {
+        if digits.len() > 9 {
+            return Err(invalid("dateTime fraction exceeds 9 digits"));
+        }
+        let mut padded = String::with_capacity(9);
+        padded.push_str(digits);
+        for _ in 0..(9 - digits.len()) {
+            padded.push('0');
+        }
+        padded
+            .parse::<u32>()
+            .map_err(|_| invalid("dateTime fraction is not a valid nanosecond count"))
+    }
+
+    /// Decode a native tdb-succinct `xsd:dateTime` `lexical` to its OP i64 key. WOQL folds
+    /// the timezone offset into the instant at parse time (`remove_date_time_offset`) and
+    /// stores a bare UTC `NaiveDateTime`, and compares two such values chronologically to
+    /// the nanosecond (`date_time/7` standard order) — exactly the epoch-nanoseconds order
+    /// this key reproduces. The storage bytes are decoded DEFENSIVELY (see the block
+    /// above): a bigint-seconds value outside `i64`, or an instant outside chrono's
+    /// representable range, SATURATES to `i64::MIN/MAX` by sign (the audited saturating
+    /// design); a truncated/over-long/otherwise-malformed lexical FAILS CLOSED with an
+    /// `io::Error` rather than panicking the verifier. For every store-produced lexical the
+    /// key is byte-identical to `storage_to_datetime` + `datetime_to_saturating_nanos`.
+    fn datetime_lexical_to_op_i64(lexical: &[u8]) -> io::Result<i64> {
+        use chrono::{DateTime, Utc};
+        let mut cursor: &[u8] = lexical;
+        let (is_pos, seconds) = dt_decode_seconds(&mut cursor)?;
+        let fraction = dt_decode_fraction(&mut cursor, is_pos)?;
+        // A well-formed dateTime lexical is exactly the seconds prefix + fraction field;
+        // any trailing bytes are malformed.
+        if !cursor.is_empty() {
+            return Err(invalid("dateTime lexical has trailing bytes"));
+        }
+        let seconds = match seconds {
+            Some(seconds) => seconds,
+            // Bigint seconds beyond i64 ⇒ far outside the i64-nanoseconds window; saturate.
+            None => return Ok(if is_pos { i64::MAX } else { i64::MIN }),
+        };
+        let nanos = if fraction.is_empty() {
+            0
+        } else {
+            dt_fraction_to_nanos(&fraction)?
+        };
+        // Reconstruct the SAME instant `storage_to_datetime` would (checked constructors),
+        // then reuse `datetime_to_saturating_nanos` for a byte-identical key. A negative
+        // instant with a fraction is stored as `(seconds - 1, 1e9 - nanos)`.
+        let instant = if fraction.is_empty() || is_pos {
+            DateTime::<Utc>::from_timestamp(seconds, nanos)
+        } else {
+            seconds
+                .checked_sub(1)
+                .and_then(|s| DateTime::<Utc>::from_timestamp(s, 1_000_000_000 - nanos))
+        };
+        match instant {
+            Some(instant) => Ok(datetime_to_saturating_nanos(instant.naive_utc())),
+            // Fits i64 seconds but beyond chrono's representable range ⇒ far past/future,
+            // outside the i64-nanoseconds window; saturate by sign.
+            None => Ok(if is_pos { i64::MAX } else { i64::MIN }),
+        }
+    }
+
+    /// Decode a native tdb-succinct `xsd:date` `lexical` to its OP i64 key. WOQL compares a
+    /// stored `xsd:date` as the Prolog compound `date(Year,Month,Day,Offset)` in standard
+    /// order — i.e. `(year, month, day, offset)`-LEXICAL, with the timezone offset as a
+    /// LEAST-significant tiebreaker that is never applied to shift the day (a larger offset
+    /// sorts later; `"2020-01-01"` and `"2020-01-01Z"` both have offset 0 and compare
+    /// equal). We reproduce THAT order — not a pure instant — with a key strictly monotone
+    /// in `(year, month, day, offset)`:
+    ///
+    /// ```text
+    ///   key = midnight_utc_nanos(year, month, day)  +  offset
+    /// ```
+    ///
+    /// Consecutive calendar days differ by `86_400 * 1e9 ≈ 8.64e13` nanoseconds, which
+    /// dwarfs `|offset|` (a tdb-succinct `Date.offset` is an `i16`, ≤ 32767 in magnitude),
+    /// so the offset can only ever break ties among equal `(Y,M,D)` — exactly like
+    /// `compare/3`. A comparison constant always has offset 0 (the compiler builds it so),
+    /// so the tiebreaker is only exercised by DATA rows, keeping the constant's own key a
+    /// pure midnight instant.
+    fn date_lexical_to_op_i64(lexical: &[u8]) -> io::Result<i64> {
+        use chrono::NaiveDate;
+        // A store `xsd:date` lexical is EXACTLY the 12-byte `Date` encoding —
+        //   year:i64 (offset-binary BE, 8) | month:u8 (1) | day:u8 (1) | offset:i16 (offset-binary BE, 2).
+        // Decode the fixed fields directly instead of `Date::from_lexical`, which reads a
+        // `Buf` and PANICS on a short buffer; a wrong length is a truncated or over-long
+        // (i.e. malformed) lexical ⇒ fail closed. These fixed-width reads reproduce
+        // `Date::from_lexical` byte-for-byte for every valid 12-byte lexical (the same
+        // offset-binary transform the store's `i64`/`i16` `to_lexical` applies).
+        let [y0, y1, y2, y3, y4, y5, y6, y7, month, day, o0, o1]: [u8; 12] = lexical
+            .try_into()
+            .map_err(|_| invalid("xsd:date lexical is not exactly 12 bytes"))?;
+        let year = (u64::from_be_bytes([y0, y1, y2, y3, y4, y5, y6, y7]) ^ (1u64 << 63)) as i64;
+        let offset = (u16::from_be_bytes([o0, o1]) ^ (1u16 << 15)) as i16;
+        let base = match i32::try_from(year) {
+            Ok(year) => match NaiveDate::from_ymd_opt(year, u32::from(month), u32::from(day)) {
+                // Midnight is always a valid time-of-day; still constructed via the checked
+                // `and_hms_opt` (never `.expect`) so no input can panic the verifier.
+                Some(date) => datetime_to_saturating_nanos(
+                    date.and_hms_opt(0, 0, 0)
+                        .ok_or_else(|| invalid("xsd:date midnight is not constructible"))?,
+                ),
+                // A well-formed store `Date` always has a valid calendar day; an
+                // out-of-range month/day here means the committed lexical is corrupt —
+                // fail closed rather than guess a key.
+                None => return Err(invalid("xsd:date lexical has an out-of-range month or day")),
+            },
+            // A year beyond `i32` is astronomically far past/future and unambiguously
+            // outside the i64-nanoseconds window; saturate by its sign (year ≥ 0 ⇒ far
+            // future). Here the sign of the YEAR is a sound discriminator precisely because
+            // such a year is enormous.
+            Err(_) => return Ok(if year >= 0 { i64::MAX } else { i64::MIN }),
+        };
+        // Apply the offset tiebreaker ONLY to an in-window base. A saturated boundary key
+        // (a far date, or the exact representable min/max) stays pinned so the offset can
+        // never nudge a far date back across an in-window constant. Real in-window dates
+        // sit at midnight, ≥ ~8.5e13 ns from either extreme, so `saturating_add` here never
+        // actually saturates for them — it is a guard for the boundary case only.
+        Ok(match base {
+            i64::MIN | i64::MAX => base,
+            _ => base.saturating_add(i64::from(offset)),
         })
     }
 
@@ -1348,11 +1688,31 @@ pub mod commitment {
     /// are `<= 8`, so the value always fits a `u64`. A supported type whose lexical
     /// width does NOT match the expected fixed width is treated as corruption and
     /// fails closed (this cannot happen for store-produced values).
-    pub(crate) fn node_value_op_value(object: &CanonicalObject) -> io::Result<ArkFr> {
+    ///
+    /// `Date`/`DateTime` are the sole EXCEPTION: they are order-preserving but their
+    /// native lexical is NOT the OP encoding, so they are special-cased below —
+    /// decoded to a chronological i64 key and re-encoded via [`op_offset_binary_i64`].
+    /// This is `pub` so the woql2 compiler can compute a range constant's OP value
+    /// through this EXACT function (single source of truth: the compiler's `c` is then
+    /// byte-identical to the committed dict value column by construction).
+    pub fn node_value_op_value(object: &CanonicalObject) -> io::Result<ArkFr> {
         let (datatype, lexical) = match object {
             CanonicalObject::Value { datatype, lexical } => (*datatype, lexical),
             CanonicalObject::Node(_) => return Ok(<ArkFr as DoryField>::zero()),
         };
+        // Date/DateTime: decode the native storage bytes to a chronological i64 key and
+        // re-encode as the shared offset-binary code. Handled BEFORE the generic
+        // fixed-width read because their `lexical` is variable-width (so the width check
+        // below would reject it), even though `order_preserving_numeric_width` reports 8.
+        match datatype {
+            CanonicalDatatype::DateTime => {
+                return Ok(op_offset_binary_i64(datetime_lexical_to_op_i64(lexical)?));
+            }
+            CanonicalDatatype::Date => {
+                return Ok(op_offset_binary_i64(date_lexical_to_op_i64(lexical)?));
+            }
+            _ => {}
+        }
         let width = match order_preserving_numeric_width(datatype) {
             Some(width) => width,
             None => return Ok(<ArkFr as DoryField>::zero()),
@@ -3411,8 +3771,11 @@ pub mod commitment {
         }
 
         #[test]
-        fn commitment_format_version_is_four() {
-            assert_eq!(COMMITMENT_FORMAT_VERSION, 4);
+        fn commitment_format_version_is_five() {
+            // v5 == date/dateTime dict entries carry a decoded OP value (see
+            // `node_value_op_value`); the root domain string stays `commitment-root/v4`.
+            assert_eq!(COMMITMENT_FORMAT_VERSION, 5);
+            assert_eq!(VERIFIER_COMMITMENT_FORMAT_VERSION, 2);
         }
 
         #[test]
@@ -3861,6 +4224,245 @@ pub mod commitment {
             signed_edges!(i16, CanonicalDatatype::Int16, 1u64 << 15);
             signed_edges!(i32, CanonicalDatatype::Int32, 1u64 << 31);
             signed_edges!(i64, CanonicalDatatype::Int64, 1u64 << 63);
+        }
+
+        #[test]
+        fn date_and_datetime_op_values_are_saturating_i64_nanos_offset_binary() {
+            use crate::layer::ValueTriple;
+            use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+            use dory_pcs::primitives::arithmetic::Field;
+            use tdb_succinct::{Date, TdbDataType};
+
+            // The OP value the store commits for a typed entry.
+            let op = |entry| {
+                let object = CanonicalObject::from_store_object(
+                    &ValueTriple::new_value("", "", entry).object,
+                );
+                node_value_op_value(&object).expect("op value")
+            };
+            // INDEPENDENT offset-binary code for a known i64 key (mirrors the Int64
+            // convention `(n as u64) ^ (1<<63)`), computed WITHOUT the private helper so
+            // this test is a genuine oracle for `node_value_op_value`.
+            let code = |n: i64| (n as u64) ^ (1u64 << 63);
+            let field = |n: i64| ArkFr::from_u64(code(n));
+            let utc = |secs: i64, nanos: u32| -> NaiveDateTime {
+                DateTime::<Utc>::from_timestamp(secs, nanos).unwrap().naive_utc()
+            };
+
+            // --- xsd:dateTime: chronological UTC instant, to the nanosecond ---
+            let dt_samples: Vec<(NaiveDateTime, i64)> = vec![
+                (utc(0, 0), 0),                                         // the epoch
+                (utc(0, 1), 1),                                         // +1 ns
+                (utc(-1, 0), -1_000_000_000),                          // 1 s before epoch
+                (utc(1_000_000_000, 123), 1_000_000_000 * 1_000_000_000 + 123),
+            ];
+            for (ndt, expected_nanos) in &dt_samples {
+                assert_eq!(
+                    op(NaiveDateTime::make_entry(ndt)),
+                    field(*expected_nanos),
+                    "dateTime OP == offset-binary(i64-nanos) for {ndt}",
+                );
+            }
+            // Order-preserving: sorting by the key strictly increases the offset-binary code
+            // (so a < b ⇒ OP(a) < OP(b)) — including ACROSS the epoch (negative keys).
+            let mut keys: Vec<i64> = dt_samples.iter().map(|(_, n)| *n).collect();
+            keys.sort_unstable();
+            for w in keys.windows(2) {
+                assert!(code(w[0]) < code(w[1]), "offset-binary is monotone in the key");
+            }
+
+            // dateTime SATURATION: outside the i64-nanoseconds window saturates by side.
+            let far_future = NaiveDate::from_ymd_opt(5000, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap();
+            let far_past = NaiveDate::from_ymd_opt(1000, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap();
+            assert_eq!(op(NaiveDateTime::make_entry(&far_future)), field(i64::MAX));
+            assert_eq!(op(NaiveDateTime::make_entry(&far_past)), field(i64::MIN));
+
+            // --- xsd:date: (year, month, day, offset)-lexical via midnight_utc_nanos + offset ---
+            let date_entry = |y: i64, m: u8, d: u8, off: i16| {
+                Date::make_entry(&Date {
+                    year: y,
+                    month: m,
+                    day: d,
+                    offset: off,
+                })
+            };
+            let midnight = |y: i32, m: u32, d: u32| -> i64 {
+                NaiveDate::from_ymd_opt(y, m, d)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp_nanos_opt()
+                    .unwrap()
+            };
+            let n_2020 = midnight(2020, 1, 1);
+            // offset 0 (the compiler's constant form) is a pure midnight instant.
+            assert_eq!(op(date_entry(2020, 1, 1, 0)), field(n_2020));
+            // The timezone offset is a LEAST-significant tiebreaker: a larger offset sorts
+            // later, a negative one earlier, matching WOQL's `compare/3` over `date/4`.
+            assert_eq!(op(date_entry(2020, 1, 1, 60)), field(n_2020 + 60));
+            assert_eq!(op(date_entry(2020, 1, 1, -60)), field(n_2020 - 60));
+            // The offset can NEVER cross a day boundary (a day is ~8.64e13 ns, |offset|≤32767):
+            // 2019-12-31 < any-offset 2020-01-01 < 2020-01-02.
+            let n_dec31 = midnight(2019, 12, 31);
+            let n_jan02 = midnight(2020, 1, 2);
+            assert!(code(n_dec31) < code(n_2020 - 60), "prior day < offset-shifted date");
+            assert!(code(n_2020 + 60) < code(n_jan02), "offset-shifted date < next day");
+            // date SATURATION: a year outside the window saturates, and the offset is pinned
+            // at the boundary so it can never nudge a far date back toward the constant.
+            assert_eq!(op(date_entry(5000, 1, 1, 120)), field(i64::MAX));
+            assert_eq!(op(date_entry(1000, 1, 1, -120)), field(i64::MIN));
+        }
+
+        #[test]
+        fn adversarial_date_and_datetime_lexicals_fail_closed_without_panicking() {
+            use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+            use dory_pcs::primitives::arithmetic::Field;
+            use std::panic::{catch_unwind, AssertUnwindSafe};
+            use tdb_succinct::{Date, TdbDataType};
+
+            // `node_value_op_value` runs inside `VerifierCommitmentRef::validate()` over
+            // adversary-supplied catalog rows on a trustless proof, so a panic on a crafted
+            // date/dateTime lexical is a verifier DoS. Every crafted lexical below must
+            // either fail closed (`Err`) or, for a WELL-FORMED-but-out-of-window instant,
+            // saturate (`Ok`) — but it must NEVER panic. `catch_unwind` turns any residual
+            // panic into a clean test failure. NB the ORIGINAL native decoders panicked on
+            // several of these (the exact DoS this test pins shut).
+            // Decode UNDER a panic guard: any panic is caught and re-raised as a clear
+            // test failure (the DoS we are pinning shut), leaving a plain `io::Result` the
+            // assertions can inspect and Debug-format.
+            let decode = |datatype: CanonicalDatatype, lexical: Vec<u8>| -> io::Result<ArkFr> {
+                catch_unwind(AssertUnwindSafe(|| {
+                    node_value_op_value(&CanonicalObject::Value { datatype, lexical })
+                }))
+                .unwrap_or_else(|_| {
+                    panic!("node_value_op_value PANICKED on an adversarial lexical (verifier DoS)")
+                })
+            };
+            // Offset-binary code of an i64 key (the shared saturation boundary encoding).
+            let field = |n: i64| ArkFr::from_u64((n as u64) ^ (1u64 << 63));
+
+            // --- (a) xsd:dateTime with bigint-seconds beyond i64 -----------------------
+            // Size prefix `0x8C` = positive, 12 magnitude bytes; twelve `0xFF` magnitude
+            // bytes (≫ i64::MAX); a `0x00` "false zero" fraction. WELL-FORMED but far
+            // outside the i64-nanoseconds window ⇒ SATURATES to i64::MAX (never panics; the
+            // native `int.to_i64().expect(...)` would have panicked here).
+            let mut dt_huge_pos = vec![0x8Cu8];
+            dt_huge_pos.extend(std::iter::repeat(0xFFu8).take(12));
+            dt_huge_pos.push(0x00);
+            let a = decode(CanonicalDatatype::DateTime, dt_huge_pos);
+            assert!(
+                matches!(&a, Ok(v) if *v == field(i64::MAX)),
+                "over-i64 dateTime saturates to i64::MAX, got {a:?}",
+            );
+            // Same magnitude, NEGATIVE sign (`0x73` = !0x8C): saturates to i64::MIN.
+            let mut dt_huge_neg = vec![0x73u8];
+            dt_huge_neg.extend(std::iter::repeat(0x00u8).take(12)); // !0xFF under negative sign
+            dt_huge_neg.push(0xFF); // !0x00 fraction "false zero" under negative sign
+            let a_neg = decode(CanonicalDatatype::DateTime, dt_huge_neg);
+            assert!(
+                matches!(&a_neg, Ok(v) if *v == field(i64::MIN)),
+                "under-i64 dateTime saturates to i64::MIN, got {a_neg:?}",
+            );
+            // (a') the SAME huge magnitude but TRUNCATED (missing the fraction byte): an
+            // undecodable/malformed lexical ⇒ fails closed with Err (no panic).
+            let mut dt_huge_trunc = vec![0x8Cu8];
+            dt_huge_trunc.extend(std::iter::repeat(0xFFu8).take(12));
+            let a_trunc = decode(CanonicalDatatype::DateTime, dt_huge_trunc);
+            assert!(a_trunc.is_err(), "truncated dateTime must Err, got {a_trunc:?}");
+            // (a'') size prefix claims 8 magnitude bytes but only 2 are present ⇒ Err.
+            let a_short = decode(CanonicalDatatype::DateTime, vec![0x88, 0x01, 0x02]);
+            assert!(a_short.is_err(), "short-magnitude dateTime must Err, got {a_short:?}");
+            // (a''') empty lexical (no size prefix at all) ⇒ Err.
+            let a_empty = decode(CanonicalDatatype::DateTime, Vec::new());
+            assert!(a_empty.is_err(), "empty dateTime must Err, got {a_empty:?}");
+
+            // --- (b) truncated xsd:date (fewer than 12 bytes) --------------------------
+            let b = decode(CanonicalDatatype::Date, vec![0x00, 0x01, 0x02]);
+            assert!(b.is_err(), "truncated date must Err, got {b:?}");
+
+            // --- (c) over-long xsd:date (13 bytes) -------------------------------------
+            let c = decode(CanonicalDatatype::Date, vec![0u8; 13]);
+            assert!(c.is_err(), "over-long date must Err, got {c:?}");
+
+            // Valid store-produced date/dateTime lexicals still decode to the SAME OP
+            // values (ordering + offset tiebreaker unchanged) — proving the defensive
+            // decode did not perturb the honest path.
+            let op = |entry| {
+                node_value_op_value(&CanonicalObject::from_store_object(
+                    &crate::layer::ValueTriple::new_value("", "", entry).object,
+                ))
+                .expect("valid op value")
+            };
+            let ndt = |secs: i64, nanos: u32| -> NaiveDateTime {
+                DateTime::<Utc>::from_timestamp(secs, nanos).unwrap().naive_utc()
+            };
+            // dateTime: epoch, +1ns, 1s-before-epoch, and a large-nanos instant.
+            assert_eq!(op(NaiveDateTime::make_entry(&ndt(0, 0))), field(0));
+            assert_eq!(op(NaiveDateTime::make_entry(&ndt(0, 1))), field(1));
+            assert_eq!(op(NaiveDateTime::make_entry(&ndt(-1, 0))), field(-1_000_000_000));
+            assert_eq!(
+                op(NaiveDateTime::make_entry(&ndt(1_000_000_000, 123))),
+                field(1_000_000_000 * 1_000_000_000 + 123),
+            );
+            // date: midnight instant + offset tiebreaker, byte-identical to before.
+            let n_2020 = NaiveDate::from_ymd_opt(2020, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_nanos_opt()
+                .unwrap();
+            let dmk = |y: i64, m: u8, d: u8, off: i16| {
+                Date::make_entry(&Date { year: y, month: m, day: d, offset: off })
+            };
+            assert_eq!(op(dmk(2020, 1, 1, 0)), field(n_2020));
+            assert_eq!(op(dmk(2020, 1, 1, 60)), field(n_2020 + 60));
+            assert_eq!(op(dmk(2020, 1, 1, -60)), field(n_2020 - 60));
+        }
+
+        #[test]
+        fn non_date_entries_keep_the_zero_sentinel_byte_identically() {
+            // The date OP change must NOT perturb any non-date entry: nodes, strings, and
+            // every temporal type OTHER than date/dateTime (Time, DateTimeStamp — deliberately
+            // reject-closed) must still map to the `0` sentinel, so a layer WITHOUT dates
+            // commits a byte-identical node/value VALUE column (and thus an identical
+            // `commitment_root`) under the format bump.
+            use crate::layer::ValueTriple;
+            use chrono::{DateTime, NaiveTime, Utc};
+            use dory_pcs::primitives::arithmetic::Field;
+            use tdb_succinct::TdbDataType;
+
+            let op = |object: CanonicalObject| node_value_op_value(&object).expect("op value");
+            let value_op = |entry| {
+                op(CanonicalObject::from_store_object(
+                    &ValueTriple::new_value("", "", entry).object,
+                ))
+            };
+            let zero = <ArkFr as Field>::zero();
+
+            // A Node object.
+            assert_eq!(op(CanonicalObject::Node(b"http://ex/x".to_vec())), zero);
+            // xsd:string.
+            assert_eq!(value_op(String::make_entry(&"hello".to_string())), zero);
+            // xsd:time — a temporal type that is NOT range-supported: stays sentinel.
+            let time = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+            assert_eq!(value_op(NaiveTime::make_entry(&time)), zero);
+            // xsd:dateTimeStamp — stores like dateTime but is deliberately reject-closed
+            // (the WOQL AST cannot name it); it must remain a sentinel so a layer holding one
+            // (but no date/dateTime) stays byte-identical.
+            let stamp = tdb_succinct::DateTimeStamp(
+                DateTime::<Utc>::from_timestamp(1_600_000_000, 0)
+                    .unwrap()
+                    .naive_utc(),
+            );
+            assert_eq!(value_op(tdb_succinct::DateTimeStamp::make_entry(&stamp)), zero);
         }
 
         #[test]
