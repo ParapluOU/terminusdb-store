@@ -32,9 +32,13 @@ use dory_pcs::backends::arkworks::{
     BN254,
 };
 #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
-use dory_pcs::backends::arkworks::{BlitzarG1Backend, BlitzarRuntime};
+use dory_pcs::backends::arkworks::BlitzarG1Backend;
+// `BlitzarRuntime`/`BlitzarRuntimeConfig` appear in the public `StoreProverContext`
+// blitzar constructors' signatures, so re-export them here to make them nameable by
+// callers (and thus re-exportable through the woql2 high-level prove API) without a
+// direct `dory-pcs` dependency.
 #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
-pub use dory_pcs::backends::arkworks::BlitzarRuntimeConfig;
+pub use dory_pcs::backends::arkworks::{BlitzarRuntime, BlitzarRuntimeConfig};
 use dory_pcs::primitives::arithmetic::{Field, Group, ProverBackend};
 use dory_pcs::primitives::poly::Polynomial;
 use dory_pcs::primitives::transcript::Transcript;
