@@ -76,7 +76,13 @@ use super::dicthash::{
     honest_hash_lookup, prove_hash_lookup_inner, verify_hash_lookup_inner, HashLookupInnerProof,
 };
 use super::logup::{reciprocal_claim, reciprocal_witness, rlc_fold};
+use super::permutation::{
+    prove_relation_permutation_with_context, verify_relation_permutation, RelationPermutationProof,
+};
 use super::query::ObjectRangeSpec;
+use super::sort::{
+    prove_strictly_sorted_bits_with_context, verify_strictly_sorted_bits, SortedProof,
+};
 use super::range::{
     object_range_sel_column, prove_object_range_select_with_context, verify_object_range_select,
     ObjectRangeProof, OBJECT_RANGE_B_BITS,
@@ -651,15 +657,18 @@ pub struct ReconcileArtifacts {
     pub com_present_s: ArkGT,
     pub com_present_p: ArkGT,
     pub com_present_o: ArkGT,
-    /// present's subject/object COMBINED-DICT ids at 2^K (the small canonical id space,
-    /// authenticated in the join path against the reconciliation hashes). Predicate ids are
-    /// not needed for joins (predicate filtering stays in hash space).
+    /// present's subject/object/predicate COMBINED-DICT ids at 2^K (the small canonical id
+    /// space, authenticated against the reconciliation hashes). Subject/object are joined on;
+    /// the predicate id is used to form the bounded canonical-triple key for the
+    /// duplicate-freeness assertion (Wave 7 hardening).
     pub present_id_s: Vec<ArkFr>,
     pub present_id_o: Vec<ArkFr>,
+    pub present_id_p: Vec<ArkFr>,
     pub working_log: usize,
     pub present_len: usize,
-    /// The combined node/value dict at 2^K (for authenticating present's ids in the join).
+    /// The combined node/value + predicate dicts at 2^K (for authenticating present's ids).
     nv_dict: CombinedDictBuilt,
+    pred_dict: CombinedDictBuilt,
     present_rows: Vec<(ArkFr, ArkFr, ArkFr)>,
 }
 
@@ -770,6 +779,7 @@ fn prove_reconcile_core(
     let mut present_o = vec![f0(); k_size];
     let mut present_id_s = vec![f0(); k_size];
     let mut present_id_o = vec![f0(); k_size];
+    let mut present_id_p = vec![f0(); k_size];
     let mut present_rows = Vec::with_capacity(present_len);
     for (i, record) in present.iter().enumerate() {
         let sh = subject_hash(record);
@@ -780,6 +790,7 @@ fn prove_reconcile_core(
         present_o[i] = oh;
         present_id_s[i] = ark(record.subject_id);
         present_id_o[i] = ark(record.object_id);
+        present_id_p[i] = ark(record.predicate_id);
         present_rows.push((sh, ph, oh));
     }
     let com_present_s = context.commit_column(&present_s)?;
@@ -837,7 +848,7 @@ fn prove_reconcile_core(
     Ok((
         ReconcileProof {
             combined_nv: combined_nv.proof.clone(),
-            combined_pred: combined_pred.proof,
+            combined_pred: combined_pred.proof.clone(),
             working_log,
             groups,
             com_present_s,
@@ -857,9 +868,11 @@ fn prove_reconcile_core(
             com_present_o,
             present_id_s,
             present_id_o,
+            present_id_p,
             working_log,
             present_len,
             nv_dict: combined_nv,
+            pred_dict: combined_pred,
             present_rows,
         },
     ))
@@ -1747,6 +1760,11 @@ pub struct PresentBgpAtomProof {
 pub struct PresentBgpProof {
     pub auth_s: PresentIdAuth,
     pub auth_o: PresentIdAuth,
+    pub auth_p: PresentIdAuth,
+    /// Wave 7 hardening: present is a SET (no duplicate canonical triple), over the bounded id
+    /// key. Sound in TERM space GIVEN the combined-dict hash-uniqueness the verifier asserts
+    /// (term ↔ id is a bijection). `None` only when present has `< 2` rows (trivially a set).
+    pub present_distinct: Option<ColumnDistinctProof>,
     pub range_dict: Option<CombinedRangeDictProof>,
     pub atoms: Vec<PresentBgpAtomProof>,
     pub chain: Option<BgpChainProof>,
@@ -1837,6 +1855,191 @@ fn present_kept_sources(kept: &[Position], artifacts: &ReconcileArtifacts) -> Ve
 /// Whether any atom carries an object-value range (drives building the combined range dict).
 fn bgp_needs_range_dict(atoms: &[PresentBgpAtom]) -> bool {
     atoms.iter().any(|atom| atom.object_range.is_some())
+}
+
+// ===========================================================================
+// Wave 7 — TRUST-BOUNDARY HARDENING: cryptographically assert the two store invariants the
+// reconcile verifier's soundness relied on out of band, instead of trusting the store.
+//
+//   (1) present DUPLICATE-FREENESS: present is a SET — no two rows share the same canonical
+//       triple. Asserted over the BOUNDED combined-dict-id key `(id_s, id_p, id_o)` — the id
+//       space the join/BGP operates in — because a 254-bit canonical-HASH key cannot be
+//       strict-sorted (adjacent gaps of near-modulus field elements exceed the 253-bit range
+//       the sort gadget bounds). A duplicated present row (a store that smuggled a duplicated
+//       addition into a bag) has a duplicated id-triple and is rejected.
+//   (2) combined-dict ID UNIQUENESS: the combined node/value dictionary assigns DISTINCT ids
+//       (no two dict rows share an id), so the id space present is joined in is well-formed
+//       (a store that reused/duplicated a dict id is rejected).
+//
+// Both reuse the audited FULL-FIELD permutation ([`super::permutation`]) + BOUNDED strict-sort
+// ([`super::sort`]) as a distinctness argument: commit the sorted column U, prove U is a
+// permutation of the key column (reciprocal LogUp, field-native, no ordering cap), then prove
+// U STRICTLY increases (each adjacent gap in `[1, 2^bits)`, forcing all entries distinct).
+// The key columns are the reconciliation-authenticated id commitments (bound to the trusted
+// head root); the whole argument runs on the shared reconcile/BGP transcript.
+//
+// RESIDUAL (documented follow-up): full dictionary HASH-uniqueness (no term re-minted with two
+// DIFFERENT ids — a duplicate HASH sitting at two ids) is NOT closed here. Detecting a
+// duplicate among 254-bit canonical hashes needs a full-field distinctness primitive (limb-wise
+// lexicographic strict sort) the store does not yet have — the magnitude strict-sort caps keys
+// at 253 bits and `hash_object`/`hash_term` values sit near the ~254-bit field modulus, so
+// their sorted adjacent gaps overflow the range check on honest stacks. Assertion (2) closes
+// duplicate/malformed IDS; hash collision-resistance (Blake2b-512) closes distinct-terms-same-
+// hash; the remaining same-hash-two-distinct-ids case is the scoped follow-up.
+// ===========================================================================
+
+/// `2^w` as a field element (`w` is small — a dictionary-id bit-width, `<= 84`).
+fn pow2_fr(w: usize) -> ArkFr {
+    let mut value = f1();
+    for _ in 0..w {
+        value = value + value;
+    }
+    value
+}
+
+/// The smallest `w` with `2^w > max_val` (so ids in `[0, max_val]` pack injectively at radix
+/// `2^w`). `max_val = 0` gives `w = 1` (a `>= 1` width for the sort domain).
+fn id_pack_width(max_val: usize) -> usize {
+    let mut w = 1usize;
+    while (1u128 << w) <= max_val as u128 {
+        w += 1;
+    }
+    w
+}
+
+/// A distinctness proof for one committed column: the sorted permutation of the column plus
+/// the strict-sortedness of that permutation (⇒ the real prefix `[0, n)` is ALL-DISTINCT).
+#[derive(Clone, Debug)]
+pub struct ColumnDistinctProof {
+    pub perm: RelationPermutationProof,
+    pub com_sorted: ArkGT,
+    pub sorted: SortedProof,
+}
+
+/// Prove the real prefix `[0, n)` of the column committed by `com` (values `column`, padded
+/// to `2^working_log`) is ALL-DISTINCT, given every real entry is a nonnegative integer
+/// `< 2^bits`. Sorts the prefix, proves the sort is a permutation of the committed column,
+/// and proves it strictly increases. Requires `n >= 2` (a `<= 1`-row column is trivially a set).
+fn prove_column_distinct(
+    context: &StoreProverContext<'_>,
+    column: &[ArkFr],
+    com: ArkGT,
+    n: usize,
+    working_log: usize,
+    bits: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<ColumnDistinctProof> {
+    use ark_ff::PrimeField;
+    if n < 2 {
+        return Err(invalid("column-distinct requires at least two rows"));
+    }
+    if bits == 0 || bits > 253 {
+        return Err(invalid("column-distinct key bit-width out of range (need 1..=253)"));
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| column[a].0.into_bigint().cmp(&column[b].0.into_bigint()));
+    let input = RelationWitness {
+        columns: vec![column.to_vec()],
+        commitments: vec![com],
+        log_domain: working_log,
+        n,
+    };
+    let perm = prove_relation_permutation_with_context(context, &input, &order, transcript)?;
+    let com_sorted = perm.commitments[0];
+    let sorted = prove_strictly_sorted_bits_with_context(
+        context, &perm.columns[0], n, bits, &com_sorted, transcript,
+    )?;
+    Ok(ColumnDistinctProof { perm: perm.proof, com_sorted, sorted })
+}
+
+fn verify_column_distinct(
+    com: ArkGT,
+    n: usize,
+    working_log: usize,
+    bits: usize,
+    proof: &ColumnDistinctProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    if n < 2 {
+        return Err(invalid("column-distinct requires at least two rows"));
+    }
+    if bits == 0 || bits > 253 {
+        return Err(invalid("column-distinct key bit-width out of range (need 1..=253)"));
+    }
+    let input = RelationCommit { commitments: vec![com], log_domain: working_log, n };
+    verify_relation_permutation(
+        &input, std::slice::from_ref(&proof.com_sorted), n, working_log, &proof.perm, transcript,
+    )?;
+    verify_strictly_sorted_bits(&proof.com_sorted, n, bits, &proof.sorted, transcript)
+}
+
+/// The bounded canonical-triple key column `id_s + 2^w*id_p + 2^(2w)*id_o` for present (an
+/// injective pack of the three authenticated dict ids, so distinct keys ⇔ distinct triples).
+/// Returns the packed column and the pack bit-width `w`; the caller derives its commitment
+/// homomorphically from the id-column commitments.
+fn present_triple_key(
+    artifacts: &ReconcileArtifacts,
+    head_nv: usize,
+    head_pred: usize,
+) -> io::Result<(Vec<ArkFr>, usize)> {
+    let w = id_pack_width(head_nv.max(head_pred));
+    if 3 * w > 253 {
+        return Err(invalid(
+            "present dedup: dictionary too large to pack a bounded canonical-triple key (need 3*width <= 253)",
+        ));
+    }
+    let wshift = pow2_fr(w);
+    let w2shift = wshift * wshift;
+    let size = artifacts.present_id_s.len();
+    let key: Vec<ArkFr> = (0..size)
+        .map(|i| {
+            artifacts.present_id_s[i] + wshift * artifacts.present_id_p[i] + w2shift * artifacts.present_id_o[i]
+        })
+        .collect();
+    Ok((key, w))
+}
+
+/// The present canonical-triple key COMMITMENT, derived homomorphically from the authenticated
+/// id-column commitments (Dory is linear): `com(id_s) + 2^w*com(id_p) + 2^(2w)*com(id_o)`.
+fn present_triple_key_commitment(auth_s: &PresentIdAuth, auth_p: &PresentIdAuth, auth_o: &PresentIdAuth, w: usize) -> ArkGT {
+    let wshift = pow2_fr(w);
+    let w2shift = wshift * wshift;
+    auth_s.com_id + wshift * auth_p.com_id + w2shift * auth_o.com_id
+}
+
+/// Assert a hash column has NO duplicate (a term appears at most once), by sorting the field
+/// values as integers and checking adjacent distinctness. This is a VERIFIER-side check over
+/// values RECOMPUTED from root-authenticated data — the field-native no-re-mint guard for
+/// ~254-bit hashes (which the magnitude strict-sort's 253-bit gap bound cannot handle).
+fn assert_hashes_unique(mut hashes: Vec<ArkFr>, what: &str) -> io::Result<()> {
+    use ark_ff::PrimeField;
+    hashes.sort_by(|a, b| a.0.into_bigint().cmp(&b.0.into_bigint()));
+    for pair in hashes.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(invalid(format!(
+                "combined {what} dictionary contains a duplicate hash (a term re-minted with two ids across layers)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Assert the COMBINED node/value + predicate dictionaries have NO duplicate hash across the
+/// chain — the real no-re-mint guard (id-distinctness is already guaranteed by the per-layer
+/// term↔id bijection + disjoint watermark ranges). The canonical hashes are recomputed from the
+/// chain catalogs, which are authenticated to the trusted head root by the reconciliation's
+/// per-layer `validate()`; so a re-minted (duplicate-hash) dictionary is soundly rejected.
+fn assert_combined_catalog_hash_unique(views: &[VerifierCommitmentRef<'_>]) -> io::Result<()> {
+    let node_value: Vec<ArkFr> = views
+        .iter()
+        .flat_map(|view| view.node_value_catalog.iter().map(|rec| hash_object(&rec.triple.object)))
+        .collect();
+    assert_hashes_unique(node_value, "node/value")?;
+    let predicate: Vec<ArkFr> = views
+        .iter()
+        .flat_map(|view| view.predicate_catalog.iter().map(|rec| hash_term(&rec.triple.predicate)))
+        .collect();
+    assert_hashes_unique(predicate, "predicate")
 }
 
 /// Prove one RANGED atom over `present`: the authenticated object-value range selection
@@ -1949,13 +2152,27 @@ fn prove_present_bgp(
         return Err(invalid("present BGP needs at least one atom"));
     }
     let m = artifacts.present_len;
-    // (1) Authenticate present's subject/object combined-dict id columns (shared by every atom).
+    let head_nv = layers.last().unwrap().state.node_value_count as usize;
+    let head_pred = layers.last().unwrap().state.predicate_count as usize;
+    // (1) Authenticate present's subject/object/predicate combined-dict id columns.
     let auth_s = prove_id_auth(context, &artifacts.present_id_s, m, &artifacts.nv_dict, transcript)?;
     let auth_o = prove_id_auth(context, &artifacts.present_id_o, m, &artifacts.nv_dict, transcript)?;
+    let auth_p = prove_id_auth(context, &artifacts.present_id_p, m, &artifacts.pred_dict, transcript)?;
+
+    // (1h) TRUST-BOUNDARY HARDENING (Wave 7): present is a SET — no duplicate canonical triple —
+    // proved over the bounded combined-dict-id key `(id_s, id_p, id_o)` on the shared transcript.
+    // (Its soundness in TERM space rests on the combined-dict hash-uniqueness the VERIFIER asserts
+    // from the root-authenticated catalogs — see `assert_combined_catalog_hash_unique`.)
+    let present_distinct = if m >= 2 {
+        let (key, w) = present_triple_key(artifacts, head_nv, head_pred)?;
+        let com_key = present_triple_key_commitment(&auth_s, &auth_p, &auth_o, w);
+        Some(prove_column_distinct(context, &key, com_key, m, artifacts.working_log, 3 * w, transcript)?)
+    } else {
+        None
+    };
 
     // (1r) The combined (id, value, datatype) range dictionary — built ONLY when some atom
     // ranges (so plain plans keep the same transcript as before), authenticated across the chain.
-    let head_nv = layers.last().unwrap().state.node_value_count as usize;
     let range_dict = if bgp_needs_range_dict(atoms) {
         let branches = range_dict_branches(layers)?;
         Some(prove_combined_range_dict(context, &branches, artifacts.working_log, transcript)?)
@@ -2020,6 +2237,8 @@ fn prove_present_bgp(
         PresentBgpProof {
             auth_s,
             auth_o,
+            auth_p,
+            present_distinct,
             range_dict: range_dict.map(|rd| rd.proof),
             atoms: atom_proofs,
             chain,
@@ -2104,9 +2323,42 @@ fn verify_present_bgp(
         return Err(invalid("present BGP atom count mismatch"));
     }
     let m = verified.present_len;
-    // (1) present id authentication against the reconciled hashes.
+    let head_pred = layers.last().unwrap().verifier_view().state.predicate_count as usize;
+    // (1) present id authentication (subject/object vs combined node/value dict, predicate vs
+    //     combined predicate dict) against the reconciled hashes.
     verify_id_auth(&reconcile.combined_nv, m, head_nv, verified.com_present_s, &proof.auth_s, transcript)?;
     verify_id_auth(&reconcile.combined_nv, m, head_nv, verified.com_present_o, &proof.auth_o, transcript)?;
+    verify_id_auth(&reconcile.combined_pred, m, head_pred, verified.com_present_p, &proof.auth_p, transcript)?;
+
+    // (1h) TRUST-BOUNDARY HARDENING (Wave 7): assert the two store invariants the reconcile
+    // verifier's soundness relies on.
+    //   HASH-UNIQUENESS (the no-re-mint guard): the combined node/value + predicate dictionaries
+    //   assign a UNIQUE id per TERM — no hash appears at two ids across the chain. Each layer's own
+    //   dict is a term↔id bijection over a disjoint id range (per-layer `validate` + watermark), so
+    //   combined IDS are already globally distinct; the remaining risk is a term RE-MINTED in two
+    //   layers (same hash, two ids). The catalogs are root-authenticated (each `view.validate()` ran
+    //   in `verify_reconcile_core`), so recomputing their canonical hashes and asserting uniqueness
+    //   directly rejects a re-minted dictionary (a duplicate-hash / bag dictionary).
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    assert_combined_catalog_hash_unique(&views)?;
+    //   present is a SET (no duplicate canonical triple) over the bounded id key; the key commitment
+    //   is DERIVED from the authenticated id commitments, so a fabricated key is rejected. Given
+    //   hash-uniqueness (term ↔ id bijective), id-triple distinctness ⇒ TERM-triple distinctness.
+    //   Presence is fixed by the public present length (a `< 2`-row present is trivially a set).
+    let present_needs_distinct = m >= 2;
+    if present_needs_distinct != proof.present_distinct.is_some() {
+        return Err(invalid("present BGP: present-distinct presence disagrees with the plan"));
+    }
+    if let Some(distinct) = &proof.present_distinct {
+        let w = id_pack_width(head_nv.max(head_pred));
+        if 3 * w > 253 {
+            return Err(invalid(
+                "present dedup: dictionary too large to pack a bounded canonical-triple key (need 3*width <= 253)",
+            ));
+        }
+        let com_key = present_triple_key_commitment(&proof.auth_s, &proof.auth_p, &proof.auth_o, w);
+        verify_column_distinct(com_key, m, verified.working_log, 3 * w, distinct, transcript)?;
+    }
 
     // (1r) The combined range dictionary — required iff (and only iff) some atom ranges.
     let needs_range = bgp_needs_range_dict(atoms);
@@ -2114,7 +2366,6 @@ fn verify_present_bgp(
         return Err(invalid("present BGP: range-dict presence disagrees with the plan"));
     }
     if let Some(range_dict) = &proof.range_dict {
-        let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
         let branches = range_dict_branch_commits(&views)?;
         verify_combined_range_dict(&branches, head_nv, verified.working_log, range_dict, transcript)?;
     }
@@ -3509,5 +3760,98 @@ mod tests {
         let head_root = lref.last().unwrap().state.commitment_root;
         let plain = [atom(var(), "http://ex/age", var())];
         assert!(verify_read_bgp(&lref, head_root, &plain, &[], &rec, &bgp).is_err());
+    }
+
+    // ============================================================
+    // Wave 7 — trust-boundary hardening (present set-ness + combined-dict id uniqueness).
+    // ============================================================
+
+    #[test]
+    fn honest_stack_asserts_present_set_and_dict_hash_unique() {
+        // A normal delta stack: present is asserted duplicate-free (over the id key) AND the
+        // combined dictionaries are asserted hash-unique (no re-mint) — both HOLD (verify passes).
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [atom(var(), "http://ex/p1", var())];
+        let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        assert!(bgp.present_distinct.is_some(), "present duplicate-freeness must be asserted");
+        // The combined catalog hash-uniqueness assertion holds on an honest stack.
+        let views: Vec<VerifierCommitmentRef<'_>> = lref.iter().map(|l| l.verifier_view()).collect();
+        assert_combined_catalog_hash_unique(&views).unwrap();
+        verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap();
+    }
+
+    #[test]
+    fn hash_uniqueness_checker_rejects_a_re_minted_dictionary() {
+        // An honest store cannot re-mint a term (per-layer validate enforces a term↔id bijection
+        // over a disjoint id range), so drive the no-re-mint checker DIRECTLY on a crafted hash
+        // column: a distinct set passes; a duplicate hash (the same term at two ids) is rejected.
+        let distinct = vec![hash_node("http://ex/a"), hash_node("http://ex/b"), hash_node("http://ex/c")];
+        assert_hashes_unique(distinct, "node/value").unwrap();
+        let re_minted = vec![
+            hash_node("http://ex/a"),
+            hash_node("http://ex/b"),
+            hash_node("http://ex/a"), // 'a' registered twice -> a re-minted term
+        ];
+        assert!(assert_hashes_unique(re_minted, "node/value").is_err());
+    }
+
+    #[test]
+    fn distinct_checker_rejects_a_duplicate_column() {
+        // An honest store cannot emit a duplicated present row or a duplicated dict id, so drive
+        // the assert's checker DIRECTLY on a crafted column: a distinct column proves + verifies;
+        // a column with a duplicate has a zero adjacent gap after sorting, which the strict-sort
+        // range check ([1, 2^bits)) rejects — so NO proof exists (the prover cannot lie).
+        let ctx = StoreProverContext::cpu();
+        let log = 3usize; // domain 8
+        let bits = 16usize;
+        let mut column = pad_to(&[ark(3), ark(5), ark(8), ark(2)], log);
+        let com = commit_col(&column);
+        let mut pt = Transcript254::new(b"wave7-distinct");
+        let proof = prove_column_distinct(&ctx, &column, com, 4, log, bits, &mut pt).unwrap();
+        let mut vt = Transcript254::new(b"wave7-distinct");
+        verify_column_distinct(com, 4, log, bits, &proof, &mut vt).unwrap();
+        // Now inject a duplicate (value 3 appears twice): after sorting, the adjacent gap of the
+        // two 3s is 0, which the strict-sort range check rejects — either the prover cannot build
+        // a proof, or the verifier rejects it. No valid distinctness proof passes.
+        column[2] = ark(3);
+        let com_dup = commit_col(&column);
+        let mut dt = Transcript254::new(b"wave7-dup");
+        match prove_column_distinct(&ctx, &column, com_dup, 4, log, bits, &mut dt) {
+            Err(_) => {}
+            Ok(dup_proof) => {
+                let mut dvt = Transcript254::new(b"wave7-dup");
+                assert!(
+                    verify_column_distinct(com_dup, 4, log, bits, &dup_proof, &mut dvt).is_err(),
+                    "the strict-sort assert must reject a duplicated column"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tampered_present_distinct_rejects() {
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [atom(var(), "http://ex/p1", var())];
+        let (rec, mut bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        bgp.present_distinct.as_mut().unwrap().com_sorted =
+            commit_col(&vec![ark(1); 1usize << rec.working_log]);
+        assert!(verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).is_err());
+    }
+
+    #[test]
+    fn dropped_present_distinct_rejects() {
+        // A prover who omits the present-set assertion (as if present had < 2 rows) is rejected:
+        // the verifier fixes the presence from the public present length.
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [atom(var(), "http://ex/p1", var())];
+        let (rec, mut bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        bgp.present_distinct = None;
+        assert!(verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).is_err());
     }
 }
