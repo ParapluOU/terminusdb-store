@@ -129,7 +129,7 @@ fn bind_hash_lookup_statement(transcript: &mut Transcript254, real_n: usize, n_d
 /// The honest witness: `v_hash[i]` is the dict hash of the real dict row whose id equals
 /// `obj_id[i]` (else the `0` sentinel, only on padding rows, which are masked out); `w[j]`
 /// counts the real query rows (`i < real_n`) mapping to dict row `j`.
-fn honest_hash_lookup(
+pub(crate) fn honest_hash_lookup(
     obj_id: &[ArkFr],
     dict_id: &[ArkFr],
     dict_hash: &[ArkFr],
@@ -162,7 +162,7 @@ fn honest_hash_lookup(
 
 /// Prove the batched hash lookup over columns that already share ONE `2^k` domain.
 #[allow(clippy::too_many_arguments)]
-fn prove_hash_lookup_inner(
+pub(crate) fn prove_hash_lookup_inner(
     context: &StoreProverContext<'_>,
     obj_id: &[ArkFr],
     com_obj_id: &ArkGT,
@@ -227,7 +227,7 @@ fn prove_hash_lookup_inner(
 /// Verify the batched hash lookup over columns sharing ONE `2^k` domain. On success the
 /// proof's `com_v_hash` commits the TRUE dict hash of each real `obj_id` row.
 #[allow(clippy::too_many_arguments)]
-fn verify_hash_lookup_inner(
+pub(crate) fn verify_hash_lookup_inner(
     com_obj_id: &ArkGT,
     com_dict_id: &ArkGT,
     com_dict_hash: &ArkGT,

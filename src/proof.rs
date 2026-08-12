@@ -829,6 +829,7 @@ pub mod pairs;
 pub mod permutation;
 pub mod query;
 pub mod range;
+pub mod reconcile;
 pub mod semijoin;
 pub mod relocate;
 pub mod sort;
