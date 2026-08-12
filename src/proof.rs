@@ -2041,6 +2041,8 @@ pub mod commitment {
                     self.predicate_catalog,
                     self.node_value_catalog,
                 ],
+                self.state.parent_node_value_count,
+                self.state.parent_predicate_count,
                 self.state.node_value_count,
                 self.state.predicate_count,
             )?;
@@ -2154,6 +2156,15 @@ pub mod commitment {
             node_value_mappings: Vec<(CanonicalObject, u64)>,
             predicate_mappings: Vec<(Vec<u8>, u64)>,
         ) -> io::Result<Self> {
+            // COMMITMENT DIET (Wave 0): a DELTA layer (parent_state_root == Some) commits
+            // only its add/remove columns + the INCREMENTAL dictionary it introduced. It
+            // must NOT carry the O(state) materialized head view; callers (rebuild) pass an
+            // empty table and the incremental (`parent_count+1..=count`) dictionary mappings.
+            if parent_state_root.is_some() && !materialized.is_empty() {
+                return Err(invalid(
+                    "delta layer commitment must not carry a materialized head view",
+                ));
+            }
             validate_construction_heap_budget(
                 &additions,
                 &removals,
@@ -2199,6 +2210,8 @@ pub mod commitment {
                     &predicate_catalog,
                     &node_value_catalog,
                 ],
+                parent_node_value_count,
+                parent_predicate_count,
                 node_value_count,
                 predicate_count,
             )?;
@@ -2291,6 +2304,16 @@ pub mod commitment {
 
         pub fn validate(&self) -> io::Result<()> {
             self.state.validate()?;
+            // COMMITMENT DIET (Wave 0): a delta layer's materialized columns are NOT bound
+            // by its root, so they MUST be empty — otherwise a decoded sidecar could smuggle
+            // in unbound (untrusted) head rows. A base layer keeps its materialized view.
+            if self.state.parent_state_root.is_some()
+                && (!self.materialized.is_empty() || self.state.materialized_count != 0)
+            {
+                return Err(invalid(
+                    "delta layer commitment must not carry a materialized head view",
+                ));
+            }
             if self.additions.len() > MAX_RECORDS
                 || self.removals.len() > MAX_RECORDS
                 || self.materialized.len() > MAX_RECORDS
@@ -2349,6 +2372,8 @@ pub mod commitment {
                     &self.predicate_catalog,
                     &self.node_value_catalog,
                 ],
+                self.state.parent_node_value_count,
+                self.state.parent_predicate_count,
                 self.state.node_value_count,
                 self.state.predicate_count,
             )?;
@@ -2789,8 +2814,25 @@ pub mod commitment {
         node_value_dict_commitments: &(ArkGT, ArkGT),
         node_value_dict_range_commitments: &(ArkGT, ArkGT),
     ) -> io::Result<ProofHash> {
+        // COMMITMENT DIET (Wave 0): a DELTA layer (parent_state_root == Some) no longer
+        // commits the materialized head view. Its root therefore binds {parent root,
+        // add/remove columns, INCREMENTAL dictionary commitments, counts} and omits the
+        // materialized column commitments AND the (now always-zero) materialized_count.
+        // Because the bound set changed, the delta root uses a BUMPED, distinct domain
+        // (`commitment-root-delta/v6`) so it can never collide with either the byte-
+        // identical v4 base root or a stale pre-diet delta root (which committed the full
+        // materialized view under the v4 domain and now rejects closed on decode).
+        //
+        // A BASE/ROLLUP/SQUASH layer (parent_state_root == None) is untouched: same
+        // `commitment-root/v4` domain, same counts (including materialized_count), and
+        // still binds the materialized column commitments — BYTE-IDENTICAL to before.
+        let is_delta = state.parent_state_root.is_some();
         let mut hasher = Sha256::new();
-        hasher.update(b"terminus-store/proof-of-woql/commitment-root/v4");
+        if is_delta {
+            hasher.update(b"terminus-store/proof-of-woql/commitment-root-delta/v6");
+        } else {
+            hasher.update(b"terminus-store/proof-of-woql/commitment-root/v4");
+        }
         match state.parent_state_root {
             Some(root) => {
                 hasher.update([1u8]);
@@ -2798,29 +2840,42 @@ pub mod commitment {
             }
             None => hasher.update([0u8]),
         }
-        for count in [
-            state.addition_count,
-            state.removal_count,
-            state.materialized_count,
-            state.parent_node_value_count,
-            state.parent_predicate_count,
-            state.node_value_count,
-            state.predicate_count,
-        ] {
+        let counts: &[u64] = if is_delta {
+            &[
+                state.addition_count,
+                state.removal_count,
+                state.parent_node_value_count,
+                state.parent_predicate_count,
+                state.node_value_count,
+                state.predicate_count,
+            ]
+        } else {
+            &[
+                state.addition_count,
+                state.removal_count,
+                state.materialized_count,
+                state.parent_node_value_count,
+                state.parent_predicate_count,
+                state.node_value_count,
+                state.predicate_count,
+            ]
+        };
+        for count in counts {
             hasher.update(count.to_be_bytes());
         }
-        for commitment in column_commitments
-            .iter()
-            .chain(materialized_column_commitments.iter())
-            .chain([
-                &predicate_dict_commitments.0,
-                &predicate_dict_commitments.1,
-                &node_value_dict_commitments.0,
-                &node_value_dict_commitments.1,
-                &node_value_dict_range_commitments.0,
-                &node_value_dict_range_commitments.1,
-            ])
-        {
+        let mut commitments: Vec<&ArkGT> = column_commitments.iter().collect();
+        if !is_delta {
+            commitments.extend(materialized_column_commitments.iter());
+        }
+        commitments.extend([
+            &predicate_dict_commitments.0,
+            &predicate_dict_commitments.1,
+            &node_value_dict_commitments.0,
+            &node_value_dict_commitments.1,
+            &node_value_dict_range_commitments.0,
+            &node_value_dict_range_commitments.1,
+        ]);
+        for commitment in commitments {
             let bytes = serialize_commitment(commitment)?;
             hasher.update((bytes.len() as u64).to_be_bytes());
             hasher.update(&bytes);
@@ -2907,6 +2962,8 @@ pub mod commitment {
                     &self.predicate_catalog,
                     &self.node_value_catalog,
                 ],
+                self.state.parent_node_value_count,
+                self.state.parent_predicate_count,
                 self.state.node_value_count,
                 self.state.predicate_count,
             )?;
@@ -3469,20 +3526,52 @@ pub mod commitment {
         Ok(())
     }
 
+    /// Validate that the (possibly INCREMENTAL) dictionary catalog covers exactly the
+    /// id interval this layer INTRODUCED — `(parent_count, count]` — and that every
+    /// delta/materialized record id introduced by this layer is bound to canonical
+    /// bytes by that catalog.
+    ///
+    /// For a BASE/ROLLUP/SQUASH layer `parent_*_count == 0`, so the interval is the
+    /// full `1..=count` and every record id is bound: this collapses to the exact
+    /// pre-diet check and stays BYTE-IDENTICAL. For a DELTA layer the catalog holds
+    /// only `parent_count+1..=count` (the commitment-diet incremental dictionary), so
+    /// INHERITED ids (`<= parent_count`) are deliberately NOT bound here — they are
+    /// authenticated by an ancestor layer's committed dictionary when the delta stack
+    /// is reconciled at proof time (Wave 1/2). A delta layer is never directly
+    /// query-provable, so no verifier trusts an inherited-id binding from this sidecar.
     #[allow(clippy::too_many_arguments)]
     fn validate_complete_catalog(
         additions: &[ProofRecord],
         removals: &[ProofRecord],
         materialized: &[ProofRecord],
         indexes: [&[ProofRecord]; 3],
+        parent_node_value_count: u64,
+        parent_predicate_count: u64,
         node_value_count: u64,
         predicate_count: u64,
     ) -> io::Result<()> {
         validate_dictionary_catalogs(indexes, node_value_count, predicate_count)?;
-        if indexes[2].len() as u64 != node_value_count || indexes[1].len() as u64 != predicate_count
+        if indexes[2].len() as u64 != node_value_count - parent_node_value_count
+            || indexes[1].len() as u64 != predicate_count - parent_predicate_count
         {
             return Err(invalid(
-                "dictionary catalog does not exactly cover the full id interval",
+                "dictionary catalog does not exactly cover the introduced id interval",
+            ));
+        }
+        // Every catalog id must lie strictly above the inherited watermark. For a base
+        // layer the watermark is 0, so this is vacuous (ids already validated `>= 1`).
+        if indexes[0]
+            .iter()
+            .any(|record| record.subject_id <= parent_node_value_count)
+            || indexes[2]
+                .iter()
+                .any(|record| record.object_id <= parent_node_value_count)
+            || indexes[1]
+                .iter()
+                .any(|record| record.predicate_id <= parent_predicate_count)
+        {
+            return Err(invalid(
+                "dictionary catalog contains an inherited id below the parent watermark",
             ));
         }
 
@@ -3504,16 +3593,23 @@ pub mod commitment {
             .chain(removals.iter())
             .chain(materialized.iter())
         {
-            if subjects_by_id.get(&record.subject_id) != Some(&record.triple.subject)
-                || objects_by_id.get(&record.subject_id)
-                    != Some(&CanonicalObject::Node(record.triple.subject.clone()))
+            // Only ids INTRODUCED by this layer are locally bound to canonical bytes;
+            // inherited ids are authenticated by an ancestor at reconciliation time.
+            if record.subject_id > parent_node_value_count
+                && (subjects_by_id.get(&record.subject_id) != Some(&record.triple.subject)
+                    || objects_by_id.get(&record.subject_id)
+                        != Some(&CanonicalObject::Node(record.triple.subject.clone())))
             {
                 return Err(invalid("subject id is not bound to canonical bytes"));
             }
-            if predicates_by_id.get(&record.predicate_id) != Some(&record.triple.predicate) {
+            if record.predicate_id > parent_predicate_count
+                && predicates_by_id.get(&record.predicate_id) != Some(&record.triple.predicate)
+            {
                 return Err(invalid("predicate id is not bound to canonical bytes"));
             }
-            if objects_by_id.get(&record.object_id) != Some(&record.triple.object) {
+            if record.object_id > parent_node_value_count
+                && objects_by_id.get(&record.object_id) != Some(&record.triple.object)
+            {
                 return Err(invalid("object id is not bound to canonical bytes"));
             }
         }

@@ -3927,6 +3927,10 @@ impl RecursiveRelationEnvelope {
         layer: &LayerCommitment,
         plan: &RelationProofPlan,
     ) -> io::Result<Self> {
+        // COMMITMENT DIET (Wave 0): a delta layer's head view / full dictionary is no
+        // longer committed, so it is not directly provable (LayerTripleCount, BGP leaves,
+        // aggregates all read the materialized head). Reject closed; roll up to a base.
+        super::query::require_base_layer_for_query(&layer.state)?;
         plan.result_shape()?;
         let mut nodes = 0;
         Self::prove_bounded(context, layer, plan, 1, &mut nodes)
@@ -5889,6 +5893,8 @@ impl RecursiveRelationEnvelope {
         expected_root: ProofHash,
         plan: &RelationProofPlan,
     ) -> io::Result<()> {
+        // COMMITMENT DIET (Wave 0): delta layers are not directly query-provable.
+        super::query::require_base_layer_for_query(layer.verifier_view().state)?;
         // Validate the entire caller-supplied tree once with a global node budget before
         // descending through the equally bounded delivered proof tree.
         plan.result_shape()?;
@@ -6938,7 +6944,7 @@ mod tests {
 
     #[test]
     fn recursive_inner_join_roundtrips_and_rejects_tamper() {
-        std::thread::Builder::new().name("inner-join-proof".into()).stack_size(32 * 1024 * 1024)
+        std::thread::Builder::new().name("inner-join-proof".into()).stack_size(256 * 1024 * 1024)
             .spawn(assert_recursive_inner_join_roundtrips_and_rejects_tamper).unwrap().join().unwrap();
     }
 
@@ -7135,36 +7141,17 @@ mod tests {
             .add_value_triple(ValueTriple::new_node(&iri("b"), &iri("q"), &iri("w")))
             .unwrap();
         let head = builder.commit().unwrap().proof_commitment().unwrap();
-        assert_eq!(head.state.materialized_count, 3);
-
-        let envelope = RecursiveRelationEnvelope::prove(&head, &plan).unwrap();
-        envelope
+        // COMMITMENT DIET (Wave 0): a DELTA head no longer commits its materialized head
+        // view or its triple count (materialized_count is now 0 and NOT root-bound), so
+        // LayerTripleCount is not directly provable over a delta head and reject-closes on
+        // BOTH prove and verify. The reconciled delta-stack path (Wave 2/3) will re-enable
+        // logical-stack counts by authenticating the delta chain to the head root.
+        assert!(head.state.parent_state_root.is_some());
+        assert_eq!(head.state.materialized_count, 0);
+        assert!(RecursiveRelationEnvelope::prove(&head, &plan).is_err());
+        // A well-formed empty-base envelope must also refuse to VERIFY against a delta head.
+        assert!(empty
             .verify(&head, head.state.commitment_root, &plan)
-            .unwrap();
-        assert_eq!(envelope.result_columns, vec![vec![ArkFr::from_u64(3)]]);
-        assert_eq!(
-            envelope.result_values,
-            vec![vec![CanonicalResultValue::GeneratedDecimalU64(3)]]
-        );
-        let bytes = envelope.encode().unwrap();
-        let decoded = RecursiveRelationEnvelope::decode(&bytes).unwrap();
-        decoded
-            .verify(&head, head.state.commitment_root, &plan)
-            .unwrap();
-
-        let mut changed = decoded.clone();
-        changed.result_columns[0][0] = ArkFr::from_u64(4);
-        let padded = vec![ArkFr::from_u64(4), ArkFr::zero()];
-        changed.result_commitments[0] = commit_column(&padded).unwrap();
-        changed.result_values = vec![vec![CanonicalResultValue::GeneratedDecimalU64(4)]];
-        assert!(changed.verify(&head, head.state.commitment_root, &plan).is_err());
-
-        let wrong_plan = RelationProofPlan {
-            query_digest: [96u8; 32],
-            kind: RelationProofPlanKind::LayerTripleCount,
-        };
-        assert!(decoded
-            .verify(&head, head.state.commitment_root, &wrong_plan)
             .is_err());
     }
 
@@ -7313,133 +7300,14 @@ mod tests {
                 datatype: CanonicalDatatype::UInt32,
             },
         };
-        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
-        envelope
-            .verify(&layer, layer.state.commitment_root, &plan)
-            .unwrap();
-        assert_eq!(envelope.result_len, 2);
-        let resolved = envelope
-            .result_values
-            .iter()
-            .map(|column| column.clone())
-            .collect::<Vec<_>>();
-        let mut rows = (0..envelope.result_len)
-            .map(|row| (resolved[0][row].clone(), resolved[1][row].clone()))
-            .collect::<Vec<_>>();
-        rows.sort();
-        assert_eq!(
-            envelope.result_values[0],
-            vec![
-                CanonicalResultValue::Object(CanonicalObject::Node(iri("a").into_bytes())),
-                CanonicalResultValue::Object(CanonicalObject::Node(iri("b").into_bytes())),
-            ]
-        );
-        assert!(rows.iter().any(|(key, sum)| {
-            key == &CanonicalResultValue::Object(CanonicalObject::Node(iri("a").into_bytes()))
-                && sum == &CanonicalResultValue::GeneratedDecimalU64(4)
-        }));
-        assert!(rows.iter().any(|(key, sum)| {
-            key == &CanonicalResultValue::Object(CanonicalObject::Node(iri("b").into_bytes()))
-                && sum == &CanonicalResultValue::GeneratedDecimalU64(u64::from(u32::MAX))
-        }));
-        let decoded = RecursiveRelationEnvelope::decode(&envelope.encode().unwrap()).unwrap();
-        decoded
-            .verify(&layer, layer.state.commitment_root, &plan)
-            .unwrap();
-
-        let mut tampered = decoded.clone();
-        tampered.result_columns[1][0] =
-            tampered.result_columns[1][0] + ArkFr::one();
-        let mut padded = tampered.result_columns[1].clone();
-        padded.resize(1usize << tampered.result_log_domain, ArkFr::zero());
-        tampered.result_commitments[1] = commit_column(&padded).unwrap();
-        assert!(tampered
-            .verify(&layer, layer.state.commitment_root, &plan)
-            .is_err());
-
-        let global_plan = RelationProofPlan {
-            query_digest: [103u8; 32],
-            kind: RelationProofPlanKind::GroupSum {
-                input: Box::new(source.clone()),
-                key_columns: vec![],
-                value_column: 2,
-                datatype: CanonicalDatatype::UInt32,
-            },
-        };
-        let global = RecursiveRelationEnvelope::prove(&layer, &global_plan).unwrap();
-        global
-            .verify(&layer, layer.state.commitment_root, &global_plan)
-            .unwrap();
-        assert_eq!(global.result_len, 1);
-        assert_eq!(
-            global.result_values,
-            vec![vec![CanonicalResultValue::GeneratedDecimalU64(
-                u64::from(u32::MAX) + 4,
-            )]]
-        );
-        let mut forged_global = global.clone();
-        forged_global.result_columns[0][0] = ArkFr::from_u64(u64::from(u32::MAX) + 5);
-        forged_global.result_commitments[0] = commit_column(&[
-            ArkFr::from_u64(u64::from(u32::MAX) + 5),
-            ArkFr::zero(),
-        ])
-        .unwrap();
-        assert!(forged_global
-            .verify(&layer, layer.state.commitment_root, &global_plan)
-            .is_err());
-
-        let wrong_datatype = RelationProofPlan {
-            query_digest: [100u8; 32],
-            kind: RelationProofPlanKind::GroupSum {
-                input: Box::new(source),
-                key_columns: vec![0],
-                value_column: 2,
-                datatype: CanonicalDatatype::UInt16,
-            },
-        };
-        assert!(decoded
-            .verify(&layer, layer.state.commitment_root, &wrong_datatype)
-            .is_err());
-
-        let empty_source = RelationProofPlan {
-            query_digest: [102u8; 32],
-            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
-                source: ColumnSource::Materialized,
-                atoms: vec![LayerBgpAtom::all_variables(iri("missing").into_bytes())],
-                joins: Vec::new(),
-            }),
-        };
-        let empty_plan = RelationProofPlan {
-            query_digest: [101u8; 32],
-            kind: RelationProofPlanKind::GroupSum {
-                input: Box::new(empty_source.clone()),
-                key_columns: vec![0],
-                value_column: 1,
-                datatype: CanonicalDatatype::UInt32,
-            },
-        };
-        let empty = RecursiveRelationEnvelope::prove(&layer, &empty_plan).unwrap();
-        empty
-            .verify(&layer, layer.state.commitment_root, &empty_plan)
-            .unwrap();
-        assert_eq!(empty.result_len, 0);
-        assert_eq!(empty.result_values, vec![Vec::new(), Vec::new()]);
-
-        let empty_global_plan = RelationProofPlan {
-            query_digest: [104u8; 32],
-            kind: RelationProofPlanKind::GroupSum {
-                input: Box::new(empty_source),
-                key_columns: vec![],
-                value_column: 1,
-                datatype: CanonicalDatatype::UInt32,
-            },
-        };
-        let empty_global = RecursiveRelationEnvelope::prove(&layer, &empty_global_plan).unwrap();
-        empty_global
-            .verify(&layer, layer.state.commitment_root, &empty_global_plan)
-            .unwrap();
-        assert_eq!(empty_global.result_len, 0);
-        assert_eq!(empty_global.result_values, vec![Vec::new()]);
+        // COMMITMENT DIET (Wave 0): this GroupSum reads the DELTA head's materialized view,
+        // which is no longer committed — proving reject-closes at the envelope entry. The
+        // reconciled delta-stack path (Wave 2/3) will re-enable delta-head aggregates over an
+        // authenticated delta chain. (`source`/`plan` build a materialized-source aggregate.)
+        assert!(layer.state.parent_state_root.is_some());
+        assert!(layer.materialized.is_empty());
+        let _ = &source;
+        assert!(RecursiveRelationEnvelope::prove(&layer, &plan).is_err());
     }
 
     #[test]
@@ -7505,61 +7373,13 @@ mod tests {
                 datatype: CanonicalDatatype::UInt32,
             },
         };
-        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
-        envelope
-            .verify(&layer, layer.state.commitment_root, &plan)
-            .unwrap();
-        assert_eq!(envelope.result_len, 4);
-        let node = |name: &str| {
-            CanonicalResultValue::Object(CanonicalObject::Node(iri(name).into_bytes()))
-        };
-        assert_eq!(envelope.result_values[0], vec![node("a"), node("a"), node("z"), node("z")]);
-        assert_eq!(envelope.result_values[1], vec![node("a"), node("z"), node("a"), node("z")]);
-        assert_eq!(
-            envelope.result_values[2],
-            vec![
-                CanonicalResultValue::GeneratedDecimalU64(12),
-                CanonicalResultValue::GeneratedDecimalU64(12),
-                CanonicalResultValue::GeneratedDecimalU64(3),
-                CanonicalResultValue::GeneratedDecimalU64(3),
-            ]
-        );
-        let decoded = RecursiveRelationEnvelope::decode(&envelope.encode().unwrap()).unwrap();
-        decoded
-            .verify(&layer, layer.state.commitment_root, &plan)
-            .unwrap();
-
-        let reordered = RelationProofPlan {
-            query_digest: [113u8; 32],
-            kind: RelationProofPlanKind::GroupSum {
-                input: Box::new(source.clone()),
-                key_columns: vec![0, 1],
-                value_column: 2,
-                datatype: CanonicalDatatype::UInt32,
-            },
-        };
-        assert!(decoded
-            .verify(&layer, layer.state.commitment_root, &reordered)
-            .is_err());
-        for key_columns in [vec![0, 0], vec![0, 3], vec![0, 1, 2]] {
-            let invalid_plan = RelationProofPlan {
-                query_digest: [114u8; 32],
-                kind: RelationProofPlanKind::GroupSum {
-                    input: Box::new(source.clone()),
-                    key_columns,
-                    value_column: 2,
-                    datatype: CanonicalDatatype::UInt32,
-                },
-            };
-            assert!(invalid_plan.result_shape().is_err());
-        }
-        let mut tampered = decoded;
-        tampered.result_columns[2][2] = ArkFr::from_u64(8);
-        tampered.result_values[2][2] = CanonicalResultValue::GeneratedDecimalU64(8);
-        tampered.result_commitments[2] = commit_column(&tampered.result_columns[2]).unwrap();
-        assert!(tampered
-            .verify(&layer, layer.state.commitment_root, &plan)
-            .is_err());
+        // COMMITMENT DIET (Wave 0): this two-key GroupSum reads the DELTA head's materialized
+        // view, which is no longer committed — proving reject-closes at the envelope entry.
+        // Reconciliation (Wave 2/3) will re-enable delta-head aggregates.
+        assert!(layer.state.parent_state_root.is_some());
+        assert!(layer.materialized.is_empty());
+        let _ = &source;
+        assert!(RecursiveRelationEnvelope::prove(&layer, &plan).is_err());
     }
 
     fn assert_recursive_two_key_group_extrema_uses_declared_node_tuple_order() {
@@ -7617,84 +7437,20 @@ mod tests {
                 kind: GroupExtremaKind::Min,
             },
         };
-        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
-        envelope.verify(&layer, layer.state.commitment_root, &plan).unwrap();
-        let node = |name: &str| {
-            CanonicalResultValue::Object(CanonicalObject::Node(iri(name).into_bytes()))
-        };
-        let value = |value: u32| {
-            CanonicalResultValue::Object(CanonicalObject::from_store_object(
-                &ValueTriple::new_value("", "", u32::make_entry(&value)).object,
-            ))
-        };
-        assert_eq!(envelope.result_len, 4);
-        assert_eq!(envelope.result_values[0], vec![node("a"), node("a"), node("z"), node("z")]);
-        assert_eq!(envelope.result_values[1], vec![node("a"), node("z"), node("a"), node("z")]);
-        assert_eq!(envelope.result_values[2], vec![value(3), value(3), value(1), value(1)]);
-        let decoded = RecursiveRelationEnvelope::decode(&envelope.encode().unwrap()).unwrap();
-        decoded.verify(&layer, layer.state.commitment_root, &plan).unwrap();
-
-        let reordered = RelationProofPlan {
-            query_digest: [132u8; 32],
-            kind: RelationProofPlanKind::GroupExtrema {
-                input: Box::new(source.clone()),
-                key_columns: vec![0, 1],
-                value_column: 2,
-                datatype: CanonicalDatatype::UInt32,
-                kind: GroupExtremaKind::Min,
-            },
-        };
-        assert!(decoded.verify(&layer, layer.state.commitment_root, &reordered).is_err());
-        let max_plan = RelationProofPlan {
-            query_digest: [132u8; 32],
-            kind: RelationProofPlanKind::GroupExtrema {
-                input: Box::new(source.clone()),
-                key_columns: vec![1, 0],
-                value_column: 2,
-                datatype: CanonicalDatatype::UInt32,
-                kind: GroupExtremaKind::Max,
-            },
-        };
-        assert!(decoded.verify(&layer, layer.state.commitment_root, &max_plan).is_err());
-        for key_columns in [vec![0, 0], vec![0, 3], vec![0, 1, 2]] {
-            let invalid = RelationProofPlan {
-                query_digest: [133u8; 32],
-                kind: RelationProofPlanKind::GroupExtrema {
-                    input: Box::new(source.clone()),
-                    key_columns,
-                    value_column: 2,
-                    datatype: CanonicalDatatype::UInt32,
-                    kind: GroupExtremaKind::Min,
-                },
-            };
-            assert!(invalid.result_shape().is_err());
-        }
-        let RecursiveRelationProof::GroupExtrema { input } = &decoded.proof else {
-            unreachable!()
-        };
-        assert!(derived_group_extrema_columns(
-            &layer,
-            input,
-            &[2],
-            0,
-            CanonicalDatatype::UInt32,
-            GroupExtremaKind::Min,
-        )
-        .is_err());
-        let non_extreme_row = input.result_values[2]
-            .iter().position(|candidate| candidate == &value(4)).unwrap();
-        let mut tampered = decoded.clone();
-        tampered.result_columns[2][0] = input.result_columns[2][non_extreme_row];
-        tampered.result_values[2][0] = input.result_values[2][non_extreme_row].clone();
-        tampered.result_commitments[2] = commit_column(&tampered.result_columns[2]).unwrap();
-        assert!(tampered.verify(&layer, layer.state.commitment_root, &plan).is_err());
+        // COMMITMENT DIET (Wave 0): this two-key GroupExtrema reads the DELTA head's
+        // materialized view, which is no longer committed — proving reject-closes at the
+        // envelope entry. Reconciliation (Wave 2/3) will re-enable delta-head aggregates.
+        assert!(layer.state.parent_state_root.is_some());
+        assert!(layer.materialized.is_empty());
+        let _ = &source;
+        assert!(RecursiveRelationEnvelope::prove(&layer, &plan).is_err());
     }
 
     #[test]
     fn recursive_two_key_group_extrema_uses_declared_node_tuple_order() {
         std::thread::Builder::new()
             .name("recursive-two-key-group-extrema".into())
-            .stack_size(32 * 1024 * 1024)
+            .stack_size(256 * 1024 * 1024)
             .spawn(assert_recursive_two_key_group_extrema_uses_declared_node_tuple_order)
             .unwrap()
             .join()
@@ -7757,7 +7513,7 @@ mod tests {
     fn recursive_zero_key_group_extrema_emits_only_for_nonempty_input() {
         std::thread::Builder::new()
             .name("recursive-zero-key-group-extrema".into())
-            .stack_size(32 * 1024 * 1024)
+            .stack_size(256 * 1024 * 1024)
             .spawn(assert_recursive_zero_key_group_extrema_emits_only_for_nonempty_input)
             .unwrap()
             .join()
@@ -7823,57 +7579,13 @@ mod tests {
                 key_columns: vec![1, 0],
             },
         };
-        let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
-        envelope
-            .verify(&layer, layer.state.commitment_root, &plan)
-            .unwrap();
-        let node = |name: &str| {
-            CanonicalResultValue::Object(CanonicalObject::Node(iri(name).into_bytes()))
-        };
-        assert_eq!(envelope.result_len, 4);
-        assert_eq!(envelope.result_values[0], vec![node("a"), node("a"), node("z"), node("z")]);
-        assert_eq!(envelope.result_values[1], vec![node("a"), node("z"), node("a"), node("z")]);
-        assert_eq!(
-            envelope.result_values[2],
-            vec![
-                CanonicalResultValue::GeneratedDecimalU64(3),
-                CanonicalResultValue::GeneratedDecimalU64(3),
-                CanonicalResultValue::GeneratedDecimalU64(2),
-                CanonicalResultValue::GeneratedDecimalU64(2),
-            ]
-        );
-        let decoded = RecursiveRelationEnvelope::decode(&envelope.encode().unwrap()).unwrap();
-        decoded
-            .verify(&layer, layer.state.commitment_root, &plan)
-            .unwrap();
-
-        let reordered = RelationProofPlan {
-            query_digest: [118u8; 32],
-            kind: RelationProofPlanKind::GroupCount {
-                input: Box::new(source.clone()),
-                key_columns: vec![0, 1],
-            },
-        };
-        assert!(decoded
-            .verify(&layer, layer.state.commitment_root, &reordered)
-            .is_err());
-        for key_columns in [vec![0, 0], vec![0, 3], vec![0, 1, 2]] {
-            let invalid = RelationProofPlan {
-                query_digest: [119u8; 32],
-                kind: RelationProofPlanKind::GroupCount {
-                    input: Box::new(source.clone()),
-                    key_columns,
-                },
-            };
-            assert!(invalid.result_shape().is_err());
-        }
-        let mut tampered = decoded;
-        tampered.result_columns[2][0] = ArkFr::from_u64(4);
-        tampered.result_values[2][0] = CanonicalResultValue::GeneratedDecimalU64(4);
-        tampered.result_commitments[2] = commit_column(&tampered.result_columns[2]).unwrap();
-        assert!(tampered
-            .verify(&layer, layer.state.commitment_root, &plan)
-            .is_err());
+        // COMMITMENT DIET (Wave 0): this two-key GroupCount reads the DELTA head's
+        // materialized view, which is no longer committed — proving reject-closes at the
+        // envelope entry. Reconciliation (Wave 2/3) will re-enable delta-head aggregates.
+        assert!(layer.state.parent_state_root.is_some());
+        assert!(layer.materialized.is_empty());
+        let _ = &source;
+        assert!(RecursiveRelationEnvelope::prove(&layer, &plan).is_err());
     }
 
     #[test]
@@ -8352,126 +8064,16 @@ mod tests {
                 datatype: CanonicalDatatype::Int64,
             },
         };
-        let keyed = RecursiveRelationEnvelope::prove(&layer, &keyed_plan).unwrap();
-        keyed
-            .verify(&layer, layer.state.commitment_root, &keyed_plan)
-            .unwrap();
-        assert_eq!(
-            keyed.result_descriptors[1].namespace,
-            ResultIdNamespace::GeneratedDecimalI64
-        );
-        assert_eq!(
-            keyed.result_values[0],
-            vec![
-                CanonicalResultValue::Object(CanonicalObject::Node(iri("a").into_bytes())),
-                CanonicalResultValue::Object(CanonicalObject::Node(iri("b").into_bytes())),
-            ]
-        );
-        assert_eq!(
-            keyed.result_values[1],
-            vec![
-                CanonicalResultValue::GeneratedDecimalI64(-1),
-                CanonicalResultValue::GeneratedDecimalI64(0),
-            ]
-        );
-        let decoded = RecursiveRelationEnvelope::decode(&keyed.encode().unwrap()).unwrap();
-        decoded
-            .verify(&layer, layer.state.commitment_root, &keyed_plan)
-            .unwrap();
+        // COMMITMENT DIET (Wave 0): every GroupSum / generated-filter over this DELTA head
+        // reads its materialized view (no longer committed), so proving reject-closes at the
+        // envelope entry. Reconciliation (Wave 2/3) will re-enable delta-head aggregates.
+        assert!(layer.state.parent_state_root.is_some());
+        assert!(layer.materialized.is_empty());
+        let _ = &keyed_plan;
+        assert!(RecursiveRelationEnvelope::prove(&layer, &keyed_plan).is_err());
 
-        let filter = |op, constant, constant_on_left| RelationProofPlan {
-            query_digest: [111u8; 32],
-            kind: RelationProofPlanKind::GeneratedI64Filter {
-                input: Box::new(keyed_plan.clone()),
-                column: 1,
-                op,
-                constant,
-                constant_on_left,
-            },
-        };
-        for (op, constant, constant_on_left, expected_len) in [
-            (GeneratedU64ComparisonOp::Eq, -1, false, 1),
-            (GeneratedU64ComparisonOp::Eq, 1, false, 0),
-            (GeneratedU64ComparisonOp::Lt, 0, false, 1),
-            (GeneratedU64ComparisonOp::Le, 0, false, 2),
-            (GeneratedU64ComparisonOp::Gt, -1, false, 1),
-            (GeneratedU64ComparisonOp::Ge, -1, false, 2),
-            (GeneratedU64ComparisonOp::Lt, -1, true, 1),
-            (GeneratedU64ComparisonOp::Le, -1, true, 2),
-            (GeneratedU64ComparisonOp::Ge, i64::MIN, false, 2),
-            (GeneratedU64ComparisonOp::Le, i64::MAX, false, 2),
-        ] {
-            let plan = filter(op, constant, constant_on_left);
-            let envelope = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
-            envelope
-                .verify(&layer, layer.state.commitment_root, &plan)
-                .unwrap();
-            assert_eq!(envelope.result_len, expected_len);
-            RecursiveRelationEnvelope::decode(&envelope.encode().unwrap())
-                .unwrap()
-                .verify(&layer, layer.state.commitment_root, &plan)
-                .unwrap();
-        }
-
-        let retained_plan = filter(GeneratedU64ComparisonOp::Lt, 0, false);
-        let retained = RecursiveRelationEnvelope::prove(&layer, &retained_plan).unwrap();
-        assert_eq!(
-            retained.result_values[1],
-            vec![CanonicalResultValue::GeneratedDecimalI64(-1)]
-        );
-        assert!(retained
-            .verify(
-                &layer,
-                layer.state.commitment_root,
-                &filter(GeneratedU64ComparisonOp::Le, 0, false),
-            )
-            .is_err());
-        assert!(retained
-            .verify(
-                &layer,
-                layer.state.commitment_root,
-                &filter(GeneratedU64ComparisonOp::Lt, 0, true),
-            )
-            .is_err());
-        let wrong_unsigned_domain = RelationProofPlan {
-            query_digest: [111u8; 32],
-            kind: RelationProofPlanKind::GeneratedU64Filter {
-                input: Box::new(keyed_plan.clone()),
-                column: 1,
-                op: GeneratedU64ComparisonOp::Lt,
-                constant: 0,
-                constant_on_left: false,
-            },
-        };
-        assert!(wrong_unsigned_domain.result_shape().is_err());
-        let mut filtered_tamper = retained;
-        filtered_tamper.result_columns[1][0] = generated_decimal_i64_field(1);
-        filtered_tamper.result_values[1][0] = CanonicalResultValue::GeneratedDecimalI64(1);
-        filtered_tamper.result_commitments[1] = commit_column(&[
-            generated_decimal_i64_field(1),
-            ArkFr::zero(),
-        ])
-        .unwrap();
-        assert!(filtered_tamper
-            .verify(&layer, layer.state.commitment_root, &retained_plan)
-            .is_err());
-
-        let mut sign_tamper = decoded.clone();
-        sign_tamper.result_columns[1][0] = generated_decimal_i64_field(1);
-        let mut padded = sign_tamper.result_columns[1].clone();
-        padded.resize(1usize << sign_tamper.result_log_domain, ArkFr::zero());
-        sign_tamper.result_commitments[1] = commit_column(&padded).unwrap();
-        assert!(sign_tamper
-            .verify(&layer, layer.state.commitment_root, &keyed_plan)
-            .is_err());
-
-        let mut domain_tamper = decoded.clone();
-        domain_tamper.result_descriptors[1].namespace =
-            ResultIdNamespace::GeneratedDecimalU64;
-        assert!(domain_tamper
-            .verify(&layer, layer.state.commitment_root, &keyed_plan)
-            .is_err());
-
+        // The signed-value OVERFLOW authentication below runs over BASE layers and is
+        // unaffected by the commitment diet, so it is retained verbatim.
         let global_plan = RelationProofPlan {
             query_digest: [110u8; 32],
             kind: RelationProofPlanKind::GroupSum {
@@ -8481,15 +8083,6 @@ mod tests {
                 datatype: CanonicalDatatype::Int64,
             },
         };
-        let global = RecursiveRelationEnvelope::prove(&layer, &global_plan).unwrap();
-        global
-            .verify(&layer, layer.state.commitment_root, &global_plan)
-            .unwrap();
-        assert_eq!(
-            global.result_values,
-            vec![vec![CanonicalResultValue::GeneratedDecimalI64(-1)]]
-        );
-
         let overflow_layer = |values: [i64; 2]| {
             let store = open_sync_memory_store();
             let builder = store.create_base_layer().unwrap();
@@ -8525,7 +8118,7 @@ mod tests {
     fn recursive_group_sum_authenticates_signed_values_domains_and_overflow() {
         std::thread::Builder::new()
             .name("store-generated-i64-filter-proof".into())
-            .stack_size(32 * 1024 * 1024)
+            .stack_size(256 * 1024 * 1024)
             .spawn(assert_recursive_group_sum_authenticates_signed_values_domains_and_overflow)
             .unwrap()
             .join()
@@ -8676,7 +8269,7 @@ mod tests {
         // test the same explicit headroom used by ordinary proving hosts.
         std::thread::Builder::new()
             .name("ordered-slice-proof".into())
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(256 * 1024 * 1024)
             .spawn(assert_recursive_ordered_slice_roundtrips_and_rejects_content_and_plan_tamper)
             .unwrap()
             .join()
@@ -8719,7 +8312,7 @@ mod tests {
 
     #[test]
     fn recursive_multikey_order_roundtrip_and_tamper() {
-        std::thread::Builder::new().name("multi-order-proof".into()).stack_size(24 * 1024 * 1024)
+        std::thread::Builder::new().name("multi-order-proof".into()).stack_size(256 * 1024 * 1024)
             .spawn(assert_recursive_multikey_order_roundtrip_and_tamper).unwrap().join().unwrap();
     }
 

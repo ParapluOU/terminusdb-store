@@ -155,6 +155,24 @@ fn source_column_commitments(
     }
 }
 
+/// COMMITMENT DIET (Wave 0): a DELTA layer (`parent_state_root == Some`) no longer
+/// commits its materialized head view (it is empty and NOT root-bound) and commits only
+/// the INCREMENTAL dictionary it introduced, so an inherited constant (e.g. a predicate
+/// defined in an ancestor) cannot be resolved locally. A delta layer is therefore NOT
+/// directly query-provable at the store level — matching the compiler's base-only gate.
+/// Direct delta-head queries reject closed here; the reconciled delta-stack path
+/// (Wave 2/3) will re-enable them by authenticating terms across the chain. Roll up or
+/// squash a delta stack to a base layer to query it directly today.
+pub(crate) fn require_base_layer_for_query(state: &CommitmentState) -> io::Result<()> {
+    if state.parent_state_root.is_some() {
+        return Err(invalid(
+            "delta layer is not directly query-provable after the commitment diet; \
+             roll up/squash to a base layer or use the reconciled delta-stack path",
+        ));
+    }
+    Ok(())
+}
+
 /// The real (unpadded) row count committed for `source`, used as the real-length pin
 /// everywhere the materialized count was. All three counts are bound by `commitment_root`.
 fn source_count(state: &CommitmentState, source: ColumnSource) -> u64 {
@@ -251,6 +269,7 @@ pub fn prove_layer_filter_with_source(
     column_source: ColumnSource,
     predicate_term: &[u8],
 ) -> io::Result<(CombinedFilterProof, ArkGT, ArkGT, usize, u64)> {
+    require_base_layer_for_query(&layer.state)?;
     let (s, p, o, n) = source_layer_columns(layer, column_source)?;
     let predicate_id = resolve_predicate_id(layer, predicate_term)?;
 
@@ -336,6 +355,7 @@ pub fn verify_layer_filter_with_source(
     proof: &CombinedFilterProof,
 ) -> io::Result<()> {
     let layer = source.verifier_view();
+    require_base_layer_for_query(layer.state)?;
     // FIX 4: pin to an EXTERNALLY-trusted root FIRST (mirroring import_pack's
     // external-root check), so the proof is bound to a root the verifier already
     // trusts rather than whatever LayerCommitment the prover supplied.
@@ -2365,6 +2385,7 @@ pub fn prove_layer_bgp_with_result_and_context(
     layer: &LayerCommitment,
     plan: &LayerBgpPlan,
 ) -> io::Result<LayerBgpResult> {
+    require_base_layer_for_query(&layer.state)?;
     let k = validate_bgp_plan(plan)?;
     // Plan-DEFAULT columns/count. Each RELATIONAL atom RE-sources its own `(s, p, o, n)` from
     // `atom.source` inside the loop below (that is what admits a cross-source join); the
@@ -2649,6 +2670,7 @@ pub fn verify_layer_bgp(
     proof: &LayerBgpProof,
 ) -> io::Result<()> {
     let layer = source.verifier_view();
+    require_base_layer_for_query(layer.state)?;
     // Anchor to an EXTERNALLY-trusted root FIRST (FIX 4), before any sub-proof.
     if layer.state.commitment_root != expected_root {
         return Err(invalid(
@@ -3178,30 +3200,14 @@ mod tests {
         let lc = head.proof_commitment().unwrap();
         assert_eq!(lc.state.addition_count, 1);
         assert_eq!(lc.state.removal_count, 1);
-        assert_eq!(lc.state.materialized_count, 3);
-        let subjects: Vec<_> = lc
-            .materialized
-            .iter()
-            .map(|record| record.triple.subject.as_slice())
-            .collect();
-        assert!(!subjects.contains(&iri("a1").as_bytes()));
-        assert!(subjects.contains(&iri("a2").as_bytes()));
-        assert!(subjects.contains(&iri("a3").as_bytes()));
-        assert!(subjects.contains(&iri("a4").as_bytes()));
-
-        let (proof, com_s, com_o, m, id) = prove_layer_filter(&lc, P1).unwrap();
-        verify_layer_filter(
-            &lc,
-            lc.state.commitment_root,
-            P1,
-            id,
-            &com_s,
-            &com_o,
-            m,
-            &proof,
-        )
-        .unwrap();
-        assert_eq!(m, 3);
+        // COMMITMENT DIET (Wave 0): a delta layer no longer carries a materialized head
+        // view (empty, count 0) and is not directly query-provable — its head view and
+        // inherited constants are not locally committed. Direct proving reject-closes;
+        // the reconciled delta-stack path (Wave 2/3) will re-enable delta-head queries.
+        assert!(lc.state.parent_state_root.is_some());
+        assert!(lc.materialized.is_empty());
+        assert_eq!(lc.state.materialized_count, 0);
+        assert!(prove_layer_filter(&lc, P1).is_err());
     }
 
     #[test]
@@ -3225,22 +3231,12 @@ mod tests {
         assert_eq!(lc.state.removal_count, 0);
         assert!(lc.state.parent_state_root.is_some());
         assert_eq!(lc.state.addition_count, 2);
-        assert_eq!(lc.state.materialized_count, 4);
-
+        // COMMITMENT DIET (Wave 0): no materialized head view is committed for a delta
+        // layer, and it is not directly query-provable (reject-close).
+        assert!(lc.materialized.is_empty());
+        assert_eq!(lc.state.materialized_count, 0);
         let pn: &[u8] = b"http://ex/pn";
-        let (proof, com_sout, com_oout, m, id) = prove_layer_filter(&lc, pn).unwrap();
-        verify_layer_filter(
-            &lc,
-            lc.state.commitment_root,
-            pn,
-            id,
-            &com_sout,
-            &com_oout,
-            m,
-            &proof,
-        )
-        .unwrap();
-        assert_eq!(m, 2);
+        assert!(prove_layer_filter(&lc, pn).is_err());
     }
 
     // ---- Delta reads: AddedTriple / DeletedTriple over the layer's own delta files ----
@@ -3274,145 +3270,79 @@ mod tests {
         head.proof_commitment().unwrap()
     }
 
-    // Prove + verify `t(?s, p1, ?o)` over `source`, returning the sorted subject IRIs of the
-    // complete authenticated result (root-bound + re-resolved from the committed dictionary).
-    fn prove_verify_source_subjects(
-        lc: &LayerCommitment,
-        source: ColumnSource,
-    ) -> Vec<String> {
+    // COMMITMENT DIET (Wave 0): a direct query `t(?s, p1, ?o)` over a DELTA layer
+    // reject-closes for EVERY column source. Additions/removals columns are still
+    // root-bound, but a delta layer no longer commits its materialized head view and
+    // commits only the INCREMENTAL dictionary it introduced, so an inherited constant
+    // (here p1, defined in the base) cannot be resolved locally. The reconciled
+    // delta-stack path (Wave 2/3) will re-enable delta-head queries by authenticating
+    // terms across the chain; today, roll up/squash to a base layer to query directly.
+    fn assert_delta_query_rejects(lc: &LayerCommitment, source: ColumnSource) {
+        assert!(lc.state.parent_state_root.is_some());
         let plan = LayerBgpPlan::with_source(
             vec![LayerBgpAtom::all_variables(P1.to_vec())],
             Vec::new(),
             source,
         );
-        let result = prove_layer_bgp_with_result(lc, &plan).unwrap();
-        verify_layer_bgp(
-            lc,
-            lc.state.commitment_root,
-            &plan,
-            &result.predicate_ids,
-            &result.result_commitments,
-            result.result_len,
-            &result.proof,
-        )
-        .unwrap();
-        let columns = result.real_columns();
-        let objects =
-            resolve_node_value_result_objects(lc, lc.state.commitment_root, &columns).unwrap();
-        let mut subjects: Vec<String> = objects[0]
-            .iter()
-            .map(|object| match object {
-                CanonicalObject::Node(bytes) => String::from_utf8(bytes.clone()).unwrap(),
-                other => panic!("subject must be a node, got {:?}", other),
-            })
-            .collect();
-        subjects.sort();
-        subjects
+        assert!(prove_layer_bgp_with_result(lc, &plan).is_err());
     }
 
     #[test]
-    fn delta_added_and_removed_triples_prove_exactly_their_delta_rows() {
+    fn delta_added_and_removed_triples_reject_direct_query_after_diet() {
         let lc = delta_layer();
         assert!(lc.state.parent_state_root.is_some());
         assert_eq!(lc.state.addition_count, 2);
         assert_eq!(lc.state.removal_count, 2);
-        assert_eq!(lc.state.materialized_count, 4);
-
-        // AddedTriple(?s, p1, ?o) proves EXACTLY the child's added rows (count == addition_count).
-        assert_eq!(
-            prove_verify_source_subjects(&lc, ColumnSource::Additions),
-            vec![iri("a5"), iri("a6")]
-        );
-        // DeletedTriple(?s, p1, ?o) proves EXACTLY the child's removed rows.
-        assert_eq!(
-            prove_verify_source_subjects(&lc, ColumnSource::Removals),
-            vec![iri("a1"), iri("a2")]
-        );
-        // The complete head view still proves all live rows (unchanged behavior).
-        assert_eq!(
-            prove_verify_source_subjects(&lc, ColumnSource::Materialized),
-            vec![iri("a3"), iri("a4"), iri("a5"), iri("a6")]
-        );
+        // No materialized head-view dump on a delta layer any more.
+        assert!(lc.materialized.is_empty());
+        assert_eq!(lc.state.materialized_count, 0);
+        // Every source reject-closes (Additions/Removals/Materialized alike).
+        assert_delta_query_rejects(&lc, ColumnSource::Additions);
+        assert_delta_query_rejects(&lc, ColumnSource::Removals);
+        assert_delta_query_rejects(&lc, ColumnSource::Materialized);
     }
 
     #[test]
     fn inherited_row_is_not_an_added_or_deleted_triple() {
+        // (Wave 0) A delta layer is not directly query-provable; every source reject-closes.
         let lc = delta_layer();
-        // a3 is inherited: visible in `materialized`, never added OR removed by this child.
-        let added = prove_verify_source_subjects(&lc, ColumnSource::Additions);
-        assert!(!added.contains(&iri("a3")));
-        let removed = prove_verify_source_subjects(&lc, ColumnSource::Removals);
-        // A still-present row is not a DeletedTriple; a freshly added row is not a removal.
-        assert!(!removed.contains(&iri("a3")));
-        assert!(!removed.contains(&iri("a5")));
+        assert_delta_query_rejects(&lc, ColumnSource::Additions);
+        assert_delta_query_rejects(&lc, ColumnSource::Removals);
     }
 
     #[test]
     fn delta_source_substitution_fails_verification() {
+        // (Wave 0) Direct delta proving reject-closes at the BGP entry before any
+        // source-substitution attack can even be set up.
         let lc = delta_layer();
-        let root = lc.state.commitment_root;
-        let atoms = vec![LayerBgpAtom::all_variables(P1.to_vec())];
-        let additions =
-            LayerBgpPlan::with_source(atoms.clone(), Vec::new(), ColumnSource::Additions);
-        let removals =
-            LayerBgpPlan::with_source(atoms.clone(), Vec::new(), ColumnSource::Removals);
-        let materialized =
-            LayerBgpPlan::with_source(atoms, Vec::new(), ColumnSource::Materialized);
-
-        // A proof produced for Additions is bound to the additions columns + the source tag.
-        let result = prove_layer_bgp_with_result(&lc, &additions).unwrap();
-        verify_layer_bgp(
-            &lc,
-            root,
-            &additions,
-            &result.predicate_ids,
-            &result.result_commitments,
-            result.result_len,
-            &result.proof,
-        )
-        .unwrap();
-        // Verifying the SAME proof against a different declared source fails: the column
-        // commitments diverge (additions vs removals) and the transcript source tag diverges;
-        // the materialized substitution also mismatches the committed row count/dimension.
-        for other in [&removals, &materialized] {
-            assert!(verify_layer_bgp(
-                &lc,
-                root,
-                other,
-                &result.predicate_ids,
-                &result.result_commitments,
-                result.result_len,
-                &result.proof,
-            )
-            .is_err());
+        for source in [
+            ColumnSource::Additions,
+            ColumnSource::Removals,
+            ColumnSource::Materialized,
+        ] {
+            let plan = LayerBgpPlan::with_source(
+                vec![LayerBgpAtom::all_variables(P1.to_vec())],
+                Vec::new(),
+                source,
+            );
+            assert!(prove_layer_bgp_with_result(&lc, &plan).is_err());
         }
     }
 
     #[test]
-    fn delta_filter_entry_proves_additions_and_removals() {
-        // The legacy Q1 filter entry, threaded with a delta source, mirrors the BGP path.
+    fn delta_filter_entry_rejects_after_diet() {
+        // The legacy Q1 filter entry also reject-closes over a delta layer for every source.
         let lc = delta_layer();
-        let root = lc.state.commitment_root;
-        for (source, expected) in [
-            (ColumnSource::Additions, 2usize),
-            (ColumnSource::Removals, 2usize),
-            (ColumnSource::Materialized, 4usize),
+        for source in [
+            ColumnSource::Additions,
+            ColumnSource::Removals,
+            ColumnSource::Materialized,
         ] {
-            let (proof, com_s, com_o, m, id) =
-                prove_layer_filter_with_source(&StoreProverContext::cpu(), &lc, source, P1)
-                    .unwrap();
-            assert_eq!(m, expected);
-            verify_layer_filter_with_source(
-                &lc, root, source, P1, id, &com_s, &com_o, m, &proof,
-            )
-            .unwrap();
-            // Wrong source rejects (defense in depth beyond the BGP path).
-            let wrong = match source {
-                ColumnSource::Additions => ColumnSource::Removals,
-                _ => ColumnSource::Additions,
-            };
-            assert!(verify_layer_filter_with_source(
-                &lc, root, wrong, P1, id, &com_s, &com_o, m, &proof,
+            assert!(prove_layer_filter_with_source(
+                &StoreProverContext::cpu(),
+                &lc,
+                source,
+                P1
             )
             .is_err());
         }
@@ -3423,30 +3353,6 @@ mod tests {
     const PADD: &[u8] = b"http://ex/padd";
     const PMAT: &[u8] = b"http://ex/pmat";
     const PREM: &[u8] = b"http://ex/prem";
-
-    // Resolve every result column through the root-bound node/value dictionary into node IRIs,
-    // returning the sorted rows (one Vec<String> per result row) for exact-content assertions.
-    fn resolve_rows(lc: &LayerCommitment, columns: &[Vec<ArkFr>]) -> Vec<Vec<String>> {
-        let objects =
-            resolve_node_value_result_objects(lc, lc.state.commitment_root, columns).unwrap();
-        let ncols = objects.len();
-        let nrows = objects.first().map_or(0, |col| col.len());
-        let mut rows = Vec::with_capacity(nrows);
-        for r in 0..nrows {
-            let mut row = Vec::with_capacity(ncols);
-            for col in objects.iter() {
-                match &col[r] {
-                    CanonicalObject::Node(bytes) => {
-                        row.push(String::from_utf8(bytes.clone()).unwrap())
-                    }
-                    other => panic!("expected a node result, got {other:?}"),
-                }
-            }
-            rows.push(row);
-        }
-        rows.sort();
-        rows
-    }
 
     // Base pmat edges y{i}->z{i} (inherited into materialized); child ADDS padd edges
     // x{i}->y{i} (into BOTH the additions delta AND the materialized head).
@@ -3534,44 +3440,27 @@ mod tests {
     }
 
     #[test]
-    fn cross_source_additions_join_materialized_proves_exact_rows() {
+    fn cross_source_additions_join_materialized_rejects_after_diet() {
+        // (Wave 0) A cross-source join reading a delta layer's Materialized head view is no
+        // longer provable — the head view is not committed and a delta layer is not directly
+        // query-provable. It reject-closes at the BGP entry.
         let lc = cross_source_add_mat_layer();
+        assert!(lc.state.parent_state_root.is_some());
         assert_eq!(lc.state.addition_count, 2);
-        assert_eq!(lc.state.materialized_count, 4);
-        let root = lc.state.commitment_root;
-        let plan = additions_join_materialized_plan();
-
-        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
-        verify_layer_bgp(
-            &lc,
-            root,
-            &plan,
-            &result.predicate_ids,
-            &result.result_commitments,
-            result.result_len,
-            &result.proof,
-        )
-        .unwrap();
-        verify_layer_bgp_result_log_domain(&lc, &plan, &result.proof, result.result_log_domain)
-            .unwrap();
-
-        // Exactly the two joined rows (?x, ?y, ?z): x_i -> y_i (added) then y_i -> z_i (mat).
-        assert_eq!(result.result_len, 2);
-        assert_eq!(
-            resolve_rows(&lc, &result.real_columns()),
-            vec![
-                vec![iri("x1"), iri("y1"), iri("z1")],
-                vec![iri("x2"), iri("y2"), iri("z2")],
-            ]
-        );
+        assert!(lc.materialized.is_empty());
+        assert_eq!(lc.state.materialized_count, 0);
+        assert!(prove_layer_bgp_with_result(&lc, &additions_join_materialized_plan()).is_err());
     }
 
     #[test]
-    fn cross_source_additions_join_removals_proves_exact_rows() {
+    fn cross_source_additions_join_removals_rejects_after_diet() {
+        // (Wave 0) Even an additions⋈removals join (both delta sources ARE root-bound) is
+        // rejected as a DIRECT delta-layer query. The reconciled delta-stack path (Wave 2/3)
+        // will carry cross-source delta joins over an authenticated delta stack instead.
         let lc = cross_source_add_rem_layer();
+        assert!(lc.state.parent_state_root.is_some());
         assert_eq!(lc.state.addition_count, 2);
         assert_eq!(lc.state.removal_count, 2);
-        let root = lc.state.commitment_root;
         let plan = LayerBgpPlan {
             source: ColumnSource::Materialized,
             atoms: vec![
@@ -3584,116 +3473,7 @@ mod tests {
                 additional_keys: Vec::new(),
             }],
         };
-
-        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
-        verify_layer_bgp(
-            &lc,
-            root,
-            &plan,
-            &result.predicate_ids,
-            &result.result_commitments,
-            result.result_len,
-            &result.proof,
-        )
-        .unwrap();
-        assert_eq!(result.result_len, 2);
-        // ?x -> ?y is an ADDED edge; ?y -> ?z is a REMOVED edge; joined on ?y.
-        assert_eq!(
-            resolve_rows(&lc, &result.real_columns()),
-            vec![
-                vec![iri("x1"), iri("y1"), iri("z1")],
-                vec![iri("x2"), iri("y2"), iri("z2")],
-            ]
-        );
-    }
-
-    #[test]
-    fn cross_source_atom_source_relabel_fails_verification() {
-        // An honest additions⋈materialized proof, re-verified under a plan whose per-atom
-        // sources were RELABELLED, must fail: the verifier sources each atom's committed
-        // columns/count from ITS trusted per-atom source, and the transcript per-atom override
-        // tags diverge (per-atom source anti-substitution).
-        let lc = cross_source_add_mat_layer();
-        let root = lc.state.commitment_root;
-        let honest = additions_join_materialized_plan();
-        let result = prove_layer_bgp_with_result(&lc, &honest).unwrap();
-        verify_layer_bgp(
-            &lc,
-            root,
-            &honest,
-            &result.predicate_ids,
-            &result.result_commitments,
-            result.result_len,
-            &result.proof,
-        )
-        .unwrap();
-
-        // (a) Relabel atom0 Additions -> Materialized (the "claim additions as materialized"
-        // attack). The materialized column set + count + domain differ from what atom0 proved.
-        let mut relabel_atom0 = honest.clone();
-        relabel_atom0.atoms[0].source = ColumnSource::Materialized;
-        assert!(verify_layer_bgp(
-            &lc,
-            root,
-            &relabel_atom0,
-            &result.predicate_ids,
-            &result.result_commitments,
-            result.result_len,
-            &result.proof,
-        )
-        .is_err());
-
-        // (b) Relabel atom1 Materialized -> Additions (source swap on the other atom).
-        let mut relabel_atom1 = honest.clone();
-        relabel_atom1.atoms[1].source = ColumnSource::Additions;
-        assert!(verify_layer_bgp(
-            &lc,
-            root,
-            &relabel_atom1,
-            &result.predicate_ids,
-            &result.result_commitments,
-            result.result_len,
-            &result.proof,
-        )
-        .is_err());
-
-        // Sanity: the untouched plan still verifies (the relabels, not the proof, broke it).
-        verify_layer_bgp(
-            &lc,
-            root,
-            &honest,
-            &result.predicate_ids,
-            &result.result_commitments,
-            result.result_len,
-            &result.proof,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn cross_source_wrong_joined_result_fails_verification() {
-        // A tampered result (columns permuted) is rejected: the chain output the verifier
-        // recomputes no longer equals the claimed result commitments.
-        let lc = cross_source_add_mat_layer();
-        let root = lc.state.commitment_root;
-        let plan = additions_join_materialized_plan();
-        let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
-
-        // Swap the ?x and ?z result columns: distinct columns -> distinct commitments, so the
-        // claimed result no longer matches the proof's authenticated chain output.
-        let mut wrong = result.result_commitments.clone();
-        wrong.swap(0, 2);
-        assert_ne!(wrong, result.result_commitments);
-        assert!(verify_layer_bgp(
-            &lc,
-            root,
-            &plan,
-            &result.predicate_ids,
-            &wrong,
-            result.result_len,
-            &result.proof,
-        )
-        .is_err());
+        assert!(prove_layer_bgp_with_result(&lc, &plan).is_err());
     }
 
     // ---- Q2: 2-atom graph-pattern (self-join) end-to-end ----

@@ -259,26 +259,45 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
             removals.try_reserve(1).map_err(io::Error::other)?;
             removals.push(record);
         }
+        // COMMITMENT DIET (Wave 0): a DELTA layer (parent_state_root == Some) commits in
+        // O(delta), NOT O(state). It skips the full `layer.triples()` materialization scan
+        // entirely and enumerates only the INCREMENTAL dictionary it introduced —
+        // `parent_count+1..=count` — instead of the full `1..=count`. A BASE/ROLLUP/SQUASH
+        // layer (parent_state_root == None) is unchanged: it still materializes every
+        // logical triple and the full dictionary, byte-identically.
+        let is_delta = parent_state_root.is_some();
+        let parent_node_value_count = layer.parent_node_value_count() as u64;
+        let parent_predicate_count = layer.parent_predicate_count() as u64;
+        let node_value_count = layer.node_and_value_count() as u64;
+        let predicate_count = layer.predicate_count() as u64;
+
         let mut materialized = Vec::new();
-        for triple in layer.triples() {
-            let value = layer.id_triple_to_string(&triple).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "cannot resolve logical triple into canonical proof bytes",
-                )
-            })?;
-            let record = ProofRecord {
-                subject_id: triple.subject,
-                predicate_id: triple.predicate,
-                object_id: triple.object,
-                triple: CanonicalTriple::from_value_triple(&value),
-            };
-            budget.record(&record)?;
-            materialized.try_reserve(1).map_err(io::Error::other)?;
-            materialized.push(record);
+        if !is_delta {
+            for triple in layer.triples() {
+                let value = layer.id_triple_to_string(&triple).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "cannot resolve logical triple into canonical proof bytes",
+                    )
+                })?;
+                let record = ProofRecord {
+                    subject_id: triple.subject,
+                    predicate_id: triple.predicate,
+                    object_id: triple.object,
+                    triple: CanonicalTriple::from_value_triple(&value),
+                };
+                budget.record(&record)?;
+                materialized.try_reserve(1).map_err(io::Error::other)?;
+                materialized.push(record);
+            }
         }
+        let node_value_dict_start = if is_delta {
+            parent_node_value_count + 1
+        } else {
+            1
+        };
         let mut node_value_mappings = Vec::new();
-        for id in 1..=layer.node_and_value_count() as u64 {
+        for id in node_value_dict_start..=node_value_count {
             let object = layer.id_object(id).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -292,8 +311,13 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
                 .map_err(io::Error::other)?;
             node_value_mappings.push((object, id));
         }
+        let predicate_dict_start = if is_delta {
+            parent_predicate_count + 1
+        } else {
+            1
+        };
         let mut predicate_mappings = Vec::new();
-        for id in 1..=layer.predicate_count() as u64 {
+        for id in predicate_dict_start..=predicate_count {
             let predicate = layer.id_predicate(id).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -307,10 +331,6 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
                 .map_err(io::Error::other)?;
             predicate_mappings.push((predicate, id));
         }
-        let parent_node_value_count = layer.parent_node_value_count() as u64;
-        let parent_predicate_count = layer.parent_predicate_count() as u64;
-        let node_value_count = layer.node_and_value_count() as u64;
-        let predicate_count = layer.predicate_count() as u64;
         tokio::task::spawn_blocking(move || {
             LayerCommitment::from_native_delta(
                 parent_state_root,
@@ -4690,6 +4710,154 @@ mod tests {
         store.fail_next_get();
         assert!(store.create_base_layer().await.is_err());
         assert!(store.directories().await.unwrap().is_empty());
+    }
+
+    // ---- Wave 0: §3 delta invariant + the commitment diet ----
+
+    /// §3 INVARIANT CHECK (`doc/proof-of-woql/delta-stack-proving.md`): terminus-store DOES
+    /// guarantee the delta invariant — a layer's `triple_additions` contain ONLY triples
+    /// ABSENT in the parent and `triple_removals` ONLY triples PRESENT in the parent — for
+    /// ALL layer kinds. Child (delta) construction enforces it directly: the phase-2 child
+    /// builder filters `add_id_triples` to `!parent.triple_exists` and `remove_id_triples`
+    /// to `parent.triple_exists` (`src/layer/internal/child.rs`), so a re-added present
+    /// triple and a phantom removal of an absent triple are BOTH dropped. Base/rollup/squash
+    /// layers have no parent (trivially clean); `delta_rollup_upto`/`squash_upto` feed a
+    /// pre-reconciled NET diff (`InternalTripleStackIterator`). Because the invariant holds,
+    /// Wave 2 reconciliation can use the clean multiset equality of §3, NOT the more complex
+    /// per-triple deepest-op-wins argument.
+    #[tokio::test]
+    async fn delta_invariant_holds_across_layer_construction() {
+        let store = MemoryLayerStore::new();
+        let mut base = store.create_base_layer().await.unwrap();
+        let base_name = base.name();
+        // Introduce the terms a, b, c, p. (a,p,b) and (c,p,b) are present; (a,p,c) and
+        // (c,p,c) are NOT — all four triples use only these inherited terms.
+        base.add_value_triple(ValueTriple::new_node("a", "p", "b"));
+        base.add_value_triple(ValueTriple::new_node("c", "p", "b"));
+        base.commit_boxed().await.unwrap();
+
+        let mut child = store.create_child_layer(base_name).await.unwrap();
+        let child_name = child.name();
+        // Re-ADD an already-PRESENT triple (must be dropped: additions are absent-only)...
+        child.add_value_triple(ValueTriple::new_node("a", "p", "b"));
+        // ...a GENUINE addition of an absent triple (must be kept)...
+        child.add_value_triple(ValueTriple::new_node("c", "p", "c"));
+        // ...REMOVE an ABSENT triple (must be dropped: removals are present-only)...
+        child.remove_value_triple(ValueTriple::new_node("a", "p", "c"));
+        // ...and a GENUINE removal of a present triple (must be kept).
+        child.remove_value_triple(ValueTriple::new_node("c", "p", "b"));
+        child.commit_boxed().await.unwrap();
+
+        let child_layer = store.get_layer(child_name).await.unwrap().unwrap();
+        let additions: Vec<_> = store
+            .triple_additions(child_name)
+            .await
+            .unwrap()
+            .map(|t| child_layer.id_triple_to_string(&t).unwrap())
+            .collect();
+        let removals: Vec<_> = store
+            .triple_removals(child_name)
+            .await
+            .unwrap()
+            .map(|t| child_layer.id_triple_to_string(&t).unwrap())
+            .collect();
+
+        // The re-added present triple was DROPPED; only the genuine (absent) addition remains.
+        assert!(
+            !additions.contains(&ValueTriple::new_node("a", "p", "b")),
+            "additions must be absent-only: an already-present re-addition must be dropped"
+        );
+        assert!(
+            additions.contains(&ValueTriple::new_node("c", "p", "c")),
+            "a genuine addition of an absent triple must be recorded"
+        );
+        // The phantom removal was DROPPED; only the genuine (present) removal remains.
+        assert!(
+            !removals.contains(&ValueTriple::new_node("a", "p", "c")),
+            "removals must be present-only: a removal of an absent triple must be dropped"
+        );
+        assert!(
+            removals.contains(&ValueTriple::new_node("c", "p", "b")),
+            "a genuine removal of a present triple must be recorded"
+        );
+    }
+
+    /// The exact `commitment_root` of the pinned base layer in
+    /// `wave0_delta_commitment_is_o_delta_and_base_is_byte_identical`, captured from the
+    /// PRE-diet (base-path-unchanged) computation. The base v4 root binding is untouched by
+    /// Wave 0, so this value must never move; if it does, the base path regressed.
+    const WAVE0_PINNED_BASE_ROOT: [u8; 32] = [
+        234, 225, 197, 77, 20, 2, 142, 55, 161, 145, 188, 128, 183, 121, 240, 32, 225, 108, 134,
+        22, 154, 186, 211, 24, 7, 128, 110, 93, 135, 69, 111, 112,
+    ];
+
+    /// WAVE 0 REGRESSION — the commitment diet. A DELTA layer's proof commitment is built
+    /// in O(delta), NOT O(state): it carries NO materialized head view (the O(state)
+    /// `layer.triples()` dump is gone) and commits ONLY the INCREMENTAL dictionary it
+    /// introduced (∝ delta, not ∝ the full cumulative dictionary). A BASE layer is
+    /// untouched — its `commitment_root` is pinned to the exact pre-diet value.
+    #[tokio::test]
+    async fn wave0_delta_commitment_is_o_delta_and_base_is_byte_identical() {
+        let store = MemoryLayerStore::new();
+        // A base layer with a sizable dictionary (24 distinct terms across 8 triples).
+        let mut base = store.create_base_layer().await.unwrap();
+        let base_name = base.name();
+        for i in 0..8 {
+            base.add_value_triple(ValueTriple::new_node(
+                &format!("s{i}"),
+                &format!("p{i}"),
+                &format!("o{i}"),
+            ));
+        }
+        base.commit_boxed().await.unwrap();
+        let base_commitment = store.prepare_proof_layer(base_name).await.unwrap();
+
+        // BASE byte-identity: still a base (no parent), still carries the full materialized
+        // head view and the full dictionary — exactly as before the diet. The root is pinned
+        // to the pre-change value; any drift means the base path regressed.
+        assert_eq!(base_commitment.state.parent_state_root, None);
+        assert_eq!(base_commitment.state.materialized_count, 8);
+        assert_eq!(base_commitment.materialized.len(), 8);
+        assert_eq!(
+            base_commitment.node_value_catalog.len() as u64,
+            base_commitment.state.node_value_count
+        );
+        assert_eq!(
+            base_commitment.state.commitment_root,
+            WAVE0_PINNED_BASE_ROOT,
+            "base layer commitment_root drifted from its pre-diet value: the base path is NOT byte-identical"
+        );
+
+        // A delta child that introduces exactly ONE new triple of all-new terms.
+        let mut child = store.create_child_layer(base_name).await.unwrap();
+        let child_name = child.name();
+        child.add_value_triple(ValueTriple::new_node("newS", "newP", "newO"));
+        child.commit_boxed().await.unwrap();
+        let delta = store.prepare_proof_layer(child_name).await.unwrap();
+
+        assert!(delta.state.parent_state_root.is_some());
+        // (0a) NO materialized head-view dump: empty table, zero count. This is the O(state)
+        // `triples()` scan that the diet eliminated on every normal commit.
+        assert!(delta.materialized.is_empty());
+        assert_eq!(delta.state.materialized_count, 0);
+        // (0b) INCREMENTAL dictionary only: the committed catalog holds JUST the terms this
+        // layer introduced (`parent_count+1..=count`), whose size is ∝ delta — NOT the
+        // cumulative dictionary (24 inherited + new). This is the O(delta) dict commitment.
+        let introduced_nv = delta.state.node_value_count - delta.state.parent_node_value_count;
+        assert_eq!(delta.node_value_catalog.len() as u64, introduced_nv);
+        assert!(
+            delta.node_value_catalog.len() < base_commitment.node_value_catalog.len(),
+            "delta dictionary is ∝ full state, not ∝ delta"
+        );
+        let introduced_pred =
+            delta.state.predicate_count - delta.state.parent_predicate_count;
+        assert_eq!(delta.predicate_catalog.len() as u64, introduced_pred);
+        // The commitment-diet delta root uses a distinct (bumped) domain and omits the
+        // materialized columns, so it can never equal the base v4 root.
+        assert_ne!(
+            delta.state.commitment_root,
+            base_commitment.state.commitment_root
+        );
     }
 
     #[tokio::test]
