@@ -60,12 +60,17 @@ use super::argument::{
 use super::anti::{
     prove_inner_join_with_keys_and_context, verify_inner_join_with_keys, InnerJoinProof,
 };
-use super::bgp::{RelationCommit, RelationWitness};
+use super::bgp::{
+    prove_bgp_chain_with_result_and_context, verify_bgp_chain, BgpChainProof, JoinStep,
+    RelationCommit, RelationWitness,
+};
 use super::commitment::{LayerCommitment, VerifierCommitmentRef, VerifierLayer};
 use super::dict::{hash_object, hash_term};
 use super::filter::{
-    prove_compaction_only_with_context, prove_filter_indicator_with_context, verify_compaction_only,
-    verify_filter_indicator, CompactionOnlyProof, FilterProof,
+    prove_compaction_only_with_context, prove_filter_indicator_with_context,
+    prove_selection_only_with_context, verify_compaction_only, verify_filter_indicator,
+    verify_selection_only, AtomFilterSpec, CompactionOnlyProof, FilterProof, Position,
+    SelectionOnlyProof,
 };
 use super::dicthash::{
     honest_hash_lookup, prove_hash_lookup_inner, verify_hash_lookup_inner, HashLookupInnerProof,
@@ -1394,6 +1399,355 @@ pub fn verify_and_resolve_two_atom_join(
     resolve_result_columns(&views, claimed_columns, &join.com_join_out, out_len, join.join_log, &kinds)
 }
 
+// ===========================================================================
+// Wave 6 — GENERAL n-atom conjunctive BGP over the reconciled `present` relation.
+//
+// This generalizes the single-atom filter and 2-atom join above to the SAME read-only
+// BGP fragment the base-layer path (`super::query::prove_layer_bgp`) supports over a
+// materialized layer: an arbitrary left-deep conjunctive chain of k atoms, constants in
+// any position, and repeated-variable same-row equality — now over a DELTA STACK, with
+// every input column authenticated to the trusted head root by the reconciliation above.
+//
+// It is built by REUSE, not new crypto. `present` is authenticated (by the reconciliation)
+// as three canonical HASH columns `[hash_object(S), hash_term(P), hash_object(O)]` at 2^K,
+// plus (via [`prove_id_auth`]) its subject/object COMBINED-DICT id columns pinned to those
+// hashes. Each atom is then the SAME audited composition the base RANGED atom uses:
+//   1. an authenticated EQUALITY SELECTION over `present`'s root-bound HASH columns
+//      ([`super::filter::prove_selection_only`]) — predicate/subject/object CONSTANTS are
+//      public canonical hashes compared against the authenticated hash columns, and a
+//      repeated variable is a same-row hash equality; this pins `sel` to EXACTLY the
+//      matching rows (complete AND sound), and an absent constant simply selects nothing;
+//   2. a COMPACTION ([`super::filter::prove_compaction_only`]) of the atom's KEPT variable
+//      columns — the reconciliation-authenticated combined-dict id columns (`present_id_s`
+//      / `present_id_o`, each pinned row-for-row to the selected term by [`verify_id_auth`])
+//      — by that same `sel`, yielding the atom's filtered relation as small joinable ids.
+// The k filtered relations feed the audited left-deep join chain ([`super::bgp`]) verbatim,
+// so >= 3-atom joins on shared node variables work by reuse. Every result column is a
+// combined-dict node/value id, resolved to canonical IRIs/typed literals by the chain
+// catalog resolver ([`resolve_result_columns`]) exactly as the 2-atom join is.
+//
+// SCOPE (this pass): the predicate of each atom is a CONSTANT IRI (its hash); every kept
+// output/join column is therefore a node/value id (uniform, joinable, resolvable). Each
+// atom keeps >= 1 variable. Predicate VARIABLES and fully-ground atoms reject-closed
+// (a later pass authenticates `present`'s predicate ids the same way as its node ids).
+// NUMERIC RANGE over `present` is deferred (it needs an authenticated order-preserving
+// value/datatype column for `present`, derived from the chain dict range commitments —
+// see the module report), so a ranged atom is not representable here.
+// ===========================================================================
+
+/// One subject/object position of a `present` BGP atom: a kept query VARIABLE (an output
+/// combined-dict id) or a CONSTANT given as its public canonical `hash_object(...)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentTerm {
+    Variable,
+    /// The public `hash_object(canonical object)` of the constant (a node IRI in the
+    /// subject or object position, or a typed literal in the object position).
+    Constant(ArkFr),
+}
+
+/// One atom of a `present` BGP: a CONSTANT predicate (its public `hash_term` IRI hash),
+/// subject and object each a [`PresentTerm`], and an optional same-row subject==object
+/// equality (both positions must then be variables). Mirrors the base
+/// [`super::query::LayerBgpAtom`] restricted to this pass's supported shape.
+#[derive(Clone, Copy, Debug)]
+pub struct PresentBgpAtom {
+    pub subject: PresentTerm,
+    /// `hash_term(predicate IRI)` — the predicate is a constant this pass.
+    pub predicate_hash: ArkFr,
+    pub object: PresentTerm,
+    pub subject_object_equal: bool,
+}
+
+/// The per-atom half of a `present` BGP proof: the authenticated equality selection over
+/// `present`'s hash columns, plus the compaction of the atom's kept id columns to the
+/// matching rows.
+#[derive(Clone, Debug)]
+pub struct PresentBgpAtomProof {
+    pub selection: SelectionOnlyProof,
+    pub com_sel: ArkGT,
+    pub compaction: CompactionOnlyProof,
+    /// One commitment per kept (variable) column, in S,O order (predicate is constant).
+    pub com_kept: Vec<ArkGT>,
+    pub m: usize,
+}
+
+/// A general n-atom BGP proof over `present`: the two present-id authentications shared by
+/// every atom, one per-atom (selection + compaction) proof, and the left-deep join chain
+/// over the filtered relations when `k >= 2` (a single atom's filtered relation is already
+/// the whole result). All under the reconciliation transcript.
+#[derive(Clone, Debug)]
+pub struct PresentBgpProof {
+    pub auth_s: PresentIdAuth,
+    pub auth_o: PresentIdAuth,
+    pub atoms: Vec<PresentBgpAtomProof>,
+    pub chain: Option<BgpChainProof>,
+    pub result_len: usize,
+    pub result_log_domain: usize,
+    pub result_arity: usize,
+}
+
+/// Build the hash-space [`AtomFilterSpec`] (predicate/subject/object constants +
+/// subject==object equality) and the KEPT variable positions (S then O; predicate is a
+/// constant so it is never kept) for a `present` atom. Rejects the unsupported shapes.
+fn present_atom_spec(atom: &PresentBgpAtom) -> io::Result<(AtomFilterSpec, Vec<Position>)> {
+    let mut constants = vec![(Position::P, atom.predicate_hash)];
+    if let PresentTerm::Constant(h) = atom.subject {
+        constants.push((Position::S, h));
+    }
+    if let PresentTerm::Constant(h) = atom.object {
+        constants.push((Position::O, h));
+    }
+    let mut kept = Vec::new();
+    if matches!(atom.subject, PresentTerm::Variable) {
+        kept.push(Position::S);
+    }
+    if matches!(atom.object, PresentTerm::Variable) {
+        kept.push(Position::O);
+    }
+    let equalities = if atom.subject_object_equal {
+        if !matches!(atom.subject, PresentTerm::Variable) || !matches!(atom.object, PresentTerm::Variable) {
+            return Err(invalid("present BGP: subject==object equality requires two variable positions"));
+        }
+        // The object is aliased to the subject: keep only the subject column.
+        kept.retain(|p| *p != Position::O);
+        vec![(Position::S, Position::O)]
+    } else {
+        Vec::new()
+    };
+    if kept.is_empty() {
+        return Err(invalid(
+            "present BGP: each atom must keep at least one variable this pass (fully-ground atoms unsupported)",
+        ));
+    }
+    // The spec is a valid S/P/O cover by construction; `prove/verify_selection_only`
+    // re-check it internally (`AtomFilterSpec::validate`).
+    let spec = AtomFilterSpec { constants, kept: kept.clone(), equalities };
+    Ok((spec, kept))
+}
+
+/// The kept-column combined-dict id commitments for `kept`, in order (S -> `present_id_s`,
+/// O -> `present_id_o`). Both are authenticated to the reconciled hashes by [`verify_id_auth`].
+fn present_kept_source_coms(
+    kept: &[Position],
+    auth_s: &PresentIdAuth,
+    auth_o: &PresentIdAuth,
+) -> io::Result<Vec<ArkGT>> {
+    kept.iter()
+        .map(|pos| match pos {
+            Position::S => Ok(auth_s.com_id),
+            Position::O => Ok(auth_o.com_id),
+            Position::P => Err(invalid("present BGP: predicate variable is unsupported this pass")),
+        })
+        .collect()
+}
+
+fn prove_present_bgp(
+    context: &StoreProverContext<'_>,
+    artifacts: &ReconcileArtifacts,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    transcript: &mut Transcript254,
+) -> io::Result<(PresentBgpProof, PresentReadResult)> {
+    if atoms.is_empty() {
+        return Err(invalid("present BGP needs at least one atom"));
+    }
+    let m = artifacts.present_len;
+    // (1) Authenticate present's subject/object combined-dict id columns (shared by every atom).
+    let auth_s = prove_id_auth(context, &artifacts.present_id_s, m, &artifacts.nv_dict, transcript)?;
+    let auth_o = prove_id_auth(context, &artifacts.present_id_o, m, &artifacts.nv_dict, transcript)?;
+
+    // (2) Per-atom: authenticated equality selection over present's HASH columns, then
+    //     compaction of the kept combined-dict id columns to the matching rows.
+    let mut atom_proofs = Vec::with_capacity(atoms.len());
+    let mut relations: Vec<RelationWitness> = Vec::with_capacity(atoms.len());
+    for atom in atoms {
+        let (spec, kept) = present_atom_spec(atom)?;
+        let (selection, com_sel, sel) = prove_selection_only_with_context(
+            context, &spec,
+            &artifacts.present_s,
+            &artifacts.present_p,
+            &artifacts.present_o,
+            m,
+            &artifacts.com_present_s,
+            &artifacts.com_present_p,
+            &artifacts.com_present_o,
+            transcript,
+        )?;
+        let source_coms = present_kept_source_coms(&kept, &auth_s, &auth_o)?;
+        let sources: Vec<Vec<ArkFr>> = kept
+            .iter()
+            .map(|pos| match pos {
+                Position::S => artifacts.present_id_s.clone(),
+                Position::O => artifacts.present_id_o.clone(),
+                Position::P => unreachable!("predicate is a constant this pass"),
+            })
+            .collect();
+        let (compaction, com_kept, kept_out, mm) = prove_compaction_only_with_context(
+            context, &sources, &source_coms, &sel, &com_sel, transcript,
+        )?;
+        relations.push(RelationWitness {
+            columns: kept_out,
+            commitments: com_kept.clone(),
+            log_domain: artifacts.working_log,
+            n: mm,
+        });
+        atom_proofs.push(PresentBgpAtomProof { selection, com_sel, compaction, com_kept, m: mm });
+    }
+
+    // (3) The left-deep chain over the filtered relations (k = 1 is already the result).
+    let (chain, result_columns, result_com_count, result_log_domain, result_m) = if relations.len() == 1 {
+        let r = &relations[0];
+        (None, r.columns.clone(), r.commitments.len(), r.log_domain, r.n)
+    } else {
+        let res = prove_bgp_chain_with_result_and_context(context, &relations, joins, transcript)?;
+        let arity = res.commitments.len();
+        (Some(res.proof), res.columns, arity, res.log_domain, res.n)
+    };
+
+    let columns: Vec<Vec<ArkFr>> = result_columns.iter().map(|c| c[..result_m].to_vec()).collect();
+    Ok((
+        PresentBgpProof {
+            auth_s,
+            auth_o,
+            atoms: atom_proofs,
+            chain,
+            result_len: result_m,
+            result_log_domain,
+            result_arity: result_com_count,
+        },
+        PresentReadResult { columns, len: result_m },
+    ))
+}
+
+fn verify_present_bgp(
+    reconcile: &ReconcileProof,
+    verified: &ReconcileVerified,
+    head_nv: usize,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    proof: &PresentBgpProof,
+    transcript: &mut Transcript254,
+) -> io::Result<(Vec<ArkGT>, usize, usize)> {
+    if atoms.is_empty() {
+        return Err(invalid("present BGP needs at least one atom"));
+    }
+    if proof.atoms.len() != atoms.len() {
+        return Err(invalid("present BGP atom count mismatch"));
+    }
+    let m = verified.present_len;
+    // (1) present id authentication against the reconciled hashes.
+    verify_id_auth(&reconcile.combined_nv, m, head_nv, verified.com_present_s, &proof.auth_s, transcript)?;
+    verify_id_auth(&reconcile.combined_nv, m, head_nv, verified.com_present_o, &proof.auth_o, transcript)?;
+
+    // (2) Per-atom selection + compaction, rebuilding each filtered relation from the
+    //     authenticated kept commitments (never trusting a fresh relation commitment).
+    let mut relations: Vec<RelationCommit> = Vec::with_capacity(atoms.len());
+    for (atom, ap) in atoms.iter().zip(proof.atoms.iter()) {
+        let (spec, kept) = present_atom_spec(atom)?;
+        verify_selection_only(
+            &spec, m, &verified.com_present_s, &verified.com_present_p, &verified.com_present_o,
+            &ap.com_sel, &ap.selection, transcript,
+        )?;
+        let source_coms = present_kept_source_coms(&kept, &proof.auth_s, &proof.auth_o)?;
+        if ap.com_kept.len() != source_coms.len() {
+            return Err(invalid("present BGP: kept commitment arity does not match the atom's variables"));
+        }
+        verify_compaction_only(&source_coms, &ap.com_sel, &ap.com_kept, ap.m, &ap.compaction, transcript)?;
+        relations.push(RelationCommit {
+            commitments: ap.com_kept.clone(),
+            log_domain: verified.working_log,
+            n: ap.m,
+        });
+    }
+
+    // (3) The left-deep chain over the filtered relations.
+    let (result_coms, result_m, result_log_domain) = if relations.len() == 1 {
+        if proof.chain.is_some() {
+            return Err(invalid("single-atom present BGP carries a spurious join chain"));
+        }
+        (relations[0].commitments.clone(), relations[0].n, verified.working_log)
+    } else {
+        let chain = proof
+            .chain
+            .as_ref()
+            .ok_or_else(|| invalid("multi-atom present BGP is missing its join chain"))?;
+        let (coms, mm) = verify_bgp_chain(&relations, joins, chain, transcript)?;
+        let log = chain
+            .stages
+            .last()
+            .ok_or_else(|| invalid("present BGP join chain has no stages"))?
+            .join
+            .num_vars();
+        (coms, mm, log)
+    };
+
+    if proof.result_len != result_m
+        || proof.result_arity != result_coms.len()
+        || proof.result_log_domain != result_log_domain
+    {
+        return Err(invalid("present BGP proof result shape disagrees with the verified chain"));
+    }
+    Ok((result_coms, result_m, result_log_domain))
+}
+
+/// Prove a general n-atom conjunctive BGP over the reconciled N-layer `present`. `atoms`
+/// are the conjuncts (constant predicate, variable/constant subject+object, optional
+/// subject==object); `joins` is the left-deep plan over the kept id columns (empty for a
+/// single atom). Reconciliation + BGP share ONE transcript, so the result is bound to the
+/// reconciliation-authenticated relation. The delivered result columns are combined-dict
+/// node/value ids (resolution deferred to [`verify_and_resolve_bgp`]).
+pub fn prove_read_bgp(
+    layers: &[&LayerCommitment],
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+) -> io::Result<(ReconcileProof, PresentBgpProof, PresentReadResult)> {
+    let context = StoreProverContext::cpu();
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
+    let (bgp, result) = prove_present_bgp(&context, &artifacts, atoms, joins, &mut transcript)?;
+    Ok((reconcile, bgp, result))
+}
+
+/// Verify a general n-atom BGP read over `present`. On success returns the authenticated
+/// result row count.
+pub fn verify_read_bgp(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    reconcile: &ReconcileProof,
+    proof: &PresentBgpProof,
+) -> io::Result<usize> {
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
+    let head_nv = layers.last().unwrap().verifier_view().state.node_value_count as usize;
+    let (_coms, result_m, _log) =
+        verify_present_bgp(reconcile, &verified, head_nv, atoms, joins, proof, &mut transcript)?;
+    Ok(result_m)
+}
+
+/// Verify a general n-atom BGP read AND resolve its result bindings to `CanonicalObject`s.
+/// Every result column is a combined-dict node/value id (predicates are constants), so
+/// each resolves against the chain node/value catalogs.
+pub fn verify_and_resolve_bgp(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    reconcile: &ReconcileProof,
+    proof: &PresentBgpProof,
+    claimed_columns: &[Vec<ArkFr>],
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
+    let head_nv = layers.last().unwrap().verifier_view().state.node_value_count as usize;
+    let (result_coms, result_m, result_log_domain) =
+        verify_present_bgp(reconcile, &verified, head_nv, atoms, joins, proof, &mut transcript)?;
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let kinds = vec![ResolveKind::NodeValueId; result_coms.len()];
+    resolve_result_columns(&views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2065,5 +2419,328 @@ mod tests {
             &lref, head_root, cp, cq, &rec, &join, &forged,
         )
         .is_err());
+    }
+
+    // ============================================================
+    // Wave 6 — general n-atom BGP over present.
+    // ============================================================
+
+    fn var() -> PresentTerm {
+        PresentTerm::Variable
+    }
+    fn node_const(iri: &str) -> PresentTerm {
+        PresentTerm::Constant(hash_node(iri))
+    }
+    fn atom(subject: PresentTerm, predicate: &str, object: PresentTerm) -> PresentBgpAtom {
+        PresentBgpAtom {
+            subject,
+            predicate_hash: hash_pred(predicate),
+            object,
+            subject_object_equal: false,
+        }
+    }
+    fn scalar_join(acc_key: usize, rel_key: usize) -> JoinStep {
+        JoinStep { acc_key, rel_key, additional_keys: Vec::new() }
+    }
+
+    /// A base+delta stack whose present supports a 3-atom chain
+    /// Triple(?x, p1, ?y) & Triple(?y, p2, ?z) & Triple(?z, p3, ?w):
+    ///   present p1 = {x1->y1, x2->y1, x4->y1}   (base x3->y3 removed; delta adds x4->y1)
+    ///   present p2 = {y1->z1}                    (base y1->z9 removed)
+    ///   present p3 = {z1->w1, z1->w2, z1->w3}    (delta adds z1->w3)
+    /// Join on ?y=y1 (3 x) and ?z=z1 (3 w) => 3 x-bindings x 3 w-bindings = 9 solutions.
+    fn bgp_stack() -> Vec<Arc<LayerCommitment>> {
+        let store = open_sync_memory_store();
+        let b = store.create_base_layer().unwrap();
+        for (s, p, o) in [
+            ("x1", "p1", "y1"), ("x2", "p1", "y1"), ("y1", "p2", "z1"),
+            ("z1", "p3", "w1"), ("z1", "p3", "w2"),
+            ("x3", "p1", "y3"), ("y1", "p2", "z9"),
+        ] {
+            b.add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o))).unwrap();
+        }
+        let base = b.commit().unwrap();
+        let base_lc = base.proof_commitment().unwrap();
+        let child = base.open_write().unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("x3"), &iri("p1"), &iri("y3"))).unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("y1"), &iri("p2"), &iri("z9"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("x4"), &iri("p1"), &iri("y1"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("z1"), &iri("p3"), &iri("w3"))).unwrap();
+        let head = child.commit().unwrap();
+        vec![base_lc, head.proof_commitment().unwrap()]
+    }
+
+    /// Materialized 3-atom chain over present, resolved to CanonicalObjects [x, y, z, w].
+    fn materialized_3chain_resolved(
+        layers: &[&LayerCommitment], p1: &str, p2: &str, p3: &str,
+    ) -> Vec<Vec<CanonicalObject>> {
+        let present = reconcile_present(layers).unwrap();
+        let mut out = Vec::new();
+        for a in present.iter().filter(|r| r.triple.predicate == p1.as_bytes()) {
+            for bb in present.iter().filter(|r| r.triple.predicate == p2.as_bytes()) {
+                if a.object_id != bb.subject_id { continue; }
+                for c in present.iter().filter(|r| r.triple.predicate == p3.as_bytes()) {
+                    if bb.object_id != c.subject_id { continue; }
+                    out.push(vec![
+                        CanonicalObject::Node(a.triple.subject.clone()),
+                        a.triple.object.clone(),
+                        bb.triple.object.clone(),
+                        c.triple.object.clone(),
+                    ]);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn three_atom_bgp_over_present() {
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [
+            atom(var(), "http://ex/p1", var()), // Triple(?x, p1, ?y)
+            atom(var(), "http://ex/p2", var()), // Triple(?y, p2, ?z)
+            atom(var(), "http://ex/p3", var()), // Triple(?z, p3, ?w)
+        ];
+        let joins = [scalar_join(1, 0), scalar_join(2, 0)]; // acc.y==r2.y ; acc.z==r3.z
+        let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let n = verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).unwrap();
+        assert_eq!(n, 9, "3-atom chain over the delta stack must have 9 solutions");
+        assert_eq!(result.len, 9);
+        let resolved = verify_and_resolve_bgp(
+            &lref, head_root, &atoms, &joins, &rec, &bgp, &result.columns,
+        )
+        .unwrap();
+        let ground =
+            materialized_3chain_resolved(&lref, "http://ex/p1", "http://ex/p2", "http://ex/p3");
+        assert_eq!(ground.len(), 9);
+        assert!(bag_eq_rows(rows_of(&resolved), ground), "resolved 3-chain must equal materialized");
+    }
+
+    #[test]
+    fn multi_constant_bgp_over_present() {
+        // Triple(x1, p1, ?y) & Triple(?y, p2, ?z): subject constant on atom 0 pins ?y=y1,
+        // then join p2 -> exactly (y1, z1). Result schema [y, z].
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [
+            atom(node_const("http://ex/x1"), "http://ex/p1", var()),
+            atom(var(), "http://ex/p2", var()),
+        ];
+        let joins = [scalar_join(0, 0)]; // acc.y == r2.y
+        let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let n = verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).unwrap();
+        assert_eq!(n, 1, "subject-constant 2-atom join has exactly one solution");
+        let resolved = verify_and_resolve_bgp(
+            &lref, head_root, &atoms, &joins, &rec, &bgp, &result.columns,
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&resolved),
+            vec![vec![
+                CanonicalObject::Node(iri("y1").into_bytes()),
+                CanonicalObject::Node(iri("z1").into_bytes()),
+            ]],
+        );
+    }
+
+    #[test]
+    fn single_atom_object_constant_bgp() {
+        // Triple(?x, p1, y1): object constant, keep subject. present p1 objects=y1: x1,x2,x4.
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [atom(var(), "http://ex/p1", node_const("http://ex/y1"))];
+        let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let n = verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap();
+        assert_eq!(n, 3);
+        let resolved = verify_and_resolve_bgp(
+            &lref, head_root, &atoms, &[], &rec, &bgp, &result.columns,
+        )
+        .unwrap();
+        let subjects: Vec<CanonicalObject> = resolved.into_iter().flatten().collect();
+        let ground: Vec<CanonicalObject> = ["x1", "x2", "x4"]
+            .iter()
+            .map(|s| CanonicalObject::Node(iri(s).into_bytes()))
+            .collect();
+        assert!(bag_eq_rows(
+            subjects.into_iter().map(|o| vec![o]).collect(),
+            ground.into_iter().map(|o| vec![o]).collect(),
+        ));
+    }
+
+    /// A stack whose present has self-loops (subject==object) and non-loops:
+    /// present = {a1->a1, a2->a2, a3->b3, a5->a5, a6->b6}. Triple(?s, pself, ?s) => {a1,a2,a5}.
+    fn self_stack() -> Vec<Arc<LayerCommitment>> {
+        let store = open_sync_memory_store();
+        let b = store.create_base_layer().unwrap();
+        for (s, o) in [("a1", "a1"), ("a2", "a2"), ("a3", "b3"), ("a4", "a4"), ("a7", "a7")] {
+            b.add_value_triple(ValueTriple::new_node(&iri(s), &iri("pself"), &iri(o))).unwrap();
+        }
+        let base = b.commit().unwrap();
+        let base_lc = base.proof_commitment().unwrap();
+        let child = base.open_write().unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("a4"), &iri("pself"), &iri("a4"))).unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("a7"), &iri("pself"), &iri("a7"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("a5"), &iri("pself"), &iri("a5"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("a6"), &iri("pself"), &iri("b6"))).unwrap();
+        let head = child.commit().unwrap();
+        vec![base_lc, head.proof_commitment().unwrap()]
+    }
+
+    #[test]
+    fn repeated_variable_bgp_over_present() {
+        let layers = self_stack();
+        let lref = refs(&layers);
+        let self_atom = PresentBgpAtom {
+            subject: var(),
+            predicate_hash: hash_pred("http://ex/pself"),
+            object: var(),
+            subject_object_equal: true,
+        };
+        let atoms = [self_atom];
+        let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let n = verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap();
+        assert_eq!(n, 3, "three present self-loops match Triple(?s, pself, ?s)");
+        let resolved = verify_and_resolve_bgp(
+            &lref, head_root, &atoms, &[], &rec, &bgp, &result.columns,
+        )
+        .unwrap();
+        let got: Vec<Vec<CanonicalObject>> = rows_of(&resolved);
+        let ground: Vec<Vec<CanonicalObject>> = ["a1", "a2", "a5"]
+            .iter()
+            .map(|s| vec![CanonicalObject::Node(iri(s).into_bytes())])
+            .collect();
+        assert!(bag_eq_rows(got, ground), "self-join must equal materialized a1,a2,a5");
+    }
+
+    // --- Soundness negatives over the general BGP path ---
+
+    #[test]
+    fn bgp_fabricated_relation_commitment_rejects() {
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [
+            atom(var(), "http://ex/p1", var()),
+            atom(var(), "http://ex/p2", var()),
+            atom(var(), "http://ex/p3", var()),
+        ];
+        let joins = [scalar_join(1, 0), scalar_join(2, 0)];
+        let (rec, mut bgp, _) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        // Fabricate atom 0's first kept column: the compaction binding fails.
+        bgp.atoms[0].com_kept[0] = commit_col(&vec![ark(4242); 1usize << rec.working_log]);
+        assert!(verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).is_err());
+    }
+
+    #[test]
+    fn bgp_dropped_row_rejects() {
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [
+            atom(var(), "http://ex/p1", var()),
+            atom(var(), "http://ex/p2", var()),
+            atom(var(), "http://ex/p3", var()),
+        ];
+        let joins = [scalar_join(1, 0), scalar_join(2, 0)];
+        let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        // Claim one fewer matching row in atom 0's compaction.
+        let mut forged = bgp.clone();
+        forged.atoms[0].m -= 1;
+        assert!(verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &forged).is_err());
+    }
+
+    #[test]
+    fn bgp_wrong_constant_rejects() {
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [
+            atom(var(), "http://ex/p1", var()),
+            atom(var(), "http://ex/p2", var()),
+        ];
+        let joins = [scalar_join(1, 0)];
+        let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        // Verify against a different first predicate: the selection is p1-bound.
+        let wrong = [
+            atom(var(), "http://ex/pX", var()),
+            atom(var(), "http://ex/p2", var()),
+        ];
+        assert!(verify_read_bgp(&lref, head_root, &wrong, &joins, &rec, &bgp).is_err());
+    }
+
+    #[test]
+    fn bgp_tampered_present_id_rejects() {
+        // Feeding a wrong combined-dict id for present (to fabricate a joining tuple)
+        // fails the id -> hash authentication against the reconciled hashes.
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [
+            atom(var(), "http://ex/p1", var()),
+            atom(var(), "http://ex/p2", var()),
+        ];
+        let joins = [scalar_join(1, 0)];
+        let (rec, mut bgp, _) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        bgp.auth_s.com_id = commit_col(&vec![ark(3); 1usize << rec.working_log]);
+        assert!(verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).is_err());
+    }
+
+    #[test]
+    fn bgp_forged_result_binding_rejects() {
+        // A prover who publishes an altered result value fails the re-commitment bind.
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [
+            atom(var(), "http://ex/p1", var()),
+            atom(var(), "http://ex/p2", var()),
+            atom(var(), "http://ex/p3", var()),
+        ];
+        let joins = [scalar_join(1, 0), scalar_join(2, 0)];
+        let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let mut forged = result.columns.clone();
+        forged[3][0] = ark(987_654_321); // fabricated ?w binding
+        assert!(verify_and_resolve_bgp(
+            &lref, head_root, &atoms, &joins, &rec, &bgp, &forged,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bgp_non_satisfying_join_tuple_is_excluded() {
+        // Ground-truth completeness+soundness: the reconciled answer equals the join over
+        // the MATERIALIZED present exactly, so a Cartesian (non-satisfying) tuple such as
+        // (x1, y1, z1, w) with a w whose z != z1 never appears. present p3 only has z1->w*,
+        // and the base's non-joining rows (x3->y3, y1->z9) were removed, so any fabricated
+        // tuple would inflate the count beyond the materialized 9.
+        let layers = bgp_stack();
+        let lref = refs(&layers);
+        let atoms = [
+            atom(var(), "http://ex/p1", var()),
+            atom(var(), "http://ex/p2", var()),
+            atom(var(), "http://ex/p3", var()),
+        ];
+        let joins = [scalar_join(1, 0), scalar_join(2, 0)];
+        let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let n = verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).unwrap();
+        let ground =
+            materialized_3chain_resolved(&lref, "http://ex/p1", "http://ex/p2", "http://ex/p3");
+        assert_eq!(n, ground.len());
+        // Every delivered tuple satisfies both join predicates (y-link and z-link).
+        let resolved = verify_and_resolve_bgp(
+            &lref, head_root, &atoms, &joins, &rec, &bgp, &result.columns,
+        )
+        .unwrap();
+        for row in rows_of(&resolved) {
+            // y == z-atom's subject was enforced by the join; assert the tuple is one the
+            // materialized set contains (no fabricated Cartesian tuple slipped through).
+            assert!(ground.contains(&row));
+        }
     }
 }
