@@ -56,9 +56,16 @@ use super::argument::{
     prove_sumcheck, verify_column_openings, verify_sumcheck, ClaimShape, ColumnOpening, Expr,
     Operand, StoreProverContext, SumcheckClaim, SumcheckProof, SumcheckShape, Term, Transcript254,
 };
+use super::anti::{
+    prove_inner_join_with_keys_and_context, verify_inner_join_with_keys, InnerJoinProof,
+};
 use super::bgp::{RelationCommit, RelationWitness};
 use super::commitment::{LayerCommitment, VerifierCommitmentRef, VerifierLayer};
 use super::dict::{hash_object, hash_term};
+use super::filter::{
+    prove_compaction_only_with_context, prove_filter_indicator_with_context, verify_compaction_only,
+    verify_filter_indicator, CompactionOnlyProof, FilterProof,
+};
 use super::dicthash::{
     honest_hash_lookup, prove_hash_lookup_inner, verify_hash_lookup_inner, HashLookupInnerProof,
 };
@@ -401,6 +408,39 @@ pub fn prove_reconcile_with_context(
     context: &StoreProverContext<'_>,
     layers: &[&LayerCommitment],
 ) -> io::Result<(ReconcileProof, ReconciledPresent)> {
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let (proof, artifacts) = prove_reconcile_core(context, layers, &mut transcript)?;
+    Ok((proof, ReconciledPresent { rows: artifacts.present_rows }))
+}
+
+/// Prover-side authenticated `present` relation (hash columns at 2^K) plus bookkeeping.
+/// Returned by [`prove_reconcile_core`] so a read query can be proved over `present` on the
+/// SAME transcript — that shared transcript is what binds the BGP to the
+/// reconciliation-authenticated relation.
+pub struct ReconcileArtifacts {
+    pub present_s: Vec<ArkFr>,
+    pub present_p: Vec<ArkFr>,
+    pub present_o: Vec<ArkFr>,
+    pub com_present_s: ArkGT,
+    pub com_present_p: ArkGT,
+    pub com_present_o: ArkGT,
+    /// present's subject/object COMBINED-DICT ids at 2^K (the small canonical id space,
+    /// authenticated in the join path against the reconciliation hashes). Predicate ids are
+    /// not needed for joins (predicate filtering stays in hash space).
+    pub present_id_s: Vec<ArkFr>,
+    pub present_id_o: Vec<ArkFr>,
+    pub working_log: usize,
+    pub present_len: usize,
+    /// The combined node/value dict at 2^K (for authenticating present's ids in the join).
+    nv_dict: CombinedDictBuilt,
+    present_rows: Vec<(ArkFr, ArkFr, ArkFr)>,
+}
+
+fn prove_reconcile_core(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    transcript: &mut Transcript254,
+) -> io::Result<(ReconcileProof, ReconcileArtifacts)> {
     let states: Vec<&super::commitment::CommitmentState> = layers.iter().map(|l| &l.state).collect();
     validate_chain_states(&states)?;
     let head = layers.last().unwrap();
@@ -424,7 +464,6 @@ pub fn prove_reconcile_with_context(
     }
     let k_size = 1usize << working_log;
 
-    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
     transcript.append_bytes(b"pow/reconcile/domain", RECONCILE_DOMAIN);
     for layer in layers {
         transcript.append_bytes(b"pow/reconcile/layer-root", &layer.state.commitment_root);
@@ -455,8 +494,8 @@ pub fn prove_reconcile_with_context(
             });
         }
     }
-    let combined_nv = prove_combined_dict(context, &nv_branches, working_log, &mut transcript)?;
-    let combined_pred = prove_combined_dict(context, &pred_branches, working_log, &mut transcript)?;
+    let combined_nv = prove_combined_dict(context, &nv_branches, working_log, transcript)?;
+    let combined_pred = prove_combined_dict(context, &pred_branches, working_log, transcript)?;
 
     // Committed group descriptors (canonical order).
     let column_commitments: Vec<&[ArkGT; 6]> = layers.iter().map(|l| &l.column_commitments).collect();
@@ -483,15 +522,15 @@ pub fn prove_reconcile_with_context(
     for (desc, &(records, _)) in descs.iter().zip(record_groups.iter()) {
         let s = prove_group_hash(
             context, records, |r| r.subject_id, &desc.s_com, desc.col_log, desc.real_len,
-            working_log, &combined_nv, &mut transcript,
+            working_log, &combined_nv, transcript,
         )?;
         let o = prove_group_hash(
             context, records, |r| r.object_id, &desc.o_com, desc.col_log, desc.real_len,
-            working_log, &combined_nv, &mut transcript,
+            working_log, &combined_nv, transcript,
         )?;
         let p = prove_group_hash(
             context, records, |r| r.predicate_id, &desc.p_com, desc.col_log, desc.real_len,
-            working_log, &combined_pred, &mut transcript,
+            working_log, &combined_pred, transcript,
         )?;
         group_spo_data.push([s.1, p.1, o.1]);
         group_spo_com.push([s.0.lookup.com_v_hash, p.0.lookup.com_v_hash, o.0.lookup.com_v_hash]);
@@ -502,6 +541,8 @@ pub fn prove_reconcile_with_context(
     let mut present_s = vec![f0(); k_size];
     let mut present_p = vec![f0(); k_size];
     let mut present_o = vec![f0(); k_size];
+    let mut present_id_s = vec![f0(); k_size];
+    let mut present_id_o = vec![f0(); k_size];
     let mut present_rows = Vec::with_capacity(present_len);
     for (i, record) in present.iter().enumerate() {
         let sh = subject_hash(record);
@@ -510,6 +551,8 @@ pub fn prove_reconcile_with_context(
         present_s[i] = sh;
         present_p[i] = ph;
         present_o[i] = oh;
+        present_id_s[i] = ark(record.subject_id);
+        present_id_o[i] = ark(record.object_id);
         present_rows.push((sh, ph, oh));
     }
     let com_present_s = context.commit_column(&present_s)?;
@@ -561,12 +604,12 @@ pub fn prove_reconcile_with_context(
         columns.push(rec_data[i].clone());
     }
     let shape = link_shape(working_log, &lens, &signs, alpha, beta);
-    let (link_sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, &mut transcript)?;
-    let link_opening = context.prove_column_openings(&columns, &r, &mut transcript)?;
+    let (link_sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
+    let link_opening = context.prove_column_openings(&columns, &r, transcript)?;
 
     Ok((
         ReconcileProof {
-            combined_nv: combined_nv.proof,
+            combined_nv: combined_nv.proof.clone(),
             combined_pred: combined_pred.proof,
             working_log,
             groups,
@@ -578,7 +621,20 @@ pub fn prove_reconcile_with_context(
             link_opening,
             present_len,
         },
-        ReconciledPresent { rows: present_rows },
+        ReconcileArtifacts {
+            present_s,
+            present_p,
+            present_o,
+            com_present_s,
+            com_present_p,
+            com_present_o,
+            present_id_s,
+            present_id_o,
+            working_log,
+            present_len,
+            nv_dict: combined_nv,
+            present_rows,
+        },
     ))
 }
 
@@ -643,6 +699,28 @@ pub fn verify_reconcile(
     trusted_head_root: ProofHash,
     proof: &ReconcileProof,
 ) -> io::Result<usize> {
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let verified = verify_reconcile_core(layers, trusted_head_root, proof, &mut transcript)?;
+    Ok(verified.present_len)
+}
+
+/// Verifier-side authenticated `present` handle (its column commitments at 2^K + counts),
+/// returned by [`verify_reconcile_core`] so a read query can be verified over it on the SAME
+/// transcript.
+pub struct ReconcileVerified {
+    pub com_present_s: ArkGT,
+    pub com_present_p: ArkGT,
+    pub com_present_o: ArkGT,
+    pub working_log: usize,
+    pub present_len: usize,
+}
+
+fn verify_reconcile_core(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    proof: &ReconcileProof,
+    transcript: &mut Transcript254,
+) -> io::Result<ReconcileVerified> {
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     // (1) Each layer authenticated against ITS OWN commitment root.
     for view in &views {
@@ -680,7 +758,6 @@ pub fn verify_reconcile(
         return Err(invalid("reconcile: working domain mismatch"));
     }
 
-    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
     transcript.append_bytes(b"pow/reconcile/domain", RECONCILE_DOMAIN);
     for view in &views {
         transcript.append_bytes(b"pow/reconcile/layer-root", &view.state.commitment_root);
@@ -707,8 +784,8 @@ pub fn verify_reconcile(
             });
         }
     }
-    verify_combined_dict(&nv_branches, head_nv, working_log, &proof.combined_nv, &mut transcript)?;
-    verify_combined_dict(&pred_branches, head_pred, working_log, &proof.combined_pred, &mut transcript)?;
+    verify_combined_dict(&nv_branches, head_nv, working_log, &proof.combined_nv, transcript)?;
+    verify_combined_dict(&pred_branches, head_pred, working_log, &proof.combined_pred, transcript)?;
 
     // Committed group descriptors (same canonical order the prover used).
     let column_commitments: Vec<&[ArkGT; 6]> = views.iter().map(|v| v.column_commitments).collect();
@@ -719,9 +796,9 @@ pub fn verify_reconcile(
 
     // Verify each group's three canonical hash lookups.
     for (desc, gp) in descs.iter().zip(proof.groups.iter()) {
-        verify_group_hash(&desc.s_com, desc.col_log, desc.real_len, working_log, &proof.combined_nv, &gp.s, &mut transcript)?;
-        verify_group_hash(&desc.o_com, desc.col_log, desc.real_len, working_log, &proof.combined_nv, &gp.o, &mut transcript)?;
-        verify_group_hash(&desc.p_com, desc.col_log, desc.real_len, working_log, &proof.combined_pred, &gp.p, &mut transcript)?;
+        verify_group_hash(&desc.s_com, desc.col_log, desc.real_len, working_log, &proof.combined_nv, &gp.s, transcript)?;
+        verify_group_hash(&desc.o_com, desc.col_log, desc.real_len, working_log, &proof.combined_nv, &gp.o, transcript)?;
+        verify_group_hash(&desc.p_com, desc.col_log, desc.real_len, working_log, &proof.combined_pred, &gp.p, transcript)?;
     }
 
     // Verify the G-way masked LogUp link.
@@ -755,7 +832,7 @@ pub fn verify_reconcile(
         return Err(invalid("reconcile: link sumcheck domain mismatch"));
     }
     let shape = link_shape(working_log, &lens, &signs, alpha, beta);
-    let (r, evals) = verify_sumcheck(&shape, &proof.link_sumcheck, &mut transcript)?;
+    let (r, evals) = verify_sumcheck(&shape, &proof.link_sumcheck, transcript)?;
     let mut commitments = Vec::with_capacity(4 * g);
     for i in 0..g {
         commitments.push(value_com[i][0]);
@@ -763,9 +840,15 @@ pub fn verify_reconcile(
         commitments.push(value_com[i][2]);
         commitments.push(proof.com_rec[i]);
     }
-    verify_column_openings(&commitments, &r, &evals, &proof.link_opening, &mut transcript)?;
+    verify_column_openings(&commitments, &r, &evals, &proof.link_opening, transcript)?;
 
-    Ok(present_len)
+    Ok(ReconcileVerified {
+        com_present_s: proof.com_present_s,
+        com_present_p: proof.com_present_p,
+        com_present_o: proof.com_present_o,
+        working_log,
+        present_len,
+    })
 }
 
 fn verify_group_hash(
@@ -783,6 +866,374 @@ fn verify_group_hash(
     verify_hash_lookup_inner(
         &gp.com_obj_at_k, &dict.com_id_at_k, &dict.com_hash_at_k, real_n, dict.n, &gp.lookup, transcript,
     )
+}
+
+// ===========================================================================
+// Wave 3 — single-atom BGP over the authenticated `present` relation.
+//
+// `present` is authenticated (by the reconciliation above) as three hash columns
+// [hash_object(S), hash_term(P), hash_object(O)] committed at 2^K with real length M.
+// A single-atom read with ONE constant position is an EXACT filter+compaction over
+// those committed columns, proved on the SAME transcript as the reconciliation (so it
+// is bound to the authenticated relation). The audited Q1 filter indicator pins the
+// selection to EXACTLY the equality-with-constant indicator (complete AND sound: every
+// matching row is selected, no non-matching row is), and the audited compaction emits
+// EXACTLY the selected rows of the two output columns. The delivered result columns are
+// authenticated hashes of the output bindings; resolving them to canonical IRIs/values
+// is deferred (see the module report).
+// ===========================================================================
+
+/// Which `present` position carries the query CONSTANT (the other two are output vars).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterPosition {
+    Subject,
+    Predicate,
+    Object,
+}
+
+/// A single-atom filter proof over `present`: the equality-indicator selection and the
+/// compaction of the two output columns to the matching rows.
+#[derive(Clone, Debug)]
+pub struct PresentFilterProof {
+    pub filter: FilterProof,
+    pub com_sel: ArkGT,
+    pub com_w: ArkGT,
+    pub compaction: CompactionOnlyProof,
+    /// The two authenticated output hash columns (the non-constant variables), matching rows.
+    pub com_out: Vec<ArkGT>,
+    pub out_len: usize,
+}
+
+/// The delivered read result: the output hash columns (real prefix) and the row count.
+pub struct PresentReadResult {
+    /// Two columns of authenticated binding HASHES (output variables), length `len`.
+    pub columns: Vec<Vec<ArkFr>>,
+    pub len: usize,
+}
+
+/// Map a filter position to `(filter column, filter commitment, [output columns], [output commitments])`.
+fn filter_selection<'a>(
+    artifacts: &'a ReconcileArtifacts,
+    position: FilterPosition,
+) -> (&'a [ArkFr], ArkGT, [&'a [ArkFr]; 2], [ArkGT; 2]) {
+    match position {
+        FilterPosition::Predicate => (
+            artifacts.present_p.as_slice(),
+            artifacts.com_present_p,
+            [artifacts.present_s.as_slice(), artifacts.present_o.as_slice()],
+            [artifacts.com_present_s, artifacts.com_present_o],
+        ),
+        FilterPosition::Subject => (
+            artifacts.present_s.as_slice(),
+            artifacts.com_present_s,
+            [artifacts.present_p.as_slice(), artifacts.present_o.as_slice()],
+            [artifacts.com_present_p, artifacts.com_present_o],
+        ),
+        FilterPosition::Object => (
+            artifacts.present_o.as_slice(),
+            artifacts.com_present_o,
+            [artifacts.present_s.as_slice(), artifacts.present_p.as_slice()],
+            [artifacts.com_present_s, artifacts.com_present_p],
+        ),
+    }
+}
+
+/// The verifier-side output commitments for a filter position (from the reconciled handle).
+fn filter_output_commitments(verified: &ReconcileVerified, position: FilterPosition) -> (ArkGT, [ArkGT; 2]) {
+    match position {
+        FilterPosition::Predicate => (verified.com_present_p, [verified.com_present_s, verified.com_present_o]),
+        FilterPosition::Subject => (verified.com_present_s, [verified.com_present_p, verified.com_present_o]),
+        FilterPosition::Object => (verified.com_present_o, [verified.com_present_s, verified.com_present_p]),
+    }
+}
+
+/// Prove an exact equality-with-constant filter on `filter_col` (committed as `com_filter`,
+/// real length `real_n`) and compact `sources` to the matching rows. Reused by the
+/// single-atom read (hash output columns) AND each join atom (id output columns).
+#[allow(clippy::too_many_arguments)]
+fn prove_filter_part(
+    context: &StoreProverContext<'_>,
+    filter_col: &[ArkFr],
+    com_filter: &ArkGT,
+    constant: ArkFr,
+    real_n: usize,
+    sources: &[Vec<ArkFr>],
+    source_coms: &[ArkGT],
+    transcript: &mut Transcript254,
+) -> io::Result<(PresentFilterProof, Vec<Vec<ArkFr>>)> {
+    let size = filter_col.len();
+    let sel: Vec<ArkFr> = (0..size)
+        .map(|i| if i < real_n && filter_col[i] == constant { f1() } else { f0() })
+        .collect();
+    let (filter, com_sel, com_w, _sel_eval) = prove_filter_indicator_with_context(
+        context, filter_col, constant, real_n, com_filter, transcript,
+    )?;
+    let (compaction, com_out, out_cols, out_len) = prove_compaction_only_with_context(
+        context, sources, source_coms, &sel, &com_sel, transcript,
+    )?;
+    Ok((PresentFilterProof { filter, com_sel, com_w, compaction, com_out, out_len }, out_cols))
+}
+
+fn verify_filter_part(
+    com_filter: &ArkGT,
+    constant: ArkFr,
+    real_n: usize,
+    source_coms: &[ArkGT],
+    proof: &PresentFilterProof,
+    transcript: &mut Transcript254,
+) -> io::Result<usize> {
+    verify_filter_indicator(
+        com_filter, constant, real_n, &proof.com_sel, &proof.com_w, &proof.filter, transcript,
+    )?;
+    verify_compaction_only(
+        source_coms, &proof.com_sel, &proof.com_out, proof.out_len, &proof.compaction, transcript,
+    )?;
+    Ok(proof.out_len)
+}
+
+fn prove_present_filter(
+    context: &StoreProverContext<'_>,
+    artifacts: &ReconcileArtifacts,
+    position: FilterPosition,
+    constant_hash: ArkFr,
+    transcript: &mut Transcript254,
+) -> io::Result<(PresentFilterProof, PresentReadResult)> {
+    let (filter_col, com_filter, sources, source_coms) = filter_selection(artifacts, position);
+    let source_vecs: Vec<Vec<ArkFr>> = sources.iter().map(|c| c.to_vec()).collect();
+    let (part, out_cols) = prove_filter_part(
+        context, filter_col, &com_filter, constant_hash, artifacts.present_len, &source_vecs, &source_coms, transcript,
+    )?;
+    let out_len = part.out_len;
+    let columns: Vec<Vec<ArkFr>> = out_cols.iter().map(|c| c[..out_len].to_vec()).collect();
+    Ok((part, PresentReadResult { columns, len: out_len }))
+}
+
+fn verify_present_filter(
+    verified: &ReconcileVerified,
+    position: FilterPosition,
+    constant_hash: ArkFr,
+    proof: &PresentFilterProof,
+    transcript: &mut Transcript254,
+) -> io::Result<usize> {
+    let (com_filter, source_coms) = filter_output_commitments(verified, position);
+    verify_filter_part(&com_filter, constant_hash, verified.present_len, &source_coms, proof, transcript)
+}
+
+/// Prove a single-atom read `Triple(...)` with ONE constant position over the reconciled
+/// N-layer `present`: reconcile + authenticated filter, one transcript. The delivered
+/// result columns are the two output variables as authenticated binding HASHES.
+pub fn prove_read_single_atom(
+    layers: &[&LayerCommitment],
+    position: FilterPosition,
+    constant_hash: ArkFr,
+) -> io::Result<(ReconcileProof, PresentFilterProof, PresentReadResult)> {
+    let context = StoreProverContext::cpu();
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
+    let (filter, result) = prove_present_filter(&context, &artifacts, position, constant_hash, &mut transcript)?;
+    Ok((reconcile, filter, result))
+}
+
+/// Verify a single-atom read. On success returns the authenticated result row count.
+pub fn verify_read_single_atom(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    position: FilterPosition,
+    constant_hash: ArkFr,
+    reconcile: &ReconcileProof,
+    filter: &PresentFilterProof,
+) -> io::Result<usize> {
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
+    verify_present_filter(&verified, position, constant_hash, filter, &mut transcript)
+}
+
+// ===========================================================================
+// Wave 3 — two-atom JOIN over present:  Triple(?x, p, ?y) & Triple(?y, q, ?z).
+//
+// The join key ?y is a term shared between atom-1's OBJECT and atom-2's SUBJECT. In hash
+// space the key is a ~254-bit field element (no magnitude-sort join). We therefore bridge
+// to the COMBINED-DICT id space — a small, dense, chain-wide canonical id per term — and
+// reuse the audited magnitude-sort inner join:
+//   * present's subject/object COMBINED ids are authenticated by an `id → hash` lookup
+//     against the combined node/value dict whose result column is required to EQUAL the
+//     reconciliation-authenticated hash column (`com_present_s`/`_o`). This pins each id to
+//     the correct term (unique id ↔ hash; `hash_object` collision-resistant), so the ids
+//     faithfully represent `present` without leaving the authenticated relation.
+//   * each atom is the audited equality filter on the hash predicate column, compacting the
+//     authenticated id columns to `R1 = [id_x, id_y]` (predicate p) and `R2 = [id_y, id_z]`
+//     (predicate q).
+//   * the audited complete-and-sound inner join joins `R1.col1 == R2.col0` on the small ids
+//     (no 254-bit cap), delivering exactly the `[id_x, id_y, id_z]` solutions.
+// Result ids resolve to canonical IRIs/values against the chain catalogs — deferred (report).
+// ===========================================================================
+
+/// `present`'s id-column authentication: the committed id column and the lookup pinning it to
+/// the reconciliation-authenticated hash column.
+#[derive(Clone, Debug)]
+pub struct PresentIdAuth {
+    pub com_id: ArkGT,
+    pub lookup: HashLookupInnerProof,
+}
+
+/// A two-atom join proof over `present`.
+#[derive(Clone, Debug)]
+pub struct PresentJoinProof {
+    pub auth_s: PresentIdAuth,
+    pub auth_o: PresentIdAuth,
+    pub filter1: PresentFilterProof,
+    pub filter2: PresentFilterProof,
+    pub inner: InnerJoinProof,
+    pub com_join_out: Vec<ArkGT>,
+    pub join_out_len: usize,
+    pub join_log: usize,
+}
+
+/// Authenticate a `present` id column (already at 2^K) against the combined node/value dict:
+/// the lookup's `com_v_hash` is later required to equal the reconciliation-authenticated hash.
+fn prove_id_auth(
+    context: &StoreProverContext<'_>,
+    id_col: &[ArkFr],
+    real_n: usize,
+    dict: &CombinedDictBuilt,
+    transcript: &mut Transcript254,
+) -> io::Result<PresentIdAuth> {
+    let com_id = context.commit_column(id_col)?;
+    let lookup = prove_hash_lookup_inner(
+        context, id_col, &com_id, &dict.id_at_k, &dict.hash_at_k, &dict.com_id_at_k, &dict.com_hash_at_k,
+        real_n, dict.n, transcript,
+    )?;
+    Ok(PresentIdAuth { com_id, lookup })
+}
+
+fn verify_id_auth(
+    reconcile_nv: &CombinedDictProof,
+    real_n: usize,
+    n_dict: usize,
+    expected_hash_com: ArkGT,
+    auth: &PresentIdAuth,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    verify_hash_lookup_inner(
+        &auth.com_id, &reconcile_nv.com_id_at_k, &reconcile_nv.com_hash_at_k, real_n, n_dict, &auth.lookup, transcript,
+    )?;
+    if auth.lookup.com_v_hash != expected_hash_com {
+        return Err(invalid("join: present id column is not authenticated to the reconciled hashes"));
+    }
+    Ok(())
+}
+
+fn prove_present_join(
+    context: &StoreProverContext<'_>,
+    artifacts: &ReconcileArtifacts,
+    const_p: ArkFr,
+    const_q: ArkFr,
+    transcript: &mut Transcript254,
+) -> io::Result<(PresentJoinProof, PresentReadResult)> {
+    let m = artifacts.present_len;
+    // (1) Authenticate present's subject/object combined-dict ids.
+    let auth_s = prove_id_auth(context, &artifacts.present_id_s, m, &artifacts.nv_dict, transcript)?;
+    let auth_o = prove_id_auth(context, &artifacts.present_id_o, m, &artifacts.nv_dict, transcript)?;
+
+    // (2) Two predicate atoms → id relations. atom1 Triple(?x,p,?y): x=subject, y=object.
+    //     atom2 Triple(?y,q,?z): y=subject, z=object. Both compact [id_s, id_o].
+    let id_sources = vec![artifacts.present_id_s.clone(), artifacts.present_id_o.clone()];
+    let id_source_coms = vec![auth_s.com_id, auth_o.com_id];
+    let (filter1, r1_cols) = prove_filter_part(
+        context, &artifacts.present_p, &artifacts.com_present_p, const_p, m, &id_sources, &id_source_coms, transcript,
+    )?;
+    let (filter2, r2_cols) = prove_filter_part(
+        context, &artifacts.present_p, &artifacts.com_present_p, const_q, m, &id_sources, &id_source_coms, transcript,
+    )?;
+
+    // (3) Inner join on the shared ?y: R1.col1 (id_y = object of atom1) == R2.col0 (id_y = subject of atom2).
+    let r1 = RelationWitness {
+        columns: r1_cols,
+        commitments: filter1.com_out.clone(),
+        log_domain: artifacts.working_log,
+        n: filter1.out_len,
+    };
+    let r2 = RelationWitness {
+        columns: r2_cols,
+        commitments: filter2.com_out.clone(),
+        log_domain: artifacts.working_log,
+        n: filter2.out_len,
+    };
+    let join = prove_inner_join_with_keys_and_context(context, &r1, &r2, &[(1, 0)], transcript)?;
+    let out_cols: Vec<Vec<ArkFr>> = join.columns.iter().map(|c| c[..join.n].to_vec()).collect();
+
+    Ok((
+        PresentJoinProof {
+            auth_s,
+            auth_o,
+            filter1,
+            filter2,
+            inner: join.proof,
+            com_join_out: join.commitments,
+            join_out_len: join.n,
+            join_log: join.log_domain,
+        },
+        PresentReadResult { columns: out_cols, len: join.n },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_present_join(
+    reconcile: &ReconcileProof,
+    verified: &ReconcileVerified,
+    head_nv: usize,
+    const_p: ArkFr,
+    const_q: ArkFr,
+    proof: &PresentJoinProof,
+    transcript: &mut Transcript254,
+) -> io::Result<usize> {
+    let m = verified.present_len;
+    // (1) present id authentication against the reconciled hashes.
+    verify_id_auth(&reconcile.combined_nv, m, head_nv, verified.com_present_s, &proof.auth_s, transcript)?;
+    verify_id_auth(&reconcile.combined_nv, m, head_nv, verified.com_present_o, &proof.auth_o, transcript)?;
+
+    // (2) The two predicate atoms.
+    let id_source_coms = [proof.auth_s.com_id, proof.auth_o.com_id];
+    let m1 = verify_filter_part(&verified.com_present_p, const_p, m, &id_source_coms, &proof.filter1, transcript)?;
+    let m2 = verify_filter_part(&verified.com_present_p, const_q, m, &id_source_coms, &proof.filter2, transcript)?;
+
+    // (3) The inner join.
+    let r1 = RelationCommit { commitments: proof.filter1.com_out.clone(), log_domain: verified.working_log, n: m1 };
+    let r2 = RelationCommit { commitments: proof.filter2.com_out.clone(), log_domain: verified.working_log, n: m2 };
+    verify_inner_join_with_keys(
+        &r1, &r2, &[(1, 0)], &proof.com_join_out, proof.join_out_len, proof.join_log, &proof.inner, transcript,
+    )?;
+    Ok(proof.join_out_len)
+}
+
+/// Prove a two-atom join read `Triple(?x, p, ?y) & Triple(?y, q, ?z)` over the reconciled
+/// N-layer `present`. The delivered result is the `[id_x, id_y, id_z]` solutions as combined-dict
+/// ids (resolution to canonical IRIs/values deferred).
+pub fn prove_read_two_atom_join(
+    layers: &[&LayerCommitment],
+    const_p: ArkFr,
+    const_q: ArkFr,
+) -> io::Result<(ReconcileProof, PresentJoinProof, PresentReadResult)> {
+    let context = StoreProverContext::cpu();
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
+    let (join, result) = prove_present_join(&context, &artifacts, const_p, const_q, &mut transcript)?;
+    Ok((reconcile, join, result))
+}
+
+/// Verify a two-atom join read. On success returns the authenticated solution count.
+pub fn verify_read_two_atom_join(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    const_p: ArkFr,
+    const_q: ArkFr,
+    reconcile: &ReconcileProof,
+    join: &PresentJoinProof,
+) -> io::Result<usize> {
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
+    let head_nv = layers.last().unwrap().verifier_view().state.node_value_count as usize;
+    verify_present_join(reconcile, &verified, head_nv, const_p, const_q, join, &mut transcript)
 }
 
 #[cfg(test)]
@@ -1039,5 +1490,255 @@ mod tests {
         let head_root = lref.last().unwrap().state.commitment_root;
         proof.combined_nv.com_hash = commit_col(&vec![ark(7); 1usize << proof.combined_nv.log]);
         assert!(verify_reconcile(&lref, head_root, &proof).is_err());
+    }
+
+    // ============================================================
+    // Wave 3 — single-atom BGP (filter) over present.
+    // ============================================================
+
+    fn hash_pred(iri: &str) -> ArkFr {
+        hash_term(iri.as_bytes())
+    }
+    fn hash_node(iri: &str) -> ArkFr {
+        hash_object(&CanonicalObject::Node(iri.as_bytes().to_vec()))
+    }
+
+    /// Base+delta with MIXED predicates so a predicate filter selects a proper subset.
+    /// Base: {a1 p1 b1, a2 p1 b2, a3 p2 c3, a4 p2 c4, a7 p1 b7, a8 p2 c8}.
+    /// Delta: remove {a1 p1 b1, a7 p1 b7}; add {a5 p1 b5, a6 p2 c6}.
+    /// present = {a2 p1 b2, a3 p2 c3, a4 p2 c4, a8 p2 c8, a5 p1 b5, a6 p2 c6}.
+    fn filter_stack() -> Vec<Arc<LayerCommitment>> {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (s, p, o) in [
+            ("a1", "p1", "b1"), ("a2", "p1", "b2"), ("a3", "p2", "c3"),
+            ("a4", "p2", "c4"), ("a7", "p1", "b7"), ("a8", "p2", "c8"),
+        ] {
+            builder.add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o))).unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let base_lc = base.proof_commitment().unwrap();
+        let child = base.open_write().unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("a1"), &iri("p1"), &iri("b1"))).unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("a7"), &iri("p1"), &iri("b7"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("a5"), &iri("p1"), &iri("b5"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("a6"), &iri("p2"), &iri("c6"))).unwrap();
+        let head = child.commit().unwrap();
+        vec![base_lc, head.proof_commitment().unwrap()]
+    }
+
+    /// Materialized single-atom filter: present rows whose `position` hashes to `constant`,
+    /// output the other two columns (matching `filter_selection`'s output order).
+    fn materialized_filter(layers: &[&LayerCommitment], position: FilterPosition, constant: ArkFr) -> Vec<(ArkFr, ArkFr)> {
+        reconcile_present(layers)
+            .unwrap()
+            .iter()
+            .filter_map(|r| {
+                let (sh, ph, oh) = (subject_hash(r), predicate_hash(r), object_hash(r));
+                let (key, out) = match position {
+                    FilterPosition::Predicate => (ph, (sh, oh)),
+                    FilterPosition::Subject => (sh, (ph, oh)),
+                    FilterPosition::Object => (oh, (sh, ph)),
+                };
+                if key == constant { Some(out) } else { None }
+            })
+            .collect()
+    }
+
+    fn out_pairs(result: &PresentReadResult) -> Vec<(ArkFr, ArkFr)> {
+        (0..result.len).map(|i| (result.columns[0][i], result.columns[1][i])).collect()
+    }
+
+    fn bag_eq_pairs(mut a: Vec<(ArkFr, ArkFr)>, mut b: Vec<(ArkFr, ArkFr)>) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let key = |t: &(ArkFr, ArkFr)| (format!("{:?}", t.0), format!("{:?}", t.1));
+        a.sort_by_key(&key);
+        b.sort_by_key(&key);
+        a == b
+    }
+
+    fn run_filter(position: FilterPosition, constant: ArkFr, expect: usize) {
+        let layers = filter_stack();
+        let lref = refs(&layers);
+        let (rec, filt, result) = prove_read_single_atom(&lref, position, constant).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let m = verify_read_single_atom(&lref, head_root, position, constant, &rec, &filt).unwrap();
+        let ground = materialized_filter(&lref, position, constant);
+        assert_eq!(m, ground.len(), "count must equal materialized filter");
+        assert_eq!(m, expect);
+        assert!(bag_eq_pairs(out_pairs(&result), ground), "result bag must equal materialized filter");
+    }
+
+    #[test]
+    fn single_atom_predicate_constant() {
+        // Triple(?s, p1, ?o): present has 2 p1 rows (a2->b2, a5->b5) and 4 p2 rows.
+        run_filter(FilterPosition::Predicate, hash_pred("http://ex/p1"), 2);
+        run_filter(FilterPosition::Predicate, hash_pred("http://ex/p2"), 4);
+        // A predicate absent from present yields the empty answer.
+        run_filter(FilterPosition::Predicate, hash_pred("http://ex/pX"), 0);
+    }
+
+    #[test]
+    fn single_atom_subject_constant() {
+        // Triple(a2, ?p, ?o): exactly {a2 p1 b2}.
+        run_filter(FilterPosition::Subject, hash_node("http://ex/a2"), 1);
+        // A removed subject (a1) is absent.
+        run_filter(FilterPosition::Subject, hash_node("http://ex/a1"), 0);
+    }
+
+    #[test]
+    fn single_atom_object_constant() {
+        // Triple(?s, ?p, c3): exactly {a3 p2 c3}.
+        run_filter(FilterPosition::Object, hash_node("http://ex/c3"), 1);
+    }
+
+    #[test]
+    fn filter_fabricated_result_row_rejects() {
+        let layers = filter_stack();
+        let lref = refs(&layers);
+        let c = hash_pred("http://ex/p1");
+        let (rec, mut filt, _) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        // Replace an output column commitment with a fabricated one: the compaction binding fails.
+        filt.com_out[0] = commit_col(&vec![ark(4242); 1usize << rec.working_log]);
+        assert!(verify_read_single_atom(&lref, head_root, FilterPosition::Predicate, c, &rec, &filt).is_err());
+    }
+
+    #[test]
+    fn filter_dropped_row_rejects() {
+        let layers = filter_stack();
+        let lref = refs(&layers);
+        let c = hash_pred("http://ex/p2"); // 4 matching rows
+        let (rec, filt, _) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let mut forged = filt.clone();
+        forged.out_len -= 1; // claim one fewer matching row
+        assert!(verify_read_single_atom(&lref, head_root, FilterPosition::Predicate, c, &rec, &forged).is_err());
+    }
+
+    #[test]
+    fn filter_wrong_constant_rejects() {
+        let layers = filter_stack();
+        let lref = refs(&layers);
+        let c = hash_pred("http://ex/p1");
+        let (rec, filt, _) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        // Verifying the p1 proof against the p2 constant must reject (selection is p1-bound).
+        let wrong = hash_pred("http://ex/p2");
+        assert!(verify_read_single_atom(&lref, head_root, FilterPosition::Predicate, wrong, &rec, &filt).is_err());
+    }
+
+    // ============================================================
+    // Wave 3 — two-atom JOIN over present.
+    // ============================================================
+
+    /// A stack whose present supports Triple(?x, p1, ?y) & Triple(?y, p2, ?z):
+    /// present p1 = {x1->y1, x2->y1, x5->y1}, p2 = {y1->z1, y1->z2, y1->z5}
+    /// (base adds two non-joining rows x3->p1->y3, y4->p2->z4 which the delta removes).
+    /// Join on ?y = y1 => 3 x-bindings × 3 z-bindings = 9 solutions.
+    fn join_stack() -> Vec<Arc<LayerCommitment>> {
+        let store = open_sync_memory_store();
+        let b = store.create_base_layer().unwrap();
+        for (s, p, o) in [
+            ("x1", "p1", "y1"), ("x2", "p1", "y1"), ("y1", "p2", "z1"),
+            ("y1", "p2", "z2"), ("x3", "p1", "y3"), ("y4", "p2", "z4"),
+        ] {
+            b.add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o))).unwrap();
+        }
+        let base = b.commit().unwrap();
+        let base_lc = base.proof_commitment().unwrap();
+        let child = base.open_write().unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("x3"), &iri("p1"), &iri("y3"))).unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("y4"), &iri("p2"), &iri("z4"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("x5"), &iri("p1"), &iri("y1"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("y1"), &iri("p2"), &iri("z5"))).unwrap();
+        let head = child.commit().unwrap();
+        vec![base_lc, head.proof_commitment().unwrap()]
+    }
+
+    /// Materialized 2-atom join over present, in COMBINED-DICT id space (matching the proof's
+    /// `[id_x, id_y, id_z]` output).
+    fn materialized_join(layers: &[&LayerCommitment], p: &str, q: &str) -> Vec<(ArkFr, ArkFr, ArkFr)> {
+        let present = reconcile_present(layers).unwrap();
+        let mut out = Vec::new();
+        for a in present.iter().filter(|r| r.triple.predicate == p.as_bytes()) {
+            for c in present.iter().filter(|r| r.triple.predicate == q.as_bytes()) {
+                if a.object_id == c.subject_id {
+                    out.push((ark(a.subject_id), ark(a.object_id), ark(c.object_id)));
+                }
+            }
+        }
+        out
+    }
+
+    fn join_out(result: &PresentReadResult) -> Vec<(ArkFr, ArkFr, ArkFr)> {
+        (0..result.len)
+            .map(|i| (result.columns[0][i], result.columns[1][i], result.columns[2][i]))
+            .collect()
+    }
+
+    #[test]
+    fn two_atom_join_over_present() {
+        let layers = join_stack();
+        let lref = refs(&layers);
+        let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
+        let (rec, join, result) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let n = verify_read_two_atom_join(&lref, head_root, cp, cq, &rec, &join).unwrap();
+        let ground = materialized_join(&lref, "http://ex/p1", "http://ex/p2");
+        assert_eq!(n, ground.len(), "join count must equal materialized join");
+        assert_eq!(n, 9);
+        assert!(bag_eq(join_out(&result), ground), "join result bag must equal materialized join");
+    }
+
+    #[test]
+    fn join_fabricated_row_rejects() {
+        let layers = join_stack();
+        let lref = refs(&layers);
+        let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
+        let (rec, mut join, _) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        // Fabricate an output column: the inner-join matched-projection binding fails.
+        join.com_join_out[0] = commit_col(&vec![ark(777); 1usize << join.join_log]);
+        assert!(verify_read_two_atom_join(&lref, head_root, cp, cq, &rec, &join).is_err());
+    }
+
+    #[test]
+    fn join_dropped_row_rejects() {
+        let layers = join_stack();
+        let lref = refs(&layers);
+        let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
+        let (rec, join, _) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let mut forged = join.clone();
+        forged.join_out_len -= 1; // claim one fewer solution
+        assert!(verify_read_two_atom_join(&lref, head_root, cp, cq, &rec, &forged).is_err());
+    }
+
+    #[test]
+    fn join_wrong_predicate_rejects() {
+        let layers = join_stack();
+        let lref = refs(&layers);
+        let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
+        let (rec, join, _) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        // Verify against a wrong second predicate: the second atom's selection is p2-bound.
+        let wrong = hash_pred("http://ex/pX");
+        assert!(verify_read_two_atom_join(&lref, head_root, cp, wrong, &rec, &join).is_err());
+    }
+
+    #[test]
+    fn join_tampered_present_id_rejects() {
+        // A prover who feeds a wrong combined-dict id for present (to fabricate a joining
+        // pair) fails the id → hash authentication against the reconciled hashes.
+        let layers = join_stack();
+        let lref = refs(&layers);
+        let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
+        let (rec, mut join, _) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        join.auth_s.com_id = commit_col(&vec![ark(3); 1usize << rec.working_log]);
+        assert!(verify_read_two_atom_join(&lref, head_root, cp, cq, &rec, &join).is_err());
     }
 }
