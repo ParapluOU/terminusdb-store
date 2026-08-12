@@ -53,8 +53,9 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    prove_sumcheck, verify_column_openings, verify_sumcheck, ClaimShape, ColumnOpening, Expr,
-    Operand, StoreProverContext, SumcheckClaim, SumcheckProof, SumcheckShape, Term, Transcript254,
+    commit_column, prove_sumcheck, verify_column_openings, verify_sumcheck, ClaimShape,
+    ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof, SumcheckShape,
+    Term, Transcript254,
 };
 use super::anti::{
     prove_inner_join_with_keys_and_context, verify_inner_join_with_keys, InnerJoinProof,
@@ -1236,6 +1237,163 @@ pub fn verify_read_two_atom_join(
     verify_present_join(reconcile, &verified, head_nv, const_p, const_q, join, &mut transcript)
 }
 
+// ===========================================================================
+// Wave 4 — RESULT RESOLUTION: authenticated (hash|id) result bindings → CanonicalObjects.
+//
+// The BGP-over-present proofs authenticate result COMMITMENTS whose columns are binding
+// HASHES (single-atom filter, `hash_object`/`hash_term`) or COMBINED-DICT IDS (join). This
+// turns them into readable answers — real IRIs / typed literals — WITHOUT re-running the query:
+//   1. The prover's claimed result VALUES (real prefix) are tied to the authenticated result
+//      commitment by re-committing (pad to the result domain, `commit_column`, require equality
+//      with the proof's committed output). A forged/altered binding fails this bind.
+//   2. Each value resolves to a `CanonicalObject` against the CHAIN catalogs — a term's canonical
+//      bytes live in the catalog of the layer whose incremental dict range defines it, so the
+//      resolver searches every layer's root-bound `node_value_catalog` / `predicate_catalog`
+//      (each id/hash is unique across the disjoint ranges). The catalogs are authenticated by the
+//      per-layer `validate()` the reconciliation verifier already ran (changed IRI/datatype/lexical
+//      bytes re-hash differently and fail the root-bound dictionary commitment).
+// Mirrors the base `resolve_result_values` discipline, generalized across the N-layer chain.
+// ===========================================================================
+
+/// How to resolve a result-column value to a `CanonicalObject`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveKind {
+    /// value = `hash_object(object)`; resolve via the chain node/value catalogs.
+    NodeValueHash,
+    /// value = combined-dict `object_id`; resolve via the chain node/value catalogs.
+    NodeValueId,
+    /// value = `hash_term(predicate)`; resolve via the chain predicate catalogs.
+    PredicateHash,
+}
+
+fn resolve_one(
+    views: &[VerifierCommitmentRef<'_>],
+    value: ArkFr,
+    kind: ResolveKind,
+) -> io::Result<CanonicalObject> {
+    match kind {
+        ResolveKind::NodeValueHash => {
+            for view in views {
+                for rec in view.node_value_catalog {
+                    if hash_object(&rec.triple.object) == value {
+                        return Ok(rec.triple.object.clone());
+                    }
+                }
+            }
+            Err(invalid("resolve: result hash is absent from the chain node/value dictionaries"))
+        }
+        ResolveKind::NodeValueId => {
+            for view in views {
+                for rec in view.node_value_catalog {
+                    if ark(rec.object_id) == value {
+                        return Ok(rec.triple.object.clone());
+                    }
+                }
+            }
+            Err(invalid("resolve: result id is absent from the chain node/value dictionaries"))
+        }
+        ResolveKind::PredicateHash => {
+            for view in views {
+                for rec in view.predicate_catalog {
+                    if hash_term(&rec.triple.predicate) == value {
+                        return Ok(CanonicalObject::Node(rec.triple.predicate.clone()));
+                    }
+                }
+            }
+            Err(invalid("resolve: result hash is absent from the chain predicate dictionaries"))
+        }
+    }
+}
+
+/// Resolve authenticated result columns to `CanonicalObject`s. `claimed_columns` are the
+/// prover's real-prefix result values; they are bound to `com_out` (the proof's committed
+/// result, at `2^domain_log`) by re-commitment before resolution.
+fn resolve_result_columns(
+    views: &[VerifierCommitmentRef<'_>],
+    claimed_columns: &[Vec<ArkFr>],
+    com_out: &[ArkGT],
+    result_len: usize,
+    domain_log: usize,
+    kinds: &[ResolveKind],
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    if claimed_columns.len() != com_out.len() || claimed_columns.len() != kinds.len() {
+        return Err(invalid("resolve: result column shape mismatch"));
+    }
+    // (1) Bind the claimed values to the authenticated result commitments.
+    for (col, com) in claimed_columns.iter().zip(com_out.iter()) {
+        if col.len() != result_len {
+            return Err(invalid("resolve: claimed result column length mismatch"));
+        }
+        let mut padded = col.clone();
+        padded.resize(1usize << domain_log, f0());
+        if commit_column(&padded)? != *com {
+            return Err(invalid(
+                "resolve: claimed result values do not open the authenticated result commitment",
+            ));
+        }
+    }
+    // (2) Resolve each value against the root-bound chain catalogs.
+    claimed_columns
+        .iter()
+        .zip(kinds)
+        .map(|(col, kind)| col.iter().map(|v| resolve_one(views, *v, *kind)).collect())
+        .collect()
+}
+
+/// The output-column resolution kinds for a single-atom filter (the two non-constant columns).
+fn filter_output_kinds(position: FilterPosition) -> [ResolveKind; 2] {
+    match position {
+        // output [S, O]
+        FilterPosition::Predicate => [ResolveKind::NodeValueHash, ResolveKind::NodeValueHash],
+        // output [P, O]
+        FilterPosition::Subject => [ResolveKind::PredicateHash, ResolveKind::NodeValueHash],
+        // output [S, P]
+        FilterPosition::Object => [ResolveKind::NodeValueHash, ResolveKind::PredicateHash],
+    }
+}
+
+/// Verify a single-atom read AND resolve its result to `CanonicalObject`s (the readable answer,
+/// authenticated against the chain — no query re-run). `claimed_columns` are the prover's
+/// published result values (from [`PresentReadResult`]).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_resolve_single_atom(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    position: FilterPosition,
+    constant_hash: ArkFr,
+    reconcile: &ReconcileProof,
+    filter: &PresentFilterProof,
+    claimed_columns: &[Vec<ArkFr>],
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
+    let out_len = verify_present_filter(&verified, position, constant_hash, filter, &mut transcript)?;
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let kinds = filter_output_kinds(position);
+    resolve_result_columns(&views, claimed_columns, &filter.com_out, out_len, verified.working_log, &kinds)
+}
+
+/// Verify a two-atom join read AND resolve its `[?x, ?y, ?z]` bindings to `CanonicalObject`s.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_resolve_two_atom_join(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    const_p: ArkFr,
+    const_q: ArkFr,
+    reconcile: &ReconcileProof,
+    join: &PresentJoinProof,
+    claimed_columns: &[Vec<ArkFr>],
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
+    let head_nv = layers.last().unwrap().verifier_view().state.node_value_count as usize;
+    let out_len = verify_present_join(reconcile, &verified, head_nv, const_p, const_q, join, &mut transcript)?;
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    // Join output [id_x, id_y, id_z] are all node/value combined-dict ids.
+    let kinds = [ResolveKind::NodeValueId, ResolveKind::NodeValueId, ResolveKind::NodeValueId];
+    resolve_result_columns(&views, claimed_columns, &join.com_join_out, out_len, join.join_log, &kinds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1740,5 +1898,172 @@ mod tests {
         let head_root = lref.last().unwrap().state.commitment_root;
         join.auth_s.com_id = commit_col(&vec![ark(3); 1usize << rec.working_log]);
         assert!(verify_read_two_atom_join(&lref, head_root, cp, cq, &rec, &join).is_err());
+    }
+
+    // ============================================================
+    // Wave 4 — result resolution to CanonicalObjects.
+    // ============================================================
+
+    fn rows_of(cols: &[Vec<CanonicalObject>]) -> Vec<Vec<CanonicalObject>> {
+        if cols.is_empty() {
+            return vec![];
+        }
+        let n = cols[0].len();
+        (0..n).map(|i| cols.iter().map(|c| c[i].clone()).collect()).collect()
+    }
+
+    fn bag_eq_rows(mut a: Vec<Vec<CanonicalObject>>, mut b: Vec<Vec<CanonicalObject>>) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let key = |r: &Vec<CanonicalObject>| format!("{r:?}");
+        a.sort_by_key(&key);
+        b.sort_by_key(&key);
+        a == b
+    }
+
+    /// Materialized single-atom filter, RESOLVED to CanonicalObjects (matching `filter_output_kinds`).
+    fn materialized_filter_resolved(
+        layers: &[&LayerCommitment],
+        position: FilterPosition,
+        constant: ArkFr,
+    ) -> Vec<Vec<CanonicalObject>> {
+        reconcile_present(layers)
+            .unwrap()
+            .iter()
+            .filter_map(|r| {
+                let (sh, ph, oh) = (subject_hash(r), predicate_hash(r), object_hash(r));
+                let node_s = CanonicalObject::Node(r.triple.subject.clone());
+                let node_p = CanonicalObject::Node(r.triple.predicate.clone());
+                let obj = r.triple.object.clone();
+                let (key, out) = match position {
+                    FilterPosition::Predicate => (ph, vec![node_s, obj]),
+                    FilterPosition::Subject => (sh, vec![node_p, obj]),
+                    FilterPosition::Object => (oh, vec![node_s, node_p]),
+                };
+                if key == constant { Some(out) } else { None }
+            })
+            .collect()
+    }
+
+    fn materialized_join_resolved(layers: &[&LayerCommitment], p: &str, q: &str) -> Vec<Vec<CanonicalObject>> {
+        let present = reconcile_present(layers).unwrap();
+        let mut out = Vec::new();
+        for a in present.iter().filter(|r| r.triple.predicate == p.as_bytes()) {
+            for c in present.iter().filter(|r| r.triple.predicate == q.as_bytes()) {
+                if a.object_id == c.subject_id {
+                    out.push(vec![
+                        CanonicalObject::Node(a.triple.subject.clone()),
+                        a.triple.object.clone(),
+                        c.triple.object.clone(),
+                    ]);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn single_atom_predicate_resolved() {
+        let layers = filter_stack();
+        let lref = refs(&layers);
+        let c = hash_pred("http://ex/p2"); // 4 rows
+        let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let resolved = verify_and_resolve_single_atom(
+            &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns,
+        )
+        .unwrap();
+        let ground = materialized_filter_resolved(&lref, FilterPosition::Predicate, c);
+        assert!(bag_eq_rows(rows_of(&resolved), ground), "resolved filter must equal materialized");
+        // Real IRIs, not hashes.
+        assert!(resolved[0].iter().all(|o| matches!(o, CanonicalObject::Node(_))));
+    }
+
+    #[test]
+    fn two_atom_join_resolved() {
+        let layers = join_stack();
+        let lref = refs(&layers);
+        let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
+        let (rec, join, result) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let resolved = verify_and_resolve_two_atom_join(
+            &lref, head_root, cp, cq, &rec, &join, &result.columns,
+        )
+        .unwrap();
+        let ground = materialized_join_resolved(&lref, "http://ex/p1", "http://ex/p2");
+        assert_eq!(resolved.len(), 3);
+        assert!(bag_eq_rows(rows_of(&resolved), ground), "resolved join must equal materialized");
+    }
+
+    /// A stack with typed string-VALUE objects, to show resolution yields `CanonicalObject::Value`.
+    fn value_stack() -> Vec<Arc<LayerCommitment>> {
+        let store = open_sync_memory_store();
+        let b = store.create_base_layer().unwrap();
+        b.add_value_triple(ValueTriple::new_string_value(&iri("a1"), &iri("p1"), "hello")).unwrap();
+        b.add_value_triple(ValueTriple::new_string_value(&iri("a2"), &iri("p1"), "world")).unwrap();
+        b.add_value_triple(ValueTriple::new_node(&iri("a3"), &iri("p1"), &iri("b3"))).unwrap();
+        b.add_value_triple(ValueTriple::new_node(&iri("a4"), &iri("p1"), &iri("b4"))).unwrap();
+        let base = b.commit().unwrap();
+        let base_lc = base.proof_commitment().unwrap();
+        let child = base.open_write().unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("a3"), &iri("p1"), &iri("b3"))).unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("a4"), &iri("p1"), &iri("b4"))).unwrap();
+        child.add_value_triple(ValueTriple::new_string_value(&iri("a5"), &iri("p1"), "foo")).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("a6"), &iri("p1"), &iri("b6"))).unwrap();
+        let head = child.commit().unwrap();
+        vec![base_lc, head.proof_commitment().unwrap()]
+    }
+
+    #[test]
+    fn resolved_typed_value_objects() {
+        let layers = value_stack();
+        let lref = refs(&layers);
+        let c = hash_pred("http://ex/p1");
+        let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let resolved = verify_and_resolve_single_atom(
+            &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns,
+        )
+        .unwrap();
+        // present = {a1 "hello", a2 "world", a5 "foo", a6 b6}: the O column resolves 3 Values + 1 Node.
+        let ground = materialized_filter_resolved(&lref, FilterPosition::Predicate, c);
+        assert!(bag_eq_rows(rows_of(&resolved), ground));
+        let objects = &resolved[1]; // the O column
+        let values = objects.iter().filter(|o| matches!(o, CanonicalObject::Value { .. })).count();
+        let nodes = objects.iter().filter(|o| matches!(o, CanonicalObject::Node(_))).count();
+        assert_eq!((values, nodes), (3, 1), "three typed literals and one node IRI resolved");
+    }
+
+    #[test]
+    fn resolve_forged_binding_rejects() {
+        // A prover who publishes an altered result value (a fabricated binding) fails the
+        // re-commitment bind to the authenticated result commitment.
+        let layers = filter_stack();
+        let lref = refs(&layers);
+        let c = hash_pred("http://ex/p2");
+        let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let mut forged = result.columns.clone();
+        forged[0][0] = ark(123_456_789); // a fabricated subject binding
+        assert!(verify_and_resolve_single_atom(
+            &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &forged,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn resolve_forged_join_binding_rejects() {
+        let layers = join_stack();
+        let lref = refs(&layers);
+        let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
+        let (rec, join, result) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let mut forged = result.columns.clone();
+        forged[2][0] = ark(424_242); // a fabricated ?z binding
+        assert!(verify_and_resolve_two_atom_join(
+            &lref, head_root, cp, cq, &rec, &join, &forged,
+        )
+        .is_err());
     }
 }
