@@ -24,7 +24,7 @@
 //! 3. **Order binding** — a `permutation` proves the ordered cons column `C[0..K]` is exactly that
 //!    cons-cell set (same cells, each once — distinctness + completeness). Then, for each cell, an
 //!    `InnerJoin` against the authenticated `rdf:rest` edge relation reads its real successor: the join
-//!    output row count pinned to `K+1` forces `rest` to be FUNCTIONAL (a cell with two `rest`s over- or
+//!    output row count pinned to `K` (= `cons_len`) forces `rest` to be FUNCTIONAL (a cell with two `rest`s over- or
 //!    under-shoots the count); a `relocation` pins the join's SUBJECT column positionally back to `C`
 //!    (so each read successor belongs to the RIGHT cell); and the audited positional-SUCCESSOR primitive
 //!    (`proof::sort`) proves the read successor column is the one-step shift of `C` (`rest(C[i])=C[i+1]`).
@@ -63,7 +63,7 @@ use crate::proof::anti::{
     prove_inner_join_with_keys_and_context, prove_left_anti_join_with_keys_and_context,
     verify_inner_join_with_keys, verify_left_anti_join_with_keys, InnerJoinProof, LeftAntiJoinProof,
 };
-use crate::proof::argument::{StoreProverContext, Transcript254};
+use crate::proof::argument::{verify_column_openings, ColumnOpening, StoreProverContext, Transcript254};
 use crate::proof::bgp::{RelationCommit, RelationWitness};
 use crate::proof::commitment::{LayerCommitment, VerifierLayer};
 use crate::proof::equality::{
@@ -224,6 +224,11 @@ pub struct OrderedListWalkProof {
     pub(crate) walk_perm: RelationPermutationProof,
     /// The committed ordered cons column `C` (the permutation output).
     pub(crate) com_walk: ArkGT,
+    /// HEAD BINDING: a Dory opening of `com_walk` at position 0 (the all-zeros evaluation point),
+    /// proving the FIRST cons cell `C[0]` equals the anchored `head` cons cell. The successor step
+    /// pins `C[1..K]` as the rest-chain but constrains NOTHING about `C[0]`; this opening is the local
+    /// guard that nails the first position to the head (design doc §3 step (b)).
+    pub(crate) head_opening: ColumnOpening,
 
     /// `InnerJoin(C, rest_edges)` reading each cell's successor; its two output commitments.
     pub(crate) rest_join: InnerJoinProof,
@@ -274,6 +279,7 @@ impl OrderedListWalkProof {
         self.cons_log_domain.put(out)?;
         self.walk_perm.put(out)?;
         self.com_walk.put(out)?;
+        self.head_opening.put(out)?;
         self.rest_join.put(out)?;
         self.rest_join_out.put(out)?;
         self.rest_reloc_subj.put(out)?;
@@ -307,6 +313,7 @@ impl OrderedListWalkProof {
             cons_log_domain: usize::get(reader)?,
             walk_perm: RelationPermutationProof::get(reader)?,
             com_walk: ArkGT::get(reader)?,
+            head_opening: ColumnOpening::get(reader)?,
             rest_join: InnerJoinProof::get(reader)?,
             rest_join_out: Vec::<ArkGT>::get(reader)?,
             rest_reloc_subj: RelocationProof::get(reader)?,
@@ -444,6 +451,15 @@ fn prove_ordered_list_walk_impl(
         n: cons_len,
     };
 
+    // (3b) HEAD BINDING (design doc §3 step (b)): open the ordered cons column `com_walk` at position 0
+    // so the verifier can bind C[0] to the anchored head. Evaluating a committed column's multilinear
+    // extension at the all-zeros point yields its entry 0, so this opening proves exactly `C[0]`. The
+    // successor step below pins C[1..K] as the rest-chain but constrains NOTHING about C[0]; this is the
+    // local guard that nails the first cell to the head cons cell.
+    let head_point = vec![ArkFr::zero(); cons_log_domain];
+    let mut t_head = lw_transcript(&root, &digest, b"head-check");
+    let head_opening = context.prove_column_openings(&[walk_col.clone()], &head_point, &mut t_head)?;
+
     // (4) rest edge relation (top-level, for the functional-edge join) + first edge relation.
     let rest_p = edge_relation_plan(digest, RDF_REST, b"rest-edges");
     let rest_edges = RecursiveRelationEnvelope::prove_bounded(context, layer, &rest_p, depth + 1, nodes)?;
@@ -519,6 +535,7 @@ fn prove_ordered_list_walk_impl(
         cons_log_domain,
         walk_perm: walk.proof,
         com_walk,
+        head_opening,
         rest_join: rest_bind.join,
         rest_join_out: rest_bind.join_out,
         rest_reloc_subj: rest_bind.reloc_subj,
@@ -751,6 +768,28 @@ impl RecursiveRelationEnvelope {
             &mut t_strip,
         )?;
 
+        // (2b) EXPLICIT cons-cell count pin (defense in depth). The stripped cons set must have exactly
+        // the closure's reachable-set size MINUS the single `rdf:nil` terminator (present iff `nil` is
+        // reachable, which it always is for a well-formed list). This equality is already implied by the
+        // strip-nil anti-join's output length, but asserting it locally stops `cons_len` from silently
+        // drifting away from the authenticated closure.
+        let nil_field = ArkFr::from_u64(nil_id);
+        let nil_reachable = walk.closure.result_columns.first().map_or(false, |column| {
+            column
+                .iter()
+                .take(walk.closure.result_len)
+                .any(|value| *value == nil_field)
+        });
+        let expected_cons_len = walk
+            .closure
+            .result_len
+            .saturating_sub(usize::from(nil_reachable));
+        if walk.cons_len != expected_cons_len {
+            return Err(invalid(
+                "ordered-list-walk cons-cell count does not equal the closure set minus the rdf:nil terminator",
+            ));
+        }
+
         // (3) ORDER: C is a permutation of the cons-cell set.
         let mut t_perm = lw_transcript(&root, &digest, b"walk-perm");
         verify_relation_permutation(
@@ -766,6 +805,34 @@ impl RecursiveRelationEnvelope {
             log_domain: walk.cons_log_domain,
             n: walk.cons_len,
         };
+
+        // (3b) HEAD BINDING (design doc §3 step (b)): the FIRST cons cell `C[0]` must be the anchored
+        // head. We open `com_walk` at position 0 (the all-zeros evaluation point selects entry 0 of the
+        // committed column) and require the opened value to equal the authenticated head cons cell read
+        // from the anchor's result column. The successor step (below) constrains only C[1..K]; without
+        // this local check, C[0]'s correctness would rest solely on the STRUCTURAL argument (the head is
+        // the unique source of the rest-chain), which the audit flagged as the most-fragile link.
+        let head_field = walk
+            .anchor
+            .result_columns
+            .first()
+            .and_then(|column| column.first())
+            .copied()
+            .ok_or_else(|| invalid("ordered-list-walk anchor head column is empty"))?;
+        let head_point = vec![ArkFr::zero(); walk.cons_log_domain];
+        let mut t_head = lw_transcript(&root, &digest, b"head-check");
+        verify_column_openings(
+            std::slice::from_ref(&walk.com_walk),
+            &head_point,
+            std::slice::from_ref(&head_field),
+            &walk.head_opening,
+            &mut t_head,
+        )
+        .map_err(|error| {
+            invalid(format!(
+                "ordered-list-walk first cons cell is not the anchored head (C[0] != head): {error}"
+            ))
+        })?;
 
         // (4) rest / first edge relations.
         let rest_p = edge_relation_plan(digest, RDF_REST, b"rest-edges");

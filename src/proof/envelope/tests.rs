@@ -2587,13 +2587,35 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let c2 = node_object_id(&layer, &cell(2));
         let a_id = node_object_id(&layer, &iri("a"));
 
-        // (1) REORDER -> rejected by the SUCCESSOR check (a valid permutation-order, wrong chain order).
+        // (1) TAIL REORDER -> rejected by the SUCCESSOR check. C[0] is held at the true head, so the new
+        // explicit C[0]==head opening PASSES; the mis-ordered tail (C[1..] is no longer the rest-chain)
+        // is what the successor step rejects. This deliberately isolates the successor guard from the
+        // head guard (a valid permutation-order, wrong chain order, correct head).
         let reorder = super::list_walk::prove_ordered_list_walk_forged(
-            &ctx, &layer, &plan, &subj_obj, p.as_bytes(), vec![c2, c1, c0],
+            &ctx, &layer, &plan, &subj_obj, p.as_bytes(), vec![c0, c2, c1],
         );
         assert!(
             reorder.and_then(|e| e.verify(&layer, root, &plan)).is_err(),
-            "reordered elements must be rejected (successor)"
+            "tail-reordered elements must be rejected (successor)"
+        );
+
+        // (1b) WRONG C[0] (position-0 forgery) -> rejected by the NEW explicit C[0]==head opening. The
+        // ordered column `[c2, c1, c0]` is a genuine permutation of the cons set (permutation PASSES),
+        // has exactly one nil successor (terminator would PASS) and the right cons count (cons_len
+        // PASSES) -- it only starts at a NON-head cons cell. The successor gadget constrains C[1..K] but
+        // NOT C[0], so with the structural argument set aside this reversal is caught SOLELY by the
+        // position-0 opening, which the verifier checks right after the permutation and BEFORE the
+        // successor step. We assert the C[0]==head error is the one that fires, proving the new check
+        // (not the successor) is the load-bearing guard for the first cell.
+        let wrong_head = super::list_walk::prove_ordered_list_walk_forged(
+            &ctx, &layer, &plan, &subj_obj, p.as_bytes(), vec![c2, c1, c0],
+        );
+        let wrong_head_err = wrong_head
+            .and_then(|e| e.verify(&layer, root, &plan))
+            .expect_err("a non-head first cons cell must be rejected");
+        assert!(
+            wrong_head_err.to_string().contains("C[0] != head"),
+            "the explicit C[0]==head opening must be the rejecting guard, got: {wrong_head_err}"
         );
 
         // (2) DROPPED middle cell -> rejected by the PERMUTATION (cell set is incomplete).
