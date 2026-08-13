@@ -185,6 +185,7 @@ pub fn prove_dict_membership(
     )
 }
 
+/// As [`prove_dict_membership`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_dict_membership_with_context(
     context: &StoreProverContext<'_>,

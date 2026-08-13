@@ -253,6 +253,7 @@ pub fn prove_distinct_valid_pairs(
     )
 }
 
+/// As [`prove_distinct_valid_pairs`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_distinct_valid_pairs_with_context(
     context: &StoreProverContext<'_>,

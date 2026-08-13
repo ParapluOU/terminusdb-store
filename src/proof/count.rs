@@ -121,6 +121,8 @@ pub fn prove_count_identity(
     )
 }
 
+/// As [`prove_count_identity`], with an explicit prover-arithmetic context (the choice of
+/// context cannot change the proof bytes or the guarantee).
 #[allow(clippy::too_many_arguments)]
 pub fn prove_count_identity_with_context(
     context: &StoreProverContext<'_>,

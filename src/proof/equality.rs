@@ -23,6 +23,9 @@ use super::invalid;
 
 const EQUALITY_DOMAIN: &[u8] = b"parture/proof-of-woql/relation-equality/v0";
 
+/// The equality to filter on: a column equals a public constant, two columns are equal in
+/// the same row, or two public constants are equal (a pure gate that keeps every row or no
+/// row). Only these relationally-safe (already-bound) forms are supported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelationEqualityConstraint {
     ColumnConstant { column: usize, value: ArkFr },
@@ -30,6 +33,9 @@ pub enum RelationEqualityConstraint {
     Constants { left: ArkFr, right: ArkFr },
 }
 
+/// A relation-equality proof: the IsZero indicator that pins the keep-selection to the
+/// exact equality, its selection + pseudo-inverse commitments, and the compaction that
+/// emits the selected rows densely.
 #[derive(Clone, Debug)]
 pub struct RelationEqualityProof {
     pub indicator: FilterProof,
@@ -38,6 +44,8 @@ pub struct RelationEqualityProof {
     pub compaction: CompactionOnlyProof,
 }
 
+/// Prover result: the proof plus the filtered output relation (surviving rows only) — its
+/// columns, their commitments, the shared `log_domain`, and the kept row count `n`.
 pub struct RelationEqualityResult {
     pub proof: RelationEqualityProof,
     pub commitments: Vec<ArkGT>,
@@ -163,6 +171,8 @@ fn predicate_commitment(
     }
 }
 
+/// Prove the exact equality-filtered relation: the returned output is EXACTLY the rows of
+/// `relation` satisfying `constraint`, densely compacted — none added, none dropped.
 pub fn prove_relation_equality(
     relation: &RelationWitness,
     constraint: &RelationEqualityConstraint,
@@ -173,6 +183,7 @@ pub fn prove_relation_equality(
     )
 }
 
+/// As [`prove_relation_equality`], with an explicit prover-arithmetic context.
 pub fn prove_relation_equality_with_context(
     context: &StoreProverContext<'_>,
     relation: &RelationWitness,
@@ -222,6 +233,8 @@ pub fn prove_relation_equality_with_context(
     })
 }
 
+/// Verify a relation-equality proof: the relation committed by `output_commitments` (with
+/// pinned length/domain) is exactly the `constraint`-satisfying rows of `relation`.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_relation_equality(
     relation: &RelationCommit,

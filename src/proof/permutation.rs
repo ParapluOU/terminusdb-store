@@ -23,6 +23,8 @@ use super::logup::{masked_multiset_link_claim, reciprocal_claim, reciprocal_witn
 
 const PERMUTATION_DOMAIN: &[u8] = b"parture/proof-of-woql/relation-permutation/v0";
 
+/// A full-row permutation proof: the two reciprocal (LogUp) commitments plus the batched
+/// sumcheck and Dory opening that link the input and output row multisets.
 #[derive(Clone, Debug)]
 pub struct RelationPermutationProof {
     pub input_reciprocal_commitment: ArkGT,
@@ -31,6 +33,8 @@ pub struct RelationPermutationProof {
     pub opening: ColumnOpening,
 }
 
+/// Prover result: the proof plus the reordered output relation (its columns, their
+/// commitments, the shared `log_domain`, and the real row count `n`).
 pub struct RelationPermutationResult {
     pub proof: RelationPermutationProof,
     pub commitments: Vec<ArkGT>,
@@ -120,6 +124,10 @@ fn permutation_shape(
     }
 }
 
+/// Prove the output relation obtained by applying `row_order` (a permutation of the real
+/// input rows) is an exact full-row permutation of `input`: same rows with the same
+/// multiplicities, columns kept tuple-correlated. Returns the reordered output and the
+/// proof. No ordering property is claimed (that is `OrderBy`'s job).
 pub fn prove_relation_permutation(
     input: &RelationWitness,
     row_order: &[usize],
@@ -133,6 +141,7 @@ pub fn prove_relation_permutation(
     )
 }
 
+/// As [`prove_relation_permutation`], with an explicit prover-arithmetic context.
 pub fn prove_relation_permutation_with_context(
     context: &StoreProverContext<'_>,
     input: &RelationWitness,
@@ -189,6 +198,8 @@ pub fn prove_relation_permutation_with_context(
     })
 }
 
+/// Verify a full-row permutation proof: the relation committed by `output_commitments`
+/// (with pinned length/domain) is exactly the row multiset of `input`.
 pub fn verify_relation_permutation(
     input: &RelationCommit,
     output_commitments: &[ArkGT],

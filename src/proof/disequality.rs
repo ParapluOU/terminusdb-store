@@ -279,6 +279,10 @@ fn chi_commitment(n: usize, size: usize) -> io::Result<(Vec<ArkFr>, ArkGT)> {
     Ok((chi, commitment))
 }
 
+/// Prove the tuple-disequality filter: starting from `relation`, drop exactly the rows in
+/// which any listed hop-`pairs` edge coincides (same subject AND object under the fixed
+/// predicate), applied as a sequence of stages. Returns the surviving relation and the
+/// proof. Used to enforce edge-simple semantics for repeated-predicate paths.
 pub fn prove_tuple_disequality(
     relation: &RelationWitness,
     pairs: &[DisequalityPair],
@@ -287,6 +291,7 @@ pub fn prove_tuple_disequality(
     prove_tuple_disequality_with_context(&StoreProverContext::cpu(), relation, pairs, transcript)
 }
 
+/// As [`prove_tuple_disequality`], with an explicit prover-arithmetic context.
 pub fn prove_tuple_disequality_with_context(
     context: &StoreProverContext<'_>,
     relation: &RelationWitness,
@@ -373,6 +378,9 @@ pub fn prove_tuple_disequality_with_context(
     })
 }
 
+/// Verify a tuple-disequality proof: the relation committed by `output_commitments` is
+/// exactly `relation` with every edge-reuse row (per the hop-`pairs`) removed and nothing
+/// else changed.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_tuple_disequality(
     relation: &RelationCommit,

@@ -33,6 +33,8 @@ use super::{invalid, CanonicalDatatype, CanonicalObject};
 
 const DOMAIN: &[u8] = b"parture/proof-of-woql/group-extrema/v0";
 
+/// Which per-group extremum to prove: the group's minimum value (`Min`) or maximum
+/// (`Max`). Selects the range operator used to prove the chosen id dominates its group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupExtremaKind {
     Min,
@@ -51,6 +53,10 @@ impl GroupExtremaKind {
     }
 }
 
+/// Per output `(key, extremum-id)` row: the subproofs that (1) carve the key's exact
+/// subgroup, (2) prove the chosen id is a member of it, (3) relocate the value + dictionary
+/// columns to a common domain, and (4) prove via a range selection that the chosen value
+/// dominates (min/max) the whole subgroup.
 #[derive(Clone, Debug)]
 pub struct GroupExtremaEntryProof {
     pub group: RelationEqualityProof,
@@ -71,11 +77,14 @@ pub struct GroupExtremaEntryProof {
     pub com_range_selection: ArkGT,
 }
 
+/// A group-extrema proof: one entry per public output group row.
 #[derive(Clone, Debug)]
 pub struct GroupExtremaProof {
     pub entries: Vec<GroupExtremaEntryProof>,
 }
 
+/// Prover result: the proof plus the output relation `(key, extremum-id)` — its columns,
+/// their commitments, the output `log_domain`, and the group count `n`.
 pub struct GroupExtremaResult {
     pub proof: GroupExtremaProof,
     pub columns: Vec<Vec<ArkFr>>,
@@ -148,6 +157,10 @@ fn extremum_encoding(source: &impl VerifierLayer, id: u64, datatype: CanonicalDa
     super::commitment::node_value_op_value(&record.triple.object)
 }
 
+/// Prove a scalar-key `GroupBy(key_column)` followed by `RangeMin`/`RangeMax(value_column)`
+/// (`kind`). The public `result_rows` are `(group key id, extremum value id)` pairs; the
+/// proof certifies they partition `input` exactly by key and that each chosen id is the
+/// true min/max of its group under the root-bound `layer` dictionary values.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_group_extrema(
     input: &RelationWitness,
@@ -165,6 +178,7 @@ pub fn prove_group_extrema(
     )
 }
 
+/// As [`prove_group_extrema`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_group_extrema_with_context(
     context: &StoreProverContext<'_>,
@@ -258,6 +272,9 @@ pub fn prove_group_extrema_with_context(
     Ok(GroupExtremaResult { proof: GroupExtremaProof { entries }, columns, commitments, log_domain: out_log, n: result_rows.len() })
 }
 
+/// Verify a group-extrema proof: the public `result_rows` are exactly one `(key, min/max)`
+/// per group, the groups partition `input`, and each extremum dominates its group under the
+/// `layer` dictionary values.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_group_extrema(
     input: &RelationCommit, key_column: usize, value_column: usize,

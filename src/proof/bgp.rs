@@ -211,6 +211,7 @@ impl JoinStep {
         }
     }
 
+    /// True if this step is a Cartesian product (no shared join key).
     pub fn is_cross_product(&self) -> bool {
         self.acc_key == usize::MAX
             && self.rel_key == usize::MAX
@@ -436,6 +437,7 @@ pub fn prove_bgp_chain_with_result(
     )
 }
 
+/// As [`prove_bgp_chain_with_result`], with an explicit prover-arithmetic context.
 pub fn prove_bgp_chain_with_result_and_context(
     context: &StoreProverContext<'_>,
     relations: &[RelationWitness],

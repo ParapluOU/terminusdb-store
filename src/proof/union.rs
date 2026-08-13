@@ -207,6 +207,7 @@ pub fn prove_bag_union(
     prove_bag_union_with_context(&StoreProverContext::cpu(), inputs, transcript)
 }
 
+/// As [`prove_bag_union`], with an explicit prover-arithmetic context.
 pub fn prove_bag_union_with_context(
     context: &StoreProverContext<'_>,
     inputs: &[RelationWitness],

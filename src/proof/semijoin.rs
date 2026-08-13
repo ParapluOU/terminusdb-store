@@ -1,5 +1,13 @@
 //! Full-field LogUp SEMI-JOIN over reconciled IRI-hash columns (CROSS-DICT join, no sort).
 //!
+//! PLAIN-ENGLISH: given instance rows `(x, class-hash)` and a set of allowed class hashes
+//! (a schema closure), this keeps exactly the instance rows whose class hash is IN the set,
+//! delivering the kept `?x` ids. It is the store side of `IsA`/subsumption. The join key is
+//! a full ~254-bit IRI hash (too large for the magnitude-sort join), so it reconciles by a
+//! field-native LogUp SET-MEMBERSHIP check instead of sorting. NOTE the documented
+//! completeness caveat below: it proves "no kept row is a non-member" (soundness), but does
+//! not by itself force EVERY member to be kept — the honest prover keeps them all.
+//!
 //! IsA (`?x isa C`, node regime) needs, for each instance row `(x, class_inst_hash)`, to KEEP it
 //! iff `class_inst_hash` is a MEMBER of the schema-closure hash SET `{class_schema_hash}`. The join
 //! keys are `hash_object(IRI)` values — full ~254-bit BN254 field elements — so the audited

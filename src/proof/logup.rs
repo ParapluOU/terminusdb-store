@@ -1,5 +1,13 @@
 //! Reusable LogUp (log-derivative) reciprocal gadget.
 //!
+//! PLAIN-ENGLISH: this is the shared toolkit that lets many gadgets prove "these two
+//! collections of rows are the same MULTISET" — same elements, same multiplicities,
+//! order ignored. That single primitive underlies filter compaction (output rows are a
+//! sub-bag of input rows), joins (the key universe covers every key), permutations,
+//! bag unions, dictionary lookups, and more. It exposes small building blocks, not a
+//! full prove/verify pair: callers assemble these claims into their own sumcheck (see
+//! [`super::argument`]). The functions here are `pub(crate)` helpers.
+//!
 //! The log-derivative identity turns a multiset equality into a single rational
 //! equation: two multisets `{a_i}` and `{b_j}` (with multiplicities) are equal
 //! iff `Σ_i mult_a(i)/(X - a_i) = Σ_j mult_b(j)/(X - b_j)` as rational functions

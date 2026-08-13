@@ -37,12 +37,19 @@ use super::{invalid, CanonicalDatatype};
 const ORDER_DOMAIN: &[u8] = b"parture/proof-of-woql/exact-scalar-order/v0";
 const ORDER_BITS: usize = 64;
 
+/// Sort direction for an ordered column: ascending or descending. Descending is proved by
+/// sorting an affine `MAX - value` transform ascending, so one nondecreasing gadget serves
+/// both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderDirection {
     Ascending,
     Descending,
 }
 
+/// An exact single-column order proof: the permutation subproof (output is the input's rows
+/// reordered), the relocations tying the id/dictionary columns to a common domain, the
+/// authenticated `id -> (value, datatype)` dictionary lookup, the datatype-completeness
+/// filter, and the nondecreasing-order proof over the (possibly complemented) sort key.
 #[derive(Clone, Debug)]
 pub struct ExactScalarOrderProof {
     pub permutation: RelationPermutationProof,
@@ -61,6 +68,8 @@ pub struct ExactScalarOrderProof {
     pub sorted: SortedProof,
 }
 
+/// Prover result: the proof plus the ordered output relation (the single id column, its
+/// commitment, the `log_domain`, and the real row count `n`).
 pub struct ExactScalarOrderResult {
     pub proof: ExactScalarOrderProof,
     pub commitments: Vec<ArkGT>,
@@ -112,6 +121,10 @@ fn bind_statement(
     );
 }
 
+/// Prove an exact single-column `OrderBy(direction)` of a one-column id relation whose ids
+/// all resolve, through the root-bound `layer` dictionary, to values of one fixed-width
+/// numeric `datatype`. Returns the ordered output relation and a proof that it is exactly
+/// the input's rows in that order (duplicates preserved, no fabricated rows).
 pub fn prove_exact_scalar_order_with_context(
     context: &StoreProverContext<'_>,
     layer: &LayerCommitment,
@@ -335,6 +348,9 @@ fn input_datatypes_for_output(
     honest_dict_lookup(ids, dict_id, dict_value, dict_datatype, n, n_dict).1
 }
 
+/// Verify an exact single-column order proof: the relation committed by `output_commitments`
+/// is the input's rows, of the given `datatype`, in the requested `direction`, under the
+/// `source` layer's authenticated dictionary values.
 pub fn verify_exact_scalar_order(
     source: &impl VerifierLayer,
     input: &RelationCommit,

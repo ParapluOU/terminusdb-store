@@ -130,6 +130,7 @@ pub fn prove_membership_with_mult(
     )
 }
 
+/// As [`prove_membership_with_mult`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_membership_with_mult_with_context(
     context: &StoreProverContext<'_>,

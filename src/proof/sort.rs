@@ -425,6 +425,7 @@ pub fn prove_strictly_sorted(
     prove_strictly_sorted_with_context(&StoreProverContext::cpu(), u, n, com_u, transcript)
 }
 
+/// As [`prove_strictly_sorted`], with an explicit prover-arithmetic context.
 pub fn prove_strictly_sorted_with_context(
     context: &StoreProverContext<'_>,
     u: &[ArkFr],
@@ -453,6 +454,7 @@ pub fn prove_strictly_sorted_bits(
     )
 }
 
+/// As [`prove_strictly_sorted_bits`], with an explicit prover-arithmetic context.
 pub fn prove_strictly_sorted_bits_with_context(
     context: &StoreProverContext<'_>,
     u: &[ArkFr],
@@ -508,6 +510,9 @@ pub fn verify_strictly_sorted_bits(
     verify_sorted_bits(com_u, n, bits, proof, SortMode::Strict, transcript)
 }
 
+/// Verify a NONDECREASING-order proof over `[0, n)` at bit width `bits` (equal adjacent
+/// values allowed; decreases rejected). The counterpart of the strict-order verifier used
+/// by `OrderBy`/lexicographic sorts.
 pub fn verify_nondecreasing_bits(
     com_u: &ArkGT,
     n: usize,

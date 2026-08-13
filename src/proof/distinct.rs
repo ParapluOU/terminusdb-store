@@ -24,6 +24,8 @@ use super::invalid;
 
 const DOMAIN: &[u8] = b"parture/proof-of-woql/relation-distinct/v0";
 
+/// Per output tuple: the chain of equality-filter proofs (one per key column) that carve
+/// out that tuple's equality class of the input, with each stage's commitments and length.
 #[derive(Clone, Debug)]
 pub struct RelationDistinctEntryProof {
     pub filters: Vec<RelationEqualityProof>,
@@ -31,11 +33,14 @@ pub struct RelationDistinctEntryProof {
     pub lengths: Vec<usize>,
 }
 
+/// A distinct-projection proof: one class-carving entry per public output tuple.
 #[derive(Clone, Debug)]
 pub struct RelationDistinctProof {
     pub entries: Vec<RelationDistinctEntryProof>,
 }
 
+/// Prover result: the proof plus the distinct output relation (its key columns, their
+/// commitments, the output `log_domain`, and the distinct-tuple count `n`).
 pub struct RelationDistinctResult {
     pub proof: RelationDistinctProof,
     pub columns: Vec<Vec<ArkFr>>,
@@ -110,6 +115,10 @@ fn padded(values: &[ArkFr], log_domain: usize) -> Vec<ArkFr> {
     result
 }
 
+/// Prove `result_rows` is EXACTLY the set of distinct tuples of `input` over `key_columns`
+/// (1 or 2 columns): each output tuple is unique, names a nonempty equality class, and the
+/// class sizes sum to the input row count — so no class is missing and no tuple invented.
+/// Unordered (first-occurrence order is not authenticated).
 pub fn prove_relation_distinct_with_context(
     context: &StoreProverContext<'_>,
     input: &RelationWitness,
@@ -197,6 +206,8 @@ pub fn prove_relation_distinct_with_context(
     })
 }
 
+/// Verify a distinct-projection proof: the public `result_rows` are exactly the distinct
+/// `key_columns` tuples of `input`, with disjoint classes covering every input row.
 pub fn verify_relation_distinct(
     input: &RelationCommit,
     key_columns: &[usize],

@@ -435,6 +435,7 @@ pub fn prove_range_select(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// As [`prove_range_select`], with an explicit prover-arithmetic context.
 pub fn prove_range_select_with_context(
     context: &StoreProverContext<'_>,
     v: &[ArkFr],
@@ -793,6 +794,7 @@ pub fn prove_dict_value_lookup(
     )
 }
 
+/// As [`prove_dict_value_lookup`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_dict_value_lookup_with_context(
     context: &StoreProverContext<'_>,
@@ -1060,6 +1062,7 @@ pub fn prove_object_range_select(
     )
 }
 
+/// As [`prove_object_range_select`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_object_range_select_with_context(
     context: &StoreProverContext<'_>,

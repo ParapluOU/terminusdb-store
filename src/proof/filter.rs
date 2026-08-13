@@ -242,6 +242,7 @@ pub fn prove_filter_indicator(
     )
 }
 
+/// As [`prove_filter_indicator`], with an explicit prover-arithmetic context.
 pub fn prove_filter_indicator_with_context(
     context: &StoreProverContext<'_>,
     predicate_column: &[ArkFr],
@@ -926,6 +927,7 @@ pub fn prove_atom_filter(
     )
 }
 
+/// As [`prove_atom_filter`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_atom_filter_with_context(
     context: &StoreProverContext<'_>,
@@ -1087,6 +1089,7 @@ pub fn prove_filter(
     )
 }
 
+/// As [`prove_filter`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_filter_with_context(
     context: &StoreProverContext<'_>,
@@ -1200,6 +1203,7 @@ pub fn prove_selection_only(
     )
 }
 
+/// As [`prove_selection_only`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_selection_only_with_context(
     context: &StoreProverContext<'_>,
@@ -1354,6 +1358,7 @@ pub fn prove_boolean_product(
     prove_boolean_product_with_context(&StoreProverContext::cpu(), a, b, com_a, com_b, transcript)
 }
 
+/// As [`prove_boolean_product`], with an explicit prover-arithmetic context.
 pub fn prove_boolean_product_with_context(
     context: &StoreProverContext<'_>,
     a: &[ArkFr],
@@ -1522,6 +1527,7 @@ pub fn prove_compaction_only(
     )
 }
 
+/// As [`prove_compaction_only`], with an explicit prover-arithmetic context.
 pub fn prove_compaction_only_with_context(
     context: &StoreProverContext<'_>,
     sources: &[Vec<ArkFr>],

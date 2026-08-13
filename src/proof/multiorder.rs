@@ -1,4 +1,24 @@
 //! Exact complete-row lexicographic order for two or three numeric Store-ID columns.
+//!
+//! WHAT IT PROVES: this is a full `ORDER BY` over a 2- or 3-column relation of Store ids.
+//! Given a committed input relation and a claimed output relation, it certifies that the
+//! output is (a) an exact full-row PERMUTATION of the input — same rows, same
+//! multiplicities, no fabricated or dropped row — AND (b) sorted by the requested key
+//! columns and directions. `key_indices` is a permutation of the columns giving the sort
+//! priority (so a subset key plus a tie-break column can express `ORDER BY key` with a
+//! deterministic total order).
+//!
+//! HOW (composition of two audited gadgets):
+//!   1. [`super::permutation`] proves output-is-a-permutation-of-input (row multiset
+//!      equality), yielding the reordered columns and their commitments.
+//!   2. The ids are resolved to their authenticated fixed-width numeric VALUES through the
+//!      layer's root-bound node/value dictionary (rejecting any id that is not the exact
+//!      planned datatype), and [`super::lexsort`] proves those value columns are
+//!      nondecreasing in the requested order.
+//! Permutation alone would allow any reordering; lexsort alone would allow fabricated
+//! rows. Together they pin the output to the one correct sorted relation. Only fixed-width
+//! order-preserving datatypes (the integer/float/boolean family) are accepted, because the
+//! order proof compares the committed value encodings as magnitudes.
 
 use std::{cmp::Ordering, io};
 use ark_ff::PrimeField;
@@ -13,12 +33,16 @@ use super::order::OrderDirection;
 use super::permutation::{prove_relation_permutation_with_context, verify_relation_permutation, RelationPermutationProof};
 use super::{invalid, CanonicalDatatype, CanonicalObject};
 
+/// An exact multi-key order proof: the output-is-a-permutation-of-input subproof plus the
+/// lexicographic-order subproof over the resolved value columns.
 #[derive(Clone, Debug)]
 pub struct ExactMultiOrderProof {
     pub permutation: RelationPermutationProof,
     pub lexicographic: LexicographicSortedProof,
 }
 
+/// Prover result: the proof plus the sorted output relation (its id columns, their
+/// commitments, the shared power-of-two `log_domain`, and the real row count `n`).
 pub struct ExactMultiOrderResult {
     pub proof: ExactMultiOrderProof, pub commitments: Vec<ArkGT>,
     pub columns: Vec<Vec<ArkFr>>, pub log_domain: usize, pub n: usize,
@@ -65,6 +89,11 @@ fn bind(transcript: &mut Transcript254, datatypes: &[CanonicalDatatype], key_ind
     for datatype in datatypes { transcript.append_bytes(b"pow/multi-order/datatype", &[*datatype as u8]); }
 }
 
+/// Prove a full 2- or 3-column `ORDER BY` of `input` against the root-bound `layer`
+/// dictionary. `datatypes` gives each column's expected fixed-width datatype;
+/// `key_indices` is a permutation of the columns giving sort priority; `directions` is the
+/// per-key ascending/descending sense. Returns the sorted output relation and the proof
+/// that it is the input's rows in exactly that order.
 pub fn prove_exact_multi_order_with_context(context: &StoreProverContext<'_>, layer: &LayerCommitment, input: &RelationWitness, datatypes: &[CanonicalDatatype], key_indices: &[usize], directions: &[OrderDirection], transcript: &mut Transcript254) -> io::Result<ExactMultiOrderResult> {
     validate_shape(input.columns.len(), datatypes, key_indices, directions)?;
     let domain = 1usize << input.log_domain;
@@ -88,6 +117,10 @@ pub fn prove_exact_multi_order_with_context(context: &StoreProverContext<'_>, la
     Ok(ExactMultiOrderResult { proof: ExactMultiOrderProof { permutation: permutation.proof, lexicographic }, commitments: permutation.commitments, columns: permutation.columns, log_domain: permutation.log_domain, n: permutation.n })
 }
 
+/// Verify an exact multi-key order proof: the claimed output relation (its `output_columns`
+/// / `output_commitments`, length, and domain) is a full-row permutation of `input` AND is
+/// sorted by `key_indices`/`directions` under the `source` layer's authenticated
+/// dictionary values.
 pub fn verify_exact_multi_order(source: &impl VerifierLayer, input: &RelationCommit, output_columns: &[Vec<ArkFr>], datatypes: &[CanonicalDatatype], key_indices: &[usize], directions: &[OrderDirection], output_commitments: &[ArkGT], output_len: usize, output_log_domain: usize, proof: &ExactMultiOrderProof, transcript: &mut Transcript254) -> io::Result<()> {
     validate_shape(input.commitments.len(), datatypes, key_indices, directions)?; bind(transcript, datatypes, key_indices, directions, input.n);
     verify_relation_permutation(input, output_commitments, output_len, output_log_domain, &proof.permutation, transcript)?;

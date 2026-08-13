@@ -1,4 +1,21 @@
 //! Nondecreasing lexicographic ordering for two or three authenticated 64-bit key columns.
+//!
+//! WHAT IT PROVES: given 2 or 3 committed key columns (each a 64-bit id) with a per-key
+//! sort DIRECTION (ascending/descending), the real rows `[0, n)` are already sorted
+//! lexicographically — row `i` is `<=` row `i+1` under the requested column priority and
+//! directions. It does not reorder anything; it certifies an ordering the caller already
+//! produced.
+//!
+//! HOW: the keys are packed into ONE column by a base-`2^64` positional number
+//! (`key0 * 2^64^(k-1) + ... + key_{k-1}`), with descending columns bit-complemented so
+//! "smaller packed value" always means "earlier in the requested order". Proving the
+//! packed column is nondecreasing (via [`super::sort`]'s bit-range gadget over `64*k`
+//! bits) is exactly proving lexicographic order of the originals. The packed column's
+//! commitment is rebuilt homomorphically from the individual key commitments and the
+//! public real-row mask, so it cannot be a different column than the committed keys.
+//!
+//! WHERE: the ordering half of exact multi-key `OrderBy` — [`super::multiorder`] pairs
+//! this with a permutation proof (rows are the same multiset) to get a full ORDER BY.
 
 use std::io;
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
@@ -8,6 +25,8 @@ use super::order::OrderDirection;
 use super::sort::{prove_nondecreasing_bits_with_context, verify_nondecreasing_bits, SortedProof};
 use super::invalid;
 
+/// A lexicographic-order proof: the nondecreasing-range proof over the single packed
+/// key column (the pack is reconstructed by both sides, so it carries no extra data).
 #[derive(Clone, Debug)]
 pub struct LexicographicSortedProof { pub sorted: SortedProof }
 
@@ -53,6 +72,12 @@ fn pack(columns: &[Vec<ArkFr>], directions: &[OrderDirection], n: usize) -> io::
     }).collect())
 }
 
+/// Prove the real rows `[0, n)` of the given key columns are nondecreasing in the
+/// requested lexicographic order. `columns`/`commitments` are the 2 or 3 key columns and
+/// their commitments; `directions` gives each key's ascending/descending sense;
+/// `chi_commitment` commits the public real-row mask (1 on `[0, n)`, 0 on padding) used to
+/// zero out padding in the descending bit-complement. The prover checks its packed column
+/// matches the homomorphically-derived commitment before proving nondecreasing.
 pub fn prove_lexicographically_nondecreasing_with_context(
     context: &StoreProverContext<'_>, columns: &[Vec<ArkFr>], commitments: &[ArkGT],
     directions: &[OrderDirection], chi_commitment: &ArkGT, n: usize,
@@ -65,6 +90,9 @@ pub fn prove_lexicographically_nondecreasing_with_context(
     Ok(LexicographicSortedProof { sorted: prove_nondecreasing_bits_with_context(context, &packed, n, bits, &commitment, transcript)? })
 }
 
+/// Verify a lexicographic-order proof. Rebuilds the packed-column commitment from the key
+/// commitments, directions, and the real-row mask, then checks the packed column is
+/// nondecreasing over `[0, n)`. On success the committed keys are in the requested order.
 pub fn verify_lexicographically_nondecreasing(
     commitments: &[ArkGT], directions: &[OrderDirection], chi_commitment: &ArkGT,
     n: usize, proof: &LexicographicSortedProof, transcript: &mut Transcript254,

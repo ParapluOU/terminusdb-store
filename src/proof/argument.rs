@@ -10,6 +10,45 @@
 //!
 //! Scope (Phase 2a): sumcheck + Dory glue only. No filter/join/dictionary/LogUp.
 //!
+//! # Reader's guide (no cryptography assumed)
+//! Every other gadget in this directory ultimately reduces the statement it wants to
+//! prove — "this output relation is exactly the matching rows", "these two columns are
+//! a permutation of each other", and so on — to two machine-checkable facts about a
+//! handful of fixed-width number columns:
+//!   1. some arithmetic identity holds when it is summed over all the rows, and
+//!   2. the columns named in that identity really are the ones the prover committed to
+//!      earlier (so a cheat cannot quietly substitute different numbers).
+//! This module is the shared engine for BOTH halves; the per-gadget files just describe
+//! which columns and which identity to feed it.
+//!
+//! Three concepts carry the whole design:
+//! * A COMMITMENT is a short, binding fingerprint of an entire column. Publishing it
+//!   pins the column down without revealing or resending it, and it is *homomorphic*
+//!   (the fingerprint of `a + gamma*b` can be computed from the fingerprints of `a`
+//!   and `b`). [`commit_column`] produces one.
+//! * The SUMCHECK ([`prove_sumcheck`] / [`verify_sumcheck`]) lets a verifier become
+//!   convinced that "the sum of this expression over all `2^k` rows equals the claimed
+//!   value" while only ever evaluating the expression at ONE random row. A cheating
+//!   prover would have to survive a random challenge it cannot predict, which succeeds
+//!   only with negligible probability. Two claim shapes exist: [`ClaimShape::ZeroSum`]
+//!   ("the sum equals the public target") and [`ClaimShape::Identity`] ("the expression
+//!   is zero at EVERY row", reduced to a single sum via a random `eq` weighting — the
+//!   standard zero-check). It is made non-interactive with a Fiat-Shamir transcript, so
+//!   the "random" challenges are derived by hashing everything committed so far.
+//! * The sumcheck finishes by having the prover claim each committed column's value at
+//!   that one random row. The DORY OPENING glue
+//!   ([`prove_column_openings`] / [`verify_column_openings`]) is what forces those
+//!   claimed values to be consistent with the earlier commitments; many column openings
+//!   are batched into a single one using the commitment's homomorphism. "Dory" is the
+//!   underlying polynomial-commitment scheme (over the BN254 elliptic curve).
+//!
+//! A typical gadget therefore: commits its columns, appends the commitments to the
+//! transcript, builds a [`SumcheckShape`] describing the identity it needs, runs
+//! [`prove_sumcheck`], then [`prove_column_openings`] at the point the sumcheck lands
+//! on. The verifier replays the same steps. If both pass, the gadget's statement holds
+//! except with negligible probability. Nothing in THIS file is specific to any one
+//! gadget — see the individual files for what each proves.
+//!
 //! # Point convention (load-bearing)
 //! `dory-pcs` evaluates a committed vector as a multilinear extension with a
 //! LSB-first variable/bit mapping (see its `multilinear_lagrange_basis`): flat
@@ -243,6 +282,8 @@ impl StoreProverContext<'static> {
         }
     }
 
+    /// A Blitzar (native/GPU) accelerated G1 context at the given setup `tier`, with the
+    /// stock Arkworks G2 backend. Arithmetic-only: it cannot change proof bytes.
     #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
     pub fn blitzar(runtime: &Arc<BlitzarRuntime>, tier: ProverSetupTier) -> io::Result<Self> {
         Self::blitzar_with_g2_backend(runtime, tier, RoutineBackend::<G2Routines>::new())
@@ -272,6 +313,8 @@ impl StoreProverContext<'static> {
         })
     }
 
+    /// Initialize a shared Blitzar runtime (GPU/native MSM backend) to pass to
+    /// [`Self::blitzar`]. One runtime can be reused across many prover contexts.
     #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
     pub fn initialize_blitzar(config: BlitzarRuntimeConfig) -> Arc<BlitzarRuntime> {
         Arc::new(BlitzarRuntime::initialize(config))

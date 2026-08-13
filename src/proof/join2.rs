@@ -643,6 +643,7 @@ pub fn binary_join_commitments(
     )
 }
 
+/// As [`binary_join_commitments`], with an explicit prover-arithmetic context.
 pub fn binary_join_commitments_with_context(
     context: &StoreProverContext<'_>,
     r_key: &[ArkFr],
@@ -735,6 +736,7 @@ pub fn prove_binary_join(
     )
 }
 
+/// As [`prove_binary_join`], with an explicit prover-arithmetic context (64-bit keys).
 pub fn prove_binary_join_with_context(
     context: &StoreProverContext<'_>,
     r_key: &[ArkFr],
@@ -764,6 +766,7 @@ pub fn prove_binary_join_with_key_bits(
     )
 }
 
+/// As [`prove_binary_join_with_key_bits`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_binary_join_with_key_bits_and_context(
     context: &StoreProverContext<'_>,

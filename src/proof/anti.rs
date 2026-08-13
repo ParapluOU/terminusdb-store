@@ -1,11 +1,24 @@
-//! Authenticated correlated negation as a left anti-join.
+//! Authenticated correlated negation as a left anti-join, plus the inner/left-outer
+//! joins and global `Not` that reuse the same machinery.
 //!
-//! For committed relations `L` and `R`, this operator retains exactly those rows of
-//! `L` whose scalar join key has zero matching rows in `R`.  It composes three audited
-//! gadgets: the complete binary join authenticates every per-left match multiplicity;
-//! the filter IsZero argument pins a selection bit to `multiplicity == 0`; and exact
-//! compaction emits the selected left rows.  Thus duplicate right matches cannot change
-//! the result, while omitting even one matching key cannot make a left row survive.
+//! For committed relations `L` and `R`, the LEFT ANTI-JOIN retains exactly those rows of
+//! `L` whose join key has zero matching rows in `R` (this is WOQL correlated `Not`). It
+//! composes three audited gadgets: the complete binary join ([`super::join2`])
+//! authenticates every per-left match MULTIPLICITY; the filter IsZero argument
+//! ([`super::filter`]) pins a selection bit to `multiplicity == 0`; and exact compaction
+//! emits the selected left rows. Thus duplicate right matches cannot change the result,
+//! while omitting even one matching key cannot make a left row survive.
+//!
+//! The same authenticated match count powers the sibling operators in this file:
+//! * GLOBAL `Not(L, R)` — uncorrelated negation: keep `L` iff `R` is empty. No argument
+//!   is needed beyond the public right length.
+//! * INNER JOIN — the matched projection of the binary join (the complement of the
+//!   anti-join's unmatched left rows), authenticated by replaying the join argument.
+//! * LEFT OUTER JOIN — the inner-join matches bag-unioned ([`super::union`]) with the
+//!   anti-join's unmatched left rows (padded with nulls on the right side).
+//!
+//! Each `_with_keys` entry accepts one scalar key column or two injectively packed key
+//! columns; the plain entries are the single-scalar-key special case.
 
 use std::io;
 
@@ -195,6 +208,10 @@ fn multiplicities(rho: &[ArkFr], left_rows: usize, join_rows: usize, size: usize
     result
 }
 
+/// A left anti-join proof: the relocations tying both inputs into the binary-join domain,
+/// the complete binary join (which authenticates each left row's match count), the IsZero
+/// filter pinning the keep-selection to `match-count == 0`, and the compaction emitting the
+/// surviving (unmatched) left rows.
 #[derive(Clone, Debug)]
 pub struct LeftAntiJoinProof {
     pub left_relocations: Vec<RelocationProof>,
@@ -208,6 +225,9 @@ pub struct LeftAntiJoinProof {
     pub compaction: CompactionOnlyProof,
 }
 
+/// Prover result: the anti-join proof plus the unmatched-left output relation (its columns,
+/// commitments, domain, and count). Also carries the COMPLETE matched inner-join relation
+/// (retained so the inner/outer wrappers can build on it without re-proving the join).
 pub struct LeftAntiJoinResult {
     pub proof: LeftAntiJoinProof,
     pub commitments: Vec<ArkGT>,
@@ -230,6 +250,8 @@ pub struct InnerJoinProof {
     pub unmatched_len: usize,
 }
 
+/// Prover result: the inner-join proof plus the matched output relation (schema
+/// `[left.., right-only..]`), its commitments, domain, and matched row count `n`.
 pub struct InnerJoinResult {
     pub proof: InnerJoinProof,
     pub commitments: Vec<ArkGT>,
@@ -238,6 +260,9 @@ pub struct InnerJoinResult {
     pub n: usize,
 }
 
+/// A left-outer-join proof: the anti-join proof (authenticating both the matched inner
+/// relation and the unmatched-left rows) plus the bag-union proof that stitches the matched
+/// rows together with the null-padded unmatched-left rows into the outer result.
 #[derive(Clone, Debug)]
 pub struct LeftOuterJoinProof {
     pub anti: LeftAntiJoinProof,
@@ -246,6 +271,8 @@ pub struct LeftOuterJoinProof {
     pub union: BagUnionProof,
 }
 
+/// Prover result: the left-outer-join proof plus the outer output relation (matched rows
+/// followed by null-extended unmatched-left rows), its commitments, domain, and count `n`.
 pub struct LeftOuterJoinResult {
     pub proof: LeftOuterJoinProof,
     pub commitments: Vec<ArkGT>,
@@ -323,6 +350,7 @@ pub fn prove_global_not(
     prove_global_not_with_context(&StoreProverContext::cpu(), left, right)
 }
 
+/// As [`prove_global_not`], with an explicit prover-arithmetic context.
 pub fn prove_global_not_with_context(
     context: &StoreProverContext<'_>,
     left: &RelationWitness,
@@ -347,6 +375,8 @@ pub fn prove_global_not_with_context(
     Ok((commitments, columns, left.log_domain, 0))
 }
 
+/// Verify a global `Not`: when `right` is empty the output must be exactly `left`;
+/// otherwise the output must be canonically empty (every outer row suppressed).
 pub fn verify_global_not(
     left: &RelationCommit,
     right: &RelationCommit,
@@ -389,6 +419,7 @@ pub fn prove_left_anti_join(
     )
 }
 
+/// As [`prove_left_anti_join`], with an explicit prover-arithmetic context.
 pub fn prove_left_anti_join_with_context(
     context: &StoreProverContext<'_>,
     left: &RelationWitness,
@@ -414,6 +445,7 @@ pub fn prove_left_anti_join_with_keys(
     )
 }
 
+/// As [`prove_left_anti_join_with_keys`], with an explicit prover-arithmetic context.
 pub fn prove_left_anti_join_with_keys_and_context(
     context: &StoreProverContext<'_>,
     left: &RelationWitness,
@@ -650,6 +682,8 @@ pub fn verify_left_anti_join(
     )
 }
 
+/// Verify a left anti-join over one scalar or two packed key columns: the relation
+/// committed by `output_commitments` is exactly the rows of `left` with no `right` match.
 pub fn verify_left_anti_join_with_keys(
     left: &RelationCommit,
     right: &RelationCommit,
@@ -767,6 +801,9 @@ pub fn verify_left_anti_join_with_keys(
     )
 }
 
+/// Prove a natural INNER join over one scalar or two packed key columns: the matched
+/// projection (schema `[left.., right-only..]`) of the complete binary join. Returns the
+/// matched relation and the proof.
 pub fn prove_inner_join_with_keys(
     left: &RelationWitness,
     right: &RelationWitness,
@@ -778,6 +815,7 @@ pub fn prove_inner_join_with_keys(
     )
 }
 
+/// As [`prove_inner_join_with_keys`], with an explicit prover-arithmetic context.
 pub fn prove_inner_join_with_keys_and_context(
     context: &StoreProverContext<'_>,
     left: &RelationWitness,
@@ -803,6 +841,9 @@ pub fn prove_inner_join_with_keys_and_context(
     })
 }
 
+/// Verify a natural inner-join proof: `output_commitments` is exactly the matched
+/// projection of the join of `left` and `right` on `key_pairs` (replaying the anti-join's
+/// authenticated binary join, then checking the public matched projection).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_inner_join_with_keys(
     left: &RelationCommit,
@@ -847,6 +888,7 @@ pub fn prove_left_outer_join_with_keys(
     )
 }
 
+/// As [`prove_left_outer_join_with_keys`], with an explicit prover-arithmetic context.
 pub fn prove_left_outer_join_with_keys_and_context(
     context: &StoreProverContext<'_>,
     left: &RelationWitness,
@@ -895,6 +937,9 @@ pub fn prove_left_outer_join_with_keys_and_context(
     })
 }
 
+/// Verify a left-outer-join proof: `output_commitments` is exactly the matched inner
+/// relation bag-unioned with the null-extended unmatched-left rows of `left` against
+/// `right` on `key_pairs`.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_left_outer_join_with_keys(
     left: &RelationCommit,
@@ -1001,6 +1046,7 @@ pub fn prove_global_left_outer_join(
     )
 }
 
+/// As [`prove_global_left_outer_join`], with an explicit prover-arithmetic context.
 pub fn prove_global_left_outer_join_with_context(
     context: &StoreProverContext<'_>,
     left: &RelationWitness,
@@ -1023,6 +1069,10 @@ pub fn prove_global_left_outer_join_with_context(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Verify an uncorrelated `Optional` (global left outer join): `output_commitments` is the
+/// Cartesian product of `left` with `right` when `right` is nonempty, or exactly one
+/// null-extension per `left` row when `right` is empty. The synthetic UNIT key column is
+/// verifier-derived and stripped from the public result.
 pub fn verify_global_left_outer_join(
     left: &RelationCommit,
     right: &RelationCommit,

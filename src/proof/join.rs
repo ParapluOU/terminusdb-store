@@ -128,6 +128,7 @@ pub fn self_join_commitments(
     )
 }
 
+/// As [`self_join_commitments`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn self_join_commitments_with_context(
     context: &StoreProverContext<'_>,
@@ -212,6 +213,7 @@ pub fn prove_self_join_complete(
     )
 }
 
+/// As [`prove_self_join_complete`], with an explicit prover-arithmetic context.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_self_join_complete_with_context(
     context: &StoreProverContext<'_>,

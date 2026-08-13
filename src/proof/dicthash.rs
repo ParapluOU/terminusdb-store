@@ -1,5 +1,13 @@
 //! Batched authenticated `id → hash(IRI)` dictionary lookup (CROSS-DICT join gadget 1).
 //!
+//! PLAIN-ENGLISH: given a committed column of dictionary ids, this proves a committed
+//! output column holds, for each row, the collision-resistant HASH of the IRI/value that
+//! id names in the layer's own root-bound dictionary. Because the hash depends only on the
+//! IRI (not on which integer id a particular graph happened to assign it), two graphs with
+//! SEPARATE dictionaries can be joined by joining on these authenticated hashes — see
+//! [`super::semijoin`] and the cross-root join node. The soundness engine is the same LogUp
+//! multiset argument as [`super::dict`]; this file adds the root-relocation plumbing.
+//!
 //! This is the single-output-column analogue of [`super::range::prove_dict_value_lookup`]
 //! (the batched `id → (value, datatype)` object-range lookup): given a committed id
 //! column `obj_id` (a relation's join-key column, the ids of node/value dictionary

@@ -111,6 +111,8 @@ pub fn prove_column_relocation(
     )
 }
 
+/// As [`prove_column_relocation`], with an explicit prover-arithmetic context (the choice
+/// of context cannot change the proof bytes or the guarantee).
 pub fn prove_column_relocation_with_context(
     context: &StoreProverContext<'_>,
     source: &[ArkFr],
