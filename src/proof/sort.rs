@@ -571,6 +571,216 @@ fn verify_sorted_bits(
     verify_column_openings(&commitments, &r, &evals, &proof.opening, transcript)
 }
 
+// ===========================================================================
+// Standalone POSITIONAL SUCCESSOR lookup (range-free reuse of the shift above).
+//
+// PLAIN-ENGLISH: the sort gadget above proves TWO things at once — (1) the SHIFT
+// relation `U_shift[i] = U[i+1]` (the index-augmented LogUp), and (2) that the
+// consecutive differences `U[i+1] - U[i]` are positive (the RANGE / booleanity +
+// recomposition claims), which is what makes the column strictly sorted. For an
+// ordered `rdf:List` walk we want ONLY piece (1): "column `next` is the one-step
+// shift of column `base`". The list's cons-cell ids are FRESH RANDOM opaque nodes,
+// so they are NOT monotonic — piece (2) would (correctly) reject them. Crucially,
+// piece (1) never compares the ids as MAGNITUDES: the distinctness that pins each
+// position comes entirely from the PUBLIC index MLE (`Operand::Idx`), and the ids
+// themselves are only ever equality-folded through `beta`. So the shift binding is
+// sound on arbitrary (unordered) node-id columns, and we expose it here WITHOUT the
+// range claims.
+//
+// SOUNDNESS (why dropping the range check is safe): the check is the single LogUp
+// equality `Sum_{i<n-1} rec_d[i] = Sum_i mult[i]*rec_c[i]` with
+// `c_fold[i] = idx[i] + beta*base[i]` and `d_fold[i] = (idx[i]+1) + beta*next[i]`.
+// Because `idx[i] = i` is distinct across the whole domain, every `c_fold[i]` is a
+// DISTINCT pole; matching a `d_fold[i]` to a `c_fold[j]` forces the integer parts
+// `i+1 = j` AND `next[i] = base[j] = base[i+1]` (a stray match would need beta to
+// hit one exact value, negligible after commitment). The committed multiplicity
+// mask `mult` is thereby forced to the honest `1 on [1,n)` — no separate booleanity
+// proof on `mult` is needed, exactly as in the sort gadget. The gadget pins
+// `next[i] = base[i+1]` for every `i` in `[0, n-1)`; it deliberately says nothing
+// about the LAST real row `next[n-1]` or padding (the caller pins the tail, e.g.
+// `next[n-1] = rdf:nil`, separately).
+
+const LABEL_SUCC_BETA: &[u8] = b"pow/successor/fingerprint-beta";
+const LABEL_SUCC_ALPHA: &[u8] = b"pow/successor/reciprocal-alpha";
+
+/// A positional-successor proof: the batched sumcheck over the shift LogUp (rec_c,
+/// rec_d, multiset-link) claims, one Dory opening over the five committed columns,
+/// and the internal witness commitments the verifier binds (`base`/`next` are passed
+/// in by the caller, so their commitments are NOT stored here).
+///
+/// `allow(dead_code)`: consumed by the ordered `rdf:List` walk composite (ReadDocument
+/// increment 1) and by this module's tests; the standalone primitive lands first.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct SuccessorProof {
+    pub sumcheck: SumcheckProof,
+    pub opening: ColumnOpening,
+    pub mult_commitment: ArkGT,
+    pub rec_c_commitment: ArkGT,
+    pub rec_d_commitment: ArkGT,
+}
+
+/// The successor sumcheck shape: the two reciprocal identities pinning `rec_c`,
+/// `rec_d`, and the masked multiset link forcing `next` to be the shift of `base`.
+/// It is EXACTLY `sort_shape` minus the booleanity + recomposition (range) claims,
+/// so `num_columns` is `COL_BIT_BASE` (= the five columns `base, next, mult, rec_c,
+/// rec_d`) with NO bit columns.
+#[allow(dead_code)]
+fn successor_shape(k: usize, n: usize, alpha: ArkFr, beta: ArkFr) -> SumcheckShape {
+    let rec_c = reciprocal_with_offset(
+        COL_REC_C,
+        f0(),
+        &[(f1(), Operand::Idx), (beta, Operand::Column(COL_U))],
+        alpha,
+    );
+    let rec_d = reciprocal_with_offset(
+        COL_REC_D,
+        f1(),
+        &[(f1(), Operand::Idx), (beta, Operand::Column(COL_U_SHIFT))],
+        alpha,
+    );
+    let shift = multiset_link_claim(
+        Operand::Chi(CHI_N1),
+        COL_REC_D,
+        Operand::Column(COL_MULT_C),
+        COL_REC_C,
+    );
+    SumcheckShape {
+        num_vars: k,
+        num_columns: COL_BIT_BASE,
+        chi_bounds: vec![n.saturating_sub(1)],
+        claims: vec![rec_c, rec_d, shift],
+    }
+}
+
+/// The honest multiplicity mask: `1` on `[1, n)`, `0` elsewhere — the c-side rows
+/// each `d_fold[i]` (i in `[0, n-1)`) must match after the `+1` index offset.
+#[allow(dead_code)]
+fn successor_mult(n: usize, n_domain: usize) -> Vec<ArkFr> {
+    let mut mult = vec![f0(); n_domain];
+    for slot in mult.iter_mut().take(n).skip(1) {
+        *slot = f1();
+    }
+    mult
+}
+
+/// Prove that committed column `next` is the one-step positional shift of committed
+/// column `base` over the real prefix: `next[i] = base[i+1]` for every `i` in
+/// `[0, n-1)`. `com_base`/`com_next` must commit the two columns padded to a shared
+/// power-of-two domain (`base.len() == next.len()`, both `>= n`). NO ordering or
+/// magnitude relation between the entries is assumed or proven — this is the
+/// range-free successor binding used by the ordered `rdf:List` walk.
+#[allow(dead_code)]
+pub(crate) fn prove_successor_lookup_with_context(
+    context: &StoreProverContext<'_>,
+    base: &[ArkFr],
+    next: &[ArkFr],
+    n: usize,
+    com_base: &ArkGT,
+    com_next: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<SuccessorProof> {
+    let n_domain = column_domain(base.len(), n)?;
+    let mult = successor_mult(n, n_domain);
+    prove_successor_with_witness_and_context(
+        context, base, next, &mult, n, com_base, com_next, transcript,
+    )
+}
+
+/// As [`prove_successor_lookup_with_context`], but with an EXPLICIT multiplicity
+/// witness. The honest entry point above supplies the `1-on-[1,n)` mask; tests use
+/// this to inject a FORGED `mult` and confirm the shift binding still rejects — the
+/// soundness comes from the public-index pole distinctness, NOT from any separate
+/// booleanity check on `mult`.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) fn prove_successor_with_witness_and_context(
+    context: &StoreProverContext<'_>,
+    base: &[ArkFr],
+    next: &[ArkFr],
+    mult: &[ArkFr],
+    n: usize,
+    com_base: &ArkGT,
+    com_next: &ArkGT,
+    transcript: &mut Transcript254,
+) -> io::Result<SuccessorProof> {
+    let n_domain = column_domain(base.len(), n)?;
+    if base.len() > n_domain || next.len() != n_domain || n > n_domain || mult.len() != n_domain {
+        return Err(invalid("successor column length mismatch"));
+    }
+    let k = n_domain.trailing_zeros() as usize;
+    let base_p = padded(base, n_domain);
+
+    let mult = mult.to_vec();
+    let mult_commitment = context.commit_column(&mult)?;
+    transcript.append_group(b"pow/successor/com-base", com_base);
+    transcript.append_group(b"pow/successor/com-next", com_next);
+    transcript.append_group(b"pow/successor/com-mult", &mult_commitment);
+    let beta = transcript.challenge_scalar(LABEL_SUCC_BETA);
+    let alpha = transcript.challenge_scalar(LABEL_SUCC_ALPHA);
+
+    let idx_col: Vec<ArkFr> = (0..n_domain).map(|i| ArkFr::from_u64(i as u64)).collect();
+    let idx_plus1: Vec<ArkFr> = (0..n_domain)
+        .map(|i| ArkFr::from_u64(i as u64 + 1))
+        .collect();
+    let rec_c = reciprocal_witness(alpha, &rlc_fold(beta, &[&idx_col, &base_p]));
+    let rec_d = reciprocal_witness(alpha, &rlc_fold(beta, &[&idx_plus1, next]));
+    let rec_c_commitment = context.commit_column(&rec_c)?;
+    let rec_d_commitment = context.commit_column(&rec_d)?;
+    transcript.append_group(b"pow/successor/com-rec-c", &rec_c_commitment);
+    transcript.append_group(b"pow/successor/com-rec-d", &rec_d_commitment);
+
+    let shape = successor_shape(k, n, alpha, beta);
+    let columns = vec![base_p, next.to_vec(), mult, rec_c, rec_d];
+    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
+    let opening = context.prove_column_openings(&columns, &r, transcript)?;
+
+    Ok(SuccessorProof {
+        sumcheck,
+        opening,
+        mult_commitment,
+        rec_c_commitment,
+        rec_d_commitment,
+    })
+}
+
+/// Verify a positional-successor proof: `com_next`'s column is the one-step shift of
+/// `com_base`'s column over `[0, n-1)`.
+#[allow(dead_code)]
+pub(crate) fn verify_successor_lookup(
+    com_base: &ArkGT,
+    com_next: &ArkGT,
+    n: usize,
+    proof: &SuccessorProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    let k = proof.sumcheck.round_polys.len();
+    if k == 0 || k >= usize::BITS as usize {
+        return Err(invalid("successor proof has an implausible variable count"));
+    }
+    if n > (1usize << k) {
+        return Err(invalid("real length exceeds the successor domain"));
+    }
+    transcript.append_group(b"pow/successor/com-base", com_base);
+    transcript.append_group(b"pow/successor/com-next", com_next);
+    transcript.append_group(b"pow/successor/com-mult", &proof.mult_commitment);
+    let beta = transcript.challenge_scalar(LABEL_SUCC_BETA);
+    let alpha = transcript.challenge_scalar(LABEL_SUCC_ALPHA);
+    transcript.append_group(b"pow/successor/com-rec-c", &proof.rec_c_commitment);
+    transcript.append_group(b"pow/successor/com-rec-d", &proof.rec_d_commitment);
+
+    let shape = successor_shape(k, n, alpha, beta);
+    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    let commitments = vec![
+        *com_base,
+        *com_next,
+        proof.mult_commitment,
+        proof.rec_c_commitment,
+        proof.rec_d_commitment,
+    ];
+    verify_column_openings(&commitments, &r, &evals, &proof.opening, transcript)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,5 +920,135 @@ mod tests {
         // Near-full padded capacity: 15 real rows in a domain of 16.
         let u: Vec<ArkFr> = (0..15u64).map(|i| fr(i * 3 + 1)).collect();
         assert!(run(&u, 15).is_ok());
+    }
+
+    // ---- Positional successor lookup (range-free shift) -------------------
+    //
+    // This is the CRUX check for the ordered `rdf:List` walk: the shift binding
+    // must hold over cons-cell ids that are FRESH RANDOM opaque nodes (NOT sorted),
+    // which the strict/nondecreasing sort verifiers would (correctly) reject.
+
+    fn succ_transcript() -> Transcript254 {
+        Transcript254::new(b"parture-successor-test")
+    }
+
+    /// Commit `base`/`next` (padded to a shared power-of-two domain) and run the
+    /// successor prove/verify round trip with the honest multiplicity mask.
+    fn run_successor(base: &[ArkFr], next: &[ArkFr], n: usize) -> io::Result<()> {
+        let n_domain = column_domain(base.len().max(next.len()), n).unwrap();
+        let base_p = padded(base, n_domain);
+        let next_p = padded(next, n_domain);
+        let com_base = commit_column(&base_p).unwrap();
+        let com_next = commit_column(&next_p).unwrap();
+        let proof = prove_successor_lookup_with_context(
+            &StoreProverContext::cpu(),
+            &base_p,
+            &next_p,
+            n,
+            &com_base,
+            &com_next,
+            &mut succ_transcript(),
+        )?;
+        verify_successor_lookup(&com_base, &com_next, n, &proof, &mut succ_transcript())
+    }
+
+    #[test]
+    fn successor_binds_shift_over_nonmonotonic_node_ids() {
+        // A cons chain's cons-cell ids as they appear IN LIST ORDER: deliberately
+        // NON-monotonic (up, down, up, down) like fresh random dictionary nodes.
+        // `next` is the one-step shift; the LAST real row of `next` is the tail
+        // sentinel (here 0 = a stand-in for rdf:nil), which the gadget does NOT
+        // constrain — the composite pins it separately.
+        let base = frs(&[500, 12, 9999, 3, 77]);
+        let next = frs(&[12, 9999, 3, 77, 0]);
+        assert!(run_successor(&base, &next, 5).is_ok());
+
+        // A two-cell list and a padded-domain (n=3 -> domain 4) list also bind.
+        assert!(run_successor(&frs(&[41, 8]), &frs(&[8, 0]), 2).is_ok());
+        assert!(run_successor(&frs(&[9, 4, 6]), &frs(&[4, 6, 0]), 3).is_ok());
+    }
+
+    #[test]
+    fn successor_rejects_reordered_next() {
+        // `next` is a PERMUTATION of the true shift but out of position: the
+        // index-augmented lookup must reject (it binds POSITION, not just the set).
+        let base = frs(&[500, 12, 9999, 3]);
+        let reordered = frs(&[9999, 12, 3, 0]); // 12 and 9999 swapped vs the true shift
+        assert!(run_successor(&base, &reordered, 4).is_err());
+    }
+
+    #[test]
+    fn successor_rejects_wrong_successor_value() {
+        // A single successor entry replaced by a fabricated id (an injected cons
+        // cell that is not the real rest): must reject.
+        let base = frs(&[500, 12, 9999, 3]);
+        let wrong = frs(&[12, 424242, 3, 0]); // next[1] should be 9999
+        assert!(run_successor(&base, &wrong, 4).is_err());
+    }
+
+    #[test]
+    fn successor_rejects_forged_multiplicity() {
+        // The soundness argument claims `mult` needs NO separate booleanity proof —
+        // the public-index pole distinctness forces it to the honest mask. Prove
+        // that: feed a WRONG `next` together with an adversarial `mult` and confirm
+        // no forged multiplicity can rescue a non-shift `next`.
+        let n = 4usize;
+        let n_domain = column_domain(4, n).unwrap();
+        let base = padded(&frs(&[500, 12, 9999, 3]), n_domain);
+        let wrong_next = padded(&frs(&[12, 424242, 3, 0]), n_domain);
+        let com_base = commit_column(&base).unwrap();
+        let com_next = commit_column(&wrong_next).unwrap();
+        // Try a spread of hand-picked forged multiplicity masks; none may verify.
+        for mult in [
+            vec![f1(); n_domain],
+            vec![f0(), f1(), f0(), f1()],
+            vec![fr(2), f1(), f1(), f0()],
+            vec![f0(), f0(), f1(), f1()],
+        ] {
+            let proof = prove_successor_with_witness_and_context(
+                &StoreProverContext::cpu(),
+                &base,
+                &wrong_next,
+                &mult,
+                n,
+                &com_base,
+                &com_next,
+                &mut succ_transcript(),
+            )
+            .unwrap();
+            assert!(
+                verify_successor_lookup(&com_base, &com_next, n, &proof, &mut succ_transcript())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn successor_rejects_statement_substitution() {
+        // A valid proof for one (base, next) pair must not verify against a
+        // different committed `next` (transcript binds both commitments).
+        let base = frs(&[500, 12, 9999, 3]);
+        let next = frs(&[12, 9999, 3, 0]);
+        let n_domain = column_domain(4, 4).unwrap();
+        let base_p = padded(&base, n_domain);
+        let next_p = padded(&next, n_domain);
+        let com_base = commit_column(&base_p).unwrap();
+        let com_next = commit_column(&next_p).unwrap();
+        let proof = prove_successor_lookup_with_context(
+            &StoreProverContext::cpu(),
+            &base_p,
+            &next_p,
+            4,
+            &com_base,
+            &com_next,
+            &mut succ_transcript(),
+        )
+        .unwrap();
+        let other_next = padded(&frs(&[12, 9999, 999, 0]), n_domain);
+        let com_other = commit_column(&other_next).unwrap();
+        assert!(
+            verify_successor_lookup(&com_base, &com_other, 4, &proof, &mut succ_transcript())
+                .is_err()
+        );
     }
 }
