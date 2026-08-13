@@ -159,4 +159,61 @@ mod tests {
         let mixed = RelationWitness::commit(vec![vec![id(&layer,1),node_id], vec![id(&layer,2),id(&layer,3)]], 2).unwrap();
         assert!(prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &mixed, &types[..2], &[0,1], &dirs[..2], &mut Transcript254::new(b"mixed")).is_err());
     }
+
+    #[test]
+    fn subset_order_ascending_tiebreak_binds_total_order_and_rejects_tamper() {
+        // Models the compiler's `OrderBy([asc(key)])` over a two-column BGP result: the named key is
+        // column 0 and the UNNAMED column 1 is appended as an ascending total-order tie-break, so the
+        // full-row `key_indices = [0, 1]` are both ascending. Column 0 repeats (1, 1, 2), so the
+        // tie-break is load-bearing: it fixes the order WITHIN the column-0 == 1 group.
+        let layer = fixture();
+        let input = RelationWitness::commit(vec![
+            vec![id(&layer, 1), id(&layer, 1), id(&layer, 2)],
+            vec![id(&layer, 5), id(&layer, 3), id(&layer, 9)],
+        ], 3).unwrap();
+        let types = [CanonicalDatatype::UInt32, CanonicalDatatype::UInt32];
+        let dirs = [OrderDirection::Ascending, OrderDirection::Ascending];
+        let result = prove_exact_multi_order_with_context(
+            &StoreProverContext::cpu(), &layer, &input, &types, &[0, 1], &dirs,
+            &mut Transcript254::new(b"subset-tiebreak"),
+        ).unwrap();
+        // Sorted by column 0 ascending, ties on column 0 broken by column 1 ascending.
+        assert_eq!(&result.columns[0][..3], &[id(&layer, 1), id(&layer, 1), id(&layer, 2)]);
+        assert_eq!(&result.columns[1][..3], &[id(&layer, 3), id(&layer, 5), id(&layer, 9)]);
+        verify_exact_multi_order(
+            &layer, &input.view(), &result.columns, &types, &[0, 1], &dirs,
+            &result.commitments, result.n, result.log_domain, &result.proof,
+            &mut Transcript254::new(b"subset-tiebreak"),
+        ).unwrap();
+
+        let reject = |columns: Vec<Vec<ArkFr>>, n: usize| {
+            let commitments = columns.iter().map(|c| commit_column(c)).collect::<io::Result<Vec<_>>>().unwrap();
+            verify_exact_multi_order(
+                &layer, &input.view(), &columns, &types, &[0, 1], &dirs,
+                &commitments, n, result.log_domain, &result.proof,
+                &mut Transcript254::new(b"subset-tiebreak"),
+            ).is_err()
+        };
+
+        // TIE-BREAK SWAP: exchange the two column-0 == 1 rows. Still a permutation and still sorted on
+        // column 0 (1, 1, 2), but column 1 within the tie group becomes descending (5, 3) — rejected.
+        let mut tie_swapped = result.columns.clone();
+        for column in tie_swapped.iter_mut() { column.swap(0, 1); }
+        assert!(reject(tie_swapped, result.n));
+
+        // REORDER across the primary key: swap the first and last rows — column 0 is no longer sorted.
+        let mut reordered = result.columns.clone();
+        for column in reordered.iter_mut() { column.swap(0, 2); }
+        assert!(reject(reordered, result.n));
+
+        // NON-PERMUTATION: overwrite a tie-break value with another catalog id absent from the input
+        // multiset (row (2, 9) -> (2, 8)); the order still holds but the multiset check rejects.
+        let mut altered = result.columns.clone();
+        altered[1][2] = id(&layer, 8);
+        assert!(reject(altered, result.n));
+
+        // TRUNCATION: claiming one fewer row is not a full-row permutation of the three input rows.
+        let truncated = result.columns.iter().map(|c| { let mut c = c.clone(); c[2] = ArkFr::zero(); c }).collect::<Vec<_>>();
+        assert!(reject(truncated, result.n - 1));
+    }
 }
