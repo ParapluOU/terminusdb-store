@@ -302,6 +302,28 @@ pub enum RelationProofPlanKind {
         /// changes is the InnerJoin key column on `E`; every other operator is direction-agnostic.
         inverted: bool,
     },
+    /// Authenticated ORDERED walk of one `rdf:List` value: given a BOUND subject node `S` and a
+    /// bound list-valued predicate `P`, deliver the list's elements `E[0..K]` IN ORDER as one
+    /// nonnullable NodeValue column (ReadDocument increment 1). This is a COMPOSITE ORCHESTRATION
+    /// over audited operators — a bound BGP anchor, a `rdf:rest` `TransitiveClosure`, a `LeftAnti`
+    /// stripping `rdf:nil`, a `permutation`, the `sort.rs` positional-successor primitive, and
+    /// `rdf:rest`/`rdf:first` `InnerJoin`s reconciled by `relocation` — NO new cryptographic gadget.
+    ///
+    /// A stored `rdf:List` is the cons chain `t(S,P,head)`, each cell `t(Ci,rdf:first,ei)` +
+    /// `t(Ci,rdf:rest,C{i+1})`, terminating `t(Ck,rdf:rest,rdf:nil)`. Cons-cell ids are FRESH random
+    /// dictionary nodes, so order is the chain TOPOLOGY, not a stored key — hence the successor walk.
+    /// The `rdf:first`/`rdf:rest`/`rdf:nil` IRIs are well-known constants resolved against the trusted
+    /// layer dictionary at prove/verify. Runs over the single INSTANCE layer (like `TransitiveClosure`,
+    /// there is no separate graph field). Fails CLOSED (never emits a bogus order) on: not exactly one
+    /// `t(S,P,head)`; a non-functional `rest`/`first` (a cell with two of either); a `rest` cycle (via
+    /// the closure round budget); an over-budget chain; or a nested-list element (an element that is
+    /// itself a cons head — deferred to a later increment).
+    OrderedListWalk {
+        /// The bound list-owning subject; must be a node IRI (a literal can never own a list edge).
+        subject: CanonicalObject,
+        /// The bound list-valued predicate IRI bytes (the `P` of `t(S,P,head)`).
+        predicate: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1204,6 +1226,26 @@ impl RelationProofPlan {
                     ));
                 }
                 // The delivered relation is the reachable SET: one nonnullable NodeValue column.
+                Ok((
+                    vec![ResultColumnDescriptor {
+                        namespace: ResultIdNamespace::NodeValue,
+                        nullable: false,
+                    }],
+                    false,
+                ))
+            }
+            RelationProofPlanKind::OrderedListWalk { subject, predicate } => {
+                // Structural, K-INDEPENDENT validation (identical for prover and verifier): the
+                // subject must be a node (a literal can never own a list edge) and the predicate
+                // IRI must be nonempty. The number of cons cells `K` lives in the PROOF, never here.
+                if !matches!(subject, CanonicalObject::Node(_)) {
+                    return Err(invalid("ordered-list-walk subject must be a node IRI"));
+                }
+                if predicate.is_empty() {
+                    return Err(invalid("ordered-list-walk predicate IRI must be nonempty"));
+                }
+                // The delivered relation is the ordered element sequence: one nonnullable NodeValue
+                // column (`domains: [None]`).
                 Ok((
                     vec![ResultColumnDescriptor {
                         namespace: ResultIdNamespace::NodeValue,

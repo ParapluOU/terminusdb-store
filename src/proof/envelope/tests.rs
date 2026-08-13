@@ -2451,3 +2451,267 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
             .join()
             .unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // Ordered rdf:List walk (ReadDocument increment 1).
+    // -----------------------------------------------------------------------
+
+    fn rdf_first() -> String {
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#first".to_string()
+    }
+    fn rdf_rest() -> String {
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest".to_string()
+    }
+    fn rdf_nil() -> String {
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil".to_string()
+    }
+    fn cell(i: usize) -> String {
+        format!("http://ex/cell{i}")
+    }
+
+    /// Build a base layer from raw node triples (IRIs used verbatim — NOT `iri()`-wrapped — so the RDF
+    /// Collection constants keep their exact well-known IRIs).
+    fn list_layer(triples: Vec<(String, String, String)>) -> LayerCommitment {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (s, p, o) in &triples {
+            builder
+                .add_value_triple(ValueTriple::new_node(s.as_str(), p.as_str(), o.as_str()))
+                .unwrap();
+        }
+        (*builder.commit().unwrap().proof_commitment().unwrap()).clone()
+    }
+
+    /// The standard cons chain `S -P-> [elements...]` using cells `cell0, cell1, …` and the RDF
+    /// `first`/`rest`/`nil` constants.
+    fn chain_triples(subject: &str, predicate: &str, elements: &[&str]) -> Vec<(String, String, String)> {
+        let mut t = Vec::new();
+        if elements.is_empty() {
+            t.push((subject.to_string(), predicate.to_string(), rdf_nil()));
+            return t;
+        }
+        t.push((subject.to_string(), predicate.to_string(), cell(0)));
+        for (i, e) in elements.iter().enumerate() {
+            t.push((cell(i), rdf_first(), iri(e)));
+            let rest = if i + 1 < elements.len() { cell(i + 1) } else { rdf_nil() };
+            t.push((cell(i), rdf_rest(), rest));
+        }
+        t
+    }
+
+    fn list_walk_plan(subject: &str, predicate: &str, digest: u8) -> RelationProofPlan {
+        RelationProofPlan {
+            query_digest: [digest; 32],
+            kind: RelationProofPlanKind::OrderedListWalk {
+                subject: CanonicalObject::Node(subject.as_bytes().to_vec()),
+                predicate: predicate.as_bytes().to_vec(),
+            },
+        }
+    }
+
+    fn node_object_id(layer: &LayerCommitment, iri_str: &str) -> u64 {
+        layer
+            .node_value_catalog
+            .iter()
+            .find(|r| matches!(&r.triple.object, CanonicalObject::Node(n) if n.as_slice() == iri_str.as_bytes()))
+            .map(|r| r.object_id)
+            .expect("node id present in layer dictionary")
+    }
+
+    fn walk_elements(env: &RecursiveRelationEnvelope) -> Vec<String> {
+        env.result_values[0]
+            .iter()
+            .map(|v| match v {
+                CanonicalResultValue::Object(CanonicalObject::Node(b)) => {
+                    String::from_utf8(b.clone()).unwrap()
+                }
+                other => panic!("unexpected list element value {:?}", other),
+            })
+            .collect()
+    }
+
+    fn big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("ordered-list-walk-proof".into())
+            .stack_size(512 * 1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn assert_ordered_list_walk_happy() {
+        let s = iri("doc");
+        let p = iri("tracks");
+        // Duplicate element `a` at two positions: order + multiplicity are both non-trivial.
+        let layer = list_layer(chain_triples(&s, &p, &["a", "b", "a"]));
+        let root = layer.state.commitment_root;
+        let plan = list_walk_plan(&s, &p, 42);
+
+        let env = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        env.verify(&layer, root, &plan).unwrap();
+        assert_eq!(walk_elements(&env), vec![iri("a"), iri("b"), iri("a")]);
+
+        // Wire round-trip still verifies.
+        let bytes = env.encode().unwrap();
+        RecursiveRelationEnvelope::decode(&bytes)
+            .unwrap()
+            .verify(&layer, root, &plan)
+            .unwrap();
+
+        // Single-element list.
+        let s1 = iri("solo");
+        let one = list_layer(chain_triples(&s1, &p, &["z"]));
+        let one_plan = list_walk_plan(&s1, &p, 42);
+        let one_env = RecursiveRelationEnvelope::prove(&one, &one_plan).unwrap();
+        one_env.verify(&one, one.state.commitment_root, &one_plan).unwrap();
+        assert_eq!(walk_elements(&one_env), vec![iri("z")]);
+    }
+
+    fn assert_ordered_list_walk_soundness() {
+        let s = iri("doc");
+        let p = iri("tracks");
+        let ctx = StoreProverContext::cpu();
+        let subj_obj = CanonicalObject::Node(s.as_bytes().to_vec());
+
+        // Non-palindrome baseline so a reordered order is a genuinely DIFFERENT answer.
+        let layer = list_layer(chain_triples(&s, &p, &["a", "b", "c"]));
+        let root = layer.state.commitment_root;
+        let plan = list_walk_plan(&s, &p, 42);
+        let env = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        env.verify(&layer, root, &plan).unwrap();
+        assert_eq!(walk_elements(&env), vec![iri("a"), iri("b"), iri("c")]);
+
+        let c0 = node_object_id(&layer, &cell(0));
+        let c1 = node_object_id(&layer, &cell(1));
+        let c2 = node_object_id(&layer, &cell(2));
+        let a_id = node_object_id(&layer, &iri("a"));
+
+        // (1) REORDER -> rejected by the SUCCESSOR check (a valid permutation-order, wrong chain order).
+        let reorder = super::list_walk::prove_ordered_list_walk_forged(
+            &ctx, &layer, &plan, &subj_obj, p.as_bytes(), vec![c2, c1, c0],
+        );
+        assert!(
+            reorder.and_then(|e| e.verify(&layer, root, &plan)).is_err(),
+            "reordered elements must be rejected (successor)"
+        );
+
+        // (2) DROPPED middle cell -> rejected by the PERMUTATION (cell set is incomplete).
+        assert!(
+            super::list_walk::prove_ordered_list_walk_forged(
+                &ctx, &layer, &plan, &subj_obj, p.as_bytes(), vec![c0, c2],
+            )
+            .and_then(|e| e.verify(&layer, root, &plan))
+            .is_err(),
+            "dropped middle cell must be rejected (permutation)"
+        );
+
+        // (3) INJECTED extra node (not a cons cell) -> rejected by the PERMUTATION membership.
+        assert!(
+            super::list_walk::prove_ordered_list_walk_forged(
+                &ctx, &layer, &plan, &subj_obj, p.as_bytes(), vec![c0, c1, a_id, c2],
+            )
+            .and_then(|e| e.verify(&layer, root, &plan))
+            .is_err(),
+            "injected non-cons node must be rejected (permutation)"
+        );
+
+        // (4) APPENDED tail past nil (extra/duplicate cell) -> rejected by the PERMUTATION.
+        assert!(
+            super::list_walk::prove_ordered_list_walk_forged(
+                &ctx, &layer, &plan, &subj_obj, p.as_bytes(), vec![c0, c1, c2, c0],
+            )
+            .and_then(|e| e.verify(&layer, root, &plan))
+            .is_err(),
+            "appended tail must be rejected (permutation)"
+        );
+
+        // (5) EARLY-nil TRUNCATION (drop the last cell) -> rejected by the PERMUTATION completeness.
+        assert!(
+            super::list_walk::prove_ordered_list_walk_forged(
+                &ctx, &layer, &plan, &subj_obj, p.as_bytes(), vec![c0, c1],
+            )
+            .and_then(|e| e.verify(&layer, root, &plan))
+            .is_err(),
+            "early truncation must be rejected (permutation)"
+        );
+
+        // (6) BRANCHING rest (a cell with two rests) -> honest prove rejects (permutation/count).
+        let mut branch_rest = chain_triples(&s, &p, &["a", "b", "c"]);
+        branch_rest.push((cell(1), rdf_rest(), cell(9)));
+        branch_rest.push((cell(9), rdf_first(), iri("x")));
+        branch_rest.push((cell(9), rdf_rest(), rdf_nil()));
+        let bl = list_layer(branch_rest);
+        assert!(
+            RecursiveRelationEnvelope::prove(&bl, &list_walk_plan(&s, &p, 42)).is_err(),
+            "branching rest must be rejected"
+        );
+
+        // (7) BRANCHING first (a cell with two firsts) -> honest prove rejects (first-join count).
+        let mut branch_first = chain_triples(&s, &p, &["a", "b", "c"]);
+        branch_first.push((cell(1), rdf_first(), iri("bb")));
+        let bf = list_layer(branch_first);
+        assert!(
+            RecursiveRelationEnvelope::prove(&bf, &list_walk_plan(&s, &p, 42)).is_err(),
+            "branching first must be rejected"
+        );
+
+        // (8) REST CYCLE (no nil) -> honest prove rejects (terminator count is 0; the closure also
+        // never reaches nil).
+        let cyc = list_layer(vec![
+            (s.clone(), p.clone(), cell(0)),
+            (cell(0), rdf_first(), iri("a")),
+            (cell(0), rdf_rest(), cell(1)),
+            (cell(1), rdf_first(), iri("b")),
+            (cell(1), rdf_rest(), cell(0)),
+        ]);
+        assert!(
+            RecursiveRelationEnvelope::prove(&cyc, &list_walk_plan(&s, &p, 42)).is_err(),
+            "rest cycle must be rejected"
+        );
+
+        // (9) NESTED list element (an element that is itself a cons head) -> honest prove rejects.
+        let nested = list_layer(vec![
+            (s.clone(), p.clone(), cell(0)),
+            (cell(0), rdf_first(), cell(5)), // element 0 IS a cons head (inner list)
+            (cell(0), rdf_rest(), cell(1)),
+            (cell(1), rdf_first(), iri("b")),
+            (cell(1), rdf_rest(), rdf_nil()),
+            (cell(5), rdf_first(), iri("q")),
+            (cell(5), rdf_rest(), rdf_nil()),
+        ]);
+        assert!(
+            RecursiveRelationEnvelope::prove(&nested, &list_walk_plan(&s, &p, 42)).is_err(),
+            "nested-list element must be rejected"
+        );
+
+        // (10) WRONG-HEAD substitution: a proof for `doc` verified against a plan for a different
+        // subject -> the anchor BGP plan digest no longer matches.
+        let plan_wrong_subject = list_walk_plan(&iri("other"), &p, 42);
+        assert!(
+            env.verify(&layer, root, &plan_wrong_subject).is_err(),
+            "wrong-head substitution must be rejected"
+        );
+
+        // (11) STATEMENT/TRANSCRIPT substitution: a different predicate, and a different query digest.
+        let plan_wrong_pred = list_walk_plan(&s, &iri("authors"), 42);
+        assert!(
+            env.verify(&layer, root, &plan_wrong_pred).is_err(),
+            "wrong predicate must be rejected"
+        );
+        let plan_wrong_digest = list_walk_plan(&s, &p, 7);
+        assert!(
+            env.verify(&layer, root, &plan_wrong_digest).is_err(),
+            "wrong query digest must be rejected"
+        );
+    }
+
+    #[test]
+    fn ordered_list_walk_end_to_end() {
+        big_stack(assert_ordered_list_walk_happy);
+    }
+
+    #[test]
+    fn ordered_list_walk_soundness_negatives() {
+        big_stack(assert_ordered_list_walk_soundness);
+    }

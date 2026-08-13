@@ -512,6 +512,14 @@ wire_struct!(LeftAntiJoinProof {
     compaction
 });
 wire_struct!(InnerJoinProof { anti, unmatched_left_commitments, unmatched_len });
+// The positional-successor primitive (`proof::sort`) consumed by the ordered `rdf:List` walk.
+wire_struct!(crate::proof::sort::SuccessorProof {
+    sumcheck,
+    opening,
+    mult_commitment,
+    rec_c_commitment,
+    rec_d_commitment
+});
 wire_struct!(TransitiveClosureRound {
     inner,
     inner_out,

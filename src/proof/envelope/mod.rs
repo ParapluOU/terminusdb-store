@@ -76,6 +76,7 @@ mod columns;
 mod layer_bgp;
 mod left_anti;
 mod left_outer;
+mod list_walk;
 mod plan;
 mod recursive;
 mod wire;

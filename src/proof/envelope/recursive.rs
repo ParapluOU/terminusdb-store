@@ -229,6 +229,13 @@ pub enum RecursiveRelationProof {
         rounds: Vec<TransitiveClosureRound>,
         fixpoint: TransitiveClosureFixpoint,
     },
+    /// Authenticated ordered `rdf:List` walk (ReadDocument increment 1). All sub-proofs — the four
+    /// authenticated child relations (anchor, closure, `rdf:rest` edges, `rdf:first` edges) and the
+    /// gluing gadgets (strip-nil anti-join, walk permutation, rest/first inner-joins + relocations,
+    /// the positional successor) — live in [`super::list_walk::OrderedListWalkProof`]. The delivered
+    /// result of THIS envelope is the ordered element column. See
+    /// [`RelationProofPlanKind::OrderedListWalk`].
+    OrderedListWalk(Box<super::list_walk::OrderedListWalkProof>),
 }
 
 /// How `A_0` (the semi-naive base) is established.
@@ -436,7 +443,7 @@ pub(super) fn closure_distinct_witness(distinct: &RelationDistinctResult) -> Rel
 }
 
 impl RecursiveRelationEnvelope {
-    fn relation_commit(&self, mapping: Option<&[usize]>) -> io::Result<RelationCommit> {
+    pub(super) fn relation_commit(&self, mapping: Option<&[usize]>) -> io::Result<RelationCommit> {
         let commitments = match mapping {
             Some(mapping) => mapping
                 .iter()
@@ -456,7 +463,7 @@ impl RecursiveRelationEnvelope {
         })
     }
 
-    fn relation_witness(&self, mapping: Option<&[usize]>) -> io::Result<RelationWitness> {
+    pub(super) fn relation_witness(&self, mapping: Option<&[usize]>) -> io::Result<RelationWitness> {
         let indexes: Vec<usize> = match mapping {
             Some(mapping) => mapping.to_vec(),
             None => (0..self.result_columns.len()).collect(),
@@ -489,7 +496,7 @@ impl RecursiveRelationEnvelope {
         })
     }
 
-    fn finish_proved(
+    pub(super) fn finish_proved(
         layer: &LayerCommitment,
         plan: &RelationProofPlan,
         proof: RecursiveRelationProof,
@@ -685,7 +692,7 @@ impl RecursiveRelationEnvelope {
         )
     }
 
-    fn prove_bounded(
+    pub(super) fn prove_bounded(
         context: &StoreProverContext<'_>,
         layer: &LayerCommitment,
         plan: &RelationProofPlan,
@@ -1261,6 +1268,11 @@ impl RecursiveRelationEnvelope {
                     context, layer, plan, edge, seed, *reflexive, *inverted, depth, nodes,
                 )
             }
+            RelationProofPlanKind::OrderedListWalk { subject, predicate } => {
+                super::list_walk::prove_ordered_list_walk(
+                    context, layer, plan, subject, predicate, depth, nodes,
+                )
+            }
         }
     }
 
@@ -1424,7 +1436,7 @@ impl RecursiveRelationEnvelope {
         )
     }
 
-    fn verify_bounded(
+    pub(super) fn verify_bounded(
         &self,
         layer: &impl VerifierLayer,
         expected_root: ProofHash,
@@ -2249,6 +2261,14 @@ impl RecursiveRelationEnvelope {
                     ));
                 }
             }
+            (
+                RecursiveRelationProof::OrderedListWalk(walk),
+                RelationProofPlanKind::OrderedListWalk { subject, predicate },
+            ) => {
+                self.verify_ordered_list_walk(
+                    layer, expected_root, plan, subject, predicate, walk, depth, nodes,
+                )?;
+            }
             _ => return Err(invalid("recursive relation proof variant mismatch")),
         }
 
@@ -2643,7 +2663,7 @@ impl RecursiveRelationEnvelope {
         Ok(())
     }
 
-    fn put_bounded(
+    pub(super) fn put_bounded(
         &self,
         out: &mut Vec<u8>,
         depth: usize,
@@ -2798,6 +2818,10 @@ impl RecursiveRelationEnvelope {
                 rounds.put(out)?;
                 fixpoint.put(out)?;
             }
+            RecursiveRelationProof::OrderedListWalk(walk) => {
+                23u8.put(out)?;
+                walk.put_bounded(out, depth, nodes)?;
+            }
         }
         self.result_commitments.put(out)?;
         self.result_columns.put(out)?;
@@ -2808,7 +2832,7 @@ impl RecursiveRelationEnvelope {
         self.result_values.put(out)
     }
 
-    fn get_bounded(
+    pub(super) fn get_bounded(
         reader: &mut Reader<'_>,
         depth: usize,
         nodes: &mut usize,
@@ -2929,6 +2953,9 @@ impl RecursiveRelationEnvelope {
                 input: Box::new(Self::get_bounded(reader, depth + 1, nodes)?),
                 proof: Box::<RelationDistinctProof>::get(reader)?,
             },
+            23 => RecursiveRelationProof::OrderedListWalk(Box::new(
+                super::list_walk::OrderedListWalkProof::get_bounded(reader, depth, nodes)?,
+            )),
             _ => return Err(invalid("invalid recursive relation proof tag")),
         };
         Ok(Self {
