@@ -324,6 +324,31 @@ pub enum RelationProofPlanKind {
         /// The bound list-valued predicate IRI bytes (the `P` of `t(S,P,head)`).
         predicate: Vec<u8>,
     },
+    /// Authenticated ORDERED walk of one 1-D DENSE `sys:Array` value: given a BOUND subject node `S`
+    /// and a bound array-valued predicate `P`, deliver the array's elements `Out[0..n]` in ascending
+    /// `sys:index` order as one nonnullable NodeValue column (ReadDocument increment 4). This is a
+    /// COMPOSITE ORCHESTRATION over audited operators — a complete bound-subject BGP for the cell set,
+    /// three `sys:index`/`sys:value`/`rdf:type` functional edge-binds (`InnerJoin` + `relocation`), an
+    /// `Equality` filter forcing `rdf:type == sys:Array`, an authenticated dictionary value/datatype
+    /// lookup, a datatype-completeness filter, and a single `permutation` to the public identity — NO
+    /// new cryptographic gadget.
+    ///
+    /// A stored array is a FLAT bag of cells (`t(S,P,cell)`, each `t(cell,rdf:type,sys:Array)`,
+    /// `t(cell,sys:index,i)`, `t(cell,sys:value,v)`); the parent points at EVERY cell, so the cell set
+    /// needs no closure/successor walk (unlike a list). Order is the authenticated numeric `sys:index`,
+    /// and density (`{indices} == {0,…,n-1}`) is certified by routing the decoded positions through a
+    /// permutation whose output index column the verifier reconstructs as the identity `[0,…,n-1]`. The
+    /// `rdf:type`/`sys:index`/`sys:value`/`sys:Array` IRIs are well-known constants resolved against the
+    /// trusted layer dictionary at prove/verify. Runs over the single INSTANCE layer (like
+    /// `OrderedListWalk`, no separate graph field). Fails CLOSED (never emits a bogus order) on: a cell
+    /// with 0-or->1 `sys:index`/`sys:value`/`rdf:type`; a non-`sys:Array` cell; an index of the wrong
+    /// datatype; a sparse/oversized index (`≥ n`); or a gap/duplicate (the density permutation).
+    OrderedArrayWalk {
+        /// The bound array-owning subject; must be a node IRI (a literal can never own an array edge).
+        subject: CanonicalObject,
+        /// The bound array-valued predicate IRI bytes (the `P` of `t(S,P,cell)`).
+        predicate: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1246,6 +1271,25 @@ impl RelationProofPlan {
                 }
                 // The delivered relation is the ordered element sequence: one nonnullable NodeValue
                 // column (`domains: [None]`).
+                Ok((
+                    vec![ResultColumnDescriptor {
+                        namespace: ResultIdNamespace::NodeValue,
+                        nullable: false,
+                    }],
+                    false,
+                ))
+            }
+            RelationProofPlanKind::OrderedArrayWalk { subject, predicate } => {
+                // Structural, N-INDEPENDENT validation (identical for prover and verifier): the subject
+                // must be a node (a literal can never own an array edge) and the predicate IRI must be
+                // nonempty. The number of cells `n` lives in the PROOF, never here.
+                if !matches!(subject, CanonicalObject::Node(_)) {
+                    return Err(invalid("ordered-array-walk subject must be a node IRI"));
+                }
+                if predicate.is_empty() {
+                    return Err(invalid("ordered-array-walk predicate IRI must be nonempty"));
+                }
+                // The delivered relation is the ordered value sequence: one nonnullable NodeValue column.
                 Ok((
                     vec![ResultColumnDescriptor {
                         namespace: ResultIdNamespace::NodeValue,

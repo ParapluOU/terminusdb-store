@@ -71,6 +71,7 @@
 //! * `recursive` — the general recursive prover/verifier driver and the bounded
 //!   transitive-closure orchestration.
 
+mod array_walk;
 mod bag_union;
 mod columns;
 mod layer_bgp;

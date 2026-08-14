@@ -2737,3 +2737,244 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     fn ordered_list_walk_soundness_negatives() {
         big_stack(assert_ordered_list_walk_soundness);
     }
+
+    // -----------------------------------------------------------------------
+    // Ordered sys:Array walk (ReadDocument increment 4).
+    // -----------------------------------------------------------------------
+
+    fn rdf_type() -> String {
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string()
+    }
+    fn sys_index() -> String {
+        "http://terminusdb.com/schema/sys#index".to_string()
+    }
+    fn sys_value() -> String {
+        "http://terminusdb.com/schema/sys#value".to_string()
+    }
+    fn sys_array() -> String {
+        "http://terminusdb.com/schema/sys#Array".to_string()
+    }
+
+    /// One raw triple of an array seed: a plain node triple, or a `sys:index` literal (a `UInt64`, the
+    /// order-preserving unsigned datatype the composite authenticates against).
+    enum ArrTriple {
+        Node(String, String, String),
+        Index(String, u64),
+    }
+
+    /// Build a base layer from raw array triples (IRIs used verbatim so the RDF/`sys:` constants keep
+    /// their exact well-known IRIs; `sys:index` literals are typed `UInt64`).
+    fn array_layer(triples: Vec<ArrTriple>) -> LayerCommitment {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for triple in &triples {
+            match triple {
+                ArrTriple::Node(s, p, o) => {
+                    builder
+                        .add_value_triple(ValueTriple::new_node(s.as_str(), p.as_str(), o.as_str()))
+                        .unwrap();
+                }
+                ArrTriple::Index(cell, index) => {
+                    builder
+                        .add_value_triple(ValueTriple::new_value(
+                            cell.as_str(),
+                            &sys_index(),
+                            u64::make_entry(index),
+                        ))
+                        .unwrap();
+                }
+            }
+        }
+        (*builder.commit().unwrap().proof_commitment().unwrap()).clone()
+    }
+
+    /// A well-formed dense array `S -P-> {cells}`. `cells` are given in PHYSICAL storage order; each is
+    /// `(index, value-suffix)`. Cell nodes are `cell0, cell1, …` (physical order), NOT index order — so
+    /// a layout whose physical order differs from index order exercises the ordering.
+    fn dense_array_triples(
+        subject: &str,
+        predicate: &str,
+        cells: &[(u64, &str)],
+    ) -> Vec<ArrTriple> {
+        let mut t = Vec::new();
+        for (k, (index, value)) in cells.iter().enumerate() {
+            let c = cell(k);
+            t.push(ArrTriple::Node(subject.to_string(), predicate.to_string(), c.clone()));
+            t.push(ArrTriple::Node(c.clone(), rdf_type(), sys_array()));
+            t.push(ArrTriple::Index(c.clone(), *index));
+            t.push(ArrTriple::Node(c.clone(), sys_value(), iri(value)));
+        }
+        t
+    }
+
+    fn array_walk_plan(subject: &str, predicate: &str, digest: u8) -> RelationProofPlan {
+        RelationProofPlan {
+            query_digest: [digest; 32],
+            kind: RelationProofPlanKind::OrderedArrayWalk {
+                subject: CanonicalObject::Node(subject.as_bytes().to_vec()),
+                predicate: predicate.as_bytes().to_vec(),
+            },
+        }
+    }
+
+    fn walk_values(env: &RecursiveRelationEnvelope) -> Vec<String> {
+        env.result_values[0]
+            .iter()
+            .map(|v| match v {
+                CanonicalResultValue::Object(CanonicalObject::Node(b)) => {
+                    String::from_utf8(b.clone()).unwrap()
+                }
+                other => panic!("unexpected array element value {:?}", other),
+            })
+            .collect()
+    }
+
+    fn assert_ordered_array_walk_happy() {
+        let s = iri("doc");
+        let p = iri("items");
+
+        // Physical order == index order: [0->x, 1->y, 2->z].
+        let layer = array_layer(dense_array_triples(&s, &p, &[(0, "x"), (1, "y"), (2, "z")]));
+        let root = layer.state.commitment_root;
+        let plan = array_walk_plan(&s, &p, 77);
+        let env = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        env.verify(&layer, root, &plan).unwrap();
+        assert_eq!(walk_values(&env), vec![iri("x"), iri("y"), iri("z")]);
+
+        // Wire round-trip still verifies.
+        let bytes = env.encode().unwrap();
+        RecursiveRelationEnvelope::decode(&bytes)
+            .unwrap()
+            .verify(&layer, root, &plan)
+            .unwrap();
+
+        // Physical order != index order: stored [idx2->a, idx0->b, idx1->c] => ordered [b, c, a].
+        let s2 = iri("doc2");
+        let layer2 = array_layer(dense_array_triples(&s2, &p, &[(2, "a"), (0, "b"), (1, "c")]));
+        let plan2 = array_walk_plan(&s2, &p, 77);
+        let env2 = RecursiveRelationEnvelope::prove(&layer2, &plan2).unwrap();
+        env2.verify(&layer2, layer2.state.commitment_root, &plan2).unwrap();
+        assert_eq!(walk_values(&env2), vec![iri("b"), iri("c"), iri("a")]);
+
+        // Duplicate VALUE at two positions (`[a, b, a]`): values are carried positionally, never
+        // deduped.
+        let s3 = iri("doc3");
+        let layer3 = array_layer(dense_array_triples(&s3, &p, &[(0, "a"), (1, "b"), (2, "a")]));
+        let plan3 = array_walk_plan(&s3, &p, 77);
+        let env3 = RecursiveRelationEnvelope::prove(&layer3, &plan3).unwrap();
+        env3.verify(&layer3, layer3.state.commitment_root, &plan3).unwrap();
+        assert_eq!(walk_values(&env3), vec![iri("a"), iri("b"), iri("a")]);
+
+        // Single element.
+        let s4 = iri("solo");
+        let layer4 = array_layer(dense_array_triples(&s4, &p, &[(0, "z")]));
+        let plan4 = array_walk_plan(&s4, &p, 77);
+        let env4 = RecursiveRelationEnvelope::prove(&layer4, &plan4).unwrap();
+        env4.verify(&layer4, layer4.state.commitment_root, &plan4).unwrap();
+        assert_eq!(walk_values(&env4), vec![iri("z")]);
+    }
+
+    fn assert_ordered_array_walk_soundness() {
+        let s = iri("doc");
+        let p = iri("items");
+        let ctx = StoreProverContext::cpu();
+        let subj = CanonicalObject::Node(s.as_bytes().to_vec());
+
+        // Non-sorted physical layout so the honest order is non-trivial: physical positions [2, 0, 1].
+        let layer = array_layer(dense_array_triples(&s, &p, &[(2, "a"), (0, "b"), (1, "c")]));
+        let root = layer.state.commitment_root;
+        let plan = array_walk_plan(&s, &p, 77);
+        let env = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
+        env.verify(&layer, root, &plan).unwrap();
+        assert_eq!(walk_values(&env), vec![iri("b"), iri("c"), iri("a")]);
+
+        // (1) REORDERED value column -> rejected by the DENSITY certificate. Forcing the delivery to
+        // physical/cell order [0,1,2] (values [a,b,c]) makes the routed index column [2,0,1] instead of
+        // the identity [0,1,2], so the permutation-to-identity fails at verify.
+        let reorder = super::array_walk::prove_ordered_array_walk_forged(
+            &ctx, &layer, &plan, &subj, p.as_bytes(), vec![0, 1, 2],
+        );
+        assert!(
+            reorder.and_then(|e| e.verify(&layer, root, &plan)).is_err(),
+            "reordered value column must be rejected (density permutation-to-identity)"
+        );
+
+        // (2) DROPPED cell -> the density permutation is a TOTAL bijection over all `n` cells, so a
+        // routing that omits a cell (length n-1) cannot even be constructed (prove rejects).
+        assert!(
+            super::array_walk::prove_ordered_array_walk_forged(
+                &ctx, &layer, &plan, &subj, p.as_bytes(), vec![1, 2],
+            )
+            .is_err(),
+            "a dropped cell cannot be routed by the density bijection"
+        );
+
+        // (3) DUPLICATE index (two cells index 0, none index 1) -> honest prove rejects (density: not a
+        // dense 0..n-1 permutation).
+        let dup = array_layer(dense_array_triples(&s, &p, &[(0, "a"), (0, "b"), (2, "c")]));
+        assert!(
+            RecursiveRelationEnvelope::prove(&dup, &array_walk_plan(&s, &p, 77)).is_err(),
+            "duplicate sys:index must be rejected"
+        );
+
+        // (4) INJECTED extra cell that is NOT a well-formed array cell (no sys:index) -> honest prove
+        // rejects (the index functional bind's count no longer equals the cell count).
+        let mut injected = dense_array_triples(&s, &p, &[(0, "a"), (1, "b"), (2, "c")]);
+        injected.push(ArrTriple::Node(s.clone(), p.clone(), cell(99)));
+        injected.push(ArrTriple::Node(cell(99), rdf_type(), sys_array()));
+        injected.push(ArrTriple::Node(cell(99), sys_value(), iri("w")));
+        let inj = array_layer(injected);
+        assert!(
+            RecursiveRelationEnvelope::prove(&inj, &array_walk_plan(&s, &p, 77)).is_err(),
+            "an injected non-cell P-object must be rejected (index functional bind)"
+        );
+
+        // (5) GAP / sparse array `[0, 2]` (n=2, index 2 >= n) -> honest prove rejects (out-of-range
+        // index; the reference null-fills a gap, so a sparse array is not a dense one).
+        let sparse = array_layer(dense_array_triples(&s, &p, &[(0, "a"), (2, "b")]));
+        assert!(
+            RecursiveRelationEnvelope::prove(&sparse, &array_walk_plan(&s, &p, 77)).is_err(),
+            "a sparse/gapped array must be rejected"
+        );
+
+        // (6) A cell with TWO sys:value -> honest prove rejects (the value functional-bind count).
+        let mut two_values = dense_array_triples(&s, &p, &[(0, "a"), (1, "b"), (2, "c")]);
+        two_values.push(ArrTriple::Node(cell(1), sys_value(), iri("bb")));
+        let tv = array_layer(two_values);
+        assert!(
+            RecursiveRelationEnvelope::prove(&tv, &array_walk_plan(&s, &p, 77)).is_err(),
+            "a cell with two sys:value must be rejected"
+        );
+
+        // (7) INDEX >= n (`[0, 1, 5]` with n=3) -> honest prove rejects (out-of-range index).
+        let big = array_layer(dense_array_triples(&s, &p, &[(0, "a"), (1, "b"), (5, "c")]));
+        assert!(
+            RecursiveRelationEnvelope::prove(&big, &array_walk_plan(&s, &p, 77)).is_err(),
+            "an index >= n must be rejected"
+        );
+
+        // (8) STATEMENT substitution: a proof aimed at a different subject / predicate / query digest is
+        // rejected (the child plan digests / query identity no longer match).
+        assert!(
+            env.verify(&layer, root, &array_walk_plan(&iri("other"), &p, 77)).is_err(),
+            "wrong subject must be rejected"
+        );
+        assert!(
+            env.verify(&layer, root, &array_walk_plan(&s, &iri("authors"), 77)).is_err(),
+            "wrong predicate must be rejected"
+        );
+        assert!(
+            env.verify(&layer, root, &array_walk_plan(&s, &p, 9)).is_err(),
+            "wrong query digest must be rejected"
+        );
+    }
+
+    #[test]
+    fn ordered_array_walk_end_to_end() {
+        big_stack(assert_ordered_array_walk_happy);
+    }
+
+    #[test]
+    fn ordered_array_walk_soundness_negatives() {
+        big_stack(assert_ordered_array_walk_soundness);
+    }

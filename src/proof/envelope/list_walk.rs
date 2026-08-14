@@ -181,7 +181,10 @@ fn closure_plan(digest: ProofHash, head: &CanonicalObject) -> RelationProofPlan 
 /// Resolve a node IRI to its dictionary id, or a deterministic IMPOSSIBLE id (`node_value_count + 1`)
 /// when absent — so an absent constant fails CLOSED downstream rather than matching anything. Both
 /// prover and verifier resolve identically.
-fn resolve_node_id_or_absent(view: &crate::proof::VerifierCommitmentRef<'_>, iri: &[u8]) -> u64 {
+///
+/// Also used by the sibling [`super::array_walk`] composite (the `rdf:type`/`sys:Array` membership
+/// resolution), which is why it is `pub(super)`.
+pub(super) fn resolve_node_id_or_absent(view: &crate::proof::VerifierCommitmentRef<'_>, iri: &[u8]) -> u64 {
     let target = CanonicalObject::Node(iri.to_vec());
     view.node_value_catalog
         .iter()
@@ -190,8 +193,9 @@ fn resolve_node_id_or_absent(view: &crate::proof::VerifierCommitmentRef<'_>, iri
         .unwrap_or_else(|| view.state.node_value_count.saturating_add(1))
 }
 
-/// Decode an authenticated node/value store id from its canonical field image.
-fn field_id(field: ArkFr) -> io::Result<u64> {
+/// Decode an authenticated node/value store id from its canonical field image. Shared with the
+/// sibling [`super::array_walk`] composite (hence `pub(super)`).
+pub(super) fn field_id(field: ArkFr) -> io::Result<u64> {
     generated_decimal_u64_value(field)
 }
 
@@ -565,12 +569,14 @@ fn prove_ordered_list_walk_impl(
     )
 }
 
-/// The intermediate sub-proofs of ONE functional-edge binding (rest or first).
-struct EdgeBind {
-    join: InnerJoinProof,
-    join_out: Vec<ArkGT>,
-    reloc_subj: RelocationProof,
-    reloc_obj: RelocationProof,
+/// The intermediate sub-proofs of ONE functional-edge binding (rest or first, or — for the sibling
+/// [`super::array_walk`] composite — `sys:index`/`sys:value`/`rdf:type`). `pub(super)` so the array
+/// walk can reuse the exact same functional-edge machinery.
+pub(super) struct EdgeBind {
+    pub(super) join: InnerJoinProof,
+    pub(super) join_out: Vec<ArkGT>,
+    pub(super) reloc_subj: RelocationProof,
+    pub(super) reloc_obj: RelocationProof,
 }
 
 /// Prove that `edge_env` (a 2-column `t(?s,pred,?o)` relation) assigns to each cell of `C` EXACTLY ONE
@@ -579,7 +585,10 @@ struct EdgeBind {
 /// a relocation lifting the join's object column onto `C`'s domain (the returned committed column). No
 /// ordering is claimed here (that is the caller's successor step for `rest`); the object column is
 /// carried positionally, so any element datatype is fine.
-fn prove_edge_bind(
+///
+/// `pub(super)` because the array-walk composite reuses this UNCHANGED for its `sys:index`,
+/// `sys:value`, and `rdf:type` functional binds (the design's steps D/E/F).
+pub(super) fn prove_edge_bind(
     context: &StoreProverContext<'_>,
     root: &ProofHash,
     digest: &ProofHash,
@@ -704,7 +713,9 @@ fn role_tag(role: &[u8], suffix: &[u8]) -> Vec<u8> {
     tag
 }
 
-fn pad_to(column: &[ArkFr], log_domain: usize) -> Vec<ArkFr> {
+/// Zero-pad a real column up to `2^log_domain`. Shared with the sibling [`super::array_walk`]
+/// composite (hence `pub(super)`).
+pub(super) fn pad_to(column: &[ArkFr], log_domain: usize) -> Vec<ArkFr> {
     let mut out = column.to_vec();
     out.resize(1usize << log_domain, ArkFr::zero());
     out
@@ -915,7 +926,9 @@ impl RecursiveRelationEnvelope {
 
 /// Verify one functional-edge binding: the inner join is a well-formed count-`L` match, its subject
 /// column equals `C` positionally, and its object column (lifted to `C`'s domain) is `com_obj`.
-fn verify_edge_bind(
+///
+/// `pub(super)` so the array-walk composite reuses it for its three functional binds.
+pub(super) fn verify_edge_bind(
     root: &ProofHash,
     digest: &ProofHash,
     c_commit: &RelationCommit,

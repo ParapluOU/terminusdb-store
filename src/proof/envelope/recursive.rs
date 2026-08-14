@@ -236,6 +236,13 @@ pub enum RecursiveRelationProof {
     /// result of THIS envelope is the ordered element column. See
     /// [`RelationProofPlanKind::OrderedListWalk`].
     OrderedListWalk(Box<super::list_walk::OrderedListWalkProof>),
+    /// Authenticated ordered 1-D dense `sys:Array` walk (ReadDocument increment 4). All sub-proofs —
+    /// the four authenticated child relations (cell set, `sys:index`/`sys:value`/`rdf:type` edges) and
+    /// the gluing gadgets (three functional edge-binds, the `sys:Array` equality filter, the dictionary
+    /// value/datatype lookup, the datatype-completeness filter, and the density+order permutation) —
+    /// live in [`super::array_walk::OrderedArrayWalkProof`]. The delivered result of THIS envelope is
+    /// the value-in-index-order column. See [`RelationProofPlanKind::OrderedArrayWalk`].
+    OrderedArrayWalk(Box<super::array_walk::OrderedArrayWalkProof>),
 }
 
 /// How `A_0` (the semi-naive base) is established.
@@ -1273,6 +1280,11 @@ impl RecursiveRelationEnvelope {
                     context, layer, plan, subject, predicate, depth, nodes,
                 )
             }
+            RelationProofPlanKind::OrderedArrayWalk { subject, predicate } => {
+                super::array_walk::prove_ordered_array_walk(
+                    context, layer, plan, subject, predicate, depth, nodes,
+                )
+            }
         }
     }
 
@@ -2269,6 +2281,14 @@ impl RecursiveRelationEnvelope {
                     layer, expected_root, plan, subject, predicate, walk, depth, nodes,
                 )?;
             }
+            (
+                RecursiveRelationProof::OrderedArrayWalk(walk),
+                RelationProofPlanKind::OrderedArrayWalk { subject, predicate },
+            ) => {
+                self.verify_ordered_array_walk(
+                    layer, expected_root, plan, subject, predicate, walk, depth, nodes,
+                )?;
+            }
             _ => return Err(invalid("recursive relation proof variant mismatch")),
         }
 
@@ -2822,6 +2842,10 @@ impl RecursiveRelationEnvelope {
                 23u8.put(out)?;
                 walk.put_bounded(out, depth, nodes)?;
             }
+            RecursiveRelationProof::OrderedArrayWalk(walk) => {
+                24u8.put(out)?;
+                walk.put_bounded(out, depth, nodes)?;
+            }
         }
         self.result_commitments.put(out)?;
         self.result_columns.put(out)?;
@@ -2955,6 +2979,9 @@ impl RecursiveRelationEnvelope {
             },
             23 => RecursiveRelationProof::OrderedListWalk(Box::new(
                 super::list_walk::OrderedListWalkProof::get_bounded(reader, depth, nodes)?,
+            )),
+            24 => RecursiveRelationProof::OrderedArrayWalk(Box::new(
+                super::array_walk::OrderedArrayWalkProof::get_bounded(reader, depth, nodes)?,
             )),
             _ => return Err(invalid("invalid recursive relation proof tag")),
         };

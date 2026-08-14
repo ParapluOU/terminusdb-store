@@ -119,7 +119,8 @@ pub(super) const ANTI_VERSION: u32 = 5;
 pub(super) const OUTER_VERSION: u32 = 2;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
-pub(super) const RECURSIVE_VERSION: u32 = 22;
+// v23 adds the ordered `sys:Array` walk composite node (tag 24).
+pub(super) const RECURSIVE_VERSION: u32 = 23;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
