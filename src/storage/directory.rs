@@ -1583,6 +1583,15 @@ mod tests {
 
         let unrolled_layer = store.get_layer(child_name).await.unwrap().unwrap();
 
+        // This stack is built directly through the low-level builder API, which does
+        // not attach the per-layer intrinsic commitment (`proof_state`) that the
+        // intrinsic-commitment feature (commit cbe48ac) now requires on the rollup
+        // path. Run the intended one-time proof-chain migration over the stack so the
+        // rollup below can read each ancestor's commitment instead of failing with
+        // "run migrate_proof_chain once". Migration only writes proof metadata; it
+        // does not alter the layers' triples, so the assertions below are unchanged.
+        store.migrate_proof_chain(child_name).await.unwrap();
+
         let _rolled_id = store.clone().rollup(unrolled_layer).await.unwrap();
         let rolled_layer = store.get_layer(child_name).await.unwrap().unwrap();
 
@@ -1633,6 +1642,14 @@ mod tests {
         builder.commit_boxed().await.unwrap();
 
         let unrolled_layer = store.get_layer(child_name).await.unwrap().unwrap();
+
+        // Legacy stack built via the low-level builder API (no per-layer intrinsic
+        // commitment). Run the one-time proof-chain migration on the head so the
+        // rollup below can read each ancestor's `proof_state` instead of failing with
+        // "run migrate_proof_chain once". Adds proof metadata only; triples (and thus
+        // the assertions below) are unchanged. `child_name` here is the head
+        // (grandchild) after the earlier shadowing, so the whole chain is migrated.
+        store.migrate_proof_chain(child_name).await.unwrap();
 
         let _rolled_id = store
             .clone()

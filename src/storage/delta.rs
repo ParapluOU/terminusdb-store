@@ -649,6 +649,19 @@ mod tests {
         let child5_name = builder.name();
         builder.commit_boxed().await.unwrap();
 
+        // This helper builds a *legacy* layer stack directly through the low-level
+        // builder API, which does not attach the per-layer intrinsic commitment
+        // (the `proof_state` file) that the intrinsic-commitment feature (commit
+        // cbe48ac) now requires on every rollup/proof path. Run the intended
+        // one-time proof-chain migration over the whole stack (this mirrors how the
+        // feature's own passing tests seed commitments via `prepare_proof_layer` in
+        // `fault_store_chain`), so the rollups in the callers below can read each
+        // ancestor's commitment instead of failing with "run migrate_proof_chain
+        // once". Migration only writes proof metadata; it does not alter any layer's
+        // triples, so the callers' rollup equivalence/content assertions are
+        // unchanged. All four callers of this helper are rollup tests that need it.
+        store.migrate_proof_chain(child5_name).await.unwrap();
+
         vec![
             base_name,
             child1_name,
