@@ -215,5 +215,9 @@ use combined_dict::*;
 pub(crate) use present_bgp::*;
 use present_filter::*;
 use present_join::*;
-use present_result::*;
+// `pub(crate)` glob so the reconciled walk composites (envelope 6c-ii) can reach the
+// `pub(crate)` chain value-resolver `resolve_node_value_id_column`; the `pub(super)` helpers
+// (`resolve_result_columns`, `filter_output_kinds`, …) stay reconcile-local (a glob caps each
+// name at its own visibility), so the external surface is unchanged.
+pub(crate) use present_result::*;
 pub(crate) use reconcile_core::*;

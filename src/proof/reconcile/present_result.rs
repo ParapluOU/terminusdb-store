@@ -113,6 +113,34 @@ pub(super) fn resolve_result_columns(
         .collect()
 }
 
+/// Bind an authenticated combined-dict node/value-id column to its commitment `com` and resolve it
+/// to `CanonicalObject`s over the CHAIN catalogs — the value-resolution surface a reconciled walk
+/// composite needs for its delivered element column (ReadDocument 6c-ii). `ids` are the prover's
+/// PUBLIC delivered ids; step (1) re-commits them at `log_domain` and requires equality with the
+/// authenticated `com` (a forged/altered id fails the bind), step (2) resolves each surviving id via
+/// the root-bound combined node/value catalogs (fail-closed on an absent id). This is exactly the
+/// `resolve_result_columns` discipline for one `NodeValueId` column — the walk's `com_elements` is
+/// authenticated by the walk's own gluing gadgets, so this ties the readable answer to it.
+pub(crate) fn resolve_node_value_id_column(
+    views: &[VerifierCommitmentRef<'_>],
+    ids: &[u64],
+    com: ArkGT,
+    log_domain: usize,
+) -> io::Result<Vec<CanonicalObject>> {
+    let column: Vec<ArkFr> = ids.iter().map(|id| ark(*id)).collect();
+    let mut resolved = resolve_result_columns(
+        views,
+        &[column],
+        &[com],
+        ids.len(),
+        log_domain,
+        &[ResolveKind::NodeValueId],
+    )?;
+    resolved
+        .pop()
+        .ok_or_else(|| invalid("resolve: empty node/value-id column"))
+}
+
 /// The output-column resolution kinds for a single-atom filter (the two non-constant columns).
 pub(super) fn filter_output_kinds(position: FilterPosition) -> [ResolveKind; 2] {
     match position {

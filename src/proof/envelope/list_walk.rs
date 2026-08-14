@@ -56,8 +56,21 @@ use dory_pcs::primitives::transcript::Transcript;
 use sha2::{Digest, Sha256};
 
 use super::plan::{RelationProofPlan, RelationProofPlanKind};
-use super::recursive::{RecursiveRelationEnvelope, RecursiveRelationProof};
+use super::recursive::{
+    closure_set_commit, prove_closure_rounds, verify_closure_rounds, ClosureRoundsWitness,
+    RecursiveRelationEnvelope, RecursiveRelationProof, TransitiveClosureFixpoint,
+    TransitiveClosureRound, TransitiveClosureSeed,
+};
+use super::reconciled::{
+    bound_subject_leaf_atom, predicate_edge_leaf_atom, prove_reconciled_leaf,
+    resolve_combined_node_id, verify_reconciled_leaf, RECONCILE_TRANSCRIPT,
+};
 use super::wire::{invalid, Reader, Wire};
+
+use crate::proof::reconcile::{
+    prove_reconcile_core, resolve_node_value_id_column, verify_reconcile_core, PresentBgpProof,
+    ReconcileProof,
+};
 
 use crate::proof::anti::{
     prove_inner_join_with_keys_and_context, prove_left_anti_join_with_keys_and_context,
@@ -588,6 +601,10 @@ pub(super) struct EdgeBind {
 ///
 /// `pub(super)` because the array-walk composite reuses this UNCHANGED for its `sys:index`,
 /// `sys:value`, and `rdf:type` functional binds (the design's steps D/E/F).
+///
+/// This materialized-envelope wrapper simply extracts the edge relation's witness and delegates to
+/// the source-agnostic [`prove_edge_bind_witness`]; the reconciled list walk (6c-ii) calls that core
+/// directly with a `present`-sourced leaf witness, so BOTH paths run byte-identical edge-bind logic.
 pub(super) fn prove_edge_bind(
     context: &StoreProverContext<'_>,
     root: &ProofHash,
@@ -600,9 +617,29 @@ pub(super) fn prove_edge_bind(
     role: &[u8],
 ) -> io::Result<(ArkGT, Vec<ArkFr>, EdgeBind)> {
     let edge_witness = edge_env.relation_witness(None)?;
+    prove_edge_bind_witness(
+        context, root, digest, c_witness, walk_col, l, cons_log_domain, &edge_witness, role,
+    )
+}
+
+/// The SOURCE-AGNOSTIC functional-edge bind: identical to [`prove_edge_bind`] but consuming the edge
+/// relation as an already-committed [`RelationWitness`] (never a `RecursiveRelationEnvelope`), so a
+/// reconciled `present`-sourced edge leaf glues in byte-identically to a materialized BGP edge child.
+/// `pub(super)` so both the materialized wrapper and the reconciled list walk call it.
+pub(super) fn prove_edge_bind_witness(
+    context: &StoreProverContext<'_>,
+    root: &ProofHash,
+    digest: &ProofHash,
+    c_witness: &RelationWitness,
+    walk_col: &[ArkFr],
+    l: usize,
+    cons_log_domain: usize,
+    edge_witness: &RelationWitness,
+    role: &[u8],
+) -> io::Result<(ArkGT, Vec<ArkFr>, EdgeBind)> {
     let mut t_join = lw_transcript(root, digest, &role_tag(role, b"join"));
     let join = prove_inner_join_with_keys_and_context(
-        context, c_witness, &edge_witness, &[(0, 0)], &mut t_join,
+        context, c_witness, edge_witness, &[(0, 0)], &mut t_join,
     )?;
     // Functionality + reachability: exactly one edge per cell => output count == L.
     if join.n != l || join.columns.len() != 2 || join.commitments.len() != 2 {
@@ -969,4 +1006,551 @@ fn singleton_commit(id: u64) -> io::Result<RelationCommit> {
         log_domain: 1,
         n: 1,
     })
+}
+
+// ===========================================================================
+// RECONCILED ordered `rdf:List` walk over a DELTA HEAD's `present` (ReadDocument increment 6c-ii).
+//
+// This is the PARALLEL sibling of the materialized [`prove_ordered_list_walk`] above: it proves the
+// EXACT ordered element sequence of a stored list at a bound `(subject, predicate)` over a
+// NON-materialized delta stack (base..head, head last), reconciling the current triple set at proof
+// time. NO new cryptography — the leaves route through the 6c-i FOUNDATION (reconcile-once +
+// `present_bgp`), and EVERY gluing gadget (strip-nil anti-join, walk permutation, head opening,
+// functional edge binds, positional successor, terminator equality, nested-list inner-join) is the
+// SAME source-agnostic call the materialized path makes, consuming the leaf `RelationWitness` /
+// `RelationCommit` byte-identically. The materialized path is UNTOUCHED.
+//
+// # The three source-specific differences from the materialized walk
+//
+// 1. **Reconcile ONCE.** `prove_reconcile_core` runs a single O(chain) reconciliation; the anchor,
+//    `rdf:rest`-edge, and `rdf:first`-edge leaves are read against the SHARED `ReconcileArtifacts`
+//    on the SHARED transcript (FOUNDATION-A `prove_reconciled_leaf`), each O(present). Every leaf's
+//    committed columns are thereby bound to the trusted head root via the audited reconcile
+//    invariant + `present_bgp` completeness. The gluing gadgets then run on FRESH transcripts (the
+//    same `lw_transcript` / `closure_transcript` separation the materialized walk uses).
+// 2. **The head id is PUBLIC and explicitly bound.** A reconciled leaf delivers a `RelationCommit`
+//    (commitments only), NOT the public result columns a materialized envelope carries. So the head
+//    cons-cell id — needed as the `rdf:rest`-closure seed AND as the `C[0]` head-binding value — is
+//    carried public in the proof and pinned to the anchor leaf's authenticated commitment by a
+//    position-0 opening (`anchor_opening`). Without this the prover could pick any seed; with it, the
+//    seed IS the real `t(S,P,head)` head. Everything else the materialized path reads for free from
+//    the anchor envelope's public column here rides on this one opening.
+// 3. **The `rdf:rest` closure is seeded by ID, threaded from the SAME reconciliation.** Rather than
+//    re-reconciling (as the FOUNDATION-B [`super::reconciled::prove_reconciled_transitive_closure`]
+//    would), the closure's edge is the ALREADY-READ `rdf:rest` leaf and its seed is the anchor's head
+//    id — so the `O(chain)` reconciliation runs exactly ONCE per walk, and the shared audited
+//    `prove_closure_rounds` / `verify_closure_rounds` drive the seed/rounds/fixpoint UNCHANGED. That
+//    same `rdf:rest` leaf is ALSO the functional rest-edge relation the successor step joins against
+//    (one read, two consumers — the closure edge and the rest bind).
+//
+// # Result values
+//
+// The delivered ordered element column is resolved against the CHAIN catalogs (the combined-dict
+// `NodeValueId` resolution — `resolve_node_value_id_column`), NOT the single-layer
+// `resolve_result_values`: the elements are combined-dict ids whose canonical bytes live in whichever
+// layer minted them, all root-authenticated by the reconciliation.
+
+/// The domain-separation digest for a reconciled ordered-list walk's gluing-gadget transcripts,
+/// deterministic from `(subject, predicate)` so prover and verifier reconstruct the IDENTICAL
+/// `lw_transcript(root, digest, role)` sequence with NO per-list information. (The materialized walk
+/// uses `plan.query_digest`; the reconciled walk has no plan node yet — the compiler lift routes to a
+/// standalone entry — so it derives an equivalent tag here.)
+fn reconciled_list_walk_digest(subject: &CanonicalObject, predicate: &[u8]) -> io::Result<ProofHash> {
+    let subject_bytes = match subject {
+        CanonicalObject::Node(bytes) => bytes,
+        _ => return Err(invalid("reconciled ordered-list-walk subject must be a node IRI")),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"pow/reconciled-ordered-list-walk/digest/v0");
+    hasher.update((subject_bytes.len() as u64).to_le_bytes());
+    hasher.update(subject_bytes);
+    hasher.update((predicate.len() as u64).to_le_bytes());
+    hasher.update(predicate);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hasher.finalize());
+    Ok(out)
+}
+
+/// Every sub-proof of one reconciled ordered `rdf:List` walk. Compared to the materialized
+/// [`OrderedListWalkProof`], the four child ENVELOPES are replaced by ONE [`ReconcileProof`] + the
+/// per-leaf [`PresentBgpProof`]s + the closure's seed/rounds/fixpoint; the head-id binding
+/// (`anchor_opening` + public `head_id`) is added; and EVERY gluing-gadget field is byte-identical.
+#[derive(Clone, Debug)]
+pub struct OrderedListWalkReconciledProof {
+    /// Proves `present` IS the current triple set of the whole delta stack (bound to the head root).
+    pub reconcile: ReconcileProof,
+    /// FOUNDATION-A anchor leaf `t(S,P,?head)` over `present` — its one object id is the head cell.
+    pub anchor_leaf: PresentBgpProof,
+    /// A position-0 opening of the anchor leaf's object commitment, binding the public [`Self::head_id`]
+    /// to the authenticated anchor (the reconciled analogue of reading a materialized anchor's column).
+    pub anchor_opening: ColumnOpening,
+    /// The head cons-cell combined-dict id (PUBLIC): the closure seed AND the `C[0]` head value.
+    pub head_id: u64,
+    /// FOUNDATION-A `t(?s,rdf:rest,?o)` leaf over `present` — the closure edge AND the rest bind edge.
+    pub rest_edge_leaf: PresentBgpProof,
+    /// FOUNDATION-A `t(?s,rdf:first,?o)` leaf over `present` — the element bind edge (and nested reject).
+    pub first_edge_leaf: PresentBgpProof,
+
+    // Reconciled reflexive `rdf:rest` closure seeded at `head_id` (SHARED round machinery).
+    pub seed: TransitiveClosureSeed,
+    pub rounds: Vec<TransitiveClosureRound>,
+    pub fixpoint: TransitiveClosureFixpoint,
+
+    // ---- Gluing gadgets — BYTE-IDENTICAL to `OrderedListWalkProof` ----
+    /// `LeftAnti(closure, {rdf:nil})` stripping the terminator; its output is the cons-cell SET.
+    pub strip_nil: LeftAntiJoinProof,
+    pub cons_commitments: Vec<ArkGT>,
+    pub cons_len: usize,
+    pub cons_log_domain: usize,
+    /// `permutation(C ≡ cons-cell set)` — the ordered cons column is exactly the cell set.
+    pub walk_perm: RelationPermutationProof,
+    pub com_walk: ArkGT,
+    /// HEAD BINDING: a position-0 opening of `com_walk`, proving `C[0]` equals the head cons cell.
+    pub head_opening: ColumnOpening,
+    /// `InnerJoin(C, rest_edges)` reading each cell's successor + relocations + committed successor.
+    pub rest_join: InnerJoinProof,
+    pub rest_join_out: Vec<ArkGT>,
+    pub rest_reloc_subj: RelocationProof,
+    pub rest_reloc_obj: RelocationProof,
+    pub com_next: ArkGT,
+    /// The positional-successor proof: `C_next[i] = C[i+1]` (the exact order).
+    pub successor: SuccessorProof,
+    /// TERMINATOR: an equality filter proving EXACTLY ONE successor equals `rdf:nil`.
+    pub terminator: crate::proof::equality::RelationEqualityProof,
+    pub terminator_out: Vec<ArkGT>,
+    /// `InnerJoin(C, first_edges)` reading each cell's element + relocations + committed element column.
+    pub first_join: InnerJoinProof,
+    pub first_join_out: Vec<ArkGT>,
+    pub first_reloc_subj: RelocationProof,
+    pub first_reloc_obj: RelocationProof,
+    pub com_elements: ArkGT,
+    /// `InnerJoin(E, first_edges)` — must be EMPTY: no element is itself a cons head (nested-list reject).
+    pub nested_join: InnerJoinProof,
+    pub nested_join_out: Vec<ArkGT>,
+
+    /// The ordered element combined-dict ids (PUBLIC): bound to `com_elements` by re-commit at verify,
+    /// then resolved to `CanonicalObject`s over the chain catalogs.
+    pub element_ids: Vec<u64>,
+}
+
+/// The `[subject, object]` id columns of a proven 2-column edge relation delivered as a
+/// [`RelationWitness`] (the reconciled analogue of [`edge_columns`], used only to order the walk on
+/// the prover side).
+fn witness_edge_columns(edge: &RelationWitness) -> io::Result<(Vec<u64>, Vec<u64>)> {
+    if edge.columns.len() != 2 {
+        return Err(invalid("reconciled ordered-list-walk edge relation must have two columns"));
+    }
+    let n = edge.n;
+    let subjects = edge.columns[0][..n]
+        .iter()
+        .map(|f| field_id(*f))
+        .collect::<io::Result<Vec<_>>>()?;
+    let objects = edge.columns[1][..n]
+        .iter()
+        .map(|f| field_id(*f))
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok((subjects, objects))
+}
+
+/// Prove the ordered element sequence of the `rdf:List` at `(subject, predicate)` over the reconciled
+/// `present` of the delta stack `layers` (base..head, `len >= 2`). Returns the proof and the ordered
+/// element column resolved against the chain catalogs. Every failure path rejects CLOSED, never
+/// emitting a bogus order — exactly like the materialized entry.
+pub fn prove_ordered_list_walk_reconciled(
+    layers: &[&LayerCommitment],
+    subject: &CanonicalObject,
+    predicate: &[u8],
+) -> io::Result<(OrderedListWalkReconciledProof, Vec<CanonicalObject>)> {
+    prove_ordered_list_walk_reconciled_impl(layers, subject, predicate, None)
+}
+
+/// Test-only forging entry mirroring [`prove_ordered_list_walk_forged`]: prove with a CALLER-CHOSEN
+/// chain order, to confirm each forgery is rejected at the right gadget over `present` (a reordered
+/// but valid permutation-order rejects at the SUCCESSOR; a wrong-cells order rejects at the PERMUTATION).
+#[cfg(test)]
+pub fn prove_ordered_list_walk_reconciled_forged(
+    layers: &[&LayerCommitment],
+    subject: &CanonicalObject,
+    predicate: &[u8],
+    walk_override: Vec<u64>,
+) -> io::Result<(OrderedListWalkReconciledProof, Vec<CanonicalObject>)> {
+    prove_ordered_list_walk_reconciled_impl(layers, subject, predicate, Some(walk_override))
+}
+
+fn prove_ordered_list_walk_reconciled_impl(
+    layers: &[&LayerCommitment],
+    subject: &CanonicalObject,
+    predicate: &[u8],
+    walk_override: Option<Vec<u64>>,
+) -> io::Result<(OrderedListWalkReconciledProof, Vec<CanonicalObject>)> {
+    let context = StoreProverContext::cpu();
+    let root = layers
+        .last()
+        .ok_or_else(|| invalid("reconciled ordered-list-walk needs a head layer"))?
+        .state
+        .commitment_root;
+    let digest = reconciled_list_walk_digest(subject, predicate)?;
+    let closure_digest = child_digest(&digest, b"closure");
+
+    // Reconcile ONCE, then read every leaf against the SHARED artifacts on the SHARED transcript.
+    let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
+    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
+
+    // (1) ANCHOR leaf t(S,P,?head): exactly one head cons cell.
+    let anchor_atom = bound_subject_leaf_atom(subject, predicate);
+    let (anchor_leaf, anchor_witness) =
+        prove_reconciled_leaf(&context, layers, &artifacts, anchor_atom, &mut transcript)?;
+    if anchor_witness.n != 1 || anchor_witness.columns.len() != 1 {
+        return Err(invalid("reconciled ordered-list-walk anchor must be exactly one head triple"));
+    }
+    let head_id = field_id(anchor_witness.columns[0][0])?;
+
+    // (2) EDGE leaves t(?s,rdf:rest,?o) and t(?s,rdf:first,?o) (shared transcript, in this order).
+    let rest_atom = predicate_edge_leaf_atom(RDF_REST);
+    let (rest_edge_leaf, rest_edge_witness) =
+        prove_reconciled_leaf(&context, layers, &artifacts, rest_atom, &mut transcript)?;
+    let first_atom = predicate_edge_leaf_atom(RDF_FIRST);
+    let (first_edge_leaf, first_edge_witness) =
+        prove_reconciled_leaf(&context, layers, &artifacts, first_atom, &mut transcript)?;
+
+    // Bind the PUBLIC head id to the anchor leaf's authenticated commitment (position-0 opening on a
+    // FRESH transcript — does not touch the shared reconciliation transcript).
+    let anchor_point = vec![ArkFr::zero(); anchor_witness.log_domain];
+    let mut t_anchor = lw_transcript(&root, &digest, b"anchor-open");
+    let anchor_opening =
+        context.prove_column_openings(&[anchor_witness.columns[0].clone()], &anchor_point, &mut t_anchor)?;
+
+    // (3) reflexive rdf:rest CLOSURE seeded at head_id over the SAME rdf:rest leaf (reconcile-once).
+    let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+        layers.iter().map(|l| l.verifier_view()).collect();
+    let nil_id = resolve_combined_node_id(&views, RDF_NIL);
+    let mut nodes = 0usize;
+    let ClosureRoundsWitness { seed, accumulator, rounds, fixpoint, reachable_ids: _ } =
+        prove_closure_rounds(&context, &rest_edge_witness, head_id, root, closure_digest, true, false, &mut nodes)?;
+
+    // (4) strip the rdf:nil terminator -> the cons-cell SET.
+    let nil_witness =
+        RelationWitness::commit_with_context(&context, vec![vec![ArkFr::from_u64(nil_id)]], 1)?;
+    let mut t_strip = lw_transcript(&root, &digest, b"strip-nil");
+    let cons = prove_left_anti_join_with_keys_and_context(
+        &context, &accumulator, &nil_witness, &[(0, 0)], &mut t_strip,
+    )?;
+    let cons_len = cons.n;
+    let cons_log_domain = cons.log_domain;
+    let cons_commitments = cons.commitments.clone();
+    let cons_ids: Vec<u64> = cons.columns[0][..cons_len]
+        .iter()
+        .map(|f| field_id(*f))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    // (5) ORDER: reconstruct the true chain order (prover convenience; soundness is in the gadgets),
+    // then prove C is a permutation of the cons-cell set.
+    let rest_map = build_edge_map(&witness_edge_columns(&rest_edge_witness)?)?;
+    let walk_ids = match walk_override {
+        Some(ids) => ids,
+        None => chain_order(head_id, nil_id, &rest_map, cons_len)?,
+    };
+    let cons_index: BTreeMap<u64, usize> = cons_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let row_order: Vec<usize> = walk_ids
+        .iter()
+        .map(|id| cons_index.get(id).copied())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| invalid("reconciled ordered-list-walk chain visited a non-cons node"))?;
+    let cons_witness = RelationWitness {
+        columns: cons.columns.clone(),
+        commitments: cons.commitments.clone(),
+        log_domain: cons_log_domain,
+        n: cons_len,
+    };
+    let mut t_perm = lw_transcript(&root, &digest, b"walk-perm");
+    let walk = prove_relation_permutation_with_context(&context, &cons_witness, &row_order, &mut t_perm)?;
+    let com_walk = walk.commitments[0];
+    let walk_col = walk.columns[0].clone();
+    let c_witness = RelationWitness {
+        columns: vec![walk_col.clone()],
+        commitments: vec![com_walk],
+        log_domain: cons_log_domain,
+        n: cons_len,
+    };
+
+    // (5b) HEAD BINDING: open com_walk at position 0 (== head cons cell). Same guard as materialized.
+    let head_point = vec![ArkFr::zero(); cons_log_domain];
+    let mut t_head = lw_transcript(&root, &digest, b"head-check");
+    let head_opening = context.prove_column_openings(&[walk_col.clone()], &head_point, &mut t_head)?;
+
+    // (6) rest bind (functional successor per cell) + positional successor (the exact order).
+    let (com_next, next_col, rest_bind) = prove_edge_bind_witness(
+        &context, &root, &digest, &c_witness, &walk_col, cons_len, cons_log_domain,
+        &rest_edge_witness, b"rest",
+    )?;
+    let mut t_succ = lw_transcript(&root, &digest, b"successor");
+    let base = walk_col.clone();
+    let next = pad_to(&next_col, cons_log_domain);
+    let successor = prove_successor_lookup_with_context(
+        &context, &base, &next, cons_len, &com_walk, &com_next, &mut t_succ,
+    )?;
+
+    // TERMINATOR: exactly one successor equals rdf:nil (a cycle has none -> count 0 -> reject).
+    let next_witness = RelationWitness {
+        columns: vec![next.clone()],
+        commitments: vec![com_next],
+        log_domain: cons_log_domain,
+        n: cons_len,
+    };
+    let nil_constraint = RelationEqualityConstraint::ColumnConstant {
+        column: 0,
+        value: ArkFr::from_u64(nil_id),
+    };
+    let mut t_term = lw_transcript(&root, &digest, b"terminator");
+    let terminator =
+        prove_relation_equality_with_context(&context, &next_witness, &nil_constraint, &mut t_term)?;
+    if terminator.n != 1 {
+        return Err(invalid(
+            "reconciled ordered-list-walk chain does not terminate at exactly one rdf:nil (cycle or missing terminator)",
+        ));
+    }
+
+    // (7) first bind (elements) -> the ordered element column E.
+    let (com_elements, elem_col, first_bind) = prove_edge_bind_witness(
+        &context, &root, &digest, &c_witness, &walk_col, cons_len, cons_log_domain,
+        &first_edge_witness, b"first",
+    )?;
+
+    // (8) nested-list reject: no delivered element is itself a cons head (a first-edge subject).
+    let e_witness = RelationWitness {
+        columns: vec![pad_to(&elem_col, cons_log_domain)],
+        commitments: vec![com_elements],
+        log_domain: cons_log_domain,
+        n: cons_len,
+    };
+    let mut t_nested = lw_transcript(&root, &digest, b"nested");
+    let nested = prove_inner_join_with_keys_and_context(
+        &context, &e_witness, &first_edge_witness, &[(0, 0)], &mut t_nested,
+    )?;
+    if nested.n != 0 {
+        return Err(invalid(
+            "reconciled ordered-list-walk element is itself a cons head (nested list not supported)",
+        ));
+    }
+
+    // (9) Resolve the delivered element column over the chain catalogs (bind to com_elements first).
+    let element_ids: Vec<u64> = elem_col[..cons_len]
+        .iter()
+        .map(|f| field_id(*f))
+        .collect::<io::Result<Vec<_>>>()?;
+    let elements = resolve_node_value_id_column(&views, &element_ids, com_elements, cons_log_domain)?;
+
+    let proof = OrderedListWalkReconciledProof {
+        reconcile,
+        anchor_leaf,
+        anchor_opening,
+        head_id,
+        rest_edge_leaf,
+        first_edge_leaf,
+        seed,
+        rounds,
+        fixpoint,
+        strip_nil: cons.proof,
+        cons_commitments,
+        cons_len,
+        cons_log_domain,
+        walk_perm: walk.proof,
+        com_walk,
+        head_opening,
+        rest_join: rest_bind.join,
+        rest_join_out: rest_bind.join_out,
+        rest_reloc_subj: rest_bind.reloc_subj,
+        rest_reloc_obj: rest_bind.reloc_obj,
+        com_next,
+        successor,
+        terminator: terminator.proof,
+        terminator_out: terminator.commitments,
+        first_join: first_bind.join,
+        first_join_out: first_bind.join_out,
+        first_reloc_subj: first_bind.reloc_subj,
+        first_reloc_obj: first_bind.reloc_obj,
+        com_elements,
+        nested_join: nested.proof,
+        nested_join_out: nested.commitments,
+        element_ids,
+    };
+    Ok((proof, elements))
+}
+
+/// Verify a reconciled ordered `rdf:List` walk against the trusted head root, returning the ordered
+/// element column resolved over the chain catalogs. Mirrors [`prove_ordered_list_walk_reconciled`]
+/// step for step: re-verify the single reconciliation + the three `present` leaves on the SHARED
+/// transcript, bind the public head id to the anchor, replay the reconciled closure, then replay every
+/// gluing gadget against the authenticated leaf commitments. Any tampered leaf / forged round / broken
+/// order fails CLOSED.
+pub fn verify_ordered_list_walk_reconciled(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    subject: &CanonicalObject,
+    predicate: &[u8],
+    proof: &OrderedListWalkReconciledProof,
+) -> io::Result<Vec<CanonicalObject>> {
+    let root = trusted_head_root;
+    let digest = reconciled_list_walk_digest(subject, predicate)?;
+    let closure_digest = child_digest(&digest, b"closure");
+
+    // Reconcile + the three leaves, replayed on the SHARED transcript in the SAME order as prove.
+    let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
+    let verified = verify_reconcile_core(layers, trusted_head_root, &proof.reconcile, &mut transcript)?;
+    let head_nv = layers
+        .last()
+        .ok_or_else(|| invalid("reconciled ordered-list-walk needs a head layer"))?
+        .verifier_view()
+        .state
+        .node_value_count as usize;
+
+    // (1) ANCHOR leaf + head-id binding.
+    let anchor_atom = bound_subject_leaf_atom(subject, predicate);
+    let anchor_commit = verify_reconciled_leaf(
+        layers, &proof.reconcile, &verified, head_nv, anchor_atom, &proof.anchor_leaf, &mut transcript,
+    )?;
+    if anchor_commit.n != 1 || anchor_commit.commitments.len() != 1 {
+        return Err(invalid("reconciled ordered-list-walk anchor must be exactly one head triple"));
+    }
+    let head_field = ArkFr::from_u64(proof.head_id);
+
+    // (2) EDGE leaves (same shared-transcript order as prove).
+    let rest_atom = predicate_edge_leaf_atom(RDF_REST);
+    let rest_commit = verify_reconciled_leaf(
+        layers, &proof.reconcile, &verified, head_nv, rest_atom, &proof.rest_edge_leaf, &mut transcript,
+    )?;
+    let first_atom = predicate_edge_leaf_atom(RDF_FIRST);
+    let first_commit = verify_reconciled_leaf(
+        layers, &proof.reconcile, &verified, head_nv, first_atom, &proof.first_edge_leaf, &mut transcript,
+    )?;
+
+    // Bind the public head id to the anchor commitment (position-0 opening; fresh transcript).
+    let anchor_point = vec![ArkFr::zero(); anchor_commit.log_domain];
+    let mut t_anchor = lw_transcript(&root, &digest, b"anchor-open");
+    verify_column_openings(
+        std::slice::from_ref(&anchor_commit.commitments[0]),
+        &anchor_point,
+        std::slice::from_ref(&head_field),
+        &proof.anchor_opening,
+        &mut t_anchor,
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "reconciled ordered-list-walk head id is not the anchored head: {error}"
+        ))
+    })?;
+
+    // (3) reflexive rdf:rest CLOSURE seeded at head_id -> reachable set (as ids).
+    let mut nodes = 0usize;
+    let reachable = verify_closure_rounds(
+        &rest_commit, proof.head_id, root, closure_digest, true, false,
+        &proof.seed, &proof.rounds, &proof.fixpoint, &mut nodes,
+    )?;
+    let closure_commit = closure_set_commit(&reachable)?;
+
+    // (4) strip nil.
+    let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+        layers.iter().map(|l| l.verifier_view()).collect();
+    let nil_id = resolve_combined_node_id(&views, RDF_NIL);
+    let nil_commit = singleton_commit(nil_id)?;
+    let cons_commit = RelationCommit {
+        commitments: proof.cons_commitments.clone(),
+        log_domain: proof.cons_log_domain,
+        n: proof.cons_len,
+    };
+    let mut t_strip = lw_transcript(&root, &digest, b"strip-nil");
+    verify_left_anti_join_with_keys(
+        &closure_commit, &nil_commit, &[(0, 0)], &proof.cons_commitments, proof.cons_len,
+        proof.cons_log_domain, &proof.strip_nil, &mut t_strip,
+    )?;
+
+    // (4b) EXPLICIT cons-cell count pin: cons_len == reachable set MINUS the single rdf:nil terminator.
+    let nil_reachable = reachable.iter().any(|id| *id == nil_id);
+    let expected_cons_len = reachable.len().saturating_sub(usize::from(nil_reachable));
+    if proof.cons_len != expected_cons_len {
+        return Err(invalid(
+            "reconciled ordered-list-walk cons-cell count does not equal the closure set minus the rdf:nil terminator",
+        ));
+    }
+
+    // (5) permutation.
+    let mut t_perm = lw_transcript(&root, &digest, b"walk-perm");
+    verify_relation_permutation(
+        &cons_commit, std::slice::from_ref(&proof.com_walk), proof.cons_len, proof.cons_log_domain,
+        &proof.walk_perm, &mut t_perm,
+    )?;
+    let c_commit = RelationCommit {
+        commitments: vec![proof.com_walk],
+        log_domain: proof.cons_log_domain,
+        n: proof.cons_len,
+    };
+
+    // (5b) HEAD BINDING: C[0] == head.
+    let head_point = vec![ArkFr::zero(); proof.cons_log_domain];
+    let mut t_head = lw_transcript(&root, &digest, b"head-check");
+    verify_column_openings(
+        std::slice::from_ref(&proof.com_walk),
+        &head_point,
+        std::slice::from_ref(&head_field),
+        &proof.head_opening,
+        &mut t_head,
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "reconciled ordered-list-walk first cons cell is not the anchored head (C[0] != head): {error}"
+        ))
+    })?;
+
+    // (6) rest bind + successor.
+    verify_edge_bind(
+        &root, &digest, &c_commit, &rest_commit, proof.cons_len, proof.cons_log_domain,
+        &proof.rest_join, &proof.rest_join_out, &proof.rest_reloc_subj, &proof.rest_reloc_obj,
+        proof.com_next, b"rest",
+    )?;
+    let mut t_succ = lw_transcript(&root, &digest, b"successor");
+    verify_successor_lookup(
+        &proof.com_walk, &proof.com_next, proof.cons_len, &proof.successor, &mut t_succ,
+    )?;
+
+    // TERMINATOR.
+    let next_commit = RelationCommit {
+        commitments: vec![proof.com_next],
+        log_domain: proof.cons_log_domain,
+        n: proof.cons_len,
+    };
+    let nil_constraint = RelationEqualityConstraint::ColumnConstant {
+        column: 0,
+        value: ArkFr::from_u64(nil_id),
+    };
+    let mut t_term = lw_transcript(&root, &digest, b"terminator");
+    verify_relation_equality(
+        &next_commit, &nil_constraint, &proof.terminator_out, 1, proof.cons_log_domain,
+        &proof.terminator, &mut t_term,
+    )?;
+
+    // (7) first bind (elements).
+    verify_edge_bind(
+        &root, &digest, &c_commit, &first_commit, proof.cons_len, proof.cons_log_domain,
+        &proof.first_join, &proof.first_join_out, &proof.first_reloc_subj, &proof.first_reloc_obj,
+        proof.com_elements, b"first",
+    )?;
+
+    // (8) nested-list reject.
+    let e_commit = RelationCommit {
+        commitments: vec![proof.com_elements],
+        log_domain: proof.cons_log_domain,
+        n: proof.cons_len,
+    };
+    let nested_log = proof.nested_join.anti.join.num_vars();
+    let mut t_nested = lw_transcript(&root, &digest, b"nested");
+    verify_inner_join_with_keys(
+        &e_commit, &first_commit, &[(0, 0)], &proof.nested_join_out, 0, nested_log,
+        &proof.nested_join, &mut t_nested,
+    )?;
+
+    // (9) Resolve the delivered element column over the chain (binds element_ids to com_elements).
+    if proof.element_ids.len() != proof.cons_len {
+        return Err(invalid("reconciled ordered-list-walk element id count mismatch"));
+    }
+    resolve_node_value_id_column(&views, &proof.element_ids, proof.com_elements, proof.cons_log_domain)
 }

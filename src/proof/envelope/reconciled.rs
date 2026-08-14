@@ -79,8 +79,10 @@ use super::recursive::{
 
 /// The reconciliation envelope transcript label — MUST match `prove_reconcile_core` /
 /// `verify_reconcile_core` (all the one-shot `prove_read_*` entries use this label too), so the
-/// leaf reads share the reconciliation's Fiat-Shamir transcript.
-const RECONCILE_TRANSCRIPT: &[u8] = b"parture-delta-reconcile-envelope";
+/// leaf reads share the reconciliation's Fiat-Shamir transcript. `pub(super)` so the sibling
+/// reconciled composites (the 6c-ii list walk) open their shared transcript with the IDENTICAL
+/// label — the leaves MUST reconcile-once on one transcript for the binding to root to hold.
+pub(super) const RECONCILE_TRANSCRIPT: &[u8] = b"parture-delta-reconcile-envelope";
 
 // ===========================================================================
 // FOUNDATION-A — the reconciled leaf provider + combined-dict constant resolution.

@@ -119,5 +119,13 @@ pub use reconciled::{
     ReconciledClosureProof,
 };
 
+// The reconciled ordered `rdf:List` walk over a delta head's `present` (ReadDocument 6c-ii) — the
+// standalone prove/verify pair the compiler lift (6c-iii) routes a delta-path `List` to. Built on the
+// 6c-i foundation; the materialized `OrderedListWalk` composite stays byte-identical (a PARALLEL entry).
+pub use list_walk::{
+    prove_ordered_list_walk_reconciled, verify_ordered_list_walk_reconciled,
+    OrderedListWalkReconciledProof,
+};
+
 #[cfg(test)]
 mod tests;

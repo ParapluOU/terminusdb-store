@@ -3347,3 +3347,173 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     fn reconciled_transitive_closure_soundness() {
         big_stack(assert_reconciled_closure_soundness);
     }
+
+    // -----------------------------------------------------------------------
+    // Reconciled ordered rdf:List walk over a delta head's `present` (ReadDocument 6c-ii).
+    // -----------------------------------------------------------------------
+
+    /// A base + 1 delta stack whose reconciled `present` is the list `doc -tracks-> [a, b, a]`
+    /// (cons chain cell0 -> cell1 -> cell2 -> nil; first edges a/b/a). The base stores a 4-element
+    /// list `[a, b, x, y]` (cell2/cell3 tail); the delta REMOVES cell2/cell3's old first/rest (4
+    /// removals) and ADDS `cell2 -first-> a`, `cell2 -rest-> nil` (2 additions) — both committed
+    /// groups have >= 2 records, satisfying the reconcile floor.
+    fn list_delta_stack() -> Vec<std::sync::Arc<LayerCommitment>> {
+        let rest = rdf_rest();
+        let first = rdf_first();
+        let nil = rdf_nil();
+        let doc = iri("doc");
+        let tracks = iri("tracks");
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (s, p, o) in [
+            (doc.clone(), tracks.clone(), cell(0)),
+            (cell(0), first.clone(), iri("a")),
+            (cell(0), rest.clone(), cell(1)),
+            (cell(1), first.clone(), iri("b")),
+            (cell(1), rest.clone(), cell(2)),
+            (cell(2), first.clone(), iri("x")),
+            (cell(2), rest.clone(), cell(3)),
+            (cell(3), first.clone(), iri("y")),
+            (cell(3), rest.clone(), nil.clone()),
+        ] {
+            builder.add_value_triple(ValueTriple::new_node(&s, &p, &o)).unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let base_lc = base.proof_commitment().unwrap();
+
+        let child = base.open_write().unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&cell(2), &first, &iri("x"))).unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&cell(2), &rest, &cell(3))).unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&cell(3), &first, &iri("y"))).unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&cell(3), &rest, &nil)).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&cell(2), &first, &iri("a"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&cell(2), &rest, &nil)).unwrap();
+        let head = child.commit().unwrap();
+        vec![base_lc, head.proof_commitment().unwrap()]
+    }
+
+    fn object_iris(objs: &[CanonicalObject]) -> Vec<String> {
+        objs.iter()
+            .map(|o| match o {
+                CanonicalObject::Node(b) => String::from_utf8(b.clone()).unwrap(),
+                other => panic!("unexpected list element object {:?}", other),
+            })
+            .collect()
+    }
+
+    /// 6c-ii PARITY: the reconciled ordered-list walk over the 2-layer delta stack delivers the EXACT
+    /// ordered elements `[a, b, a]` (order + duplicate multiplicity) AND equals the materialized
+    /// `OrderedListWalk` on a rolled-up base.
+    fn assert_reconciled_list_walk_parity() {
+        let stack = list_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let subj = CanonicalObject::Node(iri("doc").into_bytes());
+        let pred = iri("tracks");
+
+        let (proof, prover_elements) =
+            super::list_walk::prove_ordered_list_walk_reconciled(&lref, &subj, pred.as_bytes())
+                .unwrap();
+        let verifier_elements = super::list_walk::verify_ordered_list_walk_reconciled(
+            &lref, head_root, &subj, pred.as_bytes(), &proof,
+        )
+        .unwrap();
+
+        assert_eq!(object_iris(&prover_elements), object_iris(&verifier_elements));
+        assert_eq!(
+            object_iris(&verifier_elements),
+            vec![iri("a"), iri("b"), iri("a")],
+            "reconciled list walk must deliver the exact ordered [a, b, a]"
+        );
+
+        // PARITY with the materialized OrderedListWalk on a rolled-up single base layer.
+        let rolled = list_layer(chain_triples(&iri("doc"), &iri("tracks"), &["a", "b", "a"]));
+        let mat_plan = list_walk_plan(&iri("doc"), &iri("tracks"), 42);
+        let mat_env = RecursiveRelationEnvelope::prove(&rolled, &mat_plan).unwrap();
+        mat_env.verify(&rolled, rolled.state.commitment_root, &mat_plan).unwrap();
+        assert_eq!(
+            object_iris(&verifier_elements),
+            walk_elements(&mat_env),
+            "reconciled element column must equal the materialized OrderedListWalk"
+        );
+    }
+
+    /// 6c-ii SOUNDNESS over `present`: each list forgery (reorder / wrong head / dropped / injected /
+    /// gap) fails verify at the SAME gadget as the materialized walk, plus a statement substitution.
+    fn assert_reconciled_list_walk_soundness() {
+        let stack = list_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let subj = CanonicalObject::Node(iri("doc").into_bytes());
+        let pred = iri("tracks");
+        let pbytes = pred.as_bytes();
+
+        // Sanity: the honest reconciled walk verifies.
+        let (proof, _) =
+            super::list_walk::prove_ordered_list_walk_reconciled(&lref, &subj, pbytes).unwrap();
+        super::list_walk::verify_ordered_list_walk_reconciled(
+            &lref, head_root, &subj, pbytes, &proof,
+        )
+        .unwrap();
+
+        let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let c0 = super::reconciled::resolve_combined_node_id(&views, cell(0).as_bytes());
+        let c1 = super::reconciled::resolve_combined_node_id(&views, cell(1).as_bytes());
+        let c2 = super::reconciled::resolve_combined_node_id(&views, cell(2).as_bytes());
+        let a_id = super::reconciled::resolve_combined_node_id(&views, iri("a").as_bytes());
+
+        // Prove with a caller-chosen chain order, then verify — mirrors the materialized forging hook.
+        let forge = |order: Vec<u64>| {
+            super::list_walk::prove_ordered_list_walk_reconciled_forged(&lref, &subj, pbytes, order)
+                .and_then(|(proof, _)| {
+                    super::list_walk::verify_ordered_list_walk_reconciled(
+                        &lref, head_root, &subj, pbytes, &proof,
+                    )
+                })
+        };
+
+        // (1) TAIL REORDER [c0, c2, c1] -> rejected by the SUCCESSOR (C[0]==head still passes).
+        assert!(forge(vec![c0, c2, c1]).is_err(), "reordered chain must be rejected (successor)");
+
+        // (2) WRONG C[0] [c2, c1, c0] -> rejected by the explicit C[0]==head opening (a genuine
+        //     permutation of the cons set that starts at a non-head cell).
+        let wrong_head_err = forge(vec![c2, c1, c0]).expect_err("non-head first cons cell must reject");
+        assert!(
+            wrong_head_err.to_string().contains("C[0] != head"),
+            "the C[0]==head opening must be the rejecting guard, got: {wrong_head_err}"
+        );
+
+        // (3) DROPPED middle cell [c0, c2] -> rejected by the PERMUTATION completeness.
+        assert!(forge(vec![c0, c2]).is_err(), "dropped cell must be rejected (permutation)");
+
+        // (4) INJECTED non-cons node [c0, c1, a_id, c2] -> rejected by the PERMUTATION membership.
+        assert!(
+            forge(vec![c0, c1, a_id, c2]).is_err(),
+            "injected non-cons node must be rejected (permutation)"
+        );
+
+        // (5) GAP / APPENDED duplicate [c0, c1, c2, c0] -> rejected by the PERMUTATION.
+        assert!(forge(vec![c0, c1, c2, c0]).is_err(), "appended/gap cell must be rejected (permutation)");
+
+        // (6) STATEMENT substitution: verify the honest proof against a DIFFERENT predicate — the
+        //     anchor leaf reads a different `present` relation and the gluing digest changes, so the
+        //     re-aimed proof fails closed.
+        assert!(
+            super::list_walk::verify_ordered_list_walk_reconciled(
+                &lref, head_root, &subj, iri("authors").as_bytes(), &proof,
+            )
+            .is_err(),
+            "wrong predicate must be rejected (statement binding)"
+        );
+    }
+
+    #[test]
+    fn reconciled_list_walk_parity() {
+        big_stack(assert_reconciled_list_walk_parity);
+    }
+
+    #[test]
+    fn reconciled_list_walk_soundness_negatives() {
+        big_stack(assert_reconciled_list_walk_soundness);
+    }
