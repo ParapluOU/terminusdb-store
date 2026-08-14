@@ -219,7 +219,7 @@ pub struct ReconcileArtifacts {
     pub(super) present_rows: Vec<(ArkFr, ArkFr, ArkFr)>,
 }
 
-pub(super) fn prove_reconcile_core(
+pub(crate) fn prove_reconcile_core(
     context: &StoreProverContext<'_>,
     layers: &[&LayerCommitment],
     transcript: &mut Transcript254,
@@ -502,7 +502,7 @@ pub struct ReconcileVerified {
     pub present_len: usize,
 }
 
-pub(super) fn verify_reconcile_core(
+pub(crate) fn verify_reconcile_core(
     layers: &[&LayerCommitment],
     trusted_head_root: ProofHash,
     proof: &ReconcileProof,

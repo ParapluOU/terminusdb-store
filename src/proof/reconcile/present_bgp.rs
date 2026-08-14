@@ -517,7 +517,7 @@ pub(super) fn prove_present_range_atom(
     ))
 }
 
-pub(super) fn prove_present_bgp(
+pub(crate) fn prove_present_bgp(
     context: &StoreProverContext<'_>,
     layers: &[&LayerCommitment],
     artifacts: &ReconcileArtifacts,
@@ -683,7 +683,7 @@ pub(super) fn verify_present_range_atom(
     verify_compaction_only(source_coms, &sub.com_combined_sel, com_kept, m_kept, &sub.compaction, transcript)
 }
 
-pub(super) fn verify_present_bgp(
+pub(crate) fn verify_present_bgp(
     layers: &[&LayerCommitment],
     combined_nv: &CombinedDictProof,
     combined_pred: &CombinedDictProof,

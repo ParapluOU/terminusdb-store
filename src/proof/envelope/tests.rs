@@ -2978,3 +2978,372 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     fn ordered_array_walk_soundness_negatives() {
         big_stack(assert_ordered_array_walk_soundness);
     }
+
+    // -----------------------------------------------------------------------
+    // FOUNDATION-A / FOUNDATION-B over the reconciled `present` (ReadDocument 6c-i).
+    //
+    // Parity discipline: build a 2-layer delta stack (base + 1 delta) whose reconciled `present`
+    // equals a ROLLED-UP materialized single layer's triple set, then assert the reconciled
+    // edge-relation / closure over `present` EQUALS the materialized edge-relation / closure. The
+    // reconcile >=2-records-per-group floor is respected (base = 6 adds; delta = 2 removes + 3 adds).
+    // -----------------------------------------------------------------------
+
+    fn rdf_first_iri() -> String {
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#first".to_string()
+    }
+    fn rdf_rest_iri() -> String {
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest".to_string()
+    }
+    fn rdf_nil_iri() -> String {
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil".to_string()
+    }
+
+    /// The final present triple set the delta stack and the rolled-up base agree on: a cons chain
+    /// `cell0 -rest-> cell1 -rest-> cell2 -rest-> cell3 -rest-> nil` plus per-cell `first` edges.
+    fn closure_final_triples() -> Vec<(String, String, String)> {
+        let rest = rdf_rest_iri();
+        let first = rdf_first_iri();
+        let nil = rdf_nil_iri();
+        vec![
+            (iri("cell0"), rest.clone(), iri("cell1")),
+            (iri("cell1"), rest.clone(), iri("cell2")),
+            (iri("cell2"), rest.clone(), iri("cell3")),
+            (iri("cell3"), rest.clone(), nil.clone()),
+            (iri("cell0"), first.clone(), iri("e0")),
+            (iri("cell1"), first.clone(), iri("e1")),
+            (iri("cell3"), first.clone(), iri("e3")),
+        ]
+    }
+
+    /// A base + 1 delta stack whose reconciled `present` == [`closure_final_triples`]. The base
+    /// stores `cell0..cell2 -rest-> .. -rest-> nil` (+ first edges); the delta REMOVES the old
+    /// `cell2 -rest-> nil` / `cell2 -first-> e2` and ADDS `cell2 -rest-> cell3`, `cell3 -rest-> nil`,
+    /// `cell3 -first-> e3` — 2 removals + 3 additions (both >= 2, satisfying the reconcile floor).
+    fn closure_delta_stack() -> Vec<std::sync::Arc<LayerCommitment>> {
+        let rest = rdf_rest_iri();
+        let first = rdf_first_iri();
+        let nil = rdf_nil_iri();
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (s, p, o) in [
+            (iri("cell0"), rest.clone(), iri("cell1")),
+            (iri("cell1"), rest.clone(), iri("cell2")),
+            (iri("cell2"), rest.clone(), nil.clone()),
+            (iri("cell0"), first.clone(), iri("e0")),
+            (iri("cell1"), first.clone(), iri("e1")),
+            (iri("cell2"), first.clone(), iri("e2")),
+        ] {
+            builder.add_value_triple(ValueTriple::new_node(&s, &p, &o)).unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let base_lc = base.proof_commitment().unwrap();
+
+        let child = base.open_write().unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("cell2"), &rest, &nil)).unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&iri("cell2"), &first, &iri("e2"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("cell2"), &rest, &iri("cell3"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("cell3"), &rest, &nil)).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&iri("cell3"), &first, &iri("e3"))).unwrap();
+        let head = child.commit().unwrap();
+        vec![base_lc, head.proof_commitment().unwrap()]
+    }
+
+    /// A rolled-up single materialized base layer holding exactly [`closure_final_triples`].
+    fn closure_rolled_up() -> LayerCommitment {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (s, p, o) in closure_final_triples() {
+            builder.add_value_triple(ValueTriple::new_node(&s, &p, &o)).unwrap();
+        }
+        (*builder.commit().unwrap().proof_commitment().unwrap()).clone()
+    }
+
+    fn arc_refs(layers: &[std::sync::Arc<LayerCommitment>]) -> Vec<&LayerCommitment> {
+        layers.iter().map(|l| l.as_ref()).collect()
+    }
+
+    /// Resolve a combined-dict node id to its IRI over the chain views (test-only reverse lookup).
+    fn id_to_iri(views: &[crate::proof::VerifierCommitmentRef<'_>], id: u64) -> String {
+        for view in views {
+            for record in view.node_value_catalog {
+                if record.object_id == id {
+                    if let CanonicalObject::Node(bytes) = &record.triple.object {
+                        return String::from_utf8(bytes.clone()).unwrap();
+                    }
+                }
+            }
+        }
+        panic!("combined-dict id {id} absent from the chain catalogs");
+    }
+
+    fn node_iri(value: &CanonicalResultValue) -> String {
+        match value {
+            CanonicalResultValue::Object(CanonicalObject::Node(bytes)) => {
+                String::from_utf8(bytes.clone()).unwrap()
+            }
+            other => panic!("unexpected result value: {:?}", other),
+        }
+    }
+
+    /// Prove+verify a materialized 2-column edge relation `t(?s, predicate, ?o)` over `layer`, and
+    /// return its rows as an IRI-pair set.
+    fn materialized_edge_pairs(
+        layer: &LayerCommitment,
+        predicate: &str,
+    ) -> std::collections::BTreeSet<(String, String)> {
+        let plan = RelationProofPlan {
+            query_digest: [41u8; 32],
+            kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                source: ColumnSource::Materialized,
+                atoms: vec![LayerBgpAtom::all_variables(predicate.to_string().into_bytes())],
+                joins: Vec::new(),
+            }),
+        };
+        let env = RecursiveRelationEnvelope::prove(layer, &plan).unwrap();
+        env.verify(layer, layer.state.commitment_root, &plan).unwrap();
+        env.result_values[0]
+            .iter()
+            .zip(env.result_values[1].iter())
+            .map(|(s, o)| (node_iri(s), node_iri(o)))
+            .collect()
+    }
+
+    /// A materialized reflexive `predicate` transitive closure seeded at `seed`, over `layer`.
+    fn materialized_closure_set(
+        layer: &LayerCommitment,
+        predicate: &str,
+        seed: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let plan = RelationProofPlan {
+            query_digest: [43u8; 32],
+            kind: RelationProofPlanKind::TransitiveClosure {
+                edge: LayerBgpPlan {
+                    source: ColumnSource::Materialized,
+                    atoms: vec![LayerBgpAtom::all_variables(predicate.to_string().into_bytes())],
+                    joins: Vec::new(),
+                },
+                seed: CanonicalObject::Node(seed.to_string().into_bytes()),
+                reflexive: true,
+                inverted: false,
+            },
+        };
+        let env = RecursiveRelationEnvelope::prove(layer, &plan).unwrap();
+        env.verify(layer, layer.state.commitment_root, &plan).unwrap();
+        closure_result_set(&env)
+    }
+
+    /// FOUNDATION-A edge-relation parity: the reconciled `t(?s, rdf:rest, ?o)` over `present` EQUALS
+    /// the materialized edge relation on the rolled-up base (same rows, same IRIs). Also exercises the
+    /// bound-subject anchor leaf `t(cell0, rdf:rest, ?o)` = {cell1}.
+    fn assert_reconciled_edge_parity() {
+        let stack = closure_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+
+        let rest = rdf_rest_iri();
+        let materialized = materialized_edge_pairs(&closure_rolled_up(), &rest);
+        assert_eq!(materialized.len(), 4, "expected 4 rdf:rest edges");
+
+        // Reconcile ONCE, then prove the edge leaf on the SHARED transcript (FOUNDATION-A).
+        let context = StoreProverContext::cpu();
+        let mut pt = Transcript254::new(b"parture-delta-reconcile-envelope");
+        let (reconcile, artifacts) =
+            crate::proof::reconcile::prove_reconcile_core(&context, &lref, &mut pt).unwrap();
+        let (edge_proof, edge_witness) = super::reconciled::prove_reconciled_leaf(
+            &context,
+            &lref,
+            &artifacts,
+            super::reconciled::predicate_edge_leaf_atom(rest.as_bytes()),
+            &mut pt,
+        )
+        .unwrap();
+
+        // Verify reconcile + the edge leaf on a fresh mirrored transcript; get the authenticated commit.
+        let mut vt = Transcript254::new(b"parture-delta-reconcile-envelope");
+        let verified =
+            crate::proof::reconcile::verify_reconcile_core(&lref, head_root, &reconcile, &mut vt)
+                .unwrap();
+        let head_nv = lref.last().unwrap().verifier_view().state.node_value_count as usize;
+        let edge_commit = super::reconciled::verify_reconciled_leaf(
+            &lref,
+            &reconcile,
+            &verified,
+            head_nv,
+            super::reconciled::predicate_edge_leaf_atom(rest.as_bytes()),
+            &edge_proof,
+            &mut vt,
+        )
+        .unwrap();
+
+        // Bind the prover's delivered columns to the verified commitment (the resolve-binding step),
+        // then resolve the [S, O] id rows to IRIs.
+        assert_eq!(edge_witness.commitments, edge_commit.commitments);
+        for (col, com) in edge_witness.columns.iter().zip(&edge_commit.commitments) {
+            assert_eq!(commit_column(col).unwrap(), *com, "prover column must open the verified commitment");
+        }
+        let n = edge_witness.n;
+        let reconciled: std::collections::BTreeSet<(String, String)> = (0..n)
+            .map(|i| {
+                let s = crate::proof::query::generated_decimal_u64_value(edge_witness.columns[0][i]).unwrap();
+                let o = crate::proof::query::generated_decimal_u64_value(edge_witness.columns[1][i]).unwrap();
+                (id_to_iri(&views, s), id_to_iri(&views, o))
+            })
+            .collect();
+        assert_eq!(reconciled, materialized, "reconciled edge relation must equal the materialized one");
+
+        // Bound-subject anchor leaf `t(cell0, rdf:rest, ?o)` (FOUNDATION-A, kept=[O]) = {cell1}.
+        let (anchor_proof, anchor_witness) = super::reconciled::prove_reconciled_leaf(
+            &context,
+            &lref,
+            &artifacts,
+            super::reconciled::bound_subject_leaf_atom(
+                &CanonicalObject::Node(iri("cell0").into_bytes()),
+                rest.as_bytes(),
+            ),
+            &mut pt,
+        )
+        .unwrap();
+        let anchor_commit = super::reconciled::verify_reconciled_leaf(
+            &lref,
+            &reconcile,
+            &verified,
+            head_nv,
+            super::reconciled::bound_subject_leaf_atom(
+                &CanonicalObject::Node(iri("cell0").into_bytes()),
+                rest.as_bytes(),
+            ),
+            &anchor_proof,
+            &mut vt,
+        )
+        .unwrap();
+        assert_eq!(anchor_witness.n, 1, "cell0 has exactly one rdf:rest successor");
+        assert_eq!(anchor_commit.n, 1);
+        let head_id =
+            crate::proof::query::generated_decimal_u64_value(anchor_witness.columns[0][0]).unwrap();
+        assert_eq!(id_to_iri(&views, head_id), iri("cell1"));
+    }
+
+    /// FOUNDATION-B closure parity: a reconciled reflexive `rdf:rest` closure seeded at `cell0` over
+    /// `present` EQUALS the materialized closure on the rolled-up base ({cell0,cell1,cell2,cell3,nil}).
+    fn assert_reconciled_closure_parity() {
+        let stack = closure_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let rest = rdf_rest_iri();
+
+        let materialized = materialized_closure_set(&closure_rolled_up(), &rest, &iri("cell0"));
+        assert_eq!(
+            materialized,
+            vec![iri("cell0"), iri("cell1"), iri("cell2"), iri("cell3"), rdf_nil_iri()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<String>>()
+        );
+
+        let (proof, prover_ids) = super::reconciled::prove_reconciled_transitive_closure(
+            &lref,
+            rest.as_bytes(),
+            iri("cell0").as_bytes(),
+            true,
+        )
+        .unwrap();
+        let verifier_ids = super::reconciled::verify_reconciled_transitive_closure(
+            &lref,
+            head_root,
+            rest.as_bytes(),
+            iri("cell0").as_bytes(),
+            true,
+            &proof,
+        )
+        .unwrap();
+        assert_eq!(
+            prover_ids.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            verifier_ids.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            "prover and verifier must agree on the reachable id set"
+        );
+
+        let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let reconciled: std::collections::BTreeSet<String> =
+            verifier_ids.iter().map(|id| id_to_iri(&views, *id)).collect();
+        assert_eq!(reconciled, materialized, "reconciled closure must equal the materialized closure");
+    }
+
+    /// FOUNDATION-B soundness: a wrong head root, a tampered `present` edge column, a forged closure
+    /// round, and a truncated (non-converged) closure each fail verify closed.
+    fn assert_reconciled_closure_soundness() {
+        let stack = closure_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let rest = rdf_rest_iri();
+        let seed = iri("cell0");
+
+        let (proof, _) = super::reconciled::prove_reconciled_transitive_closure(
+            &lref,
+            rest.as_bytes(),
+            seed.as_bytes(),
+            true,
+        )
+        .unwrap();
+        // Sanity: the honest proof verifies.
+        super::reconciled::verify_reconciled_transitive_closure(
+            &lref, head_root, rest.as_bytes(), seed.as_bytes(), true, &proof,
+        )
+        .unwrap();
+
+        // (i) Wrong / swapped head root — the reconciliation anchor rejects.
+        let mut bogus = head_root;
+        bogus[0] ^= 0xff;
+        assert!(super::reconciled::verify_reconciled_transitive_closure(
+            &lref, bogus, rest.as_bytes(), seed.as_bytes(), true, &proof,
+        )
+        .is_err());
+        assert!(super::reconciled::verify_reconciled_transitive_closure(
+            &lref, lref[0].state.commitment_root, rest.as_bytes(), seed.as_bytes(), true, &proof,
+        )
+        .is_err());
+
+        // (ii) Tampered `present` edge column: swap the kept subject/object commitments so the edge
+        //      leaf's compaction no longer opens them — the FOUNDATION-A `present_bgp` verify rejects.
+        let mut tampered_edge = proof.clone();
+        tampered_edge.edge_leaf.atoms[0].com_kept.swap(0, 1);
+        assert!(super::reconciled::verify_reconciled_transitive_closure(
+            &lref, head_root, rest.as_bytes(), seed.as_bytes(), true, &tampered_edge,
+        )
+        .is_err());
+
+        // (iii) A spurious node forged into the final closure round — the round's Distinct exact-cover
+        //       + monotonicity check rejects (the ghost never came from an authenticated InnerJoin).
+        let mut forged_round = proof.clone();
+        assert!(!forged_round.rounds.is_empty(), "chain should need >= 2 rounds");
+        forged_round.rounds.last_mut().unwrap().next_rows.push(999_999);
+        assert!(super::reconciled::verify_reconciled_transitive_closure(
+            &lref, head_root, rest.as_bytes(), seed.as_bytes(), true, &forged_round,
+        )
+        .is_err());
+
+        // (iv) A truncated (non-converged) closure: drop the last round so the delivered accumulator
+        //      is A_{K-1} while the fixpoint was proven over A_K — the fixpoint anti-join rejects.
+        let mut truncated = proof.clone();
+        truncated.rounds.pop();
+        assert!(super::reconciled::verify_reconciled_transitive_closure(
+            &lref, head_root, rest.as_bytes(), seed.as_bytes(), true, &truncated,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn reconciled_edge_relation_parity() {
+        big_stack(assert_reconciled_edge_parity);
+    }
+
+    #[test]
+    fn reconciled_transitive_closure_parity() {
+        big_stack(assert_reconciled_closure_parity);
+    }
+
+    #[test]
+    fn reconciled_transitive_closure_soundness() {
+        big_stack(assert_reconciled_closure_soundness);
+    }

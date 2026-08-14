@@ -79,6 +79,7 @@ mod left_anti;
 mod left_outer;
 mod list_walk;
 mod plan;
+mod reconciled;
 mod recursive;
 mod wire;
 
@@ -106,6 +107,16 @@ pub use left_outer::LeftOuterJoinEnvelope;
 pub use recursive::{
     RecursiveRelationEnvelope, RecursiveRelationProof, TransitiveClosureFixpoint,
     TransitiveClosureRound, TransitiveClosureSeed,
+};
+
+// FOUNDATION for reading walk/closure composites over the reconciled `present` (ReadDocument
+// increment 6c-i) — the reconciled `TransitiveClosure` entry (FOUNDATION-B). The FOUNDATION-A leaf
+// provider (`prove/verify_reconciled_leaf`, `resolve_combined_node_id`, the leaf-atom builders)
+// stays `pub(crate)` in the submodule — it is the shared enabler consumed by the reconciled list
+// walk (6c-ii) and schema closure (6e), not a standalone public entry.
+pub use reconciled::{
+    prove_reconciled_transitive_closure, verify_reconciled_transitive_closure,
+    ReconciledClosureProof,
 };
 
 #[cfg(test)]

@@ -201,10 +201,19 @@ pub use delta_read::{
 // flat helper set the single file had. These were parent-private helpers
 // widened only to `pub(super)`; the `pub` surface is re-exported explicitly
 // above, so this does NOT widen the external surface.
+//
+// FOUNDATION-A (ReadDocument 6c-i): the two hoists that carry a `pub(crate)` item —
+// `reconcile_core` (`prove/verify_reconcile_core`) and `present_bgp`
+// (`prove/verify_present_bgp`) — are `pub(crate) use` globs, so those cores (and ONLY
+// those, since a glob re-export caps each name at its own visibility — the `pub(super)`
+// helpers stay reconcile-local) are reachable from the sibling `envelope` module. This is
+// what lets a walk/closure composite reconcile ONCE and answer each leaf read against the
+// SHARED `ReconcileArtifacts`/transcript, never re-reconciling per leaf. Their logic is
+// untouched — only the visibility path widened.
 // ---------------------------------------------------------------------------
 use combined_dict::*;
-use present_bgp::*;
+pub(crate) use present_bgp::*;
 use present_filter::*;
 use present_join::*;
 use present_result::*;
-use reconcile_core::*;
+pub(crate) use reconcile_core::*;

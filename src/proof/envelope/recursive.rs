@@ -449,6 +449,359 @@ pub(super) fn closure_distinct_witness(distinct: &RelationDistinctResult) -> Rel
     }
 }
 
+/// The seed + rounds + fixpoint of a bounded semi-naive transitive closure — the SOURCE-AGNOSTIC
+/// heart of [`RecursiveRelationEnvelope::prove_transitive_closure`], factored out so a reconciled
+/// (delta-stack) closure can reuse the EXACT round/fixpoint machinery over a `present`-sourced edge.
+///
+/// It consumes ONLY the already-committed `edge_witness` (the E relation columns/commitments) and
+/// the resolved `seed_id`, then drives the audited InnerJoin / BagUnion / Distinct / LeftAnti
+/// operator cores UNCHANGED, threading each accumulator forward by commitment on fresh
+/// `(root, digest, step, role)`-separated transcripts. Whether E was proven by a materialized
+/// single-layer BGP leaf or a reconciled FOUNDATION-A `present_bgp` leaf makes no difference here —
+/// only the edge PROVIDER and the seed RESOLUTION are source-specific. The materialized path calls
+/// this verbatim, so its proofs are byte-identical.
+pub(super) struct ClosureRoundsWitness {
+    pub seed: TransitiveClosureSeed,
+    pub accumulator: RelationWitness,
+    pub rounds: Vec<TransitiveClosureRound>,
+    pub fixpoint: TransitiveClosureFixpoint,
+    /// The reachable node-id set in delivered order (the accumulator's real prefix).
+    pub reachable_ids: Vec<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prove_closure_rounds(
+    context: &StoreProverContext<'_>,
+    edge_witness: &RelationWitness,
+    seed_id: u64,
+    root: ProofHash,
+    digest: ProofHash,
+    reflexive: bool,
+    inverted: bool,
+    nodes: &mut usize,
+) -> io::Result<ClosureRoundsWitness> {
+    // See `prove_transitive_closure`: forward walks join E.subject (0), inverted walks E.object (1).
+    let edge_key = usize::from(inverted);
+    let seed_witness =
+        RelationWitness::commit_with_context(context, vec![vec![ArkFr::from_u64(seed_id)]], 1)?;
+
+    // (3) A_0: star => {a}; plus => Distinct(object(InnerJoin({a}, E))).
+    let (seed_proof, mut accumulator, mut accumulator_ids): (
+        TransitiveClosureSeed,
+        RelationWitness,
+        std::collections::BTreeSet<u64>,
+    ) = if reflexive {
+        let ids = std::iter::once(seed_id).collect();
+        (TransitiveClosureSeed::Reflexive, seed_witness.clone(), ids)
+    } else {
+        let mut t_inner = closure_transcript(&root, &digest, 0, b"seed-inner");
+        let inner = prove_inner_join_with_keys_and_context(
+            context, &seed_witness, edge_witness, &[(0, edge_key)], &mut t_inner,
+        )?;
+        let object_witness = closure_object_branch(&inner)?;
+        let rows = closure_distinct_ids(&object_witness)?;
+        let mut t_distinct = closure_transcript(&root, &digest, 0, b"seed-distinct");
+        let distinct = prove_relation_distinct_with_context(
+            context, &object_witness, &[0], &closure_rows(&rows), &mut t_distinct,
+        )?;
+        let ids = rows.iter().copied().collect();
+        let a0 = closure_distinct_witness(&distinct);
+        (
+            TransitiveClosureSeed::Successor {
+                inner: inner.proof,
+                inner_out: inner.commitments,
+                distinct: distinct.proof,
+                rows,
+            },
+            a0,
+            ids,
+        )
+    };
+
+    // (4) Accumulate-and-dedupe rounds until the frontier is closed under the step.
+    let mut rounds: Vec<TransitiveClosureRound> = Vec::new();
+    let fixpoint = loop {
+        if *nodes >= MAX_RELATION_PROOF_NODES {
+            return Err(invalid("transitive closure proving exceeds structural node limit"));
+        }
+        *nodes += 1;
+        let step = rounds.len() as u64;
+
+        // step = InnerJoin(A_k, E) on (A_k.node == E.subject) -> [node, object].
+        let mut t_inner = closure_transcript(&root, &digest, step, b"step-inner");
+        let inner = prove_inner_join_with_keys_and_context(
+            context, &accumulator, edge_witness, &[(0, edge_key)], &mut t_inner,
+        )?;
+        let object_witness = closure_object_branch(&inner)?;
+        let neighbour_ids = closure_distinct_ids(&object_witness)?;
+
+        if neighbour_ids.iter().all(|id| accumulator_ids.contains(id)) {
+            // FIXPOINT: every one-hop neighbour of A_k is already present. The anti-join of the
+            // join's objects against A_k is empty -> A_k is closed under the step.
+            let mut t_anti = closure_transcript(&root, &digest, step, b"fix-anti");
+            let anti = prove_left_anti_join_with_keys_and_context(
+                context,
+                &closure_inner_witness(&inner),
+                &accumulator,
+                &[(1, 0)],
+                &mut t_anti,
+            )?;
+            if anti.n != 0 {
+                return Err(invalid(
+                    "transitive closure fixpoint anti-join is unexpectedly nonempty",
+                ));
+            }
+            break TransitiveClosureFixpoint {
+                inner: inner.proof,
+                inner_out: inner.commitments,
+                anti: anti.proof,
+                anti_out: anti.commitments,
+            };
+        }
+
+        if rounds.len() >= MAX_TRANSITIVE_CLOSURE_ROUNDS {
+            return Err(invalid(
+                "transitive closure frontier is deeper than the round budget (reject closed)",
+            ));
+        }
+
+        // A_{k+1} = Distinct(BagUnion(A_k, object-bag), [0]).
+        let mut t_union = closure_transcript(&root, &digest, step, b"round-union");
+        let union = prove_bag_union_with_context(
+            context,
+            &[accumulator.clone(), object_witness],
+            &mut t_union,
+        )?;
+        let union_witness = closure_union_witness(&union);
+        let next_rows = closure_distinct_ids(&union_witness)?;
+        let mut t_distinct = closure_transcript(&root, &digest, step, b"round-distinct");
+        let distinct = prove_relation_distinct_with_context(
+            context, &union_witness, &[0], &closure_rows(&next_rows), &mut t_distinct,
+        )?;
+        accumulator = closure_distinct_witness(&distinct);
+        accumulator_ids = next_rows.iter().copied().collect();
+        rounds.push(TransitiveClosureRound {
+            inner: inner.proof,
+            inner_out: inner.commitments,
+            union: union.proof,
+            union_out: union.commitments,
+            distinct: distinct.proof,
+            next_rows,
+        });
+    };
+
+    let n = accumulator.n;
+    let reachable_ids = accumulator.columns[0][..n]
+        .iter()
+        .map(|field| closure_field_node_id(*field))
+        .collect::<io::Result<Vec<u64>>>()?;
+    Ok(ClosureRoundsWitness {
+        seed: seed_proof,
+        accumulator,
+        rounds,
+        fixpoint,
+        reachable_ids,
+    })
+}
+
+/// The verifier mirror of [`prove_closure_rounds`]: replay the seed + rounds + fixpoint over an
+/// already-authenticated `edge_commit` + resolved `seed_id`, reconstructing each accumulator
+/// commitment from the PUBLIC row sets and re-running the audited operator verifiers on the same
+/// `(root, digest, step, role)` transcripts. Returns the reachable node-id set. Source-agnostic —
+/// the materialized `verify_transitive_closure` calls it verbatim, so its checks are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_closure_rounds(
+    edge_commit: &RelationCommit,
+    seed_id: u64,
+    root: ProofHash,
+    digest: ProofHash,
+    reflexive: bool,
+    inverted: bool,
+    seed: &TransitiveClosureSeed,
+    rounds: &[TransitiveClosureRound],
+    fixpoint: &TransitiveClosureFixpoint,
+    nodes: &mut usize,
+) -> io::Result<Vec<u64>> {
+    // See `prove_transitive_closure`: forward walks join E.subject (0), inverted walks E.object (1).
+    let edge_key = usize::from(inverted);
+
+    // Helper: verify one `InnerJoin(A, E) -> [node, object]` step and return (join commit,
+    // object-branch commit). The output length / domain are derived from the proof and cross-checked
+    // by the audited verifier.
+    let verify_inner = |left: &RelationCommit,
+                        inner_proof: &InnerJoinProof,
+                        inner_out: &[ArkGT],
+                        step: u64,
+                        role: &[u8]|
+     -> io::Result<(RelationCommit, RelationCommit)> {
+        if inner_out.len() != 2 {
+            return Err(invalid("transitive closure inner join output arity must be 2"));
+        }
+        let j_len = inner_proof.anti.join_len;
+        let j_log = inner_proof.anti.join.num_vars();
+        let mut transcript = closure_transcript(&root, &digest, step, role);
+        verify_inner_join_with_keys(
+            left,
+            edge_commit,
+            &[(0, edge_key)],
+            inner_out,
+            j_len,
+            j_log,
+            inner_proof,
+            &mut transcript,
+        )?;
+        let join_commit = RelationCommit {
+            commitments: inner_out.to_vec(),
+            log_domain: j_log,
+            n: j_len,
+        };
+        let object_commit = RelationCommit {
+            commitments: vec![inner_out[1]],
+            log_domain: j_log,
+            n: j_len,
+        };
+        Ok((join_commit, object_commit))
+    };
+
+    // (3) A_0.
+    let (mut accumulator_commit, mut accumulator_ids, mut accumulator_rows): (
+        RelationCommit,
+        std::collections::BTreeSet<u64>,
+        Vec<u64>,
+    ) = match (reflexive, seed) {
+        (true, TransitiveClosureSeed::Reflexive) => {
+            // star: A_0 = {a}, reconstructed as a trusted constant (identity always succeeds).
+            (
+                closure_seed_commit(seed_id)?,
+                std::iter::once(seed_id).collect(),
+                vec![seed_id],
+            )
+        }
+        (false, TransitiveClosureSeed::Successor { inner, inner_out, distinct, rows }) => {
+            // plus: A_0 = Distinct(object(InnerJoin({a}, E))).
+            let seed_commit = closure_seed_commit(seed_id)?;
+            let (_join, object_commit) =
+                verify_inner(&seed_commit, inner, inner_out, 0, b"seed-inner")?;
+            let mut t_distinct = closure_transcript(&root, &digest, 0, b"seed-distinct");
+            verify_relation_distinct(
+                &object_commit,
+                &[0],
+                &closure_rows(rows),
+                distinct,
+                &mut t_distinct,
+            )?;
+            (
+                closure_set_commit(rows)?,
+                rows.iter().copied().collect(),
+                rows.clone(),
+            )
+        }
+        _ => {
+            return Err(invalid(
+                "transitive closure seed variant does not match the star/plus plan",
+            ))
+        }
+    };
+
+    // (4) Replay each accumulate-and-dedupe round against the SAME E and the previous accumulator.
+    for (step, round) in rounds.iter().enumerate() {
+        if *nodes >= MAX_RELATION_PROOF_NODES {
+            return Err(invalid(
+                "transitive closure verification exceeds structural node limit",
+            ));
+        }
+        *nodes += 1;
+        let step = step as u64;
+        let (_join, object_commit) = verify_inner(
+            &accumulator_commit,
+            &round.inner,
+            &round.inner_out,
+            step,
+            b"step-inner",
+        )?;
+
+        // BagUnion(A_k, object-bag): both single-column; output length is the branch-length sum and
+        // the domain is bound in the proof, so the audited verifier re-derives and checks them.
+        if round.union_out.len() != 1 {
+            return Err(invalid("transitive closure union output arity must be 1"));
+        }
+        let union_len = accumulator_commit
+            .n
+            .checked_add(object_commit.n)
+            .ok_or_else(|| invalid("transitive closure union length overflow"))?;
+        let union_log = round.union.sumcheck.round_polys.len();
+        let mut t_union = closure_transcript(&root, &digest, step, b"round-union");
+        verify_bag_union(
+            &[accumulator_commit.clone(), object_commit],
+            &round.union_out,
+            union_len,
+            union_log,
+            &round.union,
+            &mut t_union,
+        )?;
+        let union_commit = RelationCommit {
+            commitments: round.union_out.clone(),
+            log_domain: union_log,
+            n: union_len,
+        };
+
+        // Distinct(union, [0]) proves next_rows are exactly the deduped union set.
+        let mut t_distinct = closure_transcript(&root, &digest, step, b"round-distinct");
+        verify_relation_distinct(
+            &union_commit,
+            &[0],
+            &closure_rows(&round.next_rows),
+            &round.distinct,
+            &mut t_distinct,
+        )?;
+
+        // Defensive monotonicity: every element of A_k must survive into A_{k+1}. This is already
+        // implied by union-branch-0 + the distinct exact-cover argument, but the redundant public
+        // set check costs nothing and pins the completeness invariant for the audit.
+        let next_ids: std::collections::BTreeSet<u64> =
+            round.next_rows.iter().copied().collect();
+        if next_ids.len() != round.next_rows.len() {
+            return Err(invalid("transitive closure round produced a duplicate set element"));
+        }
+        if !accumulator_ids.iter().all(|id| next_ids.contains(id)) {
+            return Err(invalid("transitive closure round dropped a prior reachable node"));
+        }
+
+        accumulator_commit = closure_set_commit(&round.next_rows)?;
+        accumulator_ids = next_ids;
+        accumulator_rows = round.next_rows.clone();
+    }
+
+    // (5) Empty-delta fixpoint: LeftAnti(InnerJoin(A_K, E), A_K) on (object == node) has 0 rows,
+    // i.e. A_K is closed under the step. Passing output_len 0 IS the fixpoint assertion — a
+    // non-converged closure makes the audited anti-join verifier reject.
+    let step = rounds.len() as u64;
+    let (join_commit, _object_commit) = verify_inner(
+        &accumulator_commit,
+        &fixpoint.inner,
+        &fixpoint.inner_out,
+        step,
+        b"step-inner",
+    )?;
+    if fixpoint.anti_out.len() != join_commit.commitments.len() {
+        return Err(invalid("transitive closure fixpoint anti-join output arity mismatch"));
+    }
+    let anti_log = fixpoint.anti.join.num_vars();
+    let mut t_anti = closure_transcript(&root, &digest, step, b"fix-anti");
+    verify_left_anti_join_with_keys(
+        &join_commit,
+        &accumulator_commit,
+        &[(1, 0)],
+        &fixpoint.anti_out,
+        0,
+        anti_log,
+        &fixpoint.anti,
+        &mut t_anti,
+    )?;
+
+    Ok(accumulator_rows)
+}
+
 impl RecursiveRelationEnvelope {
     pub(super) fn relation_commit(&self, mapping: Option<&[usize]>) -> io::Result<RelationCommit> {
         let commitments = match mapping {
@@ -1306,127 +1659,20 @@ impl RecursiveRelationEnvelope {
     ) -> io::Result<Self> {
         let root = layer.state.commitment_root;
         let digest = plan.query_digest;
-        // The E column joined against `A_k.node`: subject (0) for a forward walk, object (1) for the
-        // mirrored inverse walk. In BOTH cases the join output is [node, frontier] with the new frontier
-        // at index 1 (the join drops the shared key and appends E's OTHER column), so every downstream
-        // operator is identical — only this key index flips.
-        let edge_key = usize::from(inverted);
 
-        // (1) Prove the edge relation E ONCE. Reused (by commitment) in every round and the fixpoint.
+        // (1) Prove the edge relation E ONCE (source-specific: a materialized single-layer BGP leaf).
+        //     Reused (by commitment) in every round and the fixpoint.
         let edge_plan = closure_edge_plan(edge, digest);
         let edge_env = Self::prove_bounded(context, layer, &edge_plan, depth + 1, nodes)?;
         let edge_witness = edge_env.relation_witness(None)?;
 
-        // (2) Resolve the constant seed `a` and build the identity singleton {a}.
+        // (2) Resolve the constant seed `a` (source-specific: single-layer dictionary).
         let view = layer.verifier_view();
         let seed_id = resolve_closure_seed_id(&view, seed)?;
-        let seed_witness =
-            RelationWitness::commit_with_context(context, vec![vec![ArkFr::from_u64(seed_id)]], 1)?;
 
-        // (3) A_0: star => {a}; plus => Distinct(object(InnerJoin({a}, E))).
-        let (seed_proof, mut accumulator, mut accumulator_ids): (
-            TransitiveClosureSeed,
-            RelationWitness,
-            std::collections::BTreeSet<u64>,
-        ) = if reflexive {
-            let ids = std::iter::once(seed_id).collect();
-            (TransitiveClosureSeed::Reflexive, seed_witness.clone(), ids)
-        } else {
-            let mut t_inner = closure_transcript(&root, &digest, 0, b"seed-inner");
-            let inner = prove_inner_join_with_keys_and_context(
-                context, &seed_witness, &edge_witness, &[(0, edge_key)], &mut t_inner,
-            )?;
-            let object_witness = closure_object_branch(&inner)?;
-            let rows = closure_distinct_ids(&object_witness)?;
-            let mut t_distinct = closure_transcript(&root, &digest, 0, b"seed-distinct");
-            let distinct = prove_relation_distinct_with_context(
-                context, &object_witness, &[0], &closure_rows(&rows), &mut t_distinct,
-            )?;
-            let ids = rows.iter().copied().collect();
-            let a0 = closure_distinct_witness(&distinct);
-            (
-                TransitiveClosureSeed::Successor {
-                    inner: inner.proof,
-                    inner_out: inner.commitments,
-                    distinct: distinct.proof,
-                    rows,
-                },
-                a0,
-                ids,
-            )
-        };
-
-        // (4) Accumulate-and-dedupe rounds until the frontier is closed under the step.
-        let mut rounds: Vec<TransitiveClosureRound> = Vec::new();
-        let fixpoint = loop {
-            if *nodes >= MAX_RELATION_PROOF_NODES {
-                return Err(invalid("transitive closure proving exceeds structural node limit"));
-            }
-            *nodes += 1;
-            let step = rounds.len() as u64;
-
-            // step = InnerJoin(A_k, E) on (A_k.node == E.subject) -> [node, object].
-            let mut t_inner = closure_transcript(&root, &digest, step, b"step-inner");
-            let inner = prove_inner_join_with_keys_and_context(
-                context, &accumulator, &edge_witness, &[(0, edge_key)], &mut t_inner,
-            )?;
-            let object_witness = closure_object_branch(&inner)?;
-            let neighbour_ids = closure_distinct_ids(&object_witness)?;
-
-            if neighbour_ids.iter().all(|id| accumulator_ids.contains(id)) {
-                // FIXPOINT: every one-hop neighbour of A_k is already present. The anti-join of the
-                // join's objects against A_k is empty -> A_k is closed under the step.
-                let mut t_anti = closure_transcript(&root, &digest, step, b"fix-anti");
-                let anti = prove_left_anti_join_with_keys_and_context(
-                    context,
-                    &closure_inner_witness(&inner),
-                    &accumulator,
-                    &[(1, 0)],
-                    &mut t_anti,
-                )?;
-                if anti.n != 0 {
-                    return Err(invalid(
-                        "transitive closure fixpoint anti-join is unexpectedly nonempty",
-                    ));
-                }
-                break TransitiveClosureFixpoint {
-                    inner: inner.proof,
-                    inner_out: inner.commitments,
-                    anti: anti.proof,
-                    anti_out: anti.commitments,
-                };
-            }
-
-            if rounds.len() >= MAX_TRANSITIVE_CLOSURE_ROUNDS {
-                return Err(invalid(
-                    "transitive closure frontier is deeper than the round budget (reject closed)",
-                ));
-            }
-
-            // A_{k+1} = Distinct(BagUnion(A_k, object-bag), [0]).
-            let mut t_union = closure_transcript(&root, &digest, step, b"round-union");
-            let union = prove_bag_union_with_context(
-                context,
-                &[accumulator.clone(), object_witness],
-                &mut t_union,
-            )?;
-            let union_witness = closure_union_witness(&union);
-            let next_rows = closure_distinct_ids(&union_witness)?;
-            let mut t_distinct = closure_transcript(&root, &digest, step, b"round-distinct");
-            let distinct = prove_relation_distinct_with_context(
-                context, &union_witness, &[0], &closure_rows(&next_rows), &mut t_distinct,
-            )?;
-            accumulator = closure_distinct_witness(&distinct);
-            accumulator_ids = next_rows.iter().copied().collect();
-            rounds.push(TransitiveClosureRound {
-                inner: inner.proof,
-                inner_out: inner.commitments,
-                union: union.proof,
-                union_out: union.commitments,
-                distinct: distinct.proof,
-                next_rows,
-            });
-        };
+        // (3)-(4) The SOURCE-AGNOSTIC seed + rounds + fixpoint (shared with the reconciled closure).
+        let ClosureRoundsWitness { seed: seed_proof, accumulator, rounds, fixpoint, reachable_ids: _ } =
+            prove_closure_rounds(context, &edge_witness, seed_id, root, digest, reflexive, inverted, nodes)?;
 
         // (5) Deliver A_K = accumulator as the reachable SET (one nonnullable NodeValue column).
         let n = accumulator.n;
@@ -2344,192 +2590,19 @@ impl RecursiveRelationEnvelope {
     ) -> io::Result<Vec<u64>> {
         let root = expected_root;
         let digest = plan.query_digest;
-        // See `prove_transitive_closure`: forward walks join E.subject (0), inverted walks E.object (1).
-        let edge_key = usize::from(inverted);
 
         // (1) Verify the ONE edge relation E, then extract its commitment for reuse everywhere.
         let edge_plan = closure_edge_plan(edge, digest);
         edge_env.verify_bounded(layer, expected_root, &edge_plan, depth + 1, nodes)?;
         let edge_commit = edge_env.relation_commit(None)?;
 
-        // (2) Reconstruct the constant seed `{a}` from the trusted seed node.
+        // (2) Reconstruct the constant seed `{a}` from the trusted seed node (single-layer dictionary).
         let seed_id = resolve_closure_seed_id(&layer.verifier_view(), seed_obj)?;
 
-        // Helper: verify one `InnerJoin(A, E) -> [node, object]` step and return (join commit,
-        // object-branch commit). The output length / domain are derived from the proof and cross-checked
-        // by the audited verifier.
-        let verify_inner = |left: &RelationCommit,
-                            inner_proof: &InnerJoinProof,
-                            inner_out: &[ArkGT],
-                            step: u64,
-                            role: &[u8]|
-         -> io::Result<(RelationCommit, RelationCommit)> {
-            if inner_out.len() != 2 {
-                return Err(invalid("transitive closure inner join output arity must be 2"));
-            }
-            let j_len = inner_proof.anti.join_len;
-            let j_log = inner_proof.anti.join.num_vars();
-            let mut transcript = closure_transcript(&root, &digest, step, role);
-            verify_inner_join_with_keys(
-                left,
-                &edge_commit,
-                &[(0, edge_key)],
-                inner_out,
-                j_len,
-                j_log,
-                inner_proof,
-                &mut transcript,
-            )?;
-            let join_commit = RelationCommit {
-                commitments: inner_out.to_vec(),
-                log_domain: j_log,
-                n: j_len,
-            };
-            let object_commit = RelationCommit {
-                commitments: vec![inner_out[1]],
-                log_domain: j_log,
-                n: j_len,
-            };
-            Ok((join_commit, object_commit))
-        };
-
-        // (3) A_0.
-        let (mut accumulator_commit, mut accumulator_ids, mut accumulator_rows): (
-            RelationCommit,
-            std::collections::BTreeSet<u64>,
-            Vec<u64>,
-        ) = match (reflexive, seed) {
-            (true, TransitiveClosureSeed::Reflexive) => {
-                // star: A_0 = {a}, reconstructed as a trusted constant (identity always succeeds).
-                (
-                    closure_seed_commit(seed_id)?,
-                    std::iter::once(seed_id).collect(),
-                    vec![seed_id],
-                )
-            }
-            (false, TransitiveClosureSeed::Successor { inner, inner_out, distinct, rows }) => {
-                // plus: A_0 = Distinct(object(InnerJoin({a}, E))).
-                let seed_commit = closure_seed_commit(seed_id)?;
-                let (_join, object_commit) =
-                    verify_inner(&seed_commit, inner, inner_out, 0, b"seed-inner")?;
-                let mut t_distinct = closure_transcript(&root, &digest, 0, b"seed-distinct");
-                verify_relation_distinct(
-                    &object_commit,
-                    &[0],
-                    &closure_rows(rows),
-                    distinct,
-                    &mut t_distinct,
-                )?;
-                (
-                    closure_set_commit(rows)?,
-                    rows.iter().copied().collect(),
-                    rows.clone(),
-                )
-            }
-            _ => {
-                return Err(invalid(
-                    "transitive closure seed variant does not match the star/plus plan",
-                ))
-            }
-        };
-
-        // (4) Replay each accumulate-and-dedupe round against the SAME E and the previous accumulator.
-        for (step, round) in rounds.iter().enumerate() {
-            if *nodes >= MAX_RELATION_PROOF_NODES {
-                return Err(invalid(
-                    "transitive closure verification exceeds structural node limit",
-                ));
-            }
-            *nodes += 1;
-            let step = step as u64;
-            let (_join, object_commit) = verify_inner(
-                &accumulator_commit,
-                &round.inner,
-                &round.inner_out,
-                step,
-                b"step-inner",
-            )?;
-
-            // BagUnion(A_k, object-bag): both single-column; output length is the branch-length sum and
-            // the domain is bound in the proof, so the audited verifier re-derives and checks them.
-            if round.union_out.len() != 1 {
-                return Err(invalid("transitive closure union output arity must be 1"));
-            }
-            let union_len = accumulator_commit
-                .n
-                .checked_add(object_commit.n)
-                .ok_or_else(|| invalid("transitive closure union length overflow"))?;
-            let union_log = round.union.sumcheck.round_polys.len();
-            let mut t_union = closure_transcript(&root, &digest, step, b"round-union");
-            verify_bag_union(
-                &[accumulator_commit.clone(), object_commit],
-                &round.union_out,
-                union_len,
-                union_log,
-                &round.union,
-                &mut t_union,
-            )?;
-            let union_commit = RelationCommit {
-                commitments: round.union_out.clone(),
-                log_domain: union_log,
-                n: union_len,
-            };
-
-            // Distinct(union, [0]) proves next_rows are exactly the deduped union set.
-            let mut t_distinct = closure_transcript(&root, &digest, step, b"round-distinct");
-            verify_relation_distinct(
-                &union_commit,
-                &[0],
-                &closure_rows(&round.next_rows),
-                &round.distinct,
-                &mut t_distinct,
-            )?;
-
-            // Defensive monotonicity: every element of A_k must survive into A_{k+1}. This is already
-            // implied by union-branch-0 + the distinct exact-cover argument, but the redundant public
-            // set check costs nothing and pins the completeness invariant for the audit.
-            let next_ids: std::collections::BTreeSet<u64> =
-                round.next_rows.iter().copied().collect();
-            if next_ids.len() != round.next_rows.len() {
-                return Err(invalid("transitive closure round produced a duplicate set element"));
-            }
-            if !accumulator_ids.iter().all(|id| next_ids.contains(id)) {
-                return Err(invalid("transitive closure round dropped a prior reachable node"));
-            }
-
-            accumulator_commit = closure_set_commit(&round.next_rows)?;
-            accumulator_ids = next_ids;
-            accumulator_rows = round.next_rows.clone();
-        }
-
-        // (5) Empty-delta fixpoint: LeftAnti(InnerJoin(A_K, E), A_K) on (object == node) has 0 rows,
-        // i.e. A_K is closed under the step. Passing output_len 0 IS the fixpoint assertion — a
-        // non-converged closure makes the audited anti-join verifier reject.
-        let step = rounds.len() as u64;
-        let (join_commit, _object_commit) = verify_inner(
-            &accumulator_commit,
-            &fixpoint.inner,
-            &fixpoint.inner_out,
-            step,
-            b"step-inner",
-        )?;
-        if fixpoint.anti_out.len() != join_commit.commitments.len() {
-            return Err(invalid("transitive closure fixpoint anti-join output arity mismatch"));
-        }
-        let anti_log = fixpoint.anti.join.num_vars();
-        let mut t_anti = closure_transcript(&root, &digest, step, b"fix-anti");
-        verify_left_anti_join_with_keys(
-            &join_commit,
-            &accumulator_commit,
-            &[(1, 0)],
-            &fixpoint.anti_out,
-            0,
-            anti_log,
-            &fixpoint.anti,
-            &mut t_anti,
-        )?;
-
-        Ok(accumulator_rows)
+        // (3)-(5) The SOURCE-AGNOSTIC seed + rounds + fixpoint replay (shared with the reconciled closure).
+        verify_closure_rounds(
+            &edge_commit, seed_id, root, digest, reflexive, inverted, seed, rounds, fixpoint, nodes,
+        )
     }
 
     pub fn verify(
