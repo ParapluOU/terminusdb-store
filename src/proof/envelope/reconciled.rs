@@ -220,6 +220,38 @@ pub(crate) fn resolve_combined_node_id(views: &[VerifierCommitmentRef<'_>], iri:
         .saturating_add(1)
 }
 
+/// Resolve reconciled transitive-closure output node-ids back to their IRIs
+/// ([`CanonicalObject`]s) over the whole chain's root-authenticated catalogs — the exact INVERSE of
+/// [`resolve_combined_node_id`], used by ReadDocument 6e (a reconciled `sys:inherits` ancestor
+/// closure over a DELTA schema head delivers combined-dict ids, which the compiler must render as
+/// class IRIs to drive the per-ancestor frame reads).
+///
+/// SOUNDNESS: each combined-dict id is globally unique and minted in exactly one layer's catalog;
+/// every catalog is bound to the trusted head root by the reconciliation's per-layer `validate()`
+/// (which the closure verify that produced `ids` has already run against the same `layers`), so the
+/// `id -> object` lookup is root-authenticated. FAILS CLOSED on an id absent from every catalog (an
+/// unknown / forged id resolves to nothing → error), so a bogus closure output cannot silently map to
+/// a real IRI. Prover and verifier resolve identically over the same authenticated views.
+pub fn resolve_reconciled_node_ids(
+    layers: &[&LayerCommitment],
+    ids: &[u64],
+) -> io::Result<Vec<CanonicalObject>> {
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    ids.iter()
+        .map(|&id| {
+            views
+                .iter()
+                .find_map(|view| {
+                    view.node_value_catalog
+                        .iter()
+                        .find(|record| record.object_id == id)
+                        .map(|record| record.triple.object.clone())
+                })
+                .ok_or_else(|| invalid("reconciled closure output id has no chain catalog entry"))
+        })
+        .collect()
+}
+
 // ===========================================================================
 // FOUNDATION-B — the reconciled `TransitiveClosure`.
 // ===========================================================================
