@@ -136,14 +136,18 @@ pub(super) fn verify_combined_dict(
 // (Sound under the same no-re-mint invariant the reconciliation already relies on: an id is
 // defined in exactly one layer's incremental range, so it appears once in the union.)
 
-pub(super) struct CombinedRangeDictBuilt {
-    pub(super) proof: CombinedRangeDictProof,
-    pub(super) id_at_k: Vec<ArkFr>,
-    pub(super) value_at_k: Vec<ArkFr>,
-    pub(super) datatype_at_k: Vec<ArkFr>,
-    pub(super) com_id_at_k: ArkGT,
-    pub(super) com_value_at_k: ArkGT,
-    pub(super) com_datatype_at_k: ArkGT,
+/// `pub(crate)` (not `pub(super)`): the reconciled `OrderedArrayWalk` (ReadDocument 6d) authenticates
+/// each cell's `sys:index` id against this combined `(id, value, datatype)` range dictionary — the
+/// chain analogue of the materialized array walk's single-layer dict lookup — so the envelope module
+/// needs the built columns + commitments (all root-bound + relocated to the working domain).
+pub(crate) struct CombinedRangeDictBuilt {
+    pub(crate) proof: CombinedRangeDictProof,
+    pub(crate) id_at_k: Vec<ArkFr>,
+    pub(crate) value_at_k: Vec<ArkFr>,
+    pub(crate) datatype_at_k: Vec<ArkFr>,
+    pub(crate) com_id_at_k: ArkGT,
+    pub(crate) com_value_at_k: ArkGT,
+    pub(crate) com_datatype_at_k: ArkGT,
 }
 
 /// A combined `(id, value, datatype)` node/value range dictionary authenticated across the
@@ -165,7 +169,7 @@ pub struct CombinedRangeDictProof {
     pub com_datatype_at_k: ArkGT,
 }
 
-pub(super) fn prove_combined_range_dict(
+pub(crate) fn prove_combined_range_dict(
     context: &StoreProverContext<'_>,
     branches: &[RelationWitness],
     working_log: usize,
@@ -241,7 +245,7 @@ pub(super) fn prove_combined_range_dict(
     })
 }
 
-pub(super) fn verify_combined_range_dict(
+pub(crate) fn verify_combined_range_dict(
     branches: &[RelationCommit],
     expected_n: usize,
     working_log: usize,
@@ -295,7 +299,7 @@ pub(super) fn verify_combined_range_dict(
 
 /// Build the prover-side combined range-dict branches: per layer with a non-empty
 /// incremental node/value dict, its `(id, value, datatype)` columns + root-bound commitments.
-pub(super) fn range_dict_branches(layers: &[&LayerCommitment]) -> io::Result<Vec<RelationWitness>> {
+pub(crate) fn range_dict_branches(layers: &[&LayerCommitment]) -> io::Result<Vec<RelationWitness>> {
     let mut branches = Vec::new();
     for layer in layers {
         if layer.node_value_catalog.is_empty() {
@@ -320,7 +324,7 @@ pub(super) fn range_dict_branches(layers: &[&LayerCommitment]) -> io::Result<Vec
 }
 
 /// Build the verifier-side combined range-dict branches (commitments only, from the roots).
-pub(super) fn range_dict_branch_commits(views: &[VerifierCommitmentRef<'_>]) -> io::Result<Vec<RelationCommit>> {
+pub(crate) fn range_dict_branch_commits(views: &[VerifierCommitmentRef<'_>]) -> io::Result<Vec<RelationCommit>> {
     let mut branches = Vec::new();
     for view in views {
         let nv_incr = (view.state.node_value_count - view.state.parent_node_value_count) as usize;

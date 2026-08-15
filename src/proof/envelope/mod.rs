@@ -127,5 +127,15 @@ pub use list_walk::{
     OrderedListWalkReconciledProof,
 };
 
+// The reconciled ordered `sys:Array` walk over a delta head's `present` (ReadDocument 6d) — the
+// standalone prove/verify pair the compiler lift routes a delta-path `Array` to. Built on the 6c-i
+// foundation + the audited array gluing gadgets, swapping the single-layer index dict lookup for the
+// combined `(id, value, datatype)` range-dict authentication; the materialized `OrderedArrayWalk`
+// composite stays byte-identical (a PARALLEL entry).
+pub use array_walk::{
+    prove_ordered_array_walk_reconciled, verify_ordered_array_walk_reconciled,
+    OrderedArrayWalkReconciledProof,
+};
+
 #[cfg(test)]
 mod tests;

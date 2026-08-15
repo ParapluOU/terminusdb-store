@@ -3517,3 +3517,283 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     fn reconciled_list_walk_soundness_negatives() {
         big_stack(assert_reconciled_list_walk_soundness);
     }
+
+    // -----------------------------------------------------------------------
+    // Reconciled ordered sys:Array walk over a delta head's `present` (ReadDocument 6d).
+    // -----------------------------------------------------------------------
+
+    /// Add one raw array triple (a plain node edge, or a `sys:index` `UInt64` literal) to a builder.
+    fn add_arr(builder: &crate::store::sync::SyncStoreLayerBuilder, t: &ArrTriple) {
+        match t {
+            ArrTriple::Node(s, p, o) => {
+                builder.add_value_triple(ValueTriple::new_node(s.as_str(), p.as_str(), o.as_str())).unwrap();
+            }
+            ArrTriple::Index(cell, index) => {
+                builder
+                    .add_value_triple(ValueTriple::new_value(cell.as_str(), &sys_index(), u64::make_entry(index)))
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Remove one raw array triple from a write child (the inverse of [`add_arr`]).
+    fn remove_arr(builder: &crate::store::sync::SyncStoreLayerBuilder, t: &ArrTriple) {
+        match t {
+            ArrTriple::Node(s, p, o) => {
+                builder.remove_value_triple(ValueTriple::new_node(s.as_str(), p.as_str(), o.as_str())).unwrap();
+            }
+            ArrTriple::Index(cell, index) => {
+                builder
+                    .remove_value_triple(ValueTriple::new_value(cell.as_str(), &sys_index(), u64::make_entry(index)))
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Build a base + 1 delta stack: `base` triples committed as the base layer, then `removals`
+    /// removed + `additions` added in one delta layer (both committed groups must have >= 2 records to
+    /// satisfy the reconcile floor). The reconciled `present` == `(base - removals) + additions`.
+    fn build_delta_stack(
+        base: Vec<ArrTriple>,
+        removals: Vec<ArrTriple>,
+        additions: Vec<ArrTriple>,
+    ) -> Vec<std::sync::Arc<LayerCommitment>> {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for t in &base {
+            add_arr(&builder, t);
+        }
+        let base_layer = builder.commit().unwrap();
+        let base_lc = base_layer.proof_commitment().unwrap();
+
+        let child = base_layer.open_write().unwrap();
+        for t in &removals {
+            remove_arr(&child, t);
+        }
+        for t in &additions {
+            add_arr(&child, t);
+        }
+        let head = child.commit().unwrap();
+        vec![base_lc, head.proof_commitment().unwrap()]
+    }
+
+    /// The base triples of a dense/malformed array `subject -predicate-> cells`, with the LAST cell's
+    /// `sys:index`/`sys:value` deliberately WRONG (index 999 / value `__wrong__`) so a 2-removal +
+    /// 2-addition delta can correct exactly it — a valid delta stack whose `present` is the target array.
+    fn array_base_wrong_last(subject: &str, predicate: &str, cells: &[(u64, &str)]) -> Vec<ArrTriple> {
+        let last = cells.len() - 1;
+        let mut base = Vec::new();
+        for (k, (index, value)) in cells.iter().enumerate() {
+            let c = cell(k);
+            base.push(ArrTriple::Node(subject.to_string(), predicate.to_string(), c.clone()));
+            base.push(ArrTriple::Node(c.clone(), rdf_type(), sys_array()));
+            if k == last {
+                base.push(ArrTriple::Index(c.clone(), 999));
+                base.push(ArrTriple::Node(c.clone(), sys_value(), iri("__wrong__")));
+            } else {
+                base.push(ArrTriple::Index(c.clone(), *index));
+                base.push(ArrTriple::Node(c.clone(), sys_value(), iri(value)));
+            }
+        }
+        base
+    }
+
+    /// The 2-removal / 2-addition delta that corrects the last cell of [`array_base_wrong_last`].
+    fn array_last_cell_delta(cells: &[(u64, &str)]) -> (Vec<ArrTriple>, Vec<ArrTriple>) {
+        let last = cells.len() - 1;
+        let c = cell(last);
+        let (li, lv) = cells[last];
+        let removals = vec![
+            ArrTriple::Index(c.clone(), 999),
+            ArrTriple::Node(c.clone(), sys_value(), iri("__wrong__")),
+        ];
+        let additions = vec![
+            ArrTriple::Index(c.clone(), li),
+            ArrTriple::Node(c.clone(), sys_value(), iri(lv)),
+        ];
+        (removals, additions)
+    }
+
+    /// A base + 1 delta stack whose reconciled `present` is the dense/malformed array
+    /// `subject -predicate-> cells`, respecting the reconcile >= 2-records-per-group floor.
+    fn array_delta_stack(
+        subject: &str,
+        predicate: &str,
+        cells: &[(u64, &str)],
+    ) -> Vec<std::sync::Arc<LayerCommitment>> {
+        let base = array_base_wrong_last(subject, predicate, cells);
+        let (removals, additions) = array_last_cell_delta(cells);
+        build_delta_stack(base, removals, additions)
+    }
+
+    /// 6d PARITY: the reconciled ordered-array walk over the 2-layer delta stack delivers the EXACT
+    /// `sys:index`-ordered `sys:value` sequence AND equals the materialized `OrderedArrayWalk` on a
+    /// rolled-up base — for a plain array `[x, y, z]` and a duplicate-value array `[a, b, a]`.
+    fn assert_reconciled_array_walk_parity() {
+        let p = iri("items");
+        for (doc, cells, expected) in [
+            ("adoc1", vec![(0u64, "x"), (1, "y"), (2, "z")], vec!["x", "y", "z"]),
+            ("adoc2", vec![(0, "a"), (1, "b"), (2, "a")], vec!["a", "b", "a"]),
+        ] {
+            let s = iri(doc);
+            let stack = array_delta_stack(&s, &p, &cells);
+            let lref = arc_refs(&stack);
+            let head_root = lref.last().unwrap().state.commitment_root;
+            let subj = CanonicalObject::Node(s.clone().into_bytes());
+
+            let (proof, prover_elements) =
+                super::array_walk::prove_ordered_array_walk_reconciled(&lref, &subj, p.as_bytes())
+                    .unwrap();
+            let verifier_elements = super::array_walk::verify_ordered_array_walk_reconciled(
+                &lref, head_root, &subj, p.as_bytes(), &proof,
+            )
+            .unwrap();
+
+            assert_eq!(object_iris(&prover_elements), object_iris(&verifier_elements));
+            let expected: Vec<String> = expected.iter().map(|v| iri(v)).collect();
+            assert_eq!(
+                object_iris(&verifier_elements),
+                expected,
+                "reconciled array walk must deliver the exact sys:index-ordered values"
+            );
+
+            // PARITY with the materialized OrderedArrayWalk on a rolled-up single base layer.
+            let rolled = array_layer(dense_array_triples(&s, &p, &cells));
+            let mat_plan = array_walk_plan(&s, &p, 88);
+            let mat_env = RecursiveRelationEnvelope::prove(&rolled, &mat_plan).unwrap();
+            mat_env.verify(&rolled, rolled.state.commitment_root, &mat_plan).unwrap();
+            assert_eq!(
+                object_iris(&verifier_elements),
+                walk_values(&mat_env),
+                "reconciled value column must equal the materialized OrderedArrayWalk"
+            );
+        }
+    }
+
+    /// 6d SOUNDNESS over `present`: each array forgery (reorder / drop / dup-index / inject / gap+
+    /// index>=n / two-values) fails at the SAME gadget as the materialized walk, plus a statement
+    /// substitution. The reorder/drop cases use the caller-chosen density-permutation forging hook; the
+    /// malformed-array cases reject at HONEST prove.
+    fn assert_reconciled_array_walk_soundness() {
+        let p = iri("items");
+
+        // Sanity: the honest reconciled walk over a dense delta-stack array verifies.
+        let s = iri("asnd");
+        let subj = CanonicalObject::Node(s.clone().into_bytes());
+        let stack = array_delta_stack(&s, &p, &[(0, "a"), (1, "b"), (2, "c")]);
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().state.commitment_root;
+        let (proof, _) =
+            super::array_walk::prove_ordered_array_walk_reconciled(&lref, &subj, p.as_bytes()).unwrap();
+        super::array_walk::verify_ordered_array_walk_reconciled(
+            &lref, head_root, &subj, p.as_bytes(), &proof,
+        )
+        .unwrap();
+
+        // (1) REORDER (density permutation-to-identity). A 2-element array has exactly two density-
+        // permutation orders; EXACTLY ONE is the honest one (routed index == identity [0,1]) and
+        // verifies, the OTHER reorders the delivery so the routed index != identity and rejects. This
+        // holds regardless of which physical order `present` delivers the cells in.
+        let s2 = iri("aorder");
+        let subj2 = CanonicalObject::Node(s2.clone().into_bytes());
+        let stack2 = array_delta_stack(&s2, &p, &[(0, "m"), (1, "n")]);
+        let lref2 = arc_refs(&stack2);
+        let hr2 = lref2.last().unwrap().state.commitment_root;
+        let verifies = |order: Vec<usize>| {
+            super::array_walk::prove_ordered_array_walk_reconciled_forged(&lref2, &subj2, p.as_bytes(), order)
+                .and_then(|(proof, _)| {
+                    super::array_walk::verify_ordered_array_walk_reconciled(
+                        &lref2, hr2, &subj2, p.as_bytes(), &proof,
+                    )
+                })
+                .is_ok()
+        };
+        let ok_count = [vec![0usize, 1], vec![1usize, 0]].into_iter().filter(|o| verifies(o.to_vec())).count();
+        assert_eq!(
+            ok_count, 1,
+            "exactly one density order verifies; a reordered delivery must be rejected (density permutation-to-identity)"
+        );
+
+        // (2) DROPPED cell -> a length-(n-1) density routing is not a full bijection over [0,n) (prove
+        // rejects at the permutation gadget).
+        assert!(
+            super::array_walk::prove_ordered_array_walk_reconciled_forged(
+                &lref2, &subj2, p.as_bytes(), vec![0],
+            )
+            .is_err(),
+            "a dropped cell cannot be routed by the density bijection"
+        );
+
+        // (3) DUPLICATE index (two cells index 0, none index 1) -> honest prove rejects (density: not a
+        // dense 0..n-1 permutation).
+        let sdup = iri("adup");
+        let dsub = CanonicalObject::Node(sdup.clone().into_bytes());
+        let dstack = array_delta_stack(&sdup, &p, &[(0, "a"), (1, "b"), (0, "c")]);
+        assert!(
+            super::array_walk::prove_ordered_array_walk_reconciled(&arc_refs(&dstack), &dsub, p.as_bytes())
+                .is_err(),
+            "a duplicate sys:index over present must be rejected"
+        );
+
+        // (4) INJECTED extra P-object that is NOT a well-formed array cell (no sys:index) -> honest
+        // prove rejects (the index functional bind's count no longer equals the cell count).
+        let sinj = iri("ainj");
+        let isub = CanonicalObject::Node(sinj.clone().into_bytes());
+        let cells = [(0u64, "a"), (1, "b"), (2, "c")];
+        let mut base = array_base_wrong_last(&sinj, &p, &cells);
+        let inj = cell(99);
+        base.push(ArrTriple::Node(sinj.clone(), p.clone(), inj.clone()));
+        base.push(ArrTriple::Node(inj.clone(), rdf_type(), sys_array()));
+        base.push(ArrTriple::Node(inj.clone(), sys_value(), iri("w")));
+        let (rem, add) = array_last_cell_delta(&cells);
+        let istack = build_delta_stack(base, rem, add);
+        assert!(
+            super::array_walk::prove_ordered_array_walk_reconciled(&arc_refs(&istack), &isub, p.as_bytes())
+                .is_err(),
+            "an injected non-cell P-object over present must be rejected (index functional bind)"
+        );
+
+        // (5) GAP / index >= n (`[0, 2]`, n=2 with index 2 >= n) -> honest prove rejects (out-of-range
+        // index; the reference null-fills a gap, so a sparse array is not a dense one).
+        let sgap = iri("agap");
+        let gsub = CanonicalObject::Node(sgap.clone().into_bytes());
+        let gstack = array_delta_stack(&sgap, &p, &[(0, "a"), (2, "b")]);
+        assert!(
+            super::array_walk::prove_ordered_array_walk_reconciled(&arc_refs(&gstack), &gsub, p.as_bytes())
+                .is_err(),
+            "a sparse/gapped array (index >= n) over present must be rejected"
+        );
+
+        // (6) A cell with TWO sys:value -> honest prove rejects (the value functional-bind count).
+        let stv = iri("atwo");
+        let tsub = CanonicalObject::Node(stv.clone().into_bytes());
+        let mut base = array_base_wrong_last(&stv, &p, &cells);
+        base.push(ArrTriple::Node(cell(1), sys_value(), iri("bb")));
+        let (rem, add) = array_last_cell_delta(&cells);
+        let tstack = build_delta_stack(base, rem, add);
+        assert!(
+            super::array_walk::prove_ordered_array_walk_reconciled(&arc_refs(&tstack), &tsub, p.as_bytes())
+                .is_err(),
+            "a cell with two sys:value over present must be rejected (value functional bind)"
+        );
+
+        // (7) STATEMENT substitution: verify the honest proof against a DIFFERENT predicate — the leaves
+        // read a different `present` relation and the gluing digest changes, so the re-aimed proof fails.
+        assert!(
+            super::array_walk::verify_ordered_array_walk_reconciled(
+                &lref, head_root, &subj, iri("authors").as_bytes(), &proof,
+            )
+            .is_err(),
+            "wrong predicate must be rejected (statement binding)"
+        );
+    }
+
+    #[test]
+    fn reconciled_array_walk_parity() {
+        big_stack(assert_reconciled_array_walk_parity);
+    }
+
+    #[test]
+    fn reconciled_array_walk_soundness_negatives() {
+        big_stack(assert_reconciled_array_walk_soundness);
+    }

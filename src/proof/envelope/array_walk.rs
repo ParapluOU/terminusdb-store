@@ -86,11 +86,22 @@ use dory_pcs::primitives::transcript::Transcript;
 use sha2::{Digest, Sha256};
 
 use super::list_walk::{
-    pad_to, prove_edge_bind, resolve_node_id_or_absent, verify_edge_bind,
+    field_id, pad_to, prove_edge_bind, prove_edge_bind_witness, resolve_node_id_or_absent,
+    verify_edge_bind,
 };
 use super::plan::{RelationProofPlan, RelationProofPlanKind};
+use super::reconciled::{
+    bound_subject_leaf_atom, predicate_edge_leaf_atom, prove_reconciled_leaf,
+    resolve_combined_node_id, verify_reconciled_leaf, RECONCILE_TRANSCRIPT,
+};
 use super::recursive::{RecursiveRelationEnvelope, RecursiveRelationProof};
 use super::wire::{invalid, Reader, Wire};
+
+use crate::proof::reconcile::{
+    prove_combined_range_dict, prove_reconcile_core, range_dict_branch_commits, range_dict_branches,
+    resolve_node_value_id_column, verify_combined_range_dict, verify_reconcile_core,
+    CombinedRangeDictProof, PresentBgpProof, ReconcileProof,
+};
 
 use crate::proof::argument::{commit_column, StoreProverContext, Transcript254};
 use crate::proof::bgp::{RelationCommit, RelationWitness};
@@ -960,4 +971,678 @@ impl RecursiveRelationEnvelope {
             &mut t,
         )
     }
+}
+
+// ===========================================================================
+// RECONCILED ordered `sys:Array` walk over a DELTA HEAD's `present` (ReadDocument increment 6d).
+//
+// This is the PARALLEL sibling of the materialized [`prove_ordered_array_walk`] above: it proves the
+// EXACT ordered `sys:value` sequence of a stored 1-D DENSE array at a bound `(subject, predicate)` over
+// a NON-materialized delta stack (base..head, head last), reconciling the current triple set at proof
+// time. It closely MIRRORS the reconciled `rdf:List` walk (6c-ii, `list_walk.rs`) — reconcile ONCE,
+// read every leaf over `present` via the 6c-i FOUNDATION, and run the SAME source-agnostic gluing
+// gadgets — but an array has NO closure (the parent points at every cell, so the bound-subject cell
+// leaf IS the whole membership certificate; FOUNDATION-A only). The materialized path is UNTOUCHED.
+//
+// # The three source-specific differences from the materialized array walk
+//
+// 1. **Reconcile ONCE.** `prove_reconcile_core` runs a single O(chain) reconciliation; the cell leaf
+//    `t(S,P,?cell)`, the `sys:index`/`sys:value`/`rdf:type` edge leaves are read against the SHARED
+//    `ReconcileArtifacts` on the SHARED transcript (FOUNDATION-A `prove_reconciled_leaf`), each
+//    O(present). Every leaf's committed columns are bound to the trusted head root via the audited
+//    reconcile invariant + `present_bgp` completeness. The gluing gadgets run on FRESH transcripts.
+// 2. **THE WRINKLE — the index decode authenticates against the COMBINED range dict.** The materialized
+//    density certificate decodes each `sys:index` id to a `u64` position by authenticating it against a
+//    SINGLE layer's `(id, value, datatype)` dictionary. Over `present` a cell's index id is a
+//    combined-dict id whose canonical value lives in whichever layer minted it, so it MUST be
+//    authenticated against the COMBINED `(id, value, datatype)` range dictionary — the exact bag-union
+//    dict `present_bgp`'s ranged atom builds ([`prove_combined_range_dict`], every branch root-bound).
+//    This is the one genuinely-new soundness seam: a forged / mis-decoded index would corrupt the
+//    order/density, and the range-dict authentication + the density permutation-to-identity together
+//    pin the true order over the chain.
+// 3. **Values resolved over the CHAIN catalogs.** The delivered ordered value column is resolved via
+//    `resolve_node_value_id_column` (the combined-dict `NodeValueId` chain resolver), NOT the
+//    single-layer resolver — its ids' canonical bytes live in whichever layer minted them.
+//
+// Every gluing gadget — the three functional `prove_edge_bind_witness`es (index/value/type), the
+// `sys:Array` type-equality, and the DENSITY permutation-to-identity — is BYTE-IDENTICAL to the
+// materialized path; only the leaf source and the dict-lookup source change.
+
+/// The domain-separation digest for a reconciled ordered-array walk's gluing-gadget transcripts,
+/// deterministic from `(subject, predicate)` so prover and verifier reconstruct the IDENTICAL
+/// `aw_transcript(root, digest, role)` / `lw_transcript` (functional-bind) sequences. A DISTINCT domain
+/// tag keeps it disjoint from BOTH the materialized array walk's `plan.query_digest` AND the reconciled
+/// LIST walk's digest, so no sub-proof is fungible across walks.
+fn reconciled_array_walk_digest(subject: &CanonicalObject, predicate: &[u8]) -> io::Result<ProofHash> {
+    let subject_bytes = match subject {
+        CanonicalObject::Node(bytes) => bytes,
+        _ => return Err(invalid("reconciled ordered-array-walk subject must be a node IRI")),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"pow/reconciled-ordered-array-walk/digest/v0");
+    hasher.update((subject_bytes.len() as u64).to_le_bytes());
+    hasher.update(subject_bytes);
+    hasher.update((predicate.len() as u64).to_le_bytes());
+    hasher.update(predicate);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hasher.finalize());
+    Ok(out)
+}
+
+/// Every sub-proof of one reconciled ordered `sys:Array` walk. Compared to the materialized
+/// [`OrderedArrayWalkProof`], the four child ENVELOPES are replaced by ONE [`ReconcileProof`] + the
+/// per-leaf [`PresentBgpProof`]s; the density certificate carries the [`CombinedRangeDictProof`]
+/// authenticating each `sys:index` id over the chain (in place of the materialized single-layer dict);
+/// and EVERY gluing-gadget field is byte-identical to the materialized proof.
+#[derive(Clone, Debug)]
+pub struct OrderedArrayWalkReconciledProof {
+    /// Proves `present` IS the current triple set of the whole delta stack (bound to the head root).
+    pub reconcile: ReconcileProof,
+    /// FOUNDATION-A cell leaf `t(S,P,?cell)` over `present` — the COMPLETE cell set (n cells).
+    pub cells_leaf: PresentBgpProof,
+    /// FOUNDATION-A `t(?s,sys:index,?o)` leaf over `present` — the index functional-bind edge.
+    pub index_edge_leaf: PresentBgpProof,
+    /// FOUNDATION-A `t(?s,sys:value,?o)` leaf over `present` — the value functional-bind edge.
+    pub value_edge_leaf: PresentBgpProof,
+    /// FOUNDATION-A `t(?s,rdf:type,?o)` leaf over `present` — the type functional-bind edge.
+    pub type_edge_leaf: PresentBgpProof,
+
+    pub n: usize,
+    pub cell_log_domain: usize,
+
+    // ---- Gluing gadgets — BYTE-IDENTICAL to `OrderedArrayWalkProof` ----
+    /// (D) functional index bind: one `sys:index` per cell, positionally aligned.
+    pub index_join: InnerJoinProof,
+    pub index_join_out: Vec<ArkGT>,
+    pub index_reloc_subj: RelocationProof,
+    pub index_reloc_obj: RelocationProof,
+    pub com_index: ArkGT,
+    /// (E) functional value bind: one `sys:value` per cell, positionally aligned.
+    pub value_join: InnerJoinProof,
+    pub value_join_out: Vec<ArkGT>,
+    pub value_reloc_subj: RelocationProof,
+    pub value_reloc_obj: RelocationProof,
+    pub com_value: ArkGT,
+    /// (F) functional type bind + equality filter forcing `rdf:type == sys:Array`.
+    pub type_join: InnerJoinProof,
+    pub type_join_out: Vec<ArkGT>,
+    pub type_reloc_subj: RelocationProof,
+    pub type_reloc_obj: RelocationProof,
+    pub com_type: ArkGT,
+    pub type_equality: RelationEqualityProof,
+    pub type_equality_out: Vec<ArkGT>,
+
+    // (G) density + order certificate over the COMBINED range dict -----------------------------------
+    /// The combined `(id, value, datatype)` range dictionary authenticating every `sys:index` id over
+    /// the chain (the 6d wrinkle; in place of the materialized single-layer dict). Its `com_*_at_k`
+    /// commitments live at the reconciliation working domain and are re-verified against the root-bound
+    /// per-layer branch commitments.
+    pub range_dict: CombinedRangeDictProof,
+    pub common_log_domain: usize,
+    pub reloc_index_at_d: RelocationProof,
+    pub com_index_at_d: ArkGT,
+    pub reloc_value_at_d: RelocationProof,
+    pub com_value_at_d: ArkGT,
+    pub reloc_dict_id: RelocationProof,
+    pub com_dict_id_at_d: ArkGT,
+    pub reloc_dict_value: RelocationProof,
+    pub com_dict_value_at_d: ArkGT,
+    pub reloc_dict_datatype: RelocationProof,
+    pub com_dict_datatype_at_d: ArkGT,
+    pub lookup: DictLookupProof,
+    pub datatype_filter: FilterProof,
+    pub datatype_selection_commitment: ArkGT,
+    pub datatype_inverse_commitment: ArkGT,
+    pub order_perm: RelationPermutationProof,
+    pub com_out: ArkGT,
+
+    /// The ordered value combined-dict ids (PUBLIC): bound to `com_out` by re-commit at verify, then
+    /// resolved to `CanonicalObject`s over the chain catalogs.
+    pub value_ids: Vec<u64>,
+}
+
+/// Prove the ordered `sys:value` sequence of the `sys:Array` at `(subject, predicate)` over the
+/// reconciled `present` of the delta stack `layers` (base..head, `len >= 2`). Returns the proof and the
+/// ordered value column resolved against the chain catalogs. Every failure path rejects CLOSED, never
+/// emitting a bogus order — exactly like the materialized entry.
+pub fn prove_ordered_array_walk_reconciled(
+    layers: &[&LayerCommitment],
+    subject: &CanonicalObject,
+    predicate: &[u8],
+) -> io::Result<(OrderedArrayWalkReconciledProof, Vec<CanonicalObject>)> {
+    prove_ordered_array_walk_reconciled_impl(layers, subject, predicate, None)
+}
+
+/// Test-only forging entry mirroring [`prove_ordered_array_walk_forged`]: prove with a CALLER-CHOSEN
+/// density permutation row order, to confirm a broken order/density is rejected by the density
+/// permutation-to-identity at verify (a wrong order makes the routed index column differ from the
+/// public identity `[0,n-1]`; a non-permutation of `[0,n)` is rejected at prove by the gadget).
+#[cfg(test)]
+pub fn prove_ordered_array_walk_reconciled_forged(
+    layers: &[&LayerCommitment],
+    subject: &CanonicalObject,
+    predicate: &[u8],
+    row_order_override: Vec<usize>,
+) -> io::Result<(OrderedArrayWalkReconciledProof, Vec<CanonicalObject>)> {
+    prove_ordered_array_walk_reconciled_impl(layers, subject, predicate, Some(row_order_override))
+}
+
+fn prove_ordered_array_walk_reconciled_impl(
+    layers: &[&LayerCommitment],
+    subject: &CanonicalObject,
+    predicate: &[u8],
+    row_order_override: Option<Vec<usize>>,
+) -> io::Result<(OrderedArrayWalkReconciledProof, Vec<CanonicalObject>)> {
+    let context = StoreProverContext::cpu();
+    let root = layers
+        .last()
+        .ok_or_else(|| invalid("reconciled ordered-array-walk needs a head layer"))?
+        .state
+        .commitment_root;
+    let digest = reconciled_array_walk_digest(subject, predicate)?;
+    let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+        layers.iter().map(|l| l.verifier_view()).collect();
+
+    // Reconcile ONCE, then read every leaf against the SHARED artifacts on the SHARED transcript.
+    let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
+    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
+
+    // (A) CELL SET leaf t(S,P,?cell): the COMPLETE cell set (every row kept), NOT a single head.
+    let cells_atom = bound_subject_leaf_atom(subject, predicate);
+    let (cells_leaf, c_witness) =
+        prove_reconciled_leaf(&context, layers, &artifacts, cells_atom, &mut transcript)?;
+    if c_witness.columns.len() != 1 {
+        return Err(invalid("reconciled ordered-array-walk cell set must be a single node column"));
+    }
+    let n = c_witness.n;
+    if n == 0 {
+        return Err(invalid("reconciled ordered-array-walk array has no cells"));
+    }
+    let cell_log_domain = c_witness.log_domain;
+    let cells_col = c_witness.columns[0].clone();
+
+    // (B/C/type) EDGE leaves (shared transcript, in this order: index, value, type).
+    let index_atom = predicate_edge_leaf_atom(SYS_INDEX);
+    let (index_edge_leaf, index_edge_witness) =
+        prove_reconciled_leaf(&context, layers, &artifacts, index_atom, &mut transcript)?;
+    let value_atom = predicate_edge_leaf_atom(SYS_VALUE);
+    let (value_edge_leaf, value_edge_witness) =
+        prove_reconciled_leaf(&context, layers, &artifacts, value_atom, &mut transcript)?;
+    let type_atom = predicate_edge_leaf_atom(RDF_TYPE);
+    let (type_edge_leaf, type_edge_witness) =
+        prove_reconciled_leaf(&context, layers, &artifacts, type_atom, &mut transcript)?;
+
+    // (D/E/F) functional binds — the SAME source-agnostic core the materialized array walk + the
+    // reconciled list walk use (`prove_edge_bind_witness`), consuming the reconciled leaf witnesses.
+    let (com_index, index_col, index_bind) = prove_edge_bind_witness(
+        &context, &root, &digest, &c_witness, &cells_col, n, cell_log_domain, &index_edge_witness,
+        b"index",
+    )?;
+    let (com_value, value_col, value_bind) = prove_edge_bind_witness(
+        &context, &root, &digest, &c_witness, &cells_col, n, cell_log_domain, &value_edge_witness,
+        b"value",
+    )?;
+    let (com_type, type_col, type_bind) = prove_edge_bind_witness(
+        &context, &root, &digest, &c_witness, &cells_col, n, cell_log_domain, &type_edge_witness,
+        b"type",
+    )?;
+
+    // Type equality: force every cell's rdf:type == sys:Array (the sys:Array id is resolved over the
+    // CHAIN catalogs, fail-closed on absence).
+    let sys_array_id = resolve_combined_node_id(&views, SYS_ARRAY);
+    let type_witness = RelationWitness {
+        columns: vec![type_col.clone()],
+        commitments: vec![com_type],
+        log_domain: cell_log_domain,
+        n,
+    };
+    let array_constraint = RelationEqualityConstraint::ColumnConstant {
+        column: 0,
+        value: ArkFr::from_u64(sys_array_id),
+    };
+    let mut t_type = aw_transcript(&root, &digest, b"type-membership");
+    let type_eq =
+        prove_relation_equality_with_context(&context, &type_witness, &array_constraint, &mut t_type)?;
+    if type_eq.n != n {
+        return Err(invalid(
+            "reconciled ordered-array-walk has a cell whose rdf:type is not sys:Array",
+        ));
+    }
+
+    // (G) DENSITY + ORDER certificate over the COMBINED range dict (the 6d wrinkle).
+    let density = prove_density_order_reconciled(
+        &context, layers, artifacts.working_log, &root, &digest, com_index, &index_col, com_value,
+        &value_col, n, cell_log_domain, row_order_override,
+    )?;
+
+    // (9) Resolve the delivered ordered value column over the chain catalogs (binds value_ids to
+    // com_out first).
+    let value_ids: Vec<u64> = density.out_col[..n]
+        .iter()
+        .map(|f| field_id(*f))
+        .collect::<io::Result<Vec<_>>>()?;
+    let elements =
+        resolve_node_value_id_column(&views, &value_ids, density.com_out, density.common_log_domain)?;
+
+    let proof = OrderedArrayWalkReconciledProof {
+        reconcile,
+        cells_leaf,
+        index_edge_leaf,
+        value_edge_leaf,
+        type_edge_leaf,
+        n,
+        cell_log_domain,
+        index_join: index_bind.join,
+        index_join_out: index_bind.join_out,
+        index_reloc_subj: index_bind.reloc_subj,
+        index_reloc_obj: index_bind.reloc_obj,
+        com_index,
+        value_join: value_bind.join,
+        value_join_out: value_bind.join_out,
+        value_reloc_subj: value_bind.reloc_subj,
+        value_reloc_obj: value_bind.reloc_obj,
+        com_value,
+        type_join: type_bind.join,
+        type_join_out: type_bind.join_out,
+        type_reloc_subj: type_bind.reloc_subj,
+        type_reloc_obj: type_bind.reloc_obj,
+        com_type,
+        type_equality: type_eq.proof,
+        type_equality_out: type_eq.commitments,
+        range_dict: density.range_dict,
+        common_log_domain: density.common_log_domain,
+        reloc_index_at_d: density.reloc_index_at_d,
+        com_index_at_d: density.com_index_at_d,
+        reloc_value_at_d: density.reloc_value_at_d,
+        com_value_at_d: density.com_value_at_d,
+        reloc_dict_id: density.reloc_dict_id,
+        com_dict_id_at_d: density.com_dict_id_at_d,
+        reloc_dict_value: density.reloc_dict_value,
+        com_dict_value_at_d: density.com_dict_value_at_d,
+        reloc_dict_datatype: density.reloc_dict_datatype,
+        com_dict_datatype_at_d: density.com_dict_datatype_at_d,
+        lookup: density.lookup,
+        datatype_filter: density.datatype_filter,
+        datatype_selection_commitment: density.datatype_selection_commitment,
+        datatype_inverse_commitment: density.datatype_inverse_commitment,
+        order_perm: density.order_perm,
+        com_out: density.com_out,
+        value_ids,
+    };
+    Ok((proof, elements))
+}
+
+/// The prover outputs of the reconciled density+order certificate.
+struct DensityReconciledProve {
+    range_dict: CombinedRangeDictProof,
+    common_log_domain: usize,
+    reloc_index_at_d: RelocationProof,
+    com_index_at_d: ArkGT,
+    reloc_value_at_d: RelocationProof,
+    com_value_at_d: ArkGT,
+    reloc_dict_id: RelocationProof,
+    com_dict_id_at_d: ArkGT,
+    reloc_dict_value: RelocationProof,
+    com_dict_value_at_d: ArkGT,
+    reloc_dict_datatype: RelocationProof,
+    com_dict_datatype_at_d: ArkGT,
+    lookup: DictLookupProof,
+    datatype_filter: FilterProof,
+    datatype_selection_commitment: ArkGT,
+    datatype_inverse_commitment: ArkGT,
+    order_perm: RelationPermutationProof,
+    com_out: ArkGT,
+    out_col: Vec<ArkFr>,
+}
+
+/// Prove the reconciled density+order certificate. IDENTICAL to the materialized [`prove_density_order`]
+/// except the authenticated dictionary is the COMBINED `(id, value, datatype)` range dict over the
+/// whole chain (in place of a single layer's dict) — so a cell's `sys:index` id, wherever it was minted,
+/// authenticates to its true order-preserving value + datatype. Authenticates each index id, forces the
+/// datatype, decodes to a `u64` position, rejects `p_i >= n`, and routes `(position, value)` through ONE
+/// permutation onto `(identity, Out)`.
+#[allow(clippy::too_many_arguments)]
+fn prove_density_order_reconciled(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    working_log: usize,
+    root: &ProofHash,
+    digest: &ProofHash,
+    com_index: ArkGT,
+    index_col: &[ArkFr],
+    com_value: ArkGT,
+    value_col: &[ArkFr],
+    n: usize,
+    cell_log_domain: usize,
+    row_order_override: Option<Vec<usize>>,
+) -> io::Result<DensityReconciledProve> {
+    let mut t = aw_transcript(root, digest, b"density");
+
+    // (0) The COMBINED `(id, value, datatype)` range dictionary over the whole chain — the exact
+    // bag-union dict the present-BGP ranged atom builds, every branch bound to its own layer root, all
+    // relocated to the reconciliation working domain. This is what replaces the materialized array
+    // walk's single-layer dict lookup.
+    let branches = range_dict_branches(layers)?;
+    let n_dict: usize = branches.iter().map(|branch| branch.n).sum();
+    let dict = prove_combined_range_dict(context, &branches, working_log, &mut t)?;
+    let dict_log_domain = working_log;
+    let common_log_domain = cell_log_domain.max(dict_log_domain);
+    let common_domain = 1usize << common_log_domain;
+
+    let pad = |column: &[ArkFr]| -> Vec<ArkFr> {
+        let mut result = column.to_vec();
+        result.resize(common_domain, ArkFr::zero());
+        result
+    };
+
+    t.append_bytes(b"pow/array-walk/rows", &(n as u64).to_le_bytes());
+    t.append_bytes(b"pow/array-walk/common-log-domain", &(common_log_domain as u64).to_le_bytes());
+
+    // Lift the cell-aligned index/value columns and the combined dict columns UP to the shared domain
+    // (an identity relocation when the domains already agree; the source commitments are preserved).
+    let index_at_d = pad(&index_col[..n.min(index_col.len())]);
+    let com_index_at_d = context.commit_column(&index_at_d)?;
+    let reloc_index_at_d = prove_column_relocation_with_context(
+        context, index_col, &com_index, &index_at_d, &com_index_at_d, &mut t,
+    )?;
+
+    let value_at_d = pad(&value_col[..n.min(value_col.len())]);
+    let com_value_at_d = context.commit_column(&value_at_d)?;
+    let reloc_value_at_d = prove_column_relocation_with_context(
+        context, value_col, &com_value, &value_at_d, &com_value_at_d, &mut t,
+    )?;
+
+    let dict_id_at_d = pad(&dict.id_at_k);
+    let dict_value_at_d = pad(&dict.value_at_k);
+    let dict_datatype_at_d = pad(&dict.datatype_at_k);
+    let com_dict_id_at_d = context.commit_column(&dict_id_at_d)?;
+    let reloc_dict_id = prove_column_relocation_with_context(
+        context, &dict.id_at_k, &dict.com_id_at_k, &dict_id_at_d, &com_dict_id_at_d, &mut t,
+    )?;
+    let com_dict_value_at_d = context.commit_column(&dict_value_at_d)?;
+    let reloc_dict_value = prove_column_relocation_with_context(
+        context, &dict.value_at_k, &dict.com_value_at_k, &dict_value_at_d, &com_dict_value_at_d, &mut t,
+    )?;
+    let com_dict_datatype_at_d = context.commit_column(&dict_datatype_at_d)?;
+    let reloc_dict_datatype = prove_column_relocation_with_context(
+        context, &dict.datatype_at_k, &dict.com_datatype_at_k, &dict_datatype_at_d,
+        &com_dict_datatype_at_d, &mut t,
+    )?;
+
+    // Authenticate each index id -> (value, datatype) against the combined range dict.
+    let lookup = prove_dict_value_lookup_with_context(
+        context, &index_at_d, &com_index_at_d, &dict_id_at_d, &dict_value_at_d, &dict_datatype_at_d,
+        &com_dict_id_at_d, &com_dict_value_at_d, &com_dict_datatype_at_d, n, n_dict, &mut t,
+    )?;
+    let (v_val, v_dt, _w) =
+        honest_dict_lookup(&index_at_d, &dict_id_at_d, &dict_value_at_d, &dict_datatype_at_d, n, n_dict);
+
+    // Datatype completeness: EVERY index is the required order-preserving unsigned type (`sel == χ_n`).
+    let expected_datatype = ArkFr::from_u64(INDEX_DATATYPE as u64);
+    let (datatype_filter, datatype_selection_commitment, datatype_inverse_commitment, _) =
+        prove_filter_indicator_with_context(context, &v_dt, expected_datatype, n, &lookup.com_v_dt, &mut t)?;
+    let mut chi = vec![ArkFr::zero(); common_domain];
+    chi[..n].fill(ArkFr::one());
+    if datatype_selection_commitment != context.commit_column(&chi)? {
+        return Err(invalid(
+            "reconciled ordered-array-walk has a sys:index of the wrong datatype (not a decodable position)",
+        ));
+    }
+
+    // Decode each authenticated value to its integer position and reject any out-of-range index.
+    let mut positions = Vec::with_capacity(n);
+    for value in v_val.iter().take(n) {
+        let p = generated_decimal_u64_value(*value)?;
+        let p = usize::try_from(p).map_err(|_| invalid("reconciled ordered-array-walk index does not fit usize"))?;
+        if p >= n {
+            return Err(invalid(
+                "reconciled ordered-array-walk sys:index is >= the cell count (sparse or oversized array)",
+            ));
+        }
+        positions.push(p);
+    }
+
+    // The honest row order: output position `j` is filled by the cell whose index decodes to `j`.
+    let mut honest_row_order = vec![usize::MAX; n];
+    for (i, &p) in positions.iter().enumerate() {
+        if honest_row_order[p] != usize::MAX {
+            return Err(invalid(
+                "reconciled ordered-array-walk has a duplicate sys:index (not a dense 0..n-1 permutation)",
+            ));
+        }
+        honest_row_order[p] = i;
+    }
+
+    let forging = row_order_override.is_some();
+    let row_order = row_order_override.unwrap_or(honest_row_order);
+
+    // Route [position, value] -> [output-position, Out]. When honest, output-position == identity.
+    let input_witness = RelationWitness {
+        columns: vec![v_val.clone(), value_at_d.clone()],
+        commitments: vec![lookup.com_v_val, com_value_at_d],
+        log_domain: common_log_domain,
+        n,
+    };
+    let perm = prove_relation_permutation_with_context(context, &input_witness, &row_order, &mut t)?;
+    if perm.commitments.len() != 2 || perm.columns.len() != 2 {
+        return Err(invalid("reconciled ordered-array-walk density permutation has the wrong arity"));
+    }
+
+    let com_identity = identity_commitment(n, common_log_domain)?;
+    if !forging && perm.commitments[0] != com_identity {
+        return Err(invalid(
+            "reconciled ordered-array-walk routed index column is not the dense identity 0..n-1",
+        ));
+    }
+
+    Ok(DensityReconciledProve {
+        range_dict: dict.proof,
+        common_log_domain,
+        reloc_index_at_d,
+        com_index_at_d,
+        reloc_value_at_d,
+        com_value_at_d,
+        reloc_dict_id,
+        com_dict_id_at_d,
+        reloc_dict_value,
+        com_dict_value_at_d,
+        reloc_dict_datatype,
+        com_dict_datatype_at_d,
+        lookup,
+        datatype_filter,
+        datatype_selection_commitment,
+        datatype_inverse_commitment,
+        order_perm: perm.proof,
+        com_out: perm.commitments[1],
+        out_col: perm.columns[1].clone(),
+    })
+}
+
+/// Verify a reconciled ordered `sys:Array` walk against the trusted head root, returning the ordered
+/// value column resolved over the chain catalogs. Mirrors [`prove_ordered_array_walk_reconciled`] step
+/// for step: re-verify the single reconciliation + the four `present` leaves on the SHARED transcript,
+/// replay every functional bind + the `sys:Array` equality, then the density certificate whose index
+/// decode authenticates against the combined range dict. Any tampered leaf / forged index / broken
+/// order fails CLOSED.
+pub fn verify_ordered_array_walk_reconciled(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    subject: &CanonicalObject,
+    predicate: &[u8],
+    proof: &OrderedArrayWalkReconciledProof,
+) -> io::Result<Vec<CanonicalObject>> {
+    let root = trusted_head_root;
+    let digest = reconciled_array_walk_digest(subject, predicate)?;
+    let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+        layers.iter().map(|l| l.verifier_view()).collect();
+
+    // Reconcile + the four leaves, replayed on the SHARED transcript in the SAME order as prove.
+    let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
+    let verified = verify_reconcile_core(layers, trusted_head_root, &proof.reconcile, &mut transcript)?;
+    let head_nv = layers
+        .last()
+        .ok_or_else(|| invalid("reconciled ordered-array-walk needs a head layer"))?
+        .verifier_view()
+        .state
+        .node_value_count as usize;
+
+    // (A) CELL SET leaf.
+    let cells_atom = bound_subject_leaf_atom(subject, predicate);
+    let c_commit = verify_reconciled_leaf(
+        layers, &proof.reconcile, &verified, head_nv, cells_atom, &proof.cells_leaf, &mut transcript,
+    )?;
+    if c_commit.commitments.len() != 1 {
+        return Err(invalid("reconciled ordered-array-walk cell set must be a single node column"));
+    }
+    let n = c_commit.n;
+    if n == 0 || n != proof.n {
+        return Err(invalid("reconciled ordered-array-walk cell count mismatch"));
+    }
+    let cell_log_domain = c_commit.log_domain;
+    if cell_log_domain != proof.cell_log_domain {
+        return Err(invalid("reconciled ordered-array-walk cell domain mismatch"));
+    }
+
+    // (B/C/type) EDGE leaves (same shared-transcript order as prove: index, value, type).
+    let index_atom = predicate_edge_leaf_atom(SYS_INDEX);
+    let index_commit = verify_reconciled_leaf(
+        layers, &proof.reconcile, &verified, head_nv, index_atom, &proof.index_edge_leaf, &mut transcript,
+    )?;
+    let value_atom = predicate_edge_leaf_atom(SYS_VALUE);
+    let value_commit = verify_reconciled_leaf(
+        layers, &proof.reconcile, &verified, head_nv, value_atom, &proof.value_edge_leaf, &mut transcript,
+    )?;
+    let type_atom = predicate_edge_leaf_atom(RDF_TYPE);
+    let type_commit = verify_reconciled_leaf(
+        layers, &proof.reconcile, &verified, head_nv, type_atom, &proof.type_edge_leaf, &mut transcript,
+    )?;
+
+    // (D/E/F) functional binds — byte-identical to the materialized path.
+    verify_edge_bind(
+        &root, &digest, &c_commit, &index_commit, n, cell_log_domain, &proof.index_join,
+        &proof.index_join_out, &proof.index_reloc_subj, &proof.index_reloc_obj, proof.com_index, b"index",
+    )?;
+    verify_edge_bind(
+        &root, &digest, &c_commit, &value_commit, n, cell_log_domain, &proof.value_join,
+        &proof.value_join_out, &proof.value_reloc_subj, &proof.value_reloc_obj, proof.com_value, b"value",
+    )?;
+    verify_edge_bind(
+        &root, &digest, &c_commit, &type_commit, n, cell_log_domain, &proof.type_join,
+        &proof.type_join_out, &proof.type_reloc_subj, &proof.type_reloc_obj, proof.com_type, b"type",
+    )?;
+
+    // Type equality: rdf:type == sys:Array for EVERY cell (sys:Array id resolved over the chain).
+    let sys_array_id = resolve_combined_node_id(&views, SYS_ARRAY);
+    let type_commit_c = RelationCommit {
+        commitments: vec![proof.com_type],
+        log_domain: cell_log_domain,
+        n,
+    };
+    let array_constraint = RelationEqualityConstraint::ColumnConstant {
+        column: 0,
+        value: ArkFr::from_u64(sys_array_id),
+    };
+    let mut t_type = aw_transcript(&root, &digest, b"type-membership");
+    verify_relation_equality(
+        &type_commit_c, &array_constraint, &proof.type_equality_out, n, cell_log_domain,
+        &proof.type_equality, &mut t_type,
+    )?;
+
+    // (G) DENSITY + ORDER certificate over the combined range dict.
+    verify_density_order_reconciled(&views, verified.working_log, &root, &digest, proof, n, cell_log_domain)?;
+
+    // (9) Resolve the delivered ordered value column over the chain (binds value_ids to com_out).
+    if proof.value_ids.len() != n {
+        return Err(invalid("reconciled ordered-array-walk value id count mismatch"));
+    }
+    resolve_node_value_id_column(&views, &proof.value_ids, proof.com_out, proof.common_log_domain)
+}
+
+/// Verify the reconciled density+order certificate. Re-verifies the combined range dict against the
+/// root-bound per-layer branches, each relocation, the authenticated dict lookup, the datatype filter,
+/// and the permutation whose OUTPUT index column the verifier reconstructs as the public identity
+/// `[0..n-1]` (the density certificate). Mirrors [`prove_density_order_reconciled`] step for step.
+#[allow(clippy::too_many_arguments)]
+fn verify_density_order_reconciled(
+    views: &[crate::proof::VerifierCommitmentRef<'_>],
+    working_log: usize,
+    root: &ProofHash,
+    digest: &ProofHash,
+    proof: &OrderedArrayWalkReconciledProof,
+    n: usize,
+    cell_log_domain: usize,
+) -> io::Result<()> {
+    let mut t = aw_transcript(root, digest, b"density");
+
+    // (0) Re-verify the combined range dict against the root-bound per-layer branch commitments
+    // (the prover cannot substitute foreign branches).
+    let branches = range_dict_branch_commits(views)?;
+    let n_dict: usize = branches.iter().map(|branch| branch.n).sum();
+    verify_combined_range_dict(&branches, n_dict, working_log, &proof.range_dict, &mut t)?;
+    let dict_log_domain = working_log;
+    let common_log_domain = cell_log_domain.max(dict_log_domain);
+    if common_log_domain != proof.common_log_domain {
+        return Err(invalid("reconciled ordered-array-walk working domain mismatch"));
+    }
+
+    t.append_bytes(b"pow/array-walk/rows", &(n as u64).to_le_bytes());
+    t.append_bytes(b"pow/array-walk/common-log-domain", &(common_log_domain as u64).to_le_bytes());
+
+    // Relocations lifting the cell-aligned index/value columns and the combined dict columns UP.
+    verify_column_relocation(
+        &proof.com_index, cell_log_domain, &proof.com_index_at_d, common_log_domain,
+        &proof.reloc_index_at_d, &mut t,
+    )?;
+    verify_column_relocation(
+        &proof.com_value, cell_log_domain, &proof.com_value_at_d, common_log_domain,
+        &proof.reloc_value_at_d, &mut t,
+    )?;
+    verify_column_relocation(
+        &proof.range_dict.com_id_at_k, dict_log_domain, &proof.com_dict_id_at_d, common_log_domain,
+        &proof.reloc_dict_id, &mut t,
+    )?;
+    verify_column_relocation(
+        &proof.range_dict.com_value_at_k, dict_log_domain, &proof.com_dict_value_at_d, common_log_domain,
+        &proof.reloc_dict_value, &mut t,
+    )?;
+    verify_column_relocation(
+        &proof.range_dict.com_datatype_at_k, dict_log_domain, &proof.com_dict_datatype_at_d,
+        common_log_domain, &proof.reloc_dict_datatype, &mut t,
+    )?;
+
+    // Authenticate each index id -> (value, datatype) against the combined dict.
+    verify_dict_value_lookup(
+        &proof.com_index_at_d, &proof.com_dict_id_at_d, &proof.com_dict_value_at_d,
+        &proof.com_dict_datatype_at_d, n, n_dict, &proof.lookup, &mut t,
+    )?;
+
+    // Datatype completeness.
+    let expected_datatype = ArkFr::from_u64(INDEX_DATATYPE as u64);
+    verify_filter_indicator(
+        &proof.lookup.com_v_dt, expected_datatype, n, &proof.datatype_selection_commitment,
+        &proof.datatype_inverse_commitment, &proof.datatype_filter, &mut t,
+    )?;
+    let mut chi = vec![ArkFr::zero(); 1usize << common_log_domain];
+    chi[..n].fill(ArkFr::one());
+    if proof.datatype_selection_commitment != commit_column(&chi)? {
+        return Err(invalid(
+            "reconciled ordered-array-walk has a sys:index of the wrong datatype (not a decodable position)",
+        ));
+    }
+
+    // The density permutation: input [position(=v_val), value], output [identity, Out].
+    let input_commit = RelationCommit {
+        commitments: vec![proof.lookup.com_v_val, proof.com_value_at_d],
+        log_domain: common_log_domain,
+        n,
+    };
+    let com_identity = identity_commitment(n, common_log_domain)?;
+    verify_relation_permutation(
+        &input_commit,
+        &[com_identity, proof.com_out],
+        n,
+        common_log_domain,
+        &proof.order_perm,
+        &mut t,
+    )
 }

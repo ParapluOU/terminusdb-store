@@ -211,7 +211,13 @@ pub use delta_read::{
 // SHARED `ReconcileArtifacts`/transcript, never re-reconciling per leaf. Their logic is
 // untouched — only the visibility path widened.
 // ---------------------------------------------------------------------------
-use combined_dict::*;
+// `pub(crate)` glob so the reconciled `OrderedArrayWalk` (envelope 6d) can reach the `pub(crate)`
+// combined `(id, value, datatype)` RANGE-dict builders (`prove/verify_combined_range_dict`,
+// `range_dict_branches`/`range_dict_branch_commits`, `CombinedRangeDictBuilt`) it authenticates each
+// `sys:index` against; the `pub(super)` helpers (`prove/verify_combined_dict`, `CombinedDictBuilt`)
+// stay reconcile-local (a glob caps each name at its own visibility), so the external surface is
+// unchanged and the explicit `pub use combined_dict::CombinedRangeDictProof;` above still wins.
+pub(crate) use combined_dict::*;
 pub(crate) use present_bgp::*;
 use present_filter::*;
 use present_join::*;
