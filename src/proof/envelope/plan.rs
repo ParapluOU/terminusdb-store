@@ -441,15 +441,26 @@ pub enum TupleDisequalityNode {
     Constant(CanonicalObject),
 }
 
-/// One hop-pair disequality: drop the rows where stored edge `A = (a0, a1)` equals
-/// stored edge `B = (b0, b1)` under the (single, fixed) path predicate. `a0`/`b0` are
-/// the two hops' SUBJECT positions and `a1`/`b1` their OBJECT positions.
+/// One hop-pair disequality: drop the rows where stored edge `A` equals stored edge `B`. `a0`/`b0`
+/// are the two hops' SUBJECT positions and `a1`/`b1` their OBJECT positions (both in the WALK
+/// frame — an inverse hop swaps subject/object, the predicate is unchanged).
+///
+/// `predicate` selects the fingerprint arity, mirroring
+/// [`crate::proof::disequality::DisequalityPair`]:
+///   * `None` — the 2-column `(subject, object)` fold, for CONCRETE same-predicate finite repeats
+///     (the predicate is a compile-time constant identical across the hops and cancels out).
+///   * `Some((pa, pb))` — the 3-column FULL-TRIPLE `(subject, predicate, object)` fold, for hops
+///     with a FREE (wildcard `.`) predicate. Each predicate position is a `Predicate`-namespace
+///     COLUMN (a materialized wildcard predicate id) or a predicate-IRI CONSTANT (a concrete hop
+///     paired with a wildcard one). Faithful to `path.pl`'s `make_edge(subject, predicate, object)`
+///     edge identity; GENERALIZES the 2-column fold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TupleDisequalityPairPlan {
     pub a0: TupleDisequalityNode,
     pub a1: TupleDisequalityNode,
     pub b0: TupleDisequalityNode,
     pub b1: TupleDisequalityNode,
+    pub predicate: Option<(TupleDisequalityNode, TupleDisequalityNode)>,
 }
 
 pub(super) fn numeric_datatype(datatype: CanonicalDatatype) -> bool {
@@ -634,7 +645,8 @@ pub(super) fn validate_tuple_disequality_plan(
     if pairs.is_empty() {
         return Err(invalid("tuple disequality needs at least one hop-pair"));
     }
-    let check = |node: &TupleDisequalityNode| -> io::Result<()> {
+    // Subject/object positions live in the node/value namespace; a constant must be a node IRI.
+    let check_node = |node: &TupleDisequalityNode| -> io::Result<()> {
         match node {
             TupleDisequalityNode::Column(column) => {
                 let descriptor = descriptors
@@ -656,11 +668,41 @@ pub(super) fn validate_tuple_disequality_plan(
             }
         }
     };
+    // The full-triple PREDICATE position lives in the predicate namespace; a constant predicate is a
+    // node-IRI (resolved through the predicate dictionary at prove/verify time).
+    let check_predicate = |node: &TupleDisequalityNode| -> io::Result<()> {
+        match node {
+            TupleDisequalityNode::Column(column) => {
+                let descriptor = descriptors
+                    .get(*column)
+                    .ok_or_else(|| invalid("tuple disequality predicate column out of range"))?;
+                if descriptor.nullable {
+                    return Err(invalid(
+                        "tuple disequality cannot target a nullable predicate column",
+                    ));
+                }
+                if descriptor.namespace != ResultIdNamespace::Predicate {
+                    return Err(invalid(
+                        "tuple disequality predicate column must be a predicate namespace",
+                    ));
+                }
+                Ok(())
+            }
+            TupleDisequalityNode::Constant(CanonicalObject::Node(_)) => Ok(()),
+            TupleDisequalityNode::Constant(_) => {
+                Err(invalid("tuple disequality predicate constant must be a predicate IRI"))
+            }
+        }
+    };
     for pair in pairs {
-        check(&pair.a0)?;
-        check(&pair.a1)?;
-        check(&pair.b0)?;
-        check(&pair.b1)?;
+        check_node(&pair.a0)?;
+        check_node(&pair.a1)?;
+        check_node(&pair.b0)?;
+        check_node(&pair.b1)?;
+        if let Some((pa, pb)) = &pair.predicate {
+            check_predicate(pa)?;
+            check_predicate(pb)?;
+        }
     }
     Ok(())
 }
@@ -690,6 +732,28 @@ pub fn resolve_tuple_disequality_pairs(
             }
         }
     };
+    // A full-triple predicate position: a column carries verbatim; a predicate-IRI constant resolves
+    // through the PREDICATE dictionary (a not-present predicate maps to `predicate_count + 1` — an
+    // impossible id → fail-closed), mirroring `resolve` over the node/value dictionary.
+    let resolve_predicate = |node: &TupleDisequalityNode| -> DisequalityNode {
+        match node {
+            TupleDisequalityNode::Column(column) => DisequalityNode::Column(*column),
+            TupleDisequalityNode::Constant(CanonicalObject::Node(iri)) => {
+                let id = layer
+                    .predicate_catalog
+                    .iter()
+                    .find(|record| &record.triple.predicate == iri)
+                    .map(|record| record.predicate_id)
+                    .unwrap_or_else(|| layer.state.predicate_count.saturating_add(1));
+                DisequalityNode::Constant(ArkFr::from_u64(id))
+            }
+            // `validate_tuple_disequality_plan` already rejects a non-node predicate constant; this
+            // maps a would-be-invalid one to an impossible id rather than panicking (fail-closed).
+            TupleDisequalityNode::Constant(_) => {
+                DisequalityNode::Constant(ArkFr::from_u64(layer.state.predicate_count.saturating_add(1)))
+            }
+        }
+    };
     Ok(pairs
         .iter()
         .map(|pair| DisequalityPair {
@@ -697,6 +761,10 @@ pub fn resolve_tuple_disequality_pairs(
             a1: resolve(&pair.a1),
             b0: resolve(&pair.b0),
             b1: resolve(&pair.b1),
+            predicate: pair
+                .predicate
+                .as_ref()
+                .map(|(pa, pb)| (resolve_predicate(pa), resolve_predicate(pb))),
         })
         .collect())
 }

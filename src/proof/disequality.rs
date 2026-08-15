@@ -54,12 +54,16 @@
 //!   indicator is the exact `filter.rs` IsZero (claims A/B), the keep-complement is a
 //!   homomorphic commitment difference, and the compaction is the exact
 //!   `filter.rs` LogUp `prove_compaction_only`.
-//! * Predicate-BLIND per pair (the predicate id is identical across the hops sharing it
-//!   and cancels out of the fingerprint). This gadget never folds a predicate id in: the
-//!   COMPILER partitions a mixed-predicate repeat by predicate and emits a `(subject,
-//!   object)` disequality ONLY for same-predicate hop-pairs (different-predicate hops are
-//!   always distinct stored edges), so both single- and mixed-predicate repeats reduce to
-//!   this same gadget with no change.
+//! * Predicate-ARITY per pair. A [`DisequalityPair`] with `predicate == None` is the 2-column
+//!   `(subject, object)` fold: the predicate id is identical across the hops sharing it and cancels
+//!   out of the fingerprint, so the COMPILER partitions a CONCRETE mixed-predicate repeat by
+//!   predicate and emits this 2-column fold ONLY for same-predicate hop-pairs (different-predicate
+//!   hops are always distinct stored edges). A pair with `predicate == Some((pa, pb))` folds the
+//!   predicate id column in with a γ² coefficient — the FULL-TRIPLE `(subject, predicate, object)`
+//!   fold — for hops with a FREE (wildcard `.`) predicate, which cannot be statically partitioned.
+//!   The 3-column fold GENERALIZES the 2-column one (equal concrete predicate ⇒ γ² term vanishes;
+//!   differing concrete predicate ⇒ γ² term forces `Δ != 0`), so both reduce to the same
+//!   IsZero+compaction machinery with only the fold arity changing.
 //! * Its OWN transcript domain tag ([`TDQ_DOMAIN`]) so a disequality proof can never
 //!   be replayed as an equality (or any other) selection.
 
@@ -91,15 +95,31 @@ pub enum DisequalityNode {
     Constant(ArkFr),
 }
 
-/// One hop-pair disequality: drop the rows where stored edge `A = (a0, a1)` equals
-/// stored edge `B = (b0, b1)` (same fixed predicate). `a0`/`b0` are the two hops'
-/// SUBJECT positions and `a1`/`b1` their OBJECT positions.
+/// One hop-pair disequality: drop the rows where stored edge `A` equals stored edge `B`. `a0`/`b0`
+/// are the two hops' SUBJECT positions and `a1`/`b1` their OBJECT positions (both in the walk
+/// frame — see the compiler's `build_disequality_pairs`).
+///
+/// `predicate` selects the fingerprint ARITY:
+///   * `None` (the 2-column `(subject, object)` fold) — two hops share a stored edge iff their
+///     subject AND object coincide. Used for CONCRETE same-predicate finite repeats (P5a), where
+///     the predicate is a compile-time constant identical across the hops and cancels out of the
+///     fingerprint, so folding it in is unnecessary.
+///   * `Some((pa, pb))` (the 3-column `(subject, predicate, object)` FULL-TRIPLE fold) — two hops
+///     share a stored edge iff their subject AND predicate AND object coincide. Used whenever a hop
+///     has a FREE (wildcard `.`) predicate: two wildcard hops cannot be partitioned by a
+///     compile-time predicate, so the predicate id column (`pa`/`pb`) must be folded into the
+///     fingerprint with a γ² coefficient. This GENERALIZES the 2-column fold: for two concrete
+///     same-predicate hops `pa == pb` is an equal constant (γ² term vanishes) and for concrete
+///     different-predicate hops `pa != pb` forces `Δ != 0` unconditionally (always distinct), so a
+///     3-column pair reproduces P5a's per-predicate partition exactly. Faithful to `path.pl`'s
+///     edge identity `make_edge(subject, predicate, object)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DisequalityPair {
     pub a0: DisequalityNode,
     pub a1: DisequalityNode,
     pub b0: DisequalityNode,
     pub b1: DisequalityNode,
+    pub predicate: Option<(DisequalityNode, DisequalityNode)>,
 }
 
 /// One sequential filter stage's proof (one hop-pair): the IsZero indicator over the
@@ -161,6 +181,10 @@ fn validate_pairs(pairs: &[DisequalityPair], arity: usize) -> io::Result<()> {
         check(&pair.a1)?;
         check(&pair.b0)?;
         check(&pair.b1)?;
+        if let Some((pa, pb)) = &pair.predicate {
+            check(pa)?;
+            check(pb)?;
+        }
     }
     Ok(())
 }
@@ -203,12 +227,25 @@ fn bind_stage(
     for reference in [&pair.a0, &pair.a1, &pair.b0, &pair.b1] {
         node(transcript, reference);
     }
+    // Bind the full-triple predicate positions ONLY when present, so a 2-column pair's transcript is
+    // byte-identical to before this generalization (P5a unbroken) while a 3-column pair draws γ over a
+    // distinct statement (a 2-column proof can never be replayed as a 3-column one, or vice versa).
+    if let Some((pa, pb)) = &pair.predicate {
+        transcript.append_bytes(b"pow/tuple-diseq/pred", &[1]);
+        node(transcript, pa);
+        node(transcript, pb);
+    }
 }
 
 /// Accumulate the RLC-fold predicate coefficients + constant offset for one pair at a
 /// drawn `γ`. Returns `(coeffs_by_column, offset)` where the predicate column is
 /// `P_i = Σ coeffs[c]·col_c[i]` and the IsZero constant is `pred = -offset` (so
 /// `P_i == pred  ⇔  Δ_i == 0`).
+///
+/// The fingerprint difference is `Δ = (a0−b0) + γ·(a1−b1) [+ γ²·(pa−pb)]`, where the γ² predicate
+/// term is present iff `pair.predicate` is `Some` (the full-triple fold). Schwartz–Zippel: `Δ == 0`
+/// iff every coordinate difference is zero (subject, object, and — for a 3-column pair — predicate),
+/// except with probability ≤ deg(Δ)/|F| ≤ 2/|F|.
 fn fold_pair(pair: &DisequalityPair, gamma: ArkFr) -> (BTreeMap<usize, ArkFr>, ArkFr) {
     let mut coeffs: BTreeMap<usize, ArkFr> = BTreeMap::new();
     let mut offset = ArkFr::zero();
@@ -228,6 +265,12 @@ fn fold_pair(pair: &DisequalityPair, gamma: ArkFr) -> (BTreeMap<usize, ArkFr>, A
     add(&pair.b0, ArkFr::zero() - one, &mut coeffs, &mut offset);
     add(&pair.a1, gamma, &mut coeffs, &mut offset);
     add(&pair.b1, ArkFr::zero() - gamma, &mut coeffs, &mut offset);
+    if let Some((pa, pb)) = &pair.predicate {
+        // γ² weight for the predicate id column (walk-frame predicate, unchanged by orientation).
+        let gamma2 = gamma * gamma;
+        add(pa, gamma2, &mut coeffs, &mut offset);
+        add(pb, ArkFr::zero() - gamma2, &mut coeffs, &mut offset);
+    }
     (coeffs, offset)
 }
 
@@ -487,6 +530,7 @@ mod tests {
             a1: DisequalityNode::Column(1),
             b0: DisequalityNode::Column(1),
             b1: DisequalityNode::Column(2),
+            predicate: None,
         }
     }
 
@@ -570,6 +614,7 @@ mod tests {
             a1: DisequalityNode::Column(0),
             b0: DisequalityNode::Column(0),
             b1: DisequalityNode::Column(1),
+            predicate: None,
         }];
         let result = prove_tuple_disequality(&relation, &pairs, &mut transcript()).unwrap();
         verify_tuple_disequality(
@@ -601,9 +646,9 @@ mod tests {
         let relation = RelationWitness::commit(vec![x0, x1, x2, x3], 3).unwrap();
         let col = DisequalityNode::Column;
         let pairs = [
-            DisequalityPair { a0: col(0), a1: col(1), b0: col(1), b1: col(2) }, // e0,e1
-            DisequalityPair { a0: col(0), a1: col(1), b0: col(2), b1: col(3) }, // e0,e2
-            DisequalityPair { a0: col(1), a1: col(2), b0: col(2), b1: col(3) }, // e1,e2
+            DisequalityPair { a0: col(0), a1: col(1), b0: col(1), b1: col(2), predicate: None }, // e0,e1
+            DisequalityPair { a0: col(0), a1: col(1), b0: col(2), b1: col(3), predicate: None }, // e0,e2
+            DisequalityPair { a0: col(1), a1: col(2), b0: col(2), b1: col(3), predicate: None }, // e1,e2
         ];
         let result = prove_tuple_disequality(&relation, &pairs, &mut transcript()).unwrap();
         verify_tuple_disequality(
@@ -619,6 +664,126 @@ mod tests {
         assert_eq!(result.n, 1);
         assert_eq!(result.columns[0][0], fr(1));
         assert_eq!(result.columns[3][0], fr(4));
+    }
+
+    // A 2-hop WILDCARD relation over columns [s0, p0, mid, p1, o1]:
+    //   edge0 walk = (s0=col0, o0=mid=col2), predicate p0=col1
+    //   edge1 walk = (mid=col2, o1=col4),    predicate p1=col3
+    // The full-triple pair drops rows where s0==mid AND mid==o1 AND p0==p1 — the SAME stored edge
+    // (a,p,a) traversed twice — but KEEPS a row whose (s,o) coincide yet whose PREDICATE differs.
+    fn pair_full_triple() -> DisequalityPair {
+        DisequalityPair {
+            a0: DisequalityNode::Column(0),
+            a1: DisequalityNode::Column(2),
+            b0: DisequalityNode::Column(2),
+            b1: DisequalityNode::Column(4),
+            predicate: Some((DisequalityNode::Column(1), DisequalityNode::Column(3))),
+        }
+    }
+
+    #[test]
+    fn full_triple_disequality_drops_full_edge_reuse_and_keeps_predicate_difference() {
+        // Rows (s0, p0, mid, p1, o1):
+        //   A (1,5,1,5,1)  s0==mid==o1, p0==p1  -> SAME stored edge (a,5,a) twice     -> DROP
+        //   B (1,5,1,6,1)  s0==mid==o1 but p0!=p1 -> (a,5,a) then (a,6,a): distinct    -> KEEP
+        //   C (1,5,2,5,3)  mid differs -> two distinct edges                          -> KEEP
+        //   D (2,5,1,5,1)  s0 != mid -> not the same edge                             -> KEEP
+        let s0 = vec![fr(1), fr(1), fr(1), fr(2)];
+        let p0 = vec![fr(5), fr(5), fr(5), fr(5)];
+        let mid = vec![fr(1), fr(1), fr(2), fr(1)];
+        let p1 = vec![fr(5), fr(6), fr(5), fr(5)];
+        let o1 = vec![fr(1), fr(1), fr(3), fr(1)];
+        let relation = RelationWitness::commit(vec![s0, p0, mid, p1, o1], 4).unwrap();
+        let pairs = [pair_full_triple()];
+
+        let result = prove_tuple_disequality(&relation, &pairs, &mut transcript()).unwrap();
+        verify_tuple_disequality(
+            &relation.view(),
+            &pairs,
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut transcript(),
+        )
+        .unwrap();
+
+        // Exactly the three non-full-reuse rows (B, C, D) survive; the full-triple reuse row A drops.
+        assert_eq!(result.n, 3, "only the same-subject-predicate-object reuse row is dropped");
+        // Row B survived (the (s,o)-coincident but predicate-differing row): its p1 is 6, mid is 1.
+        assert_eq!(result.columns[0][..3], [fr(1), fr(1), fr(2)]);
+        assert_eq!(result.columns[3][..3], [fr(6), fr(5), fr(5)], "predicate-difference row kept");
+        assert_eq!(result.columns[2][..3], [fr(1), fr(2), fr(1)]);
+    }
+
+    #[test]
+    fn two_column_pair_ignores_predicate_and_would_drop_the_predicate_difference_row() {
+        // The SAME rows as above, but a 2-column (predicate-BLIND) pair drops on (s,o) alone: rows A
+        // AND B both collapse (s0==mid==o1), so ONLY C and D survive. This contrasts the 3-column fold
+        // (which keeps B) with the 2-column fold (which cannot distinguish B's differing predicate) —
+        // exactly why a wildcard multi-hop needs the full-triple arity.
+        let s0 = vec![fr(1), fr(1), fr(1), fr(2)];
+        let p0 = vec![fr(5), fr(5), fr(5), fr(5)];
+        let mid = vec![fr(1), fr(1), fr(2), fr(1)];
+        let p1 = vec![fr(5), fr(6), fr(5), fr(5)];
+        let o1 = vec![fr(1), fr(1), fr(3), fr(1)];
+        let relation = RelationWitness::commit(vec![s0, p0, mid, p1, o1], 4).unwrap();
+        let pairs = [DisequalityPair {
+            a0: DisequalityNode::Column(0),
+            a1: DisequalityNode::Column(2),
+            b0: DisequalityNode::Column(2),
+            b1: DisequalityNode::Column(4),
+            predicate: None,
+        }];
+        let result = prove_tuple_disequality(&relation, &pairs, &mut transcript()).unwrap();
+        verify_tuple_disequality(
+            &relation.view(),
+            &pairs,
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut transcript(),
+        )
+        .unwrap();
+        assert_eq!(result.n, 2, "2-column fold drops BOTH (s,o)-coincident rows A and B");
+    }
+
+    #[test]
+    fn full_triple_pair_with_predicate_constant_matches_a_mixed_concrete_hop() {
+        // The MIXED `Sequence([., p])` shape: hop0's predicate is a wildcard COLUMN, hop1's is the
+        // concrete CONSTANT id 5. Drop iff s0==mid AND mid==o1 AND p0(col1)==5. Same rows as above:
+        //   A (p0=5) -> 5==5 & full self-loop -> DROP;  B (p0=5, but p1=6 unused) -> still full reuse
+        //   on (s,o,p0==5)? Row B has p0=5 too, so with predicate = (col1=p0) vs const 5, B's p0==5
+        //   -> B DROPS here (its hop0 predicate matches the constant). Only C, D survive.
+        let s0 = vec![fr(1), fr(1), fr(1), fr(2)];
+        let p0 = vec![fr(5), fr(5), fr(5), fr(5)];
+        let mid = vec![fr(1), fr(1), fr(2), fr(1)];
+        let p1 = vec![fr(5), fr(6), fr(5), fr(5)];
+        let o1 = vec![fr(1), fr(1), fr(3), fr(1)];
+        let relation = RelationWitness::commit(vec![s0, p0, mid, p1, o1], 4).unwrap();
+        // Predicate positions: hop0 = wildcard column p0 (col1); hop1 = concrete constant id 5.
+        let pairs = [DisequalityPair {
+            a0: DisequalityNode::Column(0),
+            a1: DisequalityNode::Column(2),
+            b0: DisequalityNode::Column(2),
+            b1: DisequalityNode::Column(4),
+            predicate: Some((DisequalityNode::Column(1), DisequalityNode::Constant(fr(5)))),
+        }];
+        let result = prove_tuple_disequality(&relation, &pairs, &mut transcript()).unwrap();
+        verify_tuple_disequality(
+            &relation.view(),
+            &pairs,
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut transcript(),
+        )
+        .unwrap();
+        // A and B (both s0==mid==o1 with p0==5==const) drop; C (mid differs) and D (s0 differs) keep.
+        assert_eq!(result.n, 2);
+        assert_eq!(result.columns[0][..2], [fr(1), fr(2)]);
     }
 
     #[test]
