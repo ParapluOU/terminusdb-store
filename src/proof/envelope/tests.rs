@@ -2463,11 +2463,17 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         RelationProofPlan {
             query_digest: digest,
             kind: RelationProofPlanKind::TransitiveClosurePairs {
-                edge: LayerBgpPlan {
-                    source: ColumnSource::Materialized,
-                    atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
-                    joins: Vec::new(),
-                },
+                // The single-predicate pairs edge is a `Bgp` leaf carrying the closure's own digest as its
+                // identity tag (the pairs closure edge is now a general `RelationProofPlan`) — byte-identical
+                // to the previous `closure_edge_plan(edge, digest)` wrapping.
+                edge: Box::new(RelationProofPlan {
+                    query_digest: digest,
+                    kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                        source: ColumnSource::Materialized,
+                        atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
+                        joins: Vec::new(),
+                    }),
+                }),
                 inverted,
             },
         }

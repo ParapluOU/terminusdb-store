@@ -324,13 +324,21 @@ pub enum RelationProofPlanKind {
     /// `Distinct([x,y])` collapses the bag (a shortest walk repeats no edge, so edge-simple ≥1-hop
     /// reachability = transitive reachability). The compiler emits this node ONLY under that gate.
     TransitiveClosurePairs {
-        /// The edge relation `E = Triple(?s, edge_predicate, ?o)`, a 2-column [subject, object] BGP.
-        /// Proven ONCE and reused by commitment across the seed, every round, and the fixpoint.
-        edge: LayerBgpPlan,
+        /// The edge relation `E`: any 2-column [start, end] (both NodeValue) authenticated relation, NOT
+        /// just a single-predicate `Triple(?s, p, ?o)` BGP. For a single predicate it is a
+        /// `Bgp(Triple(?s, p, ?o))`; for a DERIVED all-pairs edge — an all-pairs WILDCARD `.` closure or
+        /// a COMPOUND `(p|q)+` / `(p/q)+` body (W1) — it is the projected/deduped derived relation. The
+        /// pairs closure driver is source-agnostic over `E`: it takes it BY COMMITMENT (proven ONCE via
+        /// `prove_bounded`, then reused across the seed, every round, and the fixpoint), so ONLY what `E`
+        /// *is* changes for a derived edge — the semi-naive round/fixpoint machinery is byte-identical.
+        /// The compiler-side digest binds `E`'s full structure, so all-pairs-`p` / all-pairs-`.` /
+        /// all-pairs-`(p|q)` are non-interchangeable.
+        edge: Box<RelationProofPlan>,
         /// Traversal direction over `E`. `false` walks `subject -> object` (`A_0 = (subject, object)`,
         /// round join `A_k.dst == E.subject`, extend by `E.object`); `true` walks the INVERSE edge
         /// (`A_0 = (object, subject)`, round join `A_k.dst == E.object`, extend by `E.subject`) — this
-        /// is how an inverse-predicate closure is mirrored.
+        /// is how an inverse-predicate closure is mirrored. (A DERIVED edge bakes orientation into its own
+        /// structure, so the compiler emits `inverted = false` for it.)
         inverted: bool,
     },
     /// Authenticated ORDERED walk of one `rdf:List` value: given a BOUND subject node `S` and a
@@ -1294,12 +1302,16 @@ impl RelationProofPlan {
                 ))
             }
             RelationProofPlanKind::TransitiveClosurePairs { edge, .. } => {
-                // The edge relation must be exactly a 2-column [subject, object] node/value BGP (same
-                // K-INDEPENDENT shape guard as the single-seed closure), so `A_k.dst == E.<start>`
-                // joins are namespace-compatible across rounds and the delivered pairs are two node
-                // columns. Anything else rejects closed here, identically for prover and verifier.
-                let edge_descriptors = crate::proof::query::result_column_descriptors(edge)?;
-                if crate::proof::query::has_ground_result_unit(edge)
+                // The edge relation must deliver exactly a 2-column [start, end] node/value relation (same
+                // K-INDEPENDENT shape guard as the single-seed closure), so `A_k.dst == E.<start>` joins
+                // are namespace-compatible across rounds and the delivered pairs are two node columns. A
+                // single-predicate edge is a `Bgp(Triple(?s, p, ?o))`; a DERIVED all-pairs edge (wildcard
+                // `.` / compound) is a projected/deduped node relation — either way its `result_shape` must
+                // be two nonnullable NodeValue columns. Anything else (a ground unit, a generated column, a
+                // wrong arity) rejects closed here — the shape is K-INDEPENDENT, so this validates
+                // identically for prover and verifier, and it recursively validates the whole edge subtree.
+                let (edge_descriptors, edge_ground) = edge.result_shape()?;
+                if edge_ground
                     || edge_descriptors.len() != 2
                     || edge_descriptors.iter().any(|descriptor| {
                         descriptor.nullable

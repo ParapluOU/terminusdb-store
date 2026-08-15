@@ -380,18 +380,6 @@ pub struct TransitiveClosurePairsFixpoint {
 // for one step can never be replayed as another.
 // ============================================================================
 
-/// The K-independent `edge` BGP child plan `E = Triple(?s, p, ?o)`. The edge child reuses the
-/// closure's OWN query digest as its identity tag: it is the closure's single Bgp sub-relation, bound
-/// to its concrete plan separately by `plan_digest(edge)` at the leaf, so the shared tag is a harmless
-/// identity and — crucially — lets a caller reconstruct the edge envelope from the closure digest with
-/// NO per-K or per-closure-internal information (the K-INDEPENDENT reconstruction property).
-pub(super) fn closure_edge_plan(edge: &LayerBgpPlan, closure_digest: ProofHash) -> RelationProofPlan {
-    RelationProofPlan {
-        query_digest: closure_digest,
-        kind: RelationProofPlanKind::Bgp(edge.clone()),
-    }
-}
-
 /// A fresh transcript for one closure operator call, domain-separated so no sub-proof is fungible
 /// with another. Both prover and verifier build this identically.
 pub(super) fn closure_transcript(root: &ProofHash, digest: &ProofHash, step: u64, role: &[u8]) -> Transcript254 {
@@ -2141,7 +2129,7 @@ impl RecursiveRelationEnvelope {
         context: &StoreProverContext<'_>,
         layer: &LayerCommitment,
         plan: &RelationProofPlan,
-        edge: &LayerBgpPlan,
+        edge: &RelationProofPlan,
         inverted: bool,
         depth: usize,
         nodes: &mut usize,
@@ -2149,9 +2137,13 @@ impl RecursiveRelationEnvelope {
         let root = layer.state.commitment_root;
         let digest = plan.query_digest;
 
-        // (1) Prove the edge relation E ONCE; reuse (by commitment) in every round and the fixpoint.
-        let edge_plan = closure_edge_plan(edge, digest);
-        let edge_env = Self::prove_bounded(context, layer, &edge_plan, depth + 1, nodes)?;
+        // (1) Prove the edge relation E ONCE. `E` is a general authenticated 2-column relation (a
+        //     single-predicate `Bgp`, or a DERIVED all-pairs edge — a wildcard/compound projected join);
+        //     the pairs closure is SOURCE-AGNOSTIC over it, taking it BY COMMITMENT and reusing it in the
+        //     seed, every round, and the fixpoint. The edge plan carries its own K-INDEPENDENT query digest
+        //     (the compiler binds `E`'s structure into the closure digest), so the verifier reconstructs it
+        //     from its own trusted query.
+        let edge_env = Self::prove_bounded(context, layer, edge, depth + 1, nodes)?;
         let edge_witness = edge_env.relation_witness(None)?;
 
         // (2)-(4) seed (A_0 = deduped one-hop pairs) + rounds + empty-delta fixpoint.
@@ -3150,7 +3142,7 @@ impl RecursiveRelationEnvelope {
         layer: &impl VerifierLayer,
         expected_root: ProofHash,
         plan: &RelationProofPlan,
-        edge: &LayerBgpPlan,
+        edge: &RelationProofPlan,
         inverted: bool,
         edge_env: &RecursiveRelationEnvelope,
         seed: &TransitiveClosurePairsSeed,
@@ -3162,9 +3154,10 @@ impl RecursiveRelationEnvelope {
         let root = expected_root;
         let digest = plan.query_digest;
 
-        // (1) Verify the ONE edge relation E, then extract its commitment for reuse everywhere.
-        let edge_plan = closure_edge_plan(edge, digest);
-        edge_env.verify_bounded(layer, expected_root, &edge_plan, depth + 1, nodes)?;
+        // (1) Verify the ONE edge relation E (a general 2-column authenticated relation — single predicate
+        //     or a DERIVED all-pairs edge), then extract its commitment for reuse everywhere. The edge plan
+        //     carries its own K-INDEPENDENT digest, reconstructed from the trusted query.
+        edge_env.verify_bounded(layer, expected_root, edge, depth + 1, nodes)?;
         let edge_commit = edge_env.relation_commit(None)?;
 
         // (2)-(5) The seed + rounds + fixpoint replay over the 2-column accumulator.
