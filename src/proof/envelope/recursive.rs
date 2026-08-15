@@ -229,6 +229,23 @@ pub enum RecursiveRelationProof {
         rounds: Vec<TransitiveClosureRound>,
         fixpoint: TransitiveClosureFixpoint,
     },
+    /// Bounded semi-naive ALL-PAIRS transitive closure (`path(?x, plus(p), ?y)`, both endpoints
+    /// free). Same composite discipline as [`Self::TransitiveClosure`], but the accumulator is a
+    /// 2-column pairs relation `A ⊆ (src, dst)` rather than a 1-column reachable set: `edge` is the
+    /// ONE authenticated edge relation `E` (proven once, reused by commitment), `seed` establishes
+    /// `A_0 = Distinct([src,dst], π(E))` (the direction-projected one-hop pairs), `rounds` extend each
+    /// known pair by one edge and dedup on the FULL 2-tuple, and `fixpoint` is the empty-delta
+    /// anti-join over BOTH columns proving `A_K` is closed under right-extension. The delivered result
+    /// of THIS envelope is the 2-column pairs relation `A_K`. PLUS-ONLY — there is no reflexive/star
+    /// variant here (see `plan_transitive_closure_path`: all-pairs `star` is reject-closed because
+    /// `path.pl`'s both-free identity branch `X = Y` is a single UNBOUND row, not a domain diagonal).
+    /// See [`RelationProofPlanKind::TransitiveClosurePairs`].
+    TransitiveClosurePairs {
+        edge: Box<RecursiveRelationEnvelope>,
+        seed: TransitiveClosurePairsSeed,
+        rounds: Vec<TransitiveClosurePairsRound>,
+        fixpoint: TransitiveClosurePairsFixpoint,
+    },
     /// Authenticated ordered `rdf:List` walk (ReadDocument increment 1). All sub-proofs — the four
     /// authenticated child relations (anchor, closure, `rdf:rest` edges, `rdf:first` edges) and the
     /// gluing gadgets (strip-nil anti-join, walk permutation, rest/first inner-joins + relocations,
@@ -302,6 +319,55 @@ pub struct TransitiveClosureFixpoint {
     /// `LeftAnti(inner, A_K, [(object=1, node=0)])`; the verifier asserts its output length is 0.
     pub anti: LeftAntiJoinProof,
     /// The (canonically empty) anti-join output commitments; arity matches `inner` (2 columns).
+    pub anti_out: Vec<ArkGT>,
+}
+
+/// How the ALL-PAIRS base `A_0 ⊆ (src, dst)` is established: `A_0 = Distinct([src,dst], π(E))` — the
+/// direction-projected one-hop pairs of the committed edge relation `E`, deduped on the full 2-tuple.
+/// PLUS-only, so there is NO reflexive variant (unlike [`TransitiveClosureSeed`]).
+#[derive(Clone, Debug)]
+pub struct TransitiveClosurePairsSeed {
+    /// `Distinct(π_direction(E), [0, 1])` proving `pairs` are exactly the deduped edge pairs. Its
+    /// INPUT is the direction-projected 2-column `E` (a reordering of `E`'s authenticated columns —
+    /// forward `[subject, object]`, inverted `[object, subject]`), so no fresh commitment is needed.
+    pub distinct: RelationDistinctProof,
+    /// `A_0` as resolved `(src, dst)` node ids; the verifier commits these to obtain `A_0`'s commitment.
+    pub pairs: Vec<(u64, u64)>,
+}
+
+/// One ALL-PAIRS accumulate-and-dedupe round
+/// `A_{k+1} = Distinct([src,dst], BagUnion(A_k, π_{src,ext}(InnerJoin(A_k, E))))`. Chained by
+/// COMMITMENT exactly like [`TransitiveClosureRound`], but every relation is 2-column.
+#[derive(Clone, Debug)]
+pub struct TransitiveClosurePairsRound {
+    /// `InnerJoin(A_k, E)` on `A_k.dst == E.<edge-start>`; output schema `[src, dst, ext]` (3 columns).
+    pub inner: InnerJoinProof,
+    /// The InnerJoin output commitments `[src, dst, ext]`.
+    pub inner_out: Vec<ArkGT>,
+    /// `BagUnion(A_k, π_{src,ext}(inner))`; output is a 2-column bag `[src, dst]`.
+    pub union: BagUnionProof,
+    /// The BagUnion output commitments `[src, dst]`.
+    pub union_out: Vec<ArkGT>,
+    /// `Distinct(union, [0, 1])` proving `next_pairs` are exactly the deduped 2-tuple union.
+    pub distinct: RelationDistinctProof,
+    /// `A_{k+1}` as resolved `(src, dst)` node ids; the verifier commits these to obtain `A_{k+1}`.
+    pub next_pairs: Vec<(u64, u64)>,
+}
+
+/// The ALL-PAIRS empty-delta fixpoint certificate: `LeftAnti(π_{src,ext}(InnerJoin(A_K, E)), A_K)` on
+/// `[(src==src), (ext==dst)]` has ZERO rows — every one-edge right-extension of a pair in `A_K` is
+/// already in `A_K`. Together with monotonicity (`A_0 ⊆ … ⊆ A_K`) and soundness (`A_K ⊆` the ≥1-hop
+/// closure) this proves `A_K` is exactly the transitive closure over 2-tuples. This is what makes a
+/// CYCLE terminate.
+#[derive(Clone, Debug)]
+pub struct TransitiveClosurePairsFixpoint {
+    /// `InnerJoin(A_K, E)`; output schema `[src, dst, ext]` (3 columns).
+    pub inner: InnerJoinProof,
+    /// The InnerJoin output commitments `[src, dst, ext]`.
+    pub inner_out: Vec<ArkGT>,
+    /// `LeftAnti(π_{src,ext}(inner), A_K, [(0,0), (1,1)])`; the verifier asserts its output length is 0.
+    pub anti: LeftAntiJoinProof,
+    /// The (canonically empty) anti-join output commitments; arity matches the pairs relation (2 columns).
     pub anti_out: Vec<ArkGT>,
 }
 // ============================================================================
@@ -792,6 +858,371 @@ pub(super) fn verify_closure_rounds(
         &join_commit,
         &accumulator_commit,
         &[(1, 0)],
+        &fixpoint.anti_out,
+        0,
+        anti_log,
+        &fixpoint.anti,
+        &mut t_anti,
+    )?;
+
+    Ok(accumulator_rows)
+}
+
+// ============================================================================
+// Bounded ALL-PAIRS transitive-closure orchestration helpers (2-column accumulator).
+//
+// Same discipline as the single-seed helpers above — reuse the audited InnerJoin/BagUnion/Distinct/
+// LeftAnti cores UNCHANGED, thread each round by COMMITMENT, one fresh domain-separated transcript per
+// operator call — but the accumulator is a 2-column pairs relation `A ⊆ (src, dst)`.
+// ============================================================================
+
+/// The verifier-side commitment of a pairs accumulator delivered as public `(src, dst)` node ids,
+/// padded EXACTLY as [`prove_relation_distinct_with_context`] pads its two-key output, so this equals
+/// the commitment the prover threaded forward.
+pub(super) fn closure_pairs_commit(pairs: &[(u64, u64)]) -> io::Result<RelationCommit> {
+    let log_domain = pairs.len().max(1).next_power_of_two().max(2).trailing_zeros() as usize;
+    let size = 1usize << log_domain;
+    let mut src: Vec<ArkFr> = pairs.iter().map(|(s, _)| ArkFr::from_u64(*s)).collect();
+    let mut dst: Vec<ArkFr> = pairs.iter().map(|(_, d)| ArkFr::from_u64(*d)).collect();
+    src.resize(size, ArkFr::zero());
+    dst.resize(size, ArkFr::zero());
+    Ok(RelationCommit {
+        commitments: vec![commit_column(&src)?, commit_column(&dst)?],
+        log_domain,
+        n: pairs.len(),
+    })
+}
+
+/// The direction-projected 2-column base `π(E)` for the ALL-PAIRS seed (prover side). Forward
+/// `A_0 = (subject, object)`; inverted `A_0 = (object, subject)` — a REORDERING of `E`'s already
+/// authenticated columns/commitments, so no fresh commitment is engaged.
+pub(super) fn closure_pairs_seed_input(edge: &RelationWitness, inverted: bool) -> io::Result<RelationWitness> {
+    if edge.columns.len() != 2 || edge.commitments.len() != 2 {
+        return Err(invalid("all-pairs closure edge must be a [subject, object] relation"));
+    }
+    let (a, b) = if inverted { (1, 0) } else { (0, 1) };
+    Ok(RelationWitness {
+        columns: vec![edge.columns[a].clone(), edge.columns[b].clone()],
+        commitments: vec![edge.commitments[a], edge.commitments[b]],
+        log_domain: edge.log_domain,
+        n: edge.n,
+    })
+}
+
+/// The direction-projected 2-column base commitment for the ALL-PAIRS seed (verifier side); mirrors
+/// [`closure_pairs_seed_input`] over the authenticated edge commitment.
+pub(super) fn closure_pairs_seed_input_commit(edge: &RelationCommit, inverted: bool) -> io::Result<RelationCommit> {
+    if edge.commitments.len() != 2 {
+        return Err(invalid("all-pairs closure edge must be a [subject, object] relation"));
+    }
+    let (a, b) = if inverted { (1, 0) } else { (0, 1) };
+    Ok(RelationCommit {
+        commitments: vec![edge.commitments[a], edge.commitments[b]],
+        log_domain: edge.log_domain,
+        n: edge.n,
+    })
+}
+
+/// The `[src, ext]` extended-pair branch of an `InnerJoin(A, E)` result (schema `[src, dst, ext]`):
+/// columns 0 and 2 (the accumulator's own `src` and the edge's far endpoint), the pair extended by one hop.
+pub(super) fn closure_pairs_extended_branch(inner: &InnerJoinResult) -> io::Result<RelationWitness> {
+    if inner.columns.len() != 3 || inner.commitments.len() != 3 {
+        return Err(invalid("all-pairs closure inner join must yield [src, dst, ext]"));
+    }
+    Ok(RelationWitness {
+        columns: vec![inner.columns[0].clone(), inner.columns[2].clone()],
+        commitments: vec![inner.commitments[0], inner.commitments[2]],
+        log_domain: inner.log_domain,
+        n: inner.n,
+    })
+}
+
+/// The deduped `(src, dst)` pair SET of a 2-column relation witness (prover side), preserving first
+/// occurrence order.
+pub(super) fn closure_pairs_distinct(witness: &RelationWitness) -> io::Result<Vec<(u64, u64)>> {
+    if witness.columns.len() != 2 {
+        return Err(invalid("all-pairs closure pairs relation must have two columns"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for i in 0..witness.n {
+        let s = closure_field_node_id(witness.columns[0][i])?;
+        let d = closure_field_node_id(witness.columns[1][i])?;
+        if seen.insert((s, d)) {
+            out.push((s, d));
+        }
+    }
+    Ok(out)
+}
+
+/// Wrap flat `(src, dst)` pairs as two-column distinct rows for [`prove_relation_distinct_with_context`]
+/// / [`verify_relation_distinct`].
+pub(super) fn closure_pairs_rows(pairs: &[(u64, u64)]) -> Vec<Vec<u64>> {
+    pairs.iter().map(|(s, d)| vec![*s, *d]).collect()
+}
+
+/// The seed + rounds + fixpoint of a bounded ALL-PAIRS semi-naive transitive closure. Mirrors
+/// [`prove_closure_rounds`] but every relation is 2-column and PLUS-only (no reflexive seed).
+pub(super) struct ClosurePairsRoundsWitness {
+    pub seed: TransitiveClosurePairsSeed,
+    pub accumulator: RelationWitness,
+    pub rounds: Vec<TransitiveClosurePairsRound>,
+    pub fixpoint: TransitiveClosurePairsFixpoint,
+}
+
+pub(super) fn prove_closure_pairs_rounds(
+    context: &StoreProverContext<'_>,
+    edge_witness: &RelationWitness,
+    root: ProofHash,
+    digest: ProofHash,
+    inverted: bool,
+    nodes: &mut usize,
+) -> io::Result<ClosurePairsRoundsWitness> {
+    // Forward joins `A_k.dst == E.subject` (edge col 0); inverted joins `A_k.dst == E.object` (col 1).
+    let edge_key = usize::from(inverted);
+
+    // A_0 = Distinct([src,dst], π_direction(E)): the deduped one-hop pairs.
+    let seed_input = closure_pairs_seed_input(edge_witness, inverted)?;
+    let seed_pairs = closure_pairs_distinct(&seed_input)?;
+    let mut t_seed = closure_transcript(&root, &digest, 0, b"pairs-seed-distinct");
+    let seed_distinct = prove_relation_distinct_with_context(
+        context, &seed_input, &[0, 1], &closure_pairs_rows(&seed_pairs), &mut t_seed,
+    )?;
+    let mut accumulator = closure_distinct_witness(&seed_distinct);
+    let mut accumulator_pairs: std::collections::BTreeSet<(u64, u64)> =
+        seed_pairs.iter().copied().collect();
+    let seed = TransitiveClosurePairsSeed {
+        distinct: seed_distinct.proof,
+        pairs: seed_pairs,
+    };
+
+    let mut rounds: Vec<TransitiveClosurePairsRound> = Vec::new();
+    let fixpoint = loop {
+        if *nodes >= MAX_RELATION_PROOF_NODES {
+            return Err(invalid("all-pairs closure proving exceeds structural node limit"));
+        }
+        *nodes += 1;
+        let step = rounds.len() as u64;
+
+        // step = InnerJoin(A_k, E) on (A_k.dst == E.<start>) -> [src, dst, ext].
+        let mut t_inner = closure_transcript(&root, &digest, step, b"pairs-step-inner");
+        let inner = prove_inner_join_with_keys_and_context(
+            context, &accumulator, edge_witness, &[(1, edge_key)], &mut t_inner,
+        )?;
+        let extended = closure_pairs_extended_branch(&inner)?;
+        let extended_pairs = closure_pairs_distinct(&extended)?;
+
+        if extended_pairs.iter().all(|pair| accumulator_pairs.contains(pair)) {
+            // FIXPOINT: every one-edge right-extension of A_k is already present. The anti-join of the
+            // extended pairs against A_k (on the FULL 2-tuple) is empty -> A_k is closed.
+            let mut t_anti = closure_transcript(&root, &digest, step, b"pairs-fix-anti");
+            let anti = prove_left_anti_join_with_keys_and_context(
+                context, &extended, &accumulator, &[(0, 0), (1, 1)], &mut t_anti,
+            )?;
+            if anti.n != 0 {
+                return Err(invalid(
+                    "all-pairs closure fixpoint anti-join is unexpectedly nonempty",
+                ));
+            }
+            break TransitiveClosurePairsFixpoint {
+                inner: inner.proof,
+                inner_out: inner.commitments,
+                anti: anti.proof,
+                anti_out: anti.commitments,
+            };
+        }
+
+        if rounds.len() >= MAX_TRANSITIVE_CLOSURE_ROUNDS {
+            return Err(invalid(
+                "all-pairs closure frontier is deeper than the round budget (reject closed)",
+            ));
+        }
+
+        // A_{k+1} = Distinct(BagUnion(A_k, extended-pairs), [0, 1]).
+        let mut t_union = closure_transcript(&root, &digest, step, b"pairs-round-union");
+        let union = prove_bag_union_with_context(
+            context,
+            &[accumulator.clone(), extended],
+            &mut t_union,
+        )?;
+        let union_witness = closure_union_witness(&union);
+        let next_pairs = closure_pairs_distinct(&union_witness)?;
+        let mut t_distinct = closure_transcript(&root, &digest, step, b"pairs-round-distinct");
+        let distinct = prove_relation_distinct_with_context(
+            context, &union_witness, &[0, 1], &closure_pairs_rows(&next_pairs), &mut t_distinct,
+        )?;
+        accumulator = closure_distinct_witness(&distinct);
+        accumulator_pairs = next_pairs.iter().copied().collect();
+        rounds.push(TransitiveClosurePairsRound {
+            inner: inner.proof,
+            inner_out: inner.commitments,
+            union: union.proof,
+            union_out: union.commitments,
+            distinct: distinct.proof,
+            next_pairs,
+        });
+    };
+
+    Ok(ClosurePairsRoundsWitness {
+        seed,
+        accumulator,
+        rounds,
+        fixpoint,
+    })
+}
+
+/// The verifier mirror of [`prove_closure_pairs_rounds`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_closure_pairs_rounds(
+    edge_commit: &RelationCommit,
+    root: ProofHash,
+    digest: ProofHash,
+    inverted: bool,
+    seed: &TransitiveClosurePairsSeed,
+    rounds: &[TransitiveClosurePairsRound],
+    fixpoint: &TransitiveClosurePairsFixpoint,
+    nodes: &mut usize,
+) -> io::Result<Vec<(u64, u64)>> {
+    let edge_key = usize::from(inverted);
+
+    // Verify one `InnerJoin(A, E) -> [src, dst, ext]` and return (join commit, extended-branch commit).
+    let verify_inner = |left: &RelationCommit,
+                        inner_proof: &InnerJoinProof,
+                        inner_out: &[ArkGT],
+                        step: u64,
+                        role: &[u8]|
+     -> io::Result<(RelationCommit, RelationCommit)> {
+        if inner_out.len() != 3 {
+            return Err(invalid("all-pairs closure inner join output arity must be 3"));
+        }
+        let j_len = inner_proof.anti.join_len;
+        let j_log = inner_proof.anti.join.num_vars();
+        let mut transcript = closure_transcript(&root, &digest, step, role);
+        verify_inner_join_with_keys(
+            left,
+            edge_commit,
+            &[(1, edge_key)],
+            inner_out,
+            j_len,
+            j_log,
+            inner_proof,
+            &mut transcript,
+        )?;
+        let join_commit = RelationCommit {
+            commitments: inner_out.to_vec(),
+            log_domain: j_log,
+            n: j_len,
+        };
+        let extended_commit = RelationCommit {
+            commitments: vec![inner_out[0], inner_out[2]],
+            log_domain: j_log,
+            n: j_len,
+        };
+        Ok((join_commit, extended_commit))
+    };
+
+    // A_0 = Distinct([src,dst], π_direction(E)).
+    let seed_input_commit = closure_pairs_seed_input_commit(edge_commit, inverted)?;
+    let mut t_seed = closure_transcript(&root, &digest, 0, b"pairs-seed-distinct");
+    verify_relation_distinct(
+        &seed_input_commit,
+        &[0, 1],
+        &closure_pairs_rows(&seed.pairs),
+        &seed.distinct,
+        &mut t_seed,
+    )?;
+    let mut accumulator_pairs: std::collections::BTreeSet<(u64, u64)> =
+        std::collections::BTreeSet::new();
+    for pair in &seed.pairs {
+        if !accumulator_pairs.insert(*pair) {
+            return Err(invalid("all-pairs closure seed contains a duplicate pair"));
+        }
+    }
+    let mut accumulator_commit = closure_pairs_commit(&seed.pairs)?;
+    let mut accumulator_rows = seed.pairs.clone();
+
+    // Replay each accumulate-and-dedupe round against the SAME E and the previous accumulator.
+    for (step, round) in rounds.iter().enumerate() {
+        if *nodes >= MAX_RELATION_PROOF_NODES {
+            return Err(invalid(
+                "all-pairs closure verification exceeds structural node limit",
+            ));
+        }
+        *nodes += 1;
+        let step = step as u64;
+        let (_join, extended_commit) = verify_inner(
+            &accumulator_commit,
+            &round.inner,
+            &round.inner_out,
+            step,
+            b"pairs-step-inner",
+        )?;
+
+        if round.union_out.len() != 2 {
+            return Err(invalid("all-pairs closure union output arity must be 2"));
+        }
+        let union_len = accumulator_commit
+            .n
+            .checked_add(extended_commit.n)
+            .ok_or_else(|| invalid("all-pairs closure union length overflow"))?;
+        let union_log = round.union.sumcheck.round_polys.len();
+        let mut t_union = closure_transcript(&root, &digest, step, b"pairs-round-union");
+        verify_bag_union(
+            &[accumulator_commit.clone(), extended_commit],
+            &round.union_out,
+            union_len,
+            union_log,
+            &round.union,
+            &mut t_union,
+        )?;
+        let union_commit = RelationCommit {
+            commitments: round.union_out.clone(),
+            log_domain: union_log,
+            n: union_len,
+        };
+
+        let mut t_distinct = closure_transcript(&root, &digest, step, b"pairs-round-distinct");
+        verify_relation_distinct(
+            &union_commit,
+            &[0, 1],
+            &closure_pairs_rows(&round.next_pairs),
+            &round.distinct,
+            &mut t_distinct,
+        )?;
+
+        // Defensive monotonicity over the FULL 2-tuple: no duplicate pair, every prior pair survives.
+        let next_ids: std::collections::BTreeSet<(u64, u64)> =
+            round.next_pairs.iter().copied().collect();
+        if next_ids.len() != round.next_pairs.len() {
+            return Err(invalid("all-pairs closure round produced a duplicate pair"));
+        }
+        if !accumulator_pairs.iter().all(|pair| next_ids.contains(pair)) {
+            return Err(invalid("all-pairs closure round dropped a prior reachable pair"));
+        }
+
+        accumulator_commit = closure_pairs_commit(&round.next_pairs)?;
+        accumulator_pairs = next_ids;
+        accumulator_rows = round.next_pairs.clone();
+    }
+
+    // Empty-delta fixpoint: LeftAnti(π(InnerJoin(A_K, E)), A_K) on [(0,0),(1,1)] has 0 rows.
+    let step = rounds.len() as u64;
+    let (_join, extended_commit) = verify_inner(
+        &accumulator_commit,
+        &fixpoint.inner,
+        &fixpoint.inner_out,
+        step,
+        b"pairs-step-inner",
+    )?;
+    if fixpoint.anti_out.len() != extended_commit.commitments.len() {
+        return Err(invalid("all-pairs closure fixpoint anti-join output arity mismatch"));
+    }
+    let anti_log = fixpoint.anti.join.num_vars();
+    let mut t_anti = closure_transcript(&root, &digest, step, b"pairs-fix-anti");
+    verify_left_anti_join_with_keys(
+        &extended_commit,
+        &accumulator_commit,
+        &[(0, 0), (1, 1)],
         &fixpoint.anti_out,
         0,
         anti_log,
@@ -1628,6 +2059,11 @@ impl RecursiveRelationEnvelope {
                     context, layer, plan, edge, seed, *reflexive, *inverted, depth, nodes,
                 )
             }
+            RelationProofPlanKind::TransitiveClosurePairs { edge, inverted } => {
+                Self::prove_transitive_closure_pairs(
+                    context, layer, plan, edge, *inverted, depth, nodes,
+                )
+            }
             RelationProofPlanKind::OrderedListWalk { subject, predicate } => {
                 super::list_walk::prove_ordered_list_walk(
                     context, layer, plan, subject, predicate, depth, nodes,
@@ -1689,6 +2125,58 @@ impl RecursiveRelationEnvelope {
             },
             vec![commitment],
             vec![column],
+            accumulator.log_domain,
+            n,
+        )
+    }
+
+    /// Prove a bounded ALL-PAIRS semi-naive transitive closure (`path(?x, plus(p), ?y)`, both free).
+    /// Delivers the 2-column reachable-pairs relation `A_K`. See
+    /// [`RelationProofPlanKind::TransitiveClosurePairs`].
+    #[allow(clippy::too_many_arguments)]
+    fn prove_transitive_closure_pairs(
+        context: &StoreProverContext<'_>,
+        layer: &LayerCommitment,
+        plan: &RelationProofPlan,
+        edge: &LayerBgpPlan,
+        inverted: bool,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> io::Result<Self> {
+        let root = layer.state.commitment_root;
+        let digest = plan.query_digest;
+
+        // (1) Prove the edge relation E ONCE; reuse (by commitment) in every round and the fixpoint.
+        let edge_plan = closure_edge_plan(edge, digest);
+        let edge_env = Self::prove_bounded(context, layer, &edge_plan, depth + 1, nodes)?;
+        let edge_witness = edge_env.relation_witness(None)?;
+
+        // (2)-(4) seed (A_0 = deduped one-hop pairs) + rounds + empty-delta fixpoint.
+        let ClosurePairsRoundsWitness {
+            seed,
+            accumulator,
+            rounds,
+            fixpoint,
+        } = prove_closure_pairs_rounds(context, &edge_witness, root, digest, inverted, nodes)?;
+
+        // (5) Deliver A_K = the 2-column reachable-pairs relation [src, dst].
+        let n = accumulator.n;
+        let columns = vec![
+            accumulator.columns[0][..n].to_vec(),
+            accumulator.columns[1][..n].to_vec(),
+        ];
+        let commitments = accumulator.commitments.clone();
+        Self::finish_proved(
+            layer,
+            plan,
+            RecursiveRelationProof::TransitiveClosurePairs {
+                edge: Box::new(edge_env),
+                seed,
+                rounds,
+                fixpoint,
+            },
+            commitments,
+            columns,
             accumulator.log_domain,
             n,
         )
@@ -2520,6 +3008,51 @@ impl RecursiveRelationEnvelope {
                 }
             }
             (
+                RecursiveRelationProof::TransitiveClosurePairs {
+                    edge: edge_env,
+                    seed,
+                    rounds,
+                    fixpoint,
+                },
+                RelationProofPlanKind::TransitiveClosurePairs { edge, inverted },
+            ) => {
+                let expected_pairs = self.verify_transitive_closure_pairs(
+                    layer,
+                    expected_root,
+                    plan,
+                    edge,
+                    *inverted,
+                    edge_env,
+                    seed,
+                    rounds,
+                    fixpoint,
+                    depth,
+                    nodes,
+                )?;
+                // The delivered relation must be exactly A_K (the reachable pairs), in the order the
+                // proof's final round committed it, over BOTH columns. Length, columns, and domain are
+                // cross-checked here; the shared tail then binds the commitments to these columns and
+                // resolves the ids to node IRIs against the trusted dictionary.
+                let expected_log = expected_pairs
+                    .len()
+                    .max(1)
+                    .next_power_of_two()
+                    .max(2)
+                    .trailing_zeros() as usize;
+                let expected_src: Vec<ArkFr> =
+                    expected_pairs.iter().map(|(s, _)| ArkFr::from_u64(*s)).collect();
+                let expected_dst: Vec<ArkFr> =
+                    expected_pairs.iter().map(|(_, d)| ArkFr::from_u64(*d)).collect();
+                if self.result_len != expected_pairs.len()
+                    || self.result_log_domain != expected_log
+                    || self.result_columns != vec![expected_src, expected_dst]
+                {
+                    return Err(invalid(
+                        "all-pairs closure delivered relation is not the proven reachable pairs set",
+                    ));
+                }
+            }
+            (
                 RecursiveRelationProof::OrderedListWalk(walk),
                 RelationProofPlanKind::OrderedListWalk { subject, predicate },
             ) => {
@@ -2602,6 +3135,37 @@ impl RecursiveRelationEnvelope {
         // (3)-(5) The SOURCE-AGNOSTIC seed + rounds + fixpoint replay (shared with the reconciled closure).
         verify_closure_rounds(
             &edge_commit, seed_id, root, digest, reflexive, inverted, seed, rounds, fixpoint, nodes,
+        )
+    }
+
+    /// Verify a bounded ALL-PAIRS semi-naive transitive closure and return the reachable `(src, dst)`
+    /// set the delivered relation must equal. Mirrors [`Self::verify_transitive_closure`] over 2 columns.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_transitive_closure_pairs(
+        &self,
+        layer: &impl VerifierLayer,
+        expected_root: ProofHash,
+        plan: &RelationProofPlan,
+        edge: &LayerBgpPlan,
+        inverted: bool,
+        edge_env: &RecursiveRelationEnvelope,
+        seed: &TransitiveClosurePairsSeed,
+        rounds: &[TransitiveClosurePairsRound],
+        fixpoint: &TransitiveClosurePairsFixpoint,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> io::Result<Vec<(u64, u64)>> {
+        let root = expected_root;
+        let digest = plan.query_digest;
+
+        // (1) Verify the ONE edge relation E, then extract its commitment for reuse everywhere.
+        let edge_plan = closure_edge_plan(edge, digest);
+        edge_env.verify_bounded(layer, expected_root, &edge_plan, depth + 1, nodes)?;
+        let edge_commit = edge_env.relation_commit(None)?;
+
+        // (2)-(5) The seed + rounds + fixpoint replay over the 2-column accumulator.
+        verify_closure_pairs_rounds(
+            &edge_commit, root, digest, inverted, seed, rounds, fixpoint, nodes,
         )
     }
 
@@ -2911,6 +3475,21 @@ impl RecursiveRelationEnvelope {
                 rounds.put(out)?;
                 fixpoint.put(out)?;
             }
+            RecursiveRelationProof::TransitiveClosurePairs {
+                edge,
+                seed,
+                rounds,
+                fixpoint,
+            } => {
+                25u8.put(out)?;
+                if rounds.len() > MAX_TRANSITIVE_CLOSURE_ROUNDS {
+                    return Err(invalid("too many all-pairs transitive-closure rounds"));
+                }
+                edge.put_bounded(out, depth + 1, nodes)?;
+                seed.put(out)?;
+                rounds.put(out)?;
+                fixpoint.put(out)?;
+            }
             RecursiveRelationProof::OrderedListWalk(walk) => {
                 23u8.put(out)?;
                 walk.put_bounded(out, depth, nodes)?;
@@ -3008,6 +3587,21 @@ impl RecursiveRelationEnvelope {
                 }
                 let fixpoint = TransitiveClosureFixpoint::get(reader)?;
                 RecursiveRelationProof::TransitiveClosure {
+                    edge,
+                    seed,
+                    rounds,
+                    fixpoint,
+                }
+            }
+            25 => {
+                let edge = Box::new(Self::get_bounded(reader, depth + 1, nodes)?);
+                let seed = TransitiveClosurePairsSeed::get(reader)?;
+                let rounds = Vec::<TransitiveClosurePairsRound>::get(reader)?;
+                if rounds.len() > MAX_TRANSITIVE_CLOSURE_ROUNDS {
+                    return Err(invalid("too many all-pairs transitive-closure rounds"));
+                }
+                let fixpoint = TransitiveClosurePairsFixpoint::get(reader)?;
+                RecursiveRelationProof::TransitiveClosurePairs {
                     edge,
                     seed,
                     rounds,

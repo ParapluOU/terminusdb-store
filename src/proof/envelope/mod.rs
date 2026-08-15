@@ -106,6 +106,7 @@ pub use left_outer::LeftOuterJoinEnvelope;
 
 pub use recursive::{
     RecursiveRelationEnvelope, RecursiveRelationProof, TransitiveClosureFixpoint,
+    TransitiveClosurePairsFixpoint, TransitiveClosurePairsRound, TransitiveClosurePairsSeed,
     TransitiveClosureRound, TransitiveClosureSeed,
 };
 

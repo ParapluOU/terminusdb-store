@@ -302,6 +302,30 @@ pub enum RelationProofPlanKind {
         /// changes is the InnerJoin key column on `E`; every other operator is direction-agnostic.
         inverted: bool,
     },
+    /// Bounded ALL-PAIRS transitive closure (`path(?x, plus(p), ?y)`, both endpoints free), delivering
+    /// the exact 2-column reachability relation `[src, dst]` (every pair connected by ≥1 `p`-edge).
+    ///
+    /// Same COMPOSITE discipline as [`Self::TransitiveClosure`] — a `K`-INDEPENDENT plan node over the
+    /// audited `InnerJoin`/`BagUnion`/`Distinct`/`LeftAnti` cores, NO new cryptographic gadget — but the
+    /// accumulator is a 2-column pairs relation rather than a 1-column reachable set. PLUS-ONLY: there is
+    /// no reflexive/star variant, because `path.pl`'s both-free `star` identity branch (`X = Y`,
+    /// path.pl:183) yields a single UNBOUND row, NOT a domain diagonal — so the compiler reject-closes
+    /// all-pairs `star` rather than fabricate a diagonal the reference never returns.
+    ///
+    /// Faithful to `path.pl` as a SET closure: the reference's both-free `plus` enumerates the
+    /// edge-simple BAG of endpoint pairs, which equals this pairs SET exactly once the surrounding
+    /// `Distinct([x,y])` collapses the bag (a shortest walk repeats no edge, so edge-simple ≥1-hop
+    /// reachability = transitive reachability). The compiler emits this node ONLY under that gate.
+    TransitiveClosurePairs {
+        /// The edge relation `E = Triple(?s, edge_predicate, ?o)`, a 2-column [subject, object] BGP.
+        /// Proven ONCE and reused by commitment across the seed, every round, and the fixpoint.
+        edge: LayerBgpPlan,
+        /// Traversal direction over `E`. `false` walks `subject -> object` (`A_0 = (subject, object)`,
+        /// round join `A_k.dst == E.subject`, extend by `E.object`); `true` walks the INVERSE edge
+        /// (`A_0 = (object, subject)`, round join `A_k.dst == E.object`, extend by `E.subject`) — this
+        /// is how an inverse-predicate closure is mirrored.
+        inverted: bool,
+    },
     /// Authenticated ORDERED walk of one `rdf:List` value: given a BOUND subject node `S` and a
     /// bound list-valued predicate `P`, deliver the list's elements `E[0..K]` IN ORDER as one
     /// nonnullable NodeValue column (ReadDocument increment 1). This is a COMPOSITE ORCHESTRATION
@@ -1256,6 +1280,39 @@ impl RelationProofPlan {
                         namespace: ResultIdNamespace::NodeValue,
                         nullable: false,
                     }],
+                    false,
+                ))
+            }
+            RelationProofPlanKind::TransitiveClosurePairs { edge, .. } => {
+                // The edge relation must be exactly a 2-column [subject, object] node/value BGP (same
+                // K-INDEPENDENT shape guard as the single-seed closure), so `A_k.dst == E.<start>`
+                // joins are namespace-compatible across rounds and the delivered pairs are two node
+                // columns. Anything else rejects closed here, identically for prover and verifier.
+                let edge_descriptors = crate::proof::query::result_column_descriptors(edge)?;
+                if crate::proof::query::has_ground_result_unit(edge)
+                    || edge_descriptors.len() != 2
+                    || edge_descriptors.iter().any(|descriptor| {
+                        descriptor.nullable
+                            || descriptor.namespace != ResultIdNamespace::NodeValue
+                    })
+                {
+                    return Err(invalid(
+                        "all-pairs closure edge must be a two-column node/value triple relation",
+                    ));
+                }
+                // The delivered relation is the 2-column reachability relation: two nonnullable
+                // NodeValue columns [src, dst].
+                Ok((
+                    vec![
+                        ResultColumnDescriptor {
+                            namespace: ResultIdNamespace::NodeValue,
+                            nullable: false,
+                        },
+                        ResultColumnDescriptor {
+                            namespace: ResultIdNamespace::NodeValue,
+                            nullable: false,
+                        },
+                    ],
                     false,
                 ))
             }

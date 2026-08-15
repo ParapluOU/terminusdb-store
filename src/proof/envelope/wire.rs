@@ -22,7 +22,10 @@
 //! module and imported below.
 #![allow(unused_imports)]
 
-use super::recursive::{TransitiveClosureFixpoint, TransitiveClosureRound, TransitiveClosureSeed};
+use super::recursive::{
+    TransitiveClosureFixpoint, TransitiveClosurePairsFixpoint, TransitiveClosurePairsRound,
+    TransitiveClosurePairsSeed, TransitiveClosureRound, TransitiveClosureSeed,
+};
 use std::convert::{TryFrom, TryInto};
 use std::io::{self, Cursor};
 
@@ -530,6 +533,16 @@ wire_struct!(TransitiveClosureRound {
     next_rows
 });
 wire_struct!(TransitiveClosureFixpoint { inner, inner_out, anti, anti_out });
+wire_struct!(TransitiveClosurePairsRound {
+    inner,
+    inner_out,
+    union,
+    union_out,
+    distinct,
+    next_pairs
+});
+wire_struct!(TransitiveClosurePairsFixpoint { inner, inner_out, anti, anti_out });
+wire_struct!(TransitiveClosurePairsSeed { distinct, pairs });
 impl Wire for TransitiveClosureSeed {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
         match self {

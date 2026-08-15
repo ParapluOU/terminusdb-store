@@ -2452,6 +2452,138 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
             .unwrap();
     }
 
+    // ---- Bounded ALL-PAIRS transitive closure (2-column pairs reachability) ----
+
+    fn closure_pairs_plan_dir(predicate: &str, inverted: bool, digest: [u8; 32]) -> RelationProofPlan {
+        RelationProofPlan {
+            query_digest: digest,
+            kind: RelationProofPlanKind::TransitiveClosurePairs {
+                edge: LayerBgpPlan {
+                    source: ColumnSource::Materialized,
+                    atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
+                    joins: Vec::new(),
+                },
+                inverted,
+            },
+        }
+    }
+
+    fn closure_pairs_result_set(
+        env: &RecursiveRelationEnvelope,
+    ) -> std::collections::BTreeSet<(String, String)> {
+        let node = |value: &CanonicalResultValue| match value {
+            CanonicalResultValue::Object(CanonicalObject::Node(bytes)) => {
+                String::from_utf8(bytes.clone()).unwrap()
+            }
+            other => panic!("unexpected closure result value {other:?}"),
+        };
+        env.result_values[0]
+            .iter()
+            .zip(&env.result_values[1])
+            .map(|(x, y)| (node(x), node(y)))
+            .collect()
+    }
+
+    fn iri_pairs(pairs: &[(&str, &str)]) -> std::collections::BTreeSet<(String, String)> {
+        pairs.iter().map(|(x, y)| (iri(x), iri(y))).collect()
+    }
+
+    fn assert_all_pairs_closure_end_to_end() {
+        // 3-cycle a -> b -> c -> a plus a feeder d -> a (d lies on no cycle). The closure must
+        // TERMINATE (empty-delta fixpoint) despite the cycle.
+        let layer = closure_layer(&[
+            ("a", "p", "b"),
+            ("b", "p", "c"),
+            ("c", "p", "a"),
+            ("d", "p", "a"),
+        ]);
+        let root = layer.state.commitment_root;
+
+        let plus = closure_pairs_plan_dir("p", false, [9u8; 32]);
+        let env = RecursiveRelationEnvelope::prove(&layer, &plus).unwrap();
+        env.verify(&layer, root, &plus).unwrap();
+        // a, b, c each reach every node of the cycle INCLUDING themselves (via the 3-cycle); d reaches
+        // {a, b, c} but not itself (no path returns to d). 12 pairs.
+        let forward = iri_pairs(&[
+            ("a", "a"), ("a", "b"), ("a", "c"),
+            ("b", "a"), ("b", "b"), ("b", "c"),
+            ("c", "a"), ("c", "b"), ("c", "c"),
+            ("d", "a"), ("d", "b"), ("d", "c"),
+        ]);
+        assert_eq!(closure_pairs_result_set(&env), forward);
+
+        // Wire round-trip still verifies (exercises the tag-25 put/get).
+        let bytes = env.encode().unwrap();
+        RecursiveRelationEnvelope::decode(&bytes)
+            .unwrap()
+            .verify(&layer, root, &plus)
+            .unwrap();
+
+        // INVERSE all-pairs = the TRANSPOSE of the forward relation: (x, y) iff y reaches x forward.
+        let inverse_plan = closure_pairs_plan_dir("p", true, [10u8; 32]);
+        let inverse_env = RecursiveRelationEnvelope::prove(&layer, &inverse_plan).unwrap();
+        inverse_env.verify(&layer, root, &inverse_plan).unwrap();
+        let inverse = iri_pairs(&[
+            ("a", "a"), ("a", "b"), ("a", "c"),
+            ("b", "a"), ("b", "b"), ("b", "c"),
+            ("c", "a"), ("c", "b"), ("c", "c"),
+            ("a", "d"), ("b", "d"), ("c", "d"),
+        ]);
+        assert_eq!(closure_pairs_result_set(&inverse_env), inverse);
+        // Forward and inverse are distinct plans (distinct digests): proofs are not interchangeable.
+        assert!(inverse_env.verify(&layer, root, &plus).is_err());
+        assert!(env.verify(&layer, root, &inverse_plan).is_err());
+
+        // ---- Soundness negatives ----
+
+        // (i) A TRUNCATED (non-converged) closure: drop the last round so the delivered accumulator is
+        // A_{K-1} while the fixpoint was proven over A_K. The fixpoint inner join binds A_K's commitment
+        // at a step index that no longer matches -> reject.
+        let mut truncated = env.clone();
+        if let RecursiveRelationProof::TransitiveClosurePairs { rounds, .. } = &mut truncated.proof {
+            assert!(!rounds.is_empty(), "the cyclic graph needs >= 1 round");
+            rounds.pop();
+        } else {
+            panic!("expected an all-pairs closure proof");
+        }
+        assert!(truncated.verify(&layer, root, &plus).is_err());
+
+        // (ii) A SPURIOUS pair injected into the final round's set: it never came from an authenticated
+        // InnerJoin, so the round's 2-column Distinct proof no longer covers the tampered rows -> reject.
+        let mut spurious = env.clone();
+        if let RecursiveRelationProof::TransitiveClosurePairs { rounds, .. } = &mut spurious.proof {
+            rounds.last_mut().unwrap().next_pairs.push((999_998, 999_999));
+        }
+        assert!(spurious.verify(&layer, root, &plus).is_err());
+
+        // (iii) A DROPPED genuine reachable pair from the delivered result (recommit both columns) no
+        // longer equals the proven reachable-pairs set -> reject.
+        let mut tampered = env.clone();
+        tampered.result_columns[0].pop();
+        tampered.result_columns[1].pop();
+        tampered.result_len -= 1;
+        tampered.result_values[0].pop();
+        tampered.result_values[1].pop();
+        let redomain = 1usize << tampered.result_log_domain;
+        for col in 0..2 {
+            let mut column = tampered.result_columns[col].clone();
+            column.resize(redomain, ArkFr::zero());
+            tampered.result_commitments[col] = commit_column(&column).unwrap();
+        }
+        assert!(tampered.verify(&layer, root, &plus).is_err());
+    }
+
+    #[test]
+    fn all_pairs_transitive_closure_cycle_and_soundness() {
+        std::thread::Builder::new()
+            .name("all-pairs-closure-proof".into())
+            .stack_size(128 * 1024 * 1024)
+            .spawn(assert_all_pairs_closure_end_to_end)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     // -----------------------------------------------------------------------
     // Ordered rdf:List walk (ReadDocument increment 1).
     // -----------------------------------------------------------------------
