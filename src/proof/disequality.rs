@@ -54,9 +54,12 @@
 //!   indicator is the exact `filter.rs` IsZero (claims A/B), the keep-complement is a
 //!   homomorphic commitment difference, and the compaction is the exact
 //!   `filter.rs` LogUp `prove_compaction_only`.
-//! * Single predicate ONLY (the predicate id is identical across hops and cancels out
-//!   of the fingerprint). Mixed-predicate repeats fold the predicate id into the
-//!   fingerprint and are handled by a later pass; the compiler rejects them closed.
+//! * Predicate-BLIND per pair (the predicate id is identical across the hops sharing it
+//!   and cancels out of the fingerprint). This gadget never folds a predicate id in: the
+//!   COMPILER partitions a mixed-predicate repeat by predicate and emits a `(subject,
+//!   object)` disequality ONLY for same-predicate hop-pairs (different-predicate hops are
+//!   always distinct stored edges), so both single- and mixed-predicate repeats reduce to
+//!   this same gadget with no change.
 //! * Its OWN transcript domain tag ([`TDQ_DOMAIN`]) so a disequality proof can never
 //!   be replayed as an equality (or any other) selection.
 
