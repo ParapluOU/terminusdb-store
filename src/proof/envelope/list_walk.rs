@@ -180,10 +180,18 @@ fn edge_relation_plan(digest: ProofHash, predicate: &[u8], role: &[u8]) -> Relat
 
 /// The reflexive `rdf:rest` transitive closure seeded at the anchored `head`.
 fn closure_plan(digest: ProofHash, head: &CanonicalObject) -> RelationProofPlan {
+    // The closure edge is now a general `RelationProofPlan` (the closure driver is source-agnostic over
+    // it). For this single-predicate `rdf:rest` edge it is a `Bgp` leaf carrying the closure's OWN
+    // query digest as its identity tag — byte-identical to the previous `closure_edge_plan(edge_bgp,
+    // closure_digest)` wrapping, so the reconstructed edge envelope is unchanged.
+    let closure_digest = child_digest(&digest, b"closure");
     RelationProofPlan {
-        query_digest: child_digest(&digest, b"closure"),
+        query_digest: closure_digest,
         kind: RelationProofPlanKind::TransitiveClosure {
-            edge: edge_bgp(RDF_REST),
+            edge: Box::new(RelationProofPlan {
+                query_digest: closure_digest,
+                kind: RelationProofPlanKind::Bgp(edge_bgp(RDF_REST)),
+            }),
             seed: head.clone(),
             reflexive: true,
             inverted: false,

@@ -2086,7 +2086,7 @@ impl RecursiveRelationEnvelope {
         context: &StoreProverContext<'_>,
         layer: &LayerCommitment,
         plan: &RelationProofPlan,
-        edge: &LayerBgpPlan,
+        edge: &RelationProofPlan,
         seed: &CanonicalObject,
         reflexive: bool,
         inverted: bool,
@@ -2096,10 +2096,13 @@ impl RecursiveRelationEnvelope {
         let root = layer.state.commitment_root;
         let digest = plan.query_digest;
 
-        // (1) Prove the edge relation E ONCE (source-specific: a materialized single-layer BGP leaf).
-        //     Reused (by commitment) in every round and the fixpoint.
-        let edge_plan = closure_edge_plan(edge, digest);
-        let edge_env = Self::prove_bounded(context, layer, &edge_plan, depth + 1, nodes)?;
+        // (1) Prove the edge relation E ONCE. `E` is a general authenticated 2-column relation (a
+        //     single-predicate `Bgp`, or a compound derived edge — a deduped bag-union / projected
+        //     join); the closure is SOURCE-AGNOSTIC over it, taking it BY COMMITMENT and reusing it in
+        //     every round and the fixpoint. The edge plan carries its own K-INDEPENDENT query digest
+        //     (the compiler binds `E`'s structure into the closure digest), so the verifier reconstructs
+        //     it from its own trusted query.
+        let edge_env = Self::prove_bounded(context, layer, edge, depth + 1, nodes)?;
         let edge_witness = edge_env.relation_witness(None)?;
 
         // (2) Resolve the constant seed `a` (source-specific: single-layer dictionary).
@@ -3110,7 +3113,7 @@ impl RecursiveRelationEnvelope {
         layer: &impl VerifierLayer,
         expected_root: ProofHash,
         plan: &RelationProofPlan,
-        edge: &LayerBgpPlan,
+        edge: &RelationProofPlan,
         seed_obj: &CanonicalObject,
         reflexive: bool,
         inverted: bool,
@@ -3124,9 +3127,10 @@ impl RecursiveRelationEnvelope {
         let root = expected_root;
         let digest = plan.query_digest;
 
-        // (1) Verify the ONE edge relation E, then extract its commitment for reuse everywhere.
-        let edge_plan = closure_edge_plan(edge, digest);
-        edge_env.verify_bounded(layer, expected_root, &edge_plan, depth + 1, nodes)?;
+        // (1) Verify the ONE edge relation E (a general 2-column authenticated relation — single
+        //     predicate or a compound derived edge), then extract its commitment for reuse everywhere.
+        //     The edge plan carries its own K-INDEPENDENT digest, reconstructed from the trusted query.
+        edge_env.verify_bounded(layer, expected_root, edge, depth + 1, nodes)?;
         let edge_commit = edge_env.relation_commit(None)?;
 
         // (2) Reconstruct the constant seed `{a}` from the trusted seed node (single-layer dictionary).

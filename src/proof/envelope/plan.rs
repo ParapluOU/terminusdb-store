@@ -287,9 +287,16 @@ pub enum RelationProofPlanKind {
     /// collapses the bag to a set (an endpoint `Distinct`/`Count`). The compiler therefore emits this
     /// node ONLY under such a gate; bare `star`/`plus` rejects closed.
     TransitiveClosure {
-        /// The edge relation `E = Triple(?s, edge_predicate, ?o)`, a 2-column [subject, object] BGP
-        /// (both NodeValue). Proven ONCE and reused by commitment across every round and the fixpoint.
-        edge: LayerBgpPlan,
+        /// The edge relation `E`: any 2-column [start, end] (both NodeValue) authenticated relation,
+        /// NOT just a single-predicate `Triple(?s, p, ?o)` BGP. For a single predicate it is a
+        /// `Bgp(Triple(?s, p, ?o))`; for a COMPOUND closure body (`(p|q)`, `(p/q)`) it is the derived
+        /// edge relation — a deduped bag-union of the branch edges (`(p|q)`), or the two-atom join
+        /// projected to its (start, end) endpoints (`(p/q)`). The store closure driver is
+        /// source-agnostic over `E`: it takes it BY COMMITMENT (proven ONCE via `prove_bounded`, then
+        /// reused across every round and the fixpoint), so ONLY what `E` *is* changes for a compound
+        /// body — the semi-naive round/fixpoint machinery is byte-identical. The compiler-side digest
+        /// binds `E`'s full structure, so `(p/q)+` / `(p|q)+` / single-predicate are non-interchangeable.
+        edge: Box<RelationProofPlan>,
         /// The bound seed node (a node IRI); resolved to its dictionary id at prove/verify.
         seed: CanonicalObject,
         /// `true` = `star` (the identity branch `X = Y` unconditionally succeeds, so the seed itself is
@@ -1257,13 +1264,16 @@ impl RelationProofPlan {
                 if !matches!(seed, CanonicalObject::Node(_)) {
                     return Err(invalid("transitive closure seed must be a node IRI"));
                 }
-                // The edge relation must be exactly a 2-column [subject, object] node/value BGP so
-                // that (i) `object == subject` joins are namespace-compatible across rounds and
-                // (ii) the delivered reachable set is a single node column. Anything else (a filtered
-                // BGP, a generated column, a wrong arity) rejects closed here — the shape is
-                // K-INDEPENDENT, so this validates identically for the prover and the verifier.
-                let edge_descriptors = crate::proof::query::result_column_descriptors(edge)?;
-                if crate::proof::query::has_ground_result_unit(edge)
+                // The edge relation must deliver exactly a 2-column [start, end] node/value relation so
+                // that (i) `end == start` joins are namespace-compatible across rounds and (ii) the
+                // delivered reachable set is a single node column. A single-predicate edge is a
+                // `Bgp(Triple(?s, p, ?o))`; a compound edge is a deduped bag-union / projected join of
+                // node triples — either way its `result_shape` must be two nonnullable NodeValue
+                // columns. Anything else (a ground unit, a generated column, a wrong arity) rejects
+                // closed here — the shape is K-INDEPENDENT, so this validates identically for the
+                // prover and the verifier, and it recursively validates the whole edge subtree.
+                let (edge_descriptors, edge_ground) = edge.result_shape()?;
+                if edge_ground
                     || edge_descriptors.len() != 2
                     || edge_descriptors.iter().any(|descriptor| {
                         descriptor.nullable

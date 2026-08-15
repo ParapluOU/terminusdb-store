@@ -2326,11 +2326,16 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         RelationProofPlan {
             query_digest: [7u8; 32],
             kind: RelationProofPlanKind::TransitiveClosure {
-                edge: LayerBgpPlan {
-                    source: ColumnSource::Materialized,
-                    atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
-                    joins: Vec::new(),
-                },
+                // The single-predicate edge is a `Bgp` leaf relation (the closure edge is now a general
+                // `RelationProofPlan`); it carries the closure's own digest as its identity tag.
+                edge: Box::new(RelationProofPlan {
+                    query_digest: [7u8; 32],
+                    kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                        source: ColumnSource::Materialized,
+                        atoms: vec![LayerBgpAtom::all_variables(iri(predicate).into_bytes())],
+                        joins: Vec::new(),
+                    }),
+                }),
                 seed: CanonicalObject::Node(iri(seed).into_bytes()),
                 reflexive,
                 inverted,
@@ -3249,11 +3254,14 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let plan = RelationProofPlan {
             query_digest: [43u8; 32],
             kind: RelationProofPlanKind::TransitiveClosure {
-                edge: LayerBgpPlan {
-                    source: ColumnSource::Materialized,
-                    atoms: vec![LayerBgpAtom::all_variables(predicate.to_string().into_bytes())],
-                    joins: Vec::new(),
-                },
+                edge: Box::new(RelationProofPlan {
+                    query_digest: [43u8; 32],
+                    kind: RelationProofPlanKind::Bgp(LayerBgpPlan {
+                        source: ColumnSource::Materialized,
+                        atoms: vec![LayerBgpAtom::all_variables(predicate.to_string().into_bytes())],
+                        joins: Vec::new(),
+                    }),
+                }),
                 seed: CanonicalObject::Node(seed.to_string().into_bytes()),
                 reflexive: true,
                 inverted: false,
