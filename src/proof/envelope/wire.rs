@@ -48,6 +48,7 @@ use crate::proof::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit, 
 use crate::proof::commitment::{LayerCommitment, VerifierLayer};
 use crate::proof::count::CountProof;
 use crate::proof::dict::DictProof;
+use crate::proof::logup_gkr::{GkrFractionProof, GkrLayerProof};
 use crate::proof::dicthash::{
     prove_dict_hash_lookup, verify_dict_hash_lookup, DictHashLookupProof, HashLookupInnerProof,
 };
@@ -116,14 +117,20 @@ pub(super) fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
 // v5 adds the explicit transcript/wire-bound object-kind filter. Older envelopes fail
 // explicitly rather than guessing whether a variable object meant any value, a node,
 // or a literal.
-pub(super) const VERSION: u32 = 5;
-pub(super) const UNION_VERSION: u32 = 3;
-pub(super) const ANTI_VERSION: u32 = 5;
-pub(super) const OUTER_VERSION: u32 = 2;
+// v6: LogUp-GKR migration of `dict` membership — `DictProof` drops the committed
+// `dstar` reciprocal and the batched sumcheck for a GKR fraction-tree proof + the
+// three data-column leaf evaluations, so every envelope carrying a constant-atom
+// (predicate/subject/object) membership has different proof bytes.
+pub(super) const VERSION: u32 = 6;
+pub(super) const UNION_VERSION: u32 = 4;
+pub(super) const ANTI_VERSION: u32 = 6;
+pub(super) const OUTER_VERSION: u32 = 3;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
 // v23 adds the ordered `sys:Array` walk composite node (tag 24).
-pub(super) const RECURSIVE_VERSION: u32 = 23;
+// v24: LogUp-GKR `DictProof` migration (see the `VERSION` note) — recursive
+// envelopes embed layer-BGP leaves whose membership proof bytes changed.
+pub(super) const RECURSIVE_VERSION: u32 = 24;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -374,11 +381,26 @@ wire_struct!(SumcheckProof {
     round_polys,
     claimed_evals
 });
+// LogUp-GKR migration: the reciprocal `dstar` commitment and the batched sumcheck
+// are gone; a GKR fraction-tree proof + the three data-column evaluations at the
+// leaf-opening point carry the membership statement.
+wire_struct!(GkrLayerProof {
+    round_polys,
+    child_p_left,
+    child_p_right,
+    child_q_left,
+    child_q_right
+});
+wire_struct!(GkrFractionProof {
+    root_p,
+    root_q,
+    layers
+});
 wire_struct!(DictProof {
-    sumcheck,
+    gkr,
+    col_evals,
     opening,
-    mult_commitment,
-    dstar_commitment
+    mult_commitment
 });
 wire_struct!(FilterProof { sumcheck, opening });
 wire_struct!(FullFilterProof {
@@ -965,6 +987,22 @@ impl Wire for CanonicalResultValue {
             _ => Err(invalid("invalid canonical result value tag")),
         }
     }
+}
+
+/// Encode then decode a [`DictProof`] through the envelope [`Wire`] framing, so the
+/// migrated GKR proof shape can be asserted to survive serialization and re-verify.
+#[cfg(test)]
+pub(crate) fn wire_roundtrip_dict_proof(proof: &DictProof) -> io::Result<DictProof> {
+    let mut bytes = Vec::new();
+    proof.put(&mut bytes)?;
+    let mut reader = Reader {
+        bytes: &bytes,
+        pos: 0,
+        decoded_items: 0,
+    };
+    let decoded = DictProof::get(&mut reader)?;
+    reader.finish()?;
+    Ok(decoded)
 }
 
 /// Stable identity of the variable-blind public plan. Callers independently compile

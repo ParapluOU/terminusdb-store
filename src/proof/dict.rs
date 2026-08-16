@@ -7,25 +7,46 @@
 //! membership. Q3b will commit the dictionary inside `LayerCommitment` and wire
 //! this into `prove_layer_filter`; here it stands alone.
 //!
-//! Gadget:
+//! Gadget (LogUp-GKR, Inc 1 of the reciprocal-elimination migration):
 //!   * fold each dict row `dict_fold[k] = beta*dict_hash[k] + dict_id[k]`; the
 //!     query folds to the PUBLIC scalar `q_fold = beta*q_hash + id`.
-//!   * commit a multiplicity indicator `mult[k]` (1 at the matching row, else 0)
-//!     and the reciprocal witness `dstar[k] = 1/(alpha - dict_fold[k])`.
-//!   * Identity claim (logup):  `dstar[k]*(alpha - dict_fold[k]) - 1 = 0`.
-//!   * ZeroSum claim with a PUBLIC NONZERO target:
-//!       `Sum_k mult[k]*dstar[k] = 1/(alpha - q_fold)`.
-//!     The target `1/(alpha - q_fold)` is a public scalar the verifier computes;
-//!     the batched sumcheck's initial claim is the rho-combination of the
-//!     per-claim `target`s (see `SumcheckClaim::target`).
+//!   * commit ONLY the DATA columns `[dict_hash, dict_id, mult]`, where `mult[k]`
+//!     is a multiplicity indicator (1 at the matching row, else 0). NO reciprocal
+//!     column is committed (the old `dstar` is gone).
+//!   * prove `Sum_k mult[k]/(alpha - dict_fold[k]) - 1/(alpha - q_fold) = 0` with
+//!     the GKR fraction tree ([`super::logup_gkr`]): the `D` dictionary rows form
+//!     one leaf group (numerator `mult[k]`, denominator `alpha - dict_fold[k]`) and
+//!     the public target folds in as ONE extra signed leaf `(-1, alpha - q_fold)`,
+//!     so the tree's root claim is always `P = 0`. The prover reveals only the root
+//!     `(P, Q)` and a short per-layer sumcheck; NO per-row reciprocal MSM.
 //!
-//! Soundness: at random `alpha` (drawn after `mult`/`dict`/`beta` are committed,
-//! and after `dstar`), `Sum_k mult[k]/(alpha - dict_fold[k]) = 1/(alpha - q_fold)`
-//! holds as a rational identity iff `q_fold` is in `{dict_fold[k]}` with total
-//! multiplicity exactly 1 (RHS is a single simple pole with residue 1, so the
-//! residue-at-infinity forces `Sum mult = 1`). `beta` fingerprints `(hash, id)`,
-//! so it binds the PAIR, not hash-or-id alone. Clean-room from the log-derivative
-//! identity; no COSL code.
+//! Column length vs. leaf count. The target's extra leaf pushes the leaf count to
+//! `next_pow2(D + 1) = 2D` (`D` is a committed power of two), but the dictionary
+//! columns stay committed at length `D` (unchanged; root-anchored in the BGP
+//! consumer). The prover feeds the tree the `2D` ZERO-EXTENSIONS of the data
+//! columns; the verifier opens the length-`D` committed columns at the low `k` bits
+//! `r_low` of the GKR leaf point and reconstructs each `2D` leaf-MLE as
+//! `(1 - r_high)*open(r_low)`. A single batched Dory opening of `[dict_hash,
+//! dict_id, mult]` at `r_low` binds all three to their root-anchored commitments.
+//!
+//! GAP-3 (target-pole soundness), enforced. The target leaf sits at position `D`,
+//! which lives in the zero-extended HIGH half `[D, 2D)`. The verifier reconstructs
+//! the fold columns there as `(1 - r_high)*open(r_low)`, i.e. the MLE of the column
+//! that is IDENTICALLY ZERO past the `D` committed rows. So `dict_fold[D] = 0` is
+//! forced by the opening, and the target denominator is EXACTLY `alpha - q_fold` —
+//! a prover CANNOT commit a nonzero `dict_hash[D]`/`dict_id[D]` to shift the pole
+//! and cancel a genuine dictionary pole (the classic forge). Because position `D`
+//! is outside the committed length-`D` domain, this is enforced STRUCTURALLY by the
+//! leaf tie + Dory binding rather than by a co-running Identity claim over the
+//! committed columns (there is nothing there for such a claim to constrain); the
+//! structural enforcement is strictly stronger — the forge is not even expressible.
+//!
+//! Soundness: at random `alpha` (drawn AFTER `dict`/`mult`/`beta` are committed),
+//! `Sum_k mult[k]/(alpha - dict_fold[k]) = 1/(alpha - q_fold)` holds as a rational
+//! identity iff `q_fold` is in `{dict_fold[k]}` with total multiplicity exactly 1
+//! (RHS is a single simple pole with residue 1, so the residue-at-infinity forces
+//! `Sum mult = 1`). `beta` fingerprints `(hash, id)`, so it binds the PAIR, not
+//! hash-or-id alone. Clean-room from the log-derivative identity; no COSL code.
 
 use std::io;
 
@@ -36,21 +57,24 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
-    SumcheckShape, Term, Transcript254,
+    mle_full_eval, verify_column_openings, ColumnOpening, StoreProverContext, Transcript254,
 };
 #[cfg(test)]
 use super::argument::{commit_column, prove_column_openings};
 use super::invalid;
-use super::logup::{reciprocal_claim, reciprocal_witness, rlc_fold};
+use super::logup_gkr::{
+    bind_and_verify_fraction_tree, check_leaf_tie, prove_fraction_sum_zero, FractionBuilder,
+    FractionInstance, GkrFractionProof,
+};
 use super::CanonicalObject;
 
-// Column ordering for the dictionary membership sumcheck.
+// Column ordering for the dictionary-membership data columns `[hash, id, mult]`.
+// The reciprocal witness `dstar` is GONE: the LogUp-GKR migration proves the same
+// log-derivative sum via a fraction tree over uncommitted intermediates, so no
+// reciprocal column is committed anywhere.
 const COL_HASH: usize = 0;
 const COL_ID: usize = 1;
 const COL_MULT: usize = 2;
-const COL_DSTAR: usize = 3;
 
 const LABEL_BETA: &[u8] = b"pow/dict/fingerprint-beta";
 const LABEL_ALPHA: &[u8] = b"pow/dict/reciprocal-alpha";
@@ -113,39 +137,53 @@ pub fn hash_object(obj: &CanonicalObject) -> ArkFr {
     ArkFr(Fr::from_le_bytes_mod_order(digest.as_slice()))
 }
 
-/// A dictionary-membership proof: the batched sumcheck over the reciprocal (C)
-/// and public-target LogUp (E) claims, one batched Dory opening of the four
-/// columns at `r`, and the internal witness commitments the verifier binds.
+/// A dictionary-membership proof: the GKR fraction-sum-zero proof for
+/// `Sum mult/(alpha - dict_fold) - 1/(alpha - q_fold) = 0`, the claimed evaluations
+/// of the three DATA columns at `r_low` (the low `k` bits of the GKR leaf point),
+/// one batched Dory opening of those columns at `r_low`, and the multiplicity
+/// commitment the verifier binds. NO reciprocal (`dstar`) column exists anymore.
 #[derive(Clone, Debug)]
 pub struct DictProof {
-    pub sumcheck: SumcheckProof,
+    pub gkr: GkrFractionProof,
+    pub col_evals: Vec<ArkFr>,
     pub opening: ColumnOpening,
     pub mult_commitment: ArkGT,
-    pub dstar_commitment: ArkGT,
 }
 
-/// The two claims over columns `[dict_hash, dict_id, mult, dstar]`:
-///   C (Identity): `dstar*(alpha - (beta*dict_hash + dict_id)) - 1 = 0`
-///   E (ZeroSum, target `1/(alpha - q_fold)`): `Sum mult*dstar = target`
-fn dict_shape(k: usize, alpha: ArkFr, beta: ArkFr, target: ArkFr) -> SumcheckShape {
-    // reciprocal fold order [dict_id, dict_hash] gives dict_id + beta*dict_hash.
-    let claim_c = reciprocal_claim(COL_DSTAR, &[COL_ID, COL_HASH], alpha, beta);
-    let claim_e = SumcheckClaim {
-        shape: ClaimShape::ZeroSum,
-        expr: Expr {
-            terms: vec![Term {
-                coeff: f1(),
-                operands: vec![Operand::Column(COL_MULT), Operand::Column(COL_DSTAR)],
-            }],
-        },
-        target,
-    };
-    SumcheckShape {
-        num_vars: k,
-        num_columns: 4,
-        chi_bounds: Vec::new(),
-        claims: vec![claim_c, claim_e],
-    }
+/// The PUBLIC fraction-sum-zero instance for a length-`dict_len` dictionary:
+///   * one leaf group over the `dict_len` committed dictionary rows, numerator
+///     `mult[k]`, denominator `alpha - (dict_id[k] + beta*dict_hash[k])`;
+///   * one public target leaf `(-1, alpha - q_fold)`.
+/// The leaf count pads to `next_pow2(dict_len + 1) = 2*dict_len`; the target lands
+/// at position `dict_len` (the first, structurally-zero, high-half leaf). Built
+/// IDENTICALLY by prover and verifier from public inputs only.
+fn dict_fraction_instance(
+    alpha: ArkFr,
+    beta: ArkFr,
+    q_fold: ArkFr,
+    dict_len: usize,
+) -> FractionInstance {
+    // Fold order [dict_id, dict_hash] gives `dict_id + beta*dict_hash`, matching the
+    // public query fold `q_fold = beta*q_hash + id` assembled in `query_fold`.
+    let mut builder = FractionBuilder::new(alpha, beta, vec![COL_ID, COL_HASH], 3);
+    builder.add_mult_group(f1(), COL_MULT, dict_len);
+    builder.add_target(f0() - f1(), q_fold);
+    builder.finish()
+}
+
+/// Zero-extend a length-`D` column to the fraction leaf count `to_len` (`= 2D`).
+/// The high half `[D, 2D)` is all zero, so its multilinear extension at a point
+/// `(r_low, r_high)` is `(1 - r_high) * MLE_D(col, r_low)` — the exact factor the
+/// verifier applies when reconstructing the leaf-MLEs from a length-`D` opening.
+fn zero_extend(col: &[ArkFr], to_len: usize) -> Vec<ArkFr> {
+    let mut extended = vec![f0(); to_len];
+    extended[..col.len()].copy_from_slice(col);
+    extended
+}
+
+/// The PUBLIC dictionary/query fold `q_fold = beta*q_hash + id`.
+fn query_fold(beta: ArkFr, q_hash: ArkFr, id: ArkFr) -> ArkFr {
+    beta * q_hash + id
 }
 
 fn check_dimensions(dict_hash: &[ArkFr], dict_id: &[ArkFr]) -> io::Result<usize> {
@@ -212,32 +250,41 @@ pub fn prove_dict_membership_with_context(
         .collect();
     let mult_commitment = context.commit_column(&mult)?;
 
-    // Round 1: bind the dictionary + multiplicity, then draw beta/alpha.
+    // Bind the DATA columns, THEN draw beta/alpha. Caller contract (Inc 0 audit):
+    // `alpha` MUST be drawn after the column commitments are bound so the fraction
+    // leaves are fixed before any per-layer GKR challenge. There is no reciprocal
+    // commitment anymore, so this is the last binding before the fold challenges.
     transcript.append_group(b"pow/dict/com-hash", com_dict_hash);
     transcript.append_group(b"pow/dict/com-id", com_dict_id);
     transcript.append_group(b"pow/dict/com-mult", &mult_commitment);
     let beta = transcript.challenge_scalar(LABEL_BETA);
     let alpha = transcript.challenge_scalar(LABEL_ALPHA);
+    let q_fold = query_fold(beta, q_hash, id);
 
-    // Reciprocal witness over the beta-fingerprinted dictionary rows.
-    let dict_fold = rlc_fold(beta, &[dict_id, dict_hash]);
-    let dstar = reciprocal_witness(alpha, &dict_fold);
-    let dstar_commitment = context.commit_column(&dstar)?;
+    // Prove the fraction sum over the `2D` zero-extended data columns. The fraction
+    // instance folds the dictionary rows and the public target leaf; the tree lands
+    // at `r_leaf` (length `k + 1`), whose low `k` bits are the opening point.
+    let inst = dict_fraction_instance(alpha, beta, q_fold, size);
+    let leaf_count = inst.size();
+    let extended = vec![
+        zero_extend(dict_hash, leaf_count),
+        zero_extend(dict_id, leaf_count),
+        zero_extend(&mult, leaf_count),
+    ];
+    let (gkr, r_leaf) = prove_fraction_sum_zero(&inst, &extended, transcript)?;
 
-    // Round 2: bind the reciprocal commitment, form the public target, run the
-    // batched sumcheck, and open all four columns at r.
-    transcript.append_group(b"pow/dict/com-dstar", &dstar_commitment);
-    let target = query_target(alpha, beta, q_hash, id)?;
-    let shape = dict_shape(k, alpha, beta, target);
-    let columns = vec![dict_hash.to_vec(), dict_id.to_vec(), mult, dstar];
-    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = context.prove_column_openings(&columns, &r, transcript)?;
+    // Single batched Dory opening of the length-`D` data columns at `r_low`, bound
+    // to their (root-anchored, in the BGP consumer) commitments on this transcript.
+    let r_low = &r_leaf[..k];
+    let columns = vec![dict_hash.to_vec(), dict_id.to_vec(), mult];
+    let col_evals: Vec<ArkFr> = columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+    let opening = context.prove_column_openings(&columns, r_low, transcript)?;
 
     Ok(DictProof {
-        sumcheck,
+        gkr,
+        col_evals,
         opening,
         mult_commitment,
-        dstar_commitment,
     })
 }
 
@@ -251,41 +298,55 @@ pub fn verify_dict_membership(
     proof: &DictProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    let k = proof.sumcheck.round_polys.len();
-    if k == 0 || k >= usize::BITS as usize {
+    // The GKR tree has `k + 1` layers (`2D` leaves for a length-`D = 2^k` dict), so
+    // `k = num_vars - 1` and the committed columns have length `D = 2^k`.
+    let num_vars = proof.gkr.num_vars();
+    if num_vars < 2 || num_vars >= usize::BITS as usize {
         return Err(invalid("dictionary proof has an implausible variable count"));
     }
+    let k = num_vars - 1;
+    let dict_len = 1usize << k;
+    if proof.col_evals.len() != 3 {
+        return Err(invalid("dictionary proof has the wrong number of column evaluations"));
+    }
 
+    // Same binding order as the prover: DATA columns, THEN beta/alpha.
     transcript.append_group(b"pow/dict/com-hash", com_dict_hash);
     transcript.append_group(b"pow/dict/com-id", com_dict_id);
     transcript.append_group(b"pow/dict/com-mult", &proof.mult_commitment);
     let beta = transcript.challenge_scalar(LABEL_BETA);
     let alpha = transcript.challenge_scalar(LABEL_ALPHA);
-    transcript.append_group(b"pow/dict/com-dstar", &proof.dstar_commitment);
+    let q_fold = query_fold(beta, q_hash, id);
 
-    let target = query_target(alpha, beta, q_hash, id)?;
-    let shape = dict_shape(k, alpha, beta, target);
-    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    // Bind the public instance and verify the GKR tree -> the leaf point + claims.
+    let inst = dict_fraction_instance(alpha, beta, q_fold, dict_len);
+    let (r_leaf, p_claim, q_claim) =
+        bind_and_verify_fraction_tree(&inst, &proof.gkr, transcript)?;
+
+    // Open the length-`D` committed columns at `r_low`, bound to their commitments.
+    let r_low = &r_leaf[..k];
+    let r_high = r_leaf[k];
     verify_column_openings(
-        &[
-            *com_dict_hash,
-            *com_dict_id,
-            proof.mult_commitment,
-            proof.dstar_commitment,
-        ],
-        &r,
-        &evals,
+        &[*com_dict_hash, *com_dict_id, proof.mult_commitment],
+        r_low,
+        &proof.col_evals,
         &proof.opening,
         transcript,
-    )
-}
+    )?;
 
-/// The public ZeroSum target `1/(alpha - (beta*q_hash + id))`.
-fn query_target(alpha: ArkFr, beta: ArkFr, q_hash: ArkFr, id: ArkFr) -> io::Result<ArkFr> {
-    let q_fold = beta * q_hash + id;
-    (alpha - q_fold)
-        .inv()
-        .ok_or_else(|| invalid("query fold collides with the reciprocal challenge"))
+    // Reconstruct each `2D` leaf-MLE from the length-`D` opening via the
+    // `(1 - r_high)` zero-extension factor, then tie to the GKR-reduced leaf claims.
+    // This is the GAP-3 enforcement: the target leaf at position `D` lives in the
+    // high half, so its fold columns reconstruct to ZERO (a prover cannot commit a
+    // nonzero value there); its pole is therefore exactly `alpha - q_fold` and
+    // cannot be shifted to forge membership of a non-member.
+    let one_minus_high = f1() - r_high;
+    let leaf_evals: Vec<ArkFr> = proof
+        .col_evals
+        .iter()
+        .map(|eval| one_minus_high * *eval)
+        .collect();
+    check_leaf_tie(&inst, &leaf_evals, p_claim, q_claim, &r_leaf)
 }
 
 #[cfg(test)]
@@ -435,8 +496,8 @@ mod tests {
         let id = ArkFr::from_u64(id);
 
         // Honest multiplicity commitment for a DIFFERENT (empty) selection, so the
-        // committed mult no longer matches the sumcheck's claimed values -> the
-        // Dory opening (which binds mult) fails.
+        // committed mult no longer matches the proof's claimed mult evaluation ->
+        // the Dory opening (which binds mult) fails.
         let bad_mult = commit(&vec![f0(); dict_hash.len()]);
         assert!(run(&dict_hash, &dict_id, q_hash, id, |proof| {
             proof.mult_commitment = bad_mult;
@@ -457,7 +518,8 @@ mod tests {
         assert!(prove_with_explicit_mult(&dict_hash, &dict_id, q_hash, id, &wrong_pos).is_err());
     }
 
-    // Prove/verify driving an EXPLICIT (possibly malicious) multiplicity column.
+    // Prove/verify driving an EXPLICIT (possibly malicious) multiplicity column
+    // through the honest LogUp-GKR prover flow.
     fn prove_with_explicit_mult(
         dict_hash: &[ArkFr],
         dict_id: &[ArkFr],
@@ -476,27 +538,113 @@ mod tests {
         pt.append_group(b"pow/dict/com-mult", &mult_commitment);
         let beta = pt.challenge_scalar(LABEL_BETA);
         let alpha = pt.challenge_scalar(LABEL_ALPHA);
-        let dict_fold = rlc_fold(beta, &[dict_id, dict_hash]);
-        let dstar = reciprocal_witness(alpha, &dict_fold);
-        let dstar_commitment = commit(&dstar);
-        pt.append_group(b"pow/dict/com-dstar", &dstar_commitment);
-        let target = query_target(alpha, beta, q_hash, id)?;
-        let shape = dict_shape(k, alpha, beta, target);
-        let columns = vec![
-            dict_hash.to_vec(),
-            dict_id.to_vec(),
-            mult.to_vec(),
-            dstar,
+        let q_fold = query_fold(beta, q_hash, id);
+
+        let inst = dict_fraction_instance(alpha, beta, q_fold, dict_hash.len());
+        let leaf_count = inst.size();
+        let extended = vec![
+            zero_extend(dict_hash, leaf_count),
+            zero_extend(dict_id, leaf_count),
+            zero_extend(mult, leaf_count),
         ];
-        let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, &mut pt)?;
-        let opening = prove_column_openings(&columns, &r, &mut pt)?;
+        let (gkr, r_leaf) = prove_fraction_sum_zero(&inst, &extended, &mut pt)?;
+        let r_low = &r_leaf[..k];
+        let columns = vec![dict_hash.to_vec(), dict_id.to_vec(), mult.to_vec()];
+        let col_evals: Vec<ArkFr> = columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+        let opening = prove_column_openings(&columns, r_low, &mut pt)?;
         let proof = DictProof {
-            sumcheck,
+            gkr,
+            col_evals,
             opening,
             mult_commitment,
-            dstar_commitment,
         };
         let mut vt = transcript();
         verify_dict_membership(&com_h, &com_i, q_hash, id, &proof, &mut vt)
+    }
+
+    // GAP-3 forge negative. A prover tries to prove membership of a NON-member
+    // `q` by SHIFTING the public target pole: instead of the honest target leaf
+    // `(-1, alpha - q_fold)` it forges a nonzero fold value at the target leaf
+    // position `D` so the pole becomes `alpha - q_m` for a genuine member `m`, then
+    // points `mult` at `m` so the two poles cancel and the fraction sum is zero.
+    // The forge produces a VALID zero-sum GKR proof (root P = 0), but the verifier
+    // reconstructs the fold at position `D` from the HONEST length-`D` opening via
+    // the `(1 - r_high)` zero-extension — which is identically zero there — so the
+    // reconstructed target pole is `alpha - q_fold != alpha - q_m` and the leaf tie
+    // rejects. This is exactly the pole-shift attack the module comment warns about.
+    #[test]
+    fn gap3_forged_target_pole_is_rejected() {
+        let (dict_hash, dict_id, entries) = dictionary(&["alice", "bob", "carol", "dave"]);
+        // A full power-of-two dictionary (D == 4), so the target leaf is at the very
+        // first high-half position D = 4 and there is no spare low-half padding row.
+        let k = check_dimensions(&dict_hash, &dict_id).unwrap();
+        let dict_len = dict_hash.len();
+        assert_eq!(dict_len, 4);
+
+        // The (non-member) query claims carol's id for a hash that is NOT in the dict.
+        let (_carol_hash, carol_id) = entries[2];
+        let q_hash = hash_term(b"mallory");
+        let id = ArkFr::from_u64(carol_id);
+
+        let com_h = commit(&dict_hash);
+        let com_i = commit(&dict_id);
+        // Honest multiplicity indicator points at the genuine `carol` row (index 2),
+        // whose fold the forged target pole will be shifted to cancel.
+        let mut mult = vec![f0(); dict_len];
+        mult[2] = f1();
+        let mult_commitment = commit(&mult);
+
+        let mut pt = transcript();
+        pt.append_group(b"pow/dict/com-hash", &com_h);
+        pt.append_group(b"pow/dict/com-id", &com_i);
+        pt.append_group(b"pow/dict/com-mult", &mult_commitment);
+        let beta = pt.challenge_scalar(LABEL_BETA);
+        let alpha = pt.challenge_scalar(LABEL_ALPHA);
+        let q_fold = query_fold(beta, q_hash, id);
+        let carol_fold = beta * dict_hash[2] + dict_id[2];
+
+        // Build the honest instance, but FORGE the extended fold columns: put
+        // `carol_fold - q_fold` into `dict_id` at the target leaf position D so the
+        // target denominator `alpha - fold[D] - q_fold` becomes `alpha - carol_fold`.
+        let inst = dict_fraction_instance(alpha, beta, q_fold, dict_len);
+        let leaf_count = inst.size();
+        assert_eq!(leaf_count, 2 * dict_len);
+        let ext_hash = zero_extend(&dict_hash, leaf_count);
+        let mut ext_id = zero_extend(&dict_id, leaf_count);
+        let ext_mult = zero_extend(&mult, leaf_count);
+        ext_id[dict_len] = carol_fold - q_fold; // the pole-shifting forgery
+        let (gkr, r_leaf) =
+            prove_fraction_sum_zero(&inst, &[ext_hash, ext_id, ext_mult], &mut pt).unwrap();
+        // The forged leaves genuinely sum to zero (the forge "worked" at tree level).
+        assert!(gkr.root_p.is_zero(), "forged fraction sum should be zero");
+
+        // The Dory opening is over the HONEST length-D committed columns.
+        let r_low = &r_leaf[..k];
+        let columns = vec![dict_hash.to_vec(), dict_id.to_vec(), mult.clone()];
+        let col_evals: Vec<ArkFr> = columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+        let opening = prove_column_openings(&columns, r_low, &mut pt).unwrap();
+        let proof = DictProof { gkr, col_evals, opening, mult_commitment };
+
+        // The leaf tie reconstructs fold[D] = 0 (zero-extension) -> target pole is
+        // alpha - q_fold, contradicting the forged tree -> REJECT.
+        let mut vt = transcript();
+        assert!(verify_dict_membership(&com_h, &com_i, q_hash, id, &proof, &mut vt).is_err());
+    }
+
+    // The migrated `DictProof` survives a wire round-trip and re-verifies.
+    #[test]
+    fn dict_proof_round_trips_through_wire() {
+        use crate::proof::envelope::wire_roundtrip_dict_proof;
+        let (dict_hash, dict_id, entries) = dictionary(&["alice", "bob", "carol", "dave", "erin"]);
+        let (q_hash, id) = entries[3];
+        let id = ArkFr::from_u64(id);
+        let com_h = commit(&dict_hash);
+        let com_i = commit(&dict_id);
+        let mut pt = transcript();
+        let proof =
+            prove_dict_membership(&dict_hash, &dict_id, &com_h, &com_i, q_hash, id, &mut pt).unwrap();
+        let decoded = wire_roundtrip_dict_proof(&proof).unwrap();
+        let mut vt = transcript();
+        assert!(verify_dict_membership(&com_h, &com_i, q_hash, id, &decoded, &mut vt).is_ok());
     }
 }

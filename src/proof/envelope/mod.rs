@@ -92,6 +92,8 @@ pub use wire::{
     plan_digest, MAX_QUERY_ENVELOPE_BYTES, MAX_RELATION_PROOF_DEPTH, MAX_RELATION_PROOF_NODES,
     MAX_TRANSITIVE_CLOSURE_ROUNDS,
 };
+#[cfg(test)]
+pub(crate) use wire::wire_roundtrip_dict_proof;
 
 pub use plan::{
     resolve_relation_equality_constraint, resolve_tuple_disequality_pairs, CollectionSumTemplate,

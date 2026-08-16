@@ -496,15 +496,16 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         use sha2::Digest as _;
         let hash = sha2::Sha256::digest(&bytes);
         let hash_hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        assert_eq!(bytes.len(), 142820, "materialized proof byte length changed");
-        // Hash regenerated after the hardening-batch transcript changes (B: `setup_parameter_id`
-        // now folds the generator bytes; C: transcript labels are length-prefixed) — both are
-        // transcript-bound, so every proof's challenge-derived bytes shifted while the proof
-        // STRUCTURE (byte length 142820) is unchanged and prover↔verifier still agree. This tripwire
-        // correctly fired on those intended changes; the value below is the current stable image.
+        assert_eq!(bytes.len(), 142788, "materialized proof byte length changed");
+        // Hash + length regenerated for the LogUp-GKR migration of `dict` membership: each
+        // constant-predicate atom's `DictProof` dropped the committed `dstar` reciprocal and its
+        // batched sumcheck for a GKR fraction-tree proof + three data-column leaf evaluations, so
+        // the proof bytes (structure AND transcript-derived challenges) shifted while prover↔verifier
+        // still agree. The byte length fell by 32 (2 atoms × one fewer committed GT commitment,
+        // net of the GKR rounds). This is the intended, verified new stable image.
         assert_eq!(
             hash_hex,
-            "6f78000efc4dd05158d2fc483e0089f70cca6a45c1a78cc9bdca514c9752f99b",
+            "54c577ba9616c76455d81850d5509b476e9c65111d2eb920d054fe3c8395650b",
             "materialized multi-atom proof transcript/commitments changed (byte-identity regression)"
         );
     }

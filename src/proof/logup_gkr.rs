@@ -518,7 +518,9 @@ pub struct FractionInstance {
 }
 
 impl FractionInstance {
-    fn size(&self) -> usize {
+    /// The leaf count `2^num_vars` (the power-of-two length every committed column
+    /// must match / the fraction leaf vector length the caller zero-extends to).
+    pub fn size(&self) -> usize {
         1usize << self.num_vars
     }
 
@@ -628,6 +630,30 @@ pub fn check_leaf_tie(
         return Err(invalid("leaf tie: reconstructed p_leaf disagrees with the proof"));
     }
     Ok(())
+}
+
+/// Bind the public instance and verify the GKR tree, returning the derived leaf
+/// point and the reduced `(p_leaf, q_leaf)` claims — WITHOUT opening any columns.
+///
+/// This is the transcript-owning half of [`verify_fraction_sum_zero`], split out
+/// for consumers whose committed columns are NOT the same length as the fraction
+/// leaf vector (so they cannot open at `r_leaf` directly and must reconstruct the
+/// leaf-MLEs with a dimension adjustment before calling [`check_leaf_tie`]). The
+/// dictionary membership consumer opens its length-`D` committed columns at the low
+/// `k` bits of `r_leaf` and reconstructs the `2D` leaf-MLEs via a `(1 − r_high)`
+/// zero-extension factor; doing the Dory opening itself needs `&mut transcript`,
+/// which the [`verify_fraction_sum_zero`] `open_cols` closure does not receive.
+pub fn bind_and_verify_fraction_tree(
+    inst: &FractionInstance,
+    proof: &GkrFractionProof,
+    transcript: &mut Transcript254,
+) -> io::Result<(Vec<ArkFr>, ArkFr, ArkFr)> {
+    inst.validate_shape()?;
+    if proof.layers.len() != inst.num_vars {
+        return Err(invalid("fraction proof layer count does not match the instance"));
+    }
+    append_instance(transcript, inst);
+    verify_fraction_tree(proof, transcript)
 }
 
 /// Verify a fraction-sum-zero proof: bind the instance, verify the GKR tree, obtain
