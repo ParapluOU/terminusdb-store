@@ -513,6 +513,17 @@ pub(crate) fn verify_reconcile_core(
     for view in &views {
         view.validate()?;
     }
+    // (1u) NO-RE-MINT GUARD (one of the two store invariants the reconcile verifier's soundness
+    // relies on): the combined node/value + predicate dictionaries assign a UNIQUE id per TERM — no
+    // canonical hash appears at two ids across the chain. Each layer's own dict is a term↔id
+    // bijection over a disjoint id range (per-layer `validate` + watermark), so combined IDS are
+    // already globally distinct; the remaining risk is a term RE-MINTED in two layers (same hash,
+    // two ids). The catalogs are now root-authenticated (the `view.validate()` loop above), so
+    // recomputing their canonical hashes and asserting uniqueness directly rejects a re-minted
+    // (duplicate-hash / bag) dictionary. Hoisted here so EVERY reconciled id-space read entry that
+    // goes through this core (present BGP / filter / join / result, the reconciled list/array walks)
+    // asserts it exactly once, before any id-space filter or join trusts the term↔id bijection.
+    assert_combined_catalog_hash_unique(&views)?;
     // (2) Whole parent chain + trusted head anchor.
     let states: Vec<&crate::proof::commitment::CommitmentState> = views.iter().map(|v| v.state).collect();
     validate_chain_states(&states)?;

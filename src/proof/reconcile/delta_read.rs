@@ -288,6 +288,12 @@ pub(super) fn verify_delta_read_core(
     for view in &views {
         view.validate()?;
     }
+    // (1u) NO-RE-MINT GUARD: over the now root-authenticated catalogs, assert the combined
+    // node/value + predicate dictionaries assign a UNIQUE id per term (no canonical hash at two ids
+    // across the chain). Delta-read reuses `verify_present_bgp`'s id-space filter/join logic but does
+    // NOT route through `verify_reconcile_core`, so it asserts hash-uniqueness here — mirroring that
+    // core's guard on exactly the same authenticated catalog data.
+    assert_combined_catalog_hash_unique(&views)?;
     // (2) Whole parent chain + trusted head anchor (splice/reorder/drop/foreign-proof).
     let states: Vec<&crate::proof::commitment::CommitmentState> = views.iter().map(|v| v.state).collect();
     validate_chain_states(&states)?;

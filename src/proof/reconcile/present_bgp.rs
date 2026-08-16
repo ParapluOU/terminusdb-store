@@ -708,17 +708,12 @@ pub(crate) fn verify_present_bgp(
     verify_id_auth(combined_nv, m, head_nv, verified.com_present_o, &proof.auth_o, transcript)?;
     verify_id_auth(combined_pred, m, head_pred, verified.com_present_p, &proof.auth_p, transcript)?;
 
-    // (1h) TRUST-BOUNDARY HARDENING (Wave 7): assert the two store invariants the reconcile
-    // verifier's soundness relies on.
-    //   HASH-UNIQUENESS (the no-re-mint guard): the combined node/value + predicate dictionaries
-    //   assign a UNIQUE id per TERM — no hash appears at two ids across the chain. Each layer's own
-    //   dict is a term↔id bijection over a disjoint id range (per-layer `validate` + watermark), so
-    //   combined IDS are already globally distinct; the remaining risk is a term RE-MINTED in two
-    //   layers (same hash, two ids). The catalogs are root-authenticated (each `view.validate()` ran
-    //   in `verify_reconcile_core`), so recomputing their canonical hashes and asserting uniqueness
-    //   directly rejects a re-minted dictionary (a duplicate-hash / bag dictionary).
-    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
-    assert_combined_catalog_hash_unique(&views)?;
+    // (1h) TRUST-BOUNDARY HARDENING (Wave 7): assert the store invariant `present`'s SET proof rests
+    // on. The sibling HASH-UNIQUENESS invariant (the no-re-mint guard: the combined node/value +
+    // predicate dictionaries assign a UNIQUE id per TERM, no hash at two ids across the chain) is
+    // asserted once per reconciled entry by `verify_reconcile_core` over the same root-authenticated
+    // catalogs (and by `verify_delta_read_core` on the delta-read path, which reuses this BGP core
+    // without going through `verify_reconcile_core`), so it already holds here — no second recompute.
     //   present is a SET (no duplicate canonical triple) over the bounded id key; the key commitment
     //   is DERIVED from the authenticated id commitments, so a fabricated key is rejected. Given
     //   hash-uniqueness (term ↔ id bijective), id-triple distinctness ⇒ TERM-triple distinctness.
@@ -744,6 +739,7 @@ pub(crate) fn verify_present_bgp(
         return Err(invalid("present BGP: range-dict presence disagrees with the plan"));
     }
     if let Some(range_dict) = &proof.range_dict {
+        let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
         let branches = range_dict_branch_commits(&views)?;
         verify_combined_range_dict(&branches, head_nv, verified.working_log, range_dict, transcript)?;
     }

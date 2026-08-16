@@ -1304,6 +1304,45 @@ fn hash_uniqueness_checker_rejects_a_re_minted_dictionary() {
 }
 
 #[test]
+fn hoisted_uniqueness_rejects_re_minted_views_on_the_join_path() {
+    // The no-re-mint guard `assert_combined_catalog_hash_unique` was HOISTED into
+    // `verify_reconcile_core` (and `verify_delta_read_core`), so EVERY reconciled id-space read
+    // entry — `verify_present_join` included — now asserts it, even though the join path (unlike
+    // the BGP path) carries no uniqueness call of its own. Drive that exact assertion over the
+    // SAME input it consumes on the join path: the reconciliation's `VerifierCommitmentRef` views
+    // built from a real join stack. A full end-to-end forged-proof reject is not constructible
+    // from here (the per-layer dict/root recompute helpers are `pub(super)` to the commitment
+    // module), so — mirroring the sibling checker tests above — the re-mint is injected at the
+    // views the hoisted check runs over.
+    let layers = join_stack();
+    // Honest stack: the combined dictionaries are hash-unique, so the guard PASSES — the hoist
+    // does not disturb honest join proofs (see `two_atom_join_over_present`).
+    let honest: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    assert_combined_catalog_hash_unique(&honest).unwrap();
+
+    // Adversarial re-mint: the head's incremental node/value catalog re-registers a BASE term at a
+    // FRESH id above the parent watermark (same canonical object, two distinct ids across layers).
+    // Each layer's own `validate()` still passes (per-layer catalogs stay bijective over disjoint
+    // id ranges); only the cross-layer combined-hash check catches it — which is why it MUST run on
+    // the join path. The guard now REJECTS it.
+    let base_view = layers[0].verifier_view();
+    let head_view = layers[1].verifier_view();
+    let mut re_minted_head_catalog = head_view.node_value_catalog.to_vec();
+    let mut re_mint = base_view.node_value_catalog[0].clone();
+    re_mint.object_id = head_view.state.node_value_count + 1; // a fresh id, above the watermark
+    re_minted_head_catalog.push(re_mint);
+    let re_minted_head = VerifierCommitmentRef {
+        node_value_catalog: &re_minted_head_catalog,
+        ..head_view
+    };
+    let re_minted_views = vec![base_view, re_minted_head];
+    assert!(
+        assert_combined_catalog_hash_unique(&re_minted_views).is_err(),
+        "the hoisted guard must reject a term re-minted across the chain on the join path's input"
+    );
+}
+
+#[test]
 fn distinct_checker_rejects_a_duplicate_column() {
     // An honest store cannot emit a duplicated present row or a duplicated dict id, so drive
     // the assert's checker DIRECTLY on a crafted column: a distinct column proves + verifies;
