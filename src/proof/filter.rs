@@ -33,7 +33,7 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    commit_column, prove_sumcheck, verify_column_openings, verify_sumcheck,
+    commit_column, mle_full_eval, powers, prove_sumcheck, verify_column_openings, verify_sumcheck,
     ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
     SumcheckShape, Term, Transcript254,
 };
@@ -41,25 +41,28 @@ use super::invalid;
 use super::logup::{
     multiset_link_claim, pseudo_inverse, reciprocal_claim, reciprocal_witness, rlc_fold,
 };
+use super::logup_gkr::{
+    bind_and_verify_fraction_tree, check_leaf_tie, prove_fraction_sum_zero, FractionInstance,
+    GkrFractionProof, LinearForm, LinearTerm, Src,
+};
 
 // Column ordering. The 2b-1 indicator gadget uses [P, sel, w].
 const COL_P: usize = 0;
 const COL_SEL: usize = 1;
 const COL_W: usize = 2;
-// chi_bounds indices: chi_n (real-row count n) and chi_m (output length m).
+// chi_bounds index for the 2b-1 filter/selection shape: chi_n (real-row count n).
 const CHI_N: usize = 0;
-const CHI_M: usize = 1;
 
-// Generalized per-atom filter column layout (filter on ANY subset of {S,P,O}). The
-// base columns come first so a constant position folds directly into claims A/B; the
-// kept (variable) output columns follow, then the two reciprocal columns, then the
-// optional unit INPUT column used only for a ground atom (|C| = 3).
+// Generalized per-atom filter column layout for the IsZero SELECTION sub-proof
+// (claims A, B over [S, P, O, sel, w]; filter on ANY subset of {S,P,O}). The base
+// columns come first so a constant position folds directly into claims A/B. The
+// compaction multiset link (kept outputs vs selected inputs) is proven separately by
+// a GKR fraction tree ([`filter_link_instance`]) with its OWN block-disjoint layout.
 const A_COL_S: usize = 0;
 const A_COL_P: usize = 1;
 const A_COL_O: usize = 2;
 const A_COL_SEL: usize = 3;
 const A_COL_W: usize = 4;
-const A_COL_KEPT_BASE: usize = 5;
 
 #[inline]
 fn f0() -> ArkFr {
@@ -305,18 +308,29 @@ pub fn verify_filter_indicator(
 // Full Q1: filter indicator + LogUp compaction to the dense (S_out, O_out).
 // ===========================================================================
 
-/// A complete Q1 filter query proof: the batched sumcheck over the two indicator
-/// claims (A, B) AND the three LogUp compaction claims (C, D, E), one batched
-/// Dory opening of all nine columns at `r`, and the internal witness commitments
-/// the verifier binds into the transcript.
+/// A complete Q1 filter query proof. Two independent sub-proofs bound on one
+/// transcript:
+///   * the IsZero SELECTION sub-proof — the batched sumcheck over the two indicator
+///     claims (A, B) plus one batched Dory opening of `[S, P, O, sel, w]` at its
+///     point, pinning `sel` to the constant-equality indicator (UNCHANGED by the
+///     LogUp-GKR migration);
+///   * the COMPACTION multiset LINK — a [`GkrFractionProof`] over an UNCOMMITTED
+///     block-disjoint fraction layout proving the kept output rows are exactly the
+///     selected input rows, plus the link columns' evaluations and one batched Dory
+///     opening at the leaf point. This REPLACES the old committed reciprocal columns
+///     (`cstar`/`dstar`) and the C/D/E link sumcheck; no reciprocal is committed.
 #[derive(Clone, Debug)]
 pub struct FullFilterProof {
     pub sumcheck: SumcheckProof,
     pub opening: ColumnOpening,
     pub sel_commitment: ArkGT,
     pub w_commitment: ArkGT,
-    pub cstar_commitment: ArkGT,
-    pub dstar_commitment: ArkGT,
+    /// GKR fraction tree for `Σ sel·(α−in_fold)⁻¹ − Σ [j<m]·(α−out_fold)⁻¹ = 0`.
+    pub link: GkrFractionProof,
+    /// Evaluations of `[sources.., kept_out.., sel]` at `r_low` (the low `num_vars`
+    /// bits of the GKR leaf point), bound to their commitments by `link_opening`.
+    pub link_col_evals: Vec<ArkFr>,
+    pub link_opening: ColumnOpening,
 }
 
 /// The variable/constant positions of a triple atom.
@@ -424,16 +438,6 @@ pub enum AtomFilterProof {
     Compacted(FullFilterProof),
 }
 
-fn a_col_cstar(num_kept: usize) -> usize {
-    A_COL_KEPT_BASE + num_kept
-}
-fn a_col_dstar(num_kept: usize) -> usize {
-    A_COL_KEPT_BASE + num_kept + 1
-}
-fn a_col_unit_in(num_kept: usize) -> usize {
-    A_COL_KEPT_BASE + num_kept + 2
-}
-
 /// Selection claims A and B generalized over the constant positions, folded with a
 /// PUBLIC Fiat-Shamir coefficient `beta_c` baked into the term coefficients (no new
 /// committed column):
@@ -519,44 +523,98 @@ fn selection_claims(spec: &AtomFilterSpec, beta_c: ArkFr) -> (SumcheckClaim, Sum
     )
 }
 
-/// The full atom-filter shape: selection (A, B) + compaction (C, D, E) over the kept
-/// columns. The compaction half is arity-generic (folds the kept INPUT columns for
-/// `cstar` and the kept OUTPUT columns for `dstar`).
-#[allow(clippy::too_many_arguments)]
-fn atom_shape(
+/// The IsZero SELECTION shape (claims A, B only) over `[S, P, O, sel, w]`, with
+/// `χ_n` the single chi bound. This is the selector sub-proof, UNCHANGED by the
+/// LogUp-GKR migration; the compaction multiset link is now a separate GKR fraction
+/// tree ([`filter_link_instance`]), not fused C/D/E claims in this sumcheck.
+fn atom_selection_shape(
     spec: &AtomFilterSpec,
     num_vars: usize,
     real_rows: usize,
-    output_len: usize,
-    num_kept: usize,
-    has_unit: bool,
     beta_c: ArkFr,
-    alpha: ArkFr,
-    beta: ArkFr,
 ) -> SumcheckShape {
     let (claim_a, claim_b) = selection_claims(spec, beta_c);
-
-    let kept_in: Vec<usize> = if has_unit {
-        vec![a_col_unit_in(num_kept)]
-    } else {
-        spec.kept.iter().map(|p| p.base_col()).collect()
-    };
-    let kept_out: Vec<usize> = (0..num_kept).map(|d| A_COL_KEPT_BASE + d).collect();
-    let cstar = a_col_cstar(num_kept);
-    let dstar = a_col_dstar(num_kept);
-
-    // C: cstar reciprocal over the kept INPUT fold; D: dstar over the kept OUTPUT fold.
-    let claim_c = reciprocal_claim(cstar, &kept_in, alpha, beta);
-    let claim_d = reciprocal_claim(dstar, &kept_out, alpha, beta);
-    // E (LogUp link): Σ sel*cstar - Σ chi_m*dstar = 0.
-    let claim_e = multiset_link_claim(Operand::Column(A_COL_SEL), cstar, Operand::Chi(CHI_M), dstar);
-
-    let num_columns = a_col_unit_in(num_kept) + usize::from(has_unit);
     SumcheckShape {
         num_vars,
-        num_columns,
-        chi_bounds: vec![real_rows, output_len],
-        claims: vec![claim_a, claim_b, claim_c, claim_d, claim_e],
+        num_columns: 5,
+        chi_bounds: vec![real_rows],
+        claims: vec![claim_a, claim_b],
+    }
+}
+
+/// The PUBLIC block-disjoint fraction-sum-zero instance for the compaction multiset
+/// LINK — the LogUp-GKR replacement for the old committed reciprocal columns and the
+/// C/D/E link. It proves
+/// ```text
+///     Σ_i sel_i·(α − in_fold_i)⁻¹  −  Σ_j [j < m]·(α − out_fold_j)⁻¹  =  0
+/// ```
+/// over a `2·domain`-leaf vector (`domain = 2^num_vars`): the kept INPUT sources
+/// occupy the LOW half `[0, domain)`, the kept OUTPUT columns the HIGH half. Column
+/// layout (all committed, length `domain`, block-disjoint zero-extended by the
+/// prover): `[0, num_kept)` sources (low), `[num_kept, 2·num_kept)` kept outputs
+/// (high), `2·num_kept` the selector `sel` (low).
+///   * denominator `q = α − Σ_d β^d·(source_d + kept_out_d)` — since the blocks are
+///     disjoint this is `α − in_fold` on the low half and `α − out_fold` on the high
+///     half, with the SAME `β^d` fingerprinting variable position `d` on both sides;
+///   * numerator `p = +sel(low half) − [domain ≤ j < domain+m](high half)`: each
+///     SELECTED input row contributes `+1` (via the committed `sel` column, pinned to
+///     the 0/1 constant-equality indicator by claims A, B over the same `com_sel`),
+///     each of the first `m` output rows `−1` (public prefix indicator; `m` = the
+///     revealed output length), and every padding row `0`.
+/// Both numerators are LINEAR (a committed `Src::Column` and public `Src::Prefix`es);
+/// there is NO `committed × public-Chi` product, so no GAP-1 auxiliary Identity is
+/// needed — the selector column's zero-on-padding is pinned by the co-located A/B
+/// sub-proof binding the identical `com_sel`. Built IDENTICALLY by prover and verifier
+/// from public inputs only.
+fn filter_link_instance(
+    alpha: ArkFr,
+    beta: ArkFr,
+    num_kept: usize,
+    num_vars: usize,
+    output_len: usize,
+) -> FractionInstance {
+    let domain = 1usize << num_vars;
+    let beta_powers = powers(beta, num_kept);
+    let mut q_terms = Vec::with_capacity(2 * num_kept);
+    for (d, power) in beta_powers.iter().enumerate() {
+        q_terms.push(LinearTerm {
+            coeff: f0() - *power,
+            src: Src::Column(d),
+        });
+    }
+    for (d, power) in beta_powers.iter().enumerate() {
+        q_terms.push(LinearTerm {
+            coeff: f0() - *power,
+            src: Src::Column(num_kept + d),
+        });
+    }
+    // p = +sel (low half, committed column 2·num_kept)
+    //     − ([j < domain+m] − [j < domain])  = −1 on the output rows [domain,domain+m).
+    let p_terms = vec![
+        LinearTerm {
+            coeff: f1(),
+            src: Src::Column(2 * num_kept),
+        },
+        LinearTerm {
+            coeff: f0() - f1(),
+            src: Src::Prefix(domain + output_len),
+        },
+        LinearTerm {
+            coeff: f1(),
+            src: Src::Prefix(domain),
+        },
+    ];
+    FractionInstance {
+        num_vars: num_vars + 1,
+        num_cols: 2 * num_kept + 1,
+        p_form: LinearForm {
+            constant: f0(),
+            terms: p_terms,
+        },
+        q_form: LinearForm {
+            constant: alpha,
+            terms: q_terms,
+        },
     }
 }
 
@@ -807,30 +865,52 @@ fn prove_compacted_with_witness_and_context(
     let beta = transcript.challenge_scalar(A_LABEL_BETA);
     let alpha = transcript.challenge_scalar(A_LABEL_ALPHA);
 
-    // Round 2: derived witnesses (w from beta_c; reciprocals from alpha/beta), bound
-    // AFTER the challenges are drawn.
+    // Round 2: the selection witness `w` (from beta_c), bound AFTER the challenges.
+    // No reciprocal column is committed anymore — the compaction link is a GKR
+    // fraction tree over UNCOMMITTED intermediates.
     let w = atom_w(spec, s, p, o, real_rows, beta_c);
-    let cstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(sources)));
-    let dstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(kept_out)));
     let com_w = context.commit_column(&w)?;
-    let com_cstar = context.commit_column(&cstar)?;
-    let com_dstar = context.commit_column(&dstar)?;
     transcript.append_group(b"pow/atom/com-w", &com_w);
-    transcript.append_group(b"pow/atom/com-cstar", &com_cstar);
-    transcript.append_group(b"pow/atom/com-dstar", &com_dstar);
 
-    let shape = atom_shape(
-        spec, num_vars, real_rows, output_len, num_kept, has_unit, beta_c, alpha, beta,
-    );
-    let mut columns = vec![s.to_vec(), p.to_vec(), o.to_vec(), sel.to_vec(), w];
-    columns.extend(kept_out.iter().cloned());
-    columns.push(cstar);
-    columns.push(dstar);
-    if has_unit {
-        columns.push(sources[0].clone());
+    // (A/B) The IsZero SELECTION sub-proof over [S, P, O, sel, w] — UNCHANGED.
+    let sel_shape = atom_selection_shape(spec, num_vars, real_rows, beta_c);
+    let sel_columns = vec![s.to_vec(), p.to_vec(), o.to_vec(), sel.to_vec(), w];
+    let (sumcheck, r_ab, _evals) = prove_sumcheck(&sel_shape, &sel_columns, transcript)?;
+    let opening = context.prove_column_openings(&sel_columns, &r_ab, transcript)?;
+
+    // (LINK) The compaction multiset link as ONE GKR fraction tree over the
+    // block-disjoint 2·domain layout: kept INPUT sources fill the low half, kept
+    // OUTPUT columns the high half, `sel` (low) the input numerator. `alpha`/`beta`
+    // were drawn above, AFTER every data-column commitment.
+    let domain = size;
+    let leaf_count = 2 * domain;
+    let mut extended: Vec<Vec<ArkFr>> = Vec::with_capacity(2 * num_kept + 1);
+    for source in sources {
+        let mut ext = vec![f0(); leaf_count];
+        ext[..domain].copy_from_slice(source);
+        extended.push(ext);
     }
-    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = context.prove_column_openings(&columns, &r, transcript)?;
+    for column in kept_out {
+        let mut ext = vec![f0(); leaf_count];
+        ext[domain..].copy_from_slice(column);
+        extended.push(ext);
+    }
+    let mut sel_ext = vec![f0(); leaf_count];
+    sel_ext[..domain].copy_from_slice(sel);
+    extended.push(sel_ext);
+
+    let link_inst = filter_link_instance(alpha, beta, num_kept, num_vars, output_len);
+    let (link, r_leaf) = prove_fraction_sum_zero(&link_inst, &extended, transcript)?;
+
+    // Single batched Dory opening of the length-`domain` link columns
+    // [sources.., kept_out.., sel] at r_low, bound to their commitments.
+    let r_low = &r_leaf[..num_vars];
+    let mut link_columns: Vec<Vec<ArkFr>> = Vec::with_capacity(2 * num_kept + 1);
+    link_columns.extend(sources.iter().cloned());
+    link_columns.extend(kept_out.iter().cloned());
+    link_columns.push(sel.to_vec());
+    let link_col_evals: Vec<ArkFr> = link_columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+    let link_opening = context.prove_column_openings(&link_columns, r_low, transcript)?;
 
     Ok((
         FullFilterProof {
@@ -838,8 +918,9 @@ fn prove_compacted_with_witness_and_context(
             opening,
             sel_commitment: com_sel,
             w_commitment: com_w,
-            cstar_commitment: com_cstar,
-            dstar_commitment: com_dstar,
+            link,
+            link_col_evals,
+            link_opening,
         },
         com_kept,
         output_len,
@@ -979,6 +1060,9 @@ fn verify_compacted(
     if com_kept.len() != num_kept {
         return Err(invalid("atom filter kept commitment count mismatch"));
     }
+    if proof.link_col_evals.len() != 2 * num_kept + 1 {
+        return Err(invalid("atom filter link column-evaluation count mismatch"));
+    }
     let has_unit = spec.kept.is_empty();
     // The unit INPUT column is public; the verifier recomputes its commitment.
     let com_unit_in = if has_unit {
@@ -1002,28 +1086,64 @@ fn verify_compacted(
     let beta = transcript.challenge_scalar(A_LABEL_BETA);
     let alpha = transcript.challenge_scalar(A_LABEL_ALPHA);
     transcript.append_group(b"pow/atom/com-w", &proof.w_commitment);
-    transcript.append_group(b"pow/atom/com-cstar", &proof.cstar_commitment);
-    transcript.append_group(b"pow/atom/com-dstar", &proof.dstar_commitment);
 
-    let shape = atom_shape(
-        spec, num_vars, real_rows, output_len, num_kept, has_unit, beta_c, alpha, beta,
-    );
-    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    // (A/B) Verify the IsZero SELECTION sub-proof over [S, P, O, sel, w].
+    let sel_shape = atom_selection_shape(spec, num_vars, real_rows, beta_c);
+    let (r_ab, evals) = verify_sumcheck(&sel_shape, &proof.sumcheck, transcript)?;
+    verify_column_openings(
+        &[*com_s, *com_p, *com_o, proof.sel_commitment, proof.w_commitment],
+        &r_ab,
+        &evals,
+        &proof.opening,
+        transcript,
+    )?;
 
-    let mut coms = vec![
-        *com_s,
-        *com_p,
-        *com_o,
-        proof.sel_commitment,
-        proof.w_commitment,
-    ];
-    coms.extend_from_slice(com_kept);
-    coms.push(proof.cstar_commitment);
-    coms.push(proof.dstar_commitment);
-    if let Some(c) = com_unit_in {
-        coms.push(c);
+    // (LINK) Bind the public block-disjoint instance and verify the GKR fraction tree.
+    let link_inst = filter_link_instance(alpha, beta, num_kept, num_vars, output_len);
+    let (r_leaf, p_claim, q_claim) =
+        bind_and_verify_fraction_tree(&link_inst, &proof.link, transcript)?;
+
+    // Open the length-`domain` link columns [sources.., kept_out.., sel] at r_low,
+    // bound to their commitments. Sources are the kept base columns (or the public
+    // recomputed unit column for a ground atom); kept outputs are `com_kept`; the
+    // numerator column is `com_sel` — pinned to the 0/1 selector (zero on padding and
+    // non-matches) by the A/B sub-proof above, over this same commitment.
+    let source_commitments: Vec<ArkGT> = if has_unit {
+        vec![com_unit_in.expect("ground atom recomputes the unit commitment")]
+    } else {
+        spec.kept
+            .iter()
+            .map(|pos| base_commitment(*pos, com_s, com_p, com_o))
+            .collect()
+    };
+    let r_low = &r_leaf[..num_vars];
+    let r_high = r_leaf[num_vars];
+    let mut link_coms: Vec<ArkGT> = Vec::with_capacity(2 * num_kept + 1);
+    link_coms.extend_from_slice(&source_commitments);
+    link_coms.extend_from_slice(com_kept);
+    link_coms.push(proof.sel_commitment);
+    verify_column_openings(
+        &link_coms,
+        r_low,
+        &proof.link_col_evals,
+        &proof.link_opening,
+        transcript,
+    )?;
+
+    // Reconstruct each 2·domain leaf-MLE from the length-`domain` opening via the
+    // top-bit zero-extension factor: sources + `sel` live in the LOW half (factor
+    // `1 − r_high`), kept outputs in the HIGH half (factor `r_high`). This structurally
+    // forces each side's columns to zero on the other block — neither can leak.
+    let one_minus_high = f1() - r_high;
+    let mut leaf_evals = Vec::with_capacity(2 * num_kept + 1);
+    for eval in &proof.link_col_evals[..num_kept] {
+        leaf_evals.push(one_minus_high * *eval); // sources (low half)
     }
-    verify_column_openings(&coms, &r, &evals, &proof.opening, transcript)
+    for eval in &proof.link_col_evals[num_kept..2 * num_kept] {
+        leaf_evals.push(r_high * *eval); // kept outputs (high half)
+    }
+    leaf_evals.push(one_minus_high * proof.link_col_evals[2 * num_kept]); // sel (low half)
+    check_leaf_tie(&link_inst, &leaf_evals, p_claim, q_claim, &r_leaf)
 }
 
 /// Verify a generalized per-atom filter proof. The verifier concludes `com_kept[0..m]`

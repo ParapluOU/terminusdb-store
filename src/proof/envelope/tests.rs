@@ -496,18 +496,19 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         use sha2::Digest as _;
         let hash = sha2::Sha256::digest(&bytes);
         let hash_hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        assert_eq!(bytes.len(), 150366, "materialized proof byte length changed");
-        // Hash + length regenerated for the LogUp-GKR migration of `membership` (Phase 2c-2b):
-        // the two-atom join's `join2` proof embeds two `MembershipProof`s, each of which dropped
-        // its two committed reciprocal GT commitments (`rec_u`/`rec_of`) and batched sumcheck for
-        // a block-disjoint GKR fraction-tree proof + three data-column leaf evaluations + a
-        // co-running `(1 - chi_{n_U})*w = 0` GAP-1 Identity sumcheck and its `w` opening, so the
-        // proof bytes (structure AND transcript-derived challenges) shifted while prover↔verifier
-        // still agree. The byte length rose (the GKR fraction rounds + the extra Identity sumcheck
-        // and opening outweigh the two dropped GT commitments). Intended, verified new stable image.
+        assert_eq!(bytes.len(), 158104, "materialized proof byte length changed");
+        // Hash + length regenerated for the LogUp-GKR migration of the atom-filter compaction
+        // LINK: each of the two atoms carries a `FullFilterProof` (predicate-constant filter over
+        // `knows`), which dropped its two committed reciprocal GT commitments (`cstar`/`dstar`) and
+        // the fused C/D/E link sumcheck for a block-disjoint GKR fraction-tree proof (kept outputs
+        // == selected inputs) + the link data-column leaf evaluations + a second batched opening.
+        // The IsZero selection sub-proof (A, B) is unchanged. The proof bytes (structure AND
+        // transcript-derived challenges) shifted while prover↔verifier still agree; the byte length
+        // rose (150366 -> 158104: the GKR rounds + the extra link opening/evals across BOTH atoms
+        // outweigh the four dropped GT commitments). Intended, verified new stable image.
         assert_eq!(
             hash_hex,
-            "cd6b1741d9630bb890e77a3ed7b7cc540f9c33ce7308b016d6c59356803c8618",
+            "dc3ed491790dcad98fac0858c2fd75cf14f74b8373f5dfdbe88a9291b2f4ab37",
             "materialized multi-atom proof transcript/commitments changed (byte-identity regression)"
         );
     }

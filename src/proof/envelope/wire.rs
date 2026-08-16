@@ -128,10 +128,17 @@ pub(super) fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
 // multi-atom BGP join (join2 embeds two memberships) or a hash semi-join has different
 // proof bytes. The UNION/ANTI/OUTER envelopes embed the same BGP-chain / semi-join, so
 // they bump in lockstep.
-pub(super) const VERSION: u32 = 7;
-pub(super) const UNION_VERSION: u32 = 5;
-pub(super) const ANTI_VERSION: u32 = 7;
-pub(super) const OUTER_VERSION: u32 = 4;
+// v8: LogUp-GKR migration of the atom-filter compaction LINK — `FullFilterProof` dropped
+// its two committed reciprocal GT commitments (`cstar`/`dstar`) and the fused C/D/E link
+// sumcheck for a block-disjoint GKR fraction-tree proof (kept outputs == selected inputs)
+// + the link data-column evaluations + a second batched opening. The IsZero selection
+// sub-proof (A, B) is unchanged. Every constant-position atom (predicate/subject/object
+// filter) embeds a `FullFilterProof`, so any BGP with a constant atom has different proof
+// bytes; UNION/ANTI/OUTER embed the same BGP chain and bump in lockstep.
+pub(super) const VERSION: u32 = 8;
+pub(super) const UNION_VERSION: u32 = 6;
+pub(super) const ANTI_VERSION: u32 = 8;
+pub(super) const OUTER_VERSION: u32 = 5;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
 // v23 adds the ordered `sys:Array` walk composite node (tag 24).
@@ -150,7 +157,10 @@ pub(super) const OUTER_VERSION: u32 = 4;
 // v27: LogUp-GKR `MembershipProof` migration (Phase 2c-2b, see the `VERSION` note) —
 // recursive envelopes embed BGP-chain leaves (join2's two memberships) and hash
 // semi-joins whose membership proof bytes changed.
-pub(super) const RECURSIVE_VERSION: u32 = 27;
+// v28: LogUp-GKR atom-filter compaction LINK migration (see the `VERSION` v8 note) —
+// recursive envelopes embed layer-BGP leaves whose per-atom `FullFilterProof` bytes
+// changed (committed `cstar`/`dstar` + C/D/E link sumcheck -> GKR fraction tree).
+pub(super) const RECURSIVE_VERSION: u32 = 28;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -423,13 +433,19 @@ wire_struct!(DictProof {
     mult_commitment
 });
 wire_struct!(FilterProof { sumcheck, opening });
+// LogUp-GKR migration of the atom-filter compaction LINK: the two committed reciprocal
+// commitments (`cstar`/`dstar`) and the fused C/D/E link sumcheck are gone; a GKR
+// fraction-tree proof + the link data-column evaluations at the leaf-opening point + a
+// second batched opening carry the "kept outputs == selected inputs" multiset link. The
+// IsZero selection sub-proof (A, B) is unchanged.
 wire_struct!(FullFilterProof {
     sumcheck,
     opening,
     sel_commitment,
     w_commitment,
-    cstar_commitment,
-    dstar_commitment
+    link,
+    link_col_evals,
+    link_opening
 });
 wire_struct!(SelectionOnlyProof {
     sumcheck,
