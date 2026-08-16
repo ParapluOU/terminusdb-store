@@ -1268,6 +1268,10 @@ impl RelationProofPlan {
                             | CanonicalDatatype::NonNegativeInteger
                             | CanonicalDatatype::NonPositiveInteger
                             | CanonicalDatatype::NegativeInteger
+                            // Float32/64: IEEE total-order OP key diverges from WOQL numeric order
+                            // (−0.0/NaN); float sort keys reject-close (matches `supported_datatype`).
+                            | CanonicalDatatype::Float32
+                            | CanonicalDatatype::Float64
                     )
                 {
                     return Err(invalid("invalid exact scalar order child shape"));

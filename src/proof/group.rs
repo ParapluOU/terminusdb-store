@@ -94,10 +94,14 @@ pub struct GroupExtremaResult {
 }
 
 fn supported(datatype: CanonicalDatatype) -> bool {
+    // Integral only — mirrors the LIVE extrema guard `integral_op_datatype`. Float32/64 are
+    // EXCLUDED: their committed OP value is IEEE TOTAL order (−0.0 sorts below +0.0; NaN above +∞),
+    // which diverges from WOQL numeric Min/Max, so an unfaithful float extremum must never become
+    // provable — even if this (currently caller-less) standalone GroupExtrema path is ever wired in.
     matches!(datatype, CanonicalDatatype::UInt8 | CanonicalDatatype::Int8
         | CanonicalDatatype::UInt16 | CanonicalDatatype::Int16
-        | CanonicalDatatype::UInt32 | CanonicalDatatype::Int32 | CanonicalDatatype::Float32
-        | CanonicalDatatype::UInt64 | CanonicalDatatype::Int64 | CanonicalDatatype::Float64)
+        | CanonicalDatatype::UInt32 | CanonicalDatatype::Int32
+        | CanonicalDatatype::UInt64 | CanonicalDatatype::Int64)
 }
 
 fn padded(values: &[ArkFr], log: usize) -> Vec<ArkFr> {

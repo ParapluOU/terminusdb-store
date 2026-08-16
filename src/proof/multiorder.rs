@@ -54,11 +54,13 @@ fn validate_shape(arity: usize, datatypes: &[CanonicalDatatype], key_indices: &[
     }
     let mut sorted = key_indices.to_vec(); sorted.sort_unstable();
     if sorted != (0..arity).collect::<Vec<_>>() { return Err(invalid("multi-order key indices must be an exact column permutation")); }
+    // `Float32`/`Float64` are DELIBERATELY excluded (defense-in-depth): the IEEE total-order
+    // float key diverges from WOQL numeric order on `-0.0`/`+0.0`/`NaN`, and the woql2 compiler
+    // already reject-closes float ORDER before a float key can reach this gadget.
     if datatypes.iter().any(|datatype| !matches!(datatype,
         CanonicalDatatype::Boolean | CanonicalDatatype::UInt8 | CanonicalDatatype::UInt16 |
         CanonicalDatatype::UInt32 | CanonicalDatatype::UInt64 | CanonicalDatatype::Int8 |
-        CanonicalDatatype::Int16 | CanonicalDatatype::Int32 | CanonicalDatatype::Int64 |
-        CanonicalDatatype::Float32 | CanonicalDatatype::Float64)) {
+        CanonicalDatatype::Int16 | CanonicalDatatype::Int32 | CanonicalDatatype::Int64)) {
         return Err(invalid("exact multi-order datatype is not fixed-width order-preserving"));
     }
     Ok(())

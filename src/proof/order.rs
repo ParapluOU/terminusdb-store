@@ -79,6 +79,11 @@ pub struct ExactScalarOrderResult {
 }
 
 fn supported_datatype(datatype: CanonicalDatatype) -> bool {
+    // `Float32`/`Float64` are DELIBERATELY excluded (defense-in-depth, matching the
+    // `integral_op_datatype` extrema guard). The IEEE total-order float key `node_value_op_value`
+    // commits sorts `-0.0` below `+0.0` and `NaN` above `+∞`, diverging from WOQL numeric order;
+    // the woql2 compiler already reject-closes float ORDER, so this gadget never receives a float
+    // key in production — this guard ensures it stays that way.
     matches!(
         datatype,
         CanonicalDatatype::Boolean
@@ -90,8 +95,6 @@ fn supported_datatype(datatype: CanonicalDatatype) -> bool {
             | CanonicalDatatype::Int16
             | CanonicalDatatype::Int32
             | CanonicalDatatype::Int64
-            | CanonicalDatatype::Float32
-            | CanonicalDatatype::Float64
     )
 }
 
