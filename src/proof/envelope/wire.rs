@@ -135,7 +135,12 @@ pub(super) const OUTER_VERSION: u32 = 3;
 // embed a full-row permutation proof, which dropped its two committed reciprocal GT
 // commitments and batched sumcheck for a GKR fraction-tree proof + `2*arity`
 // data-column leaf evaluations, so those envelopes' proof bytes changed.
-pub(super) const RECURSIVE_VERSION: u32 = 25;
+// v26: LogUp-GKR `HashLookupInnerProof` migration (Inc 2/5 corollary) — the recursive
+// `CrossRootHashJoin` node embeds two `DictHashLookupProof`s, whose inner `id → hash`
+// lookup dropped the two committed reciprocal GT commitments (`rec_q`/`rec_d`) and its
+// batched sumcheck for a block-disjoint GKR fraction-tree proof + five data-column leaf
+// evaluations, so those envelopes' proof bytes changed.
+pub(super) const RECURSIVE_VERSION: u32 = 26;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -681,12 +686,11 @@ wire_struct!(DictLookupProof {
     com_rec_d
 });
 wire_struct!(HashLookupInnerProof {
-    sumcheck,
+    gkr,
+    col_evals,
     opening,
     com_v_hash,
-    com_w,
-    com_rec_q,
-    com_rec_d
+    com_w
 });
 wire_struct!(DictHashLookupProof {
     relocate_dict_hash,

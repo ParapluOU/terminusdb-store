@@ -27,19 +27,44 @@
 //! `v_hash` against ITS OWN root; the [`super::envelope::RelationProofPlanKind::CrossRootHashJoin`]
 //! node then binds both roots to the trusted `database_root` and joins on the hashes.
 //!
-//! # The gadget (cloned LogUp shape)
-//! Over the shared `2^k` domain (dict columns relocated up to it, `obj_id` relocated up to
-//! it), columns `[obj_id, v_hash, rec_q, dict_id, dict_hash, w, rec_d]`:
-//!   * fold each side's `(id, hash)` with β powers: `q_fold = obj_id + β·v_hash`,
+//! # The gadget (LogUp-GKR, block-disjoint two-side layout — Inc 2/5 migration)
+//! Over the shared `2^k` domain `size` (dict columns relocated up to it, `obj_id` relocated
+//! up to it), the committed DATA columns `[obj_id, v_hash, dict_id, dict_hash, w]`:
+//!   * fold each side's `(id, hash)` with β powers, SAME power per logical column so the
+//!     fold fingerprints the PAIR identically on both sides: `q_fold = obj_id + β·v_hash`,
 //!     `d_fold = dict_id + β·dict_hash`;
-//!   * reciprocal witnesses `rec_q = 1/(α − q_fold)`, `rec_d = 1/(α − d_fold)` pinned by
-//!     Identity claims;
 //!   * multiplicity `w[j]` counts the real query rows whose id is dict row `j`;
-//!   * masked LogUp link `Σ χ_n·rec_q − Σ χ_{n_dict}·w·rec_d = 0`.
-//! `β` fingerprints the `(id, hash)` PAIR; `dict_id` uniqueness pins the matched dict row,
-//! so `v_hash[i]` is FORCED to that row's true hash (a wrong `v_hash[i]` leaves an
-//! uncancelled pole and the identity fails). Same soundness as the value lookup, minus the
-//! datatype column.
+//!   * prove `Σ_{i<real_n} 1/(α − q_fold[i]) − Σ_j w[j]/(α − d_fold[j]) = 0` with the GKR
+//!     fraction tree ([`super::logup_gkr`]) over a `2·size` leaf vector laid out
+//!     BLOCK-DISJOINT: the query rows in the LOW half `[0, size)` (denominator `α − q_fold`,
+//!     numerator the ADDITIVE public prefix indicator `+[i < real_n]`), the dict rows in the
+//!     HIGH half `[size, 2·size)` (denominator `α − d_fold`, numerator the committed
+//!     multiplicity `−w`). NO reciprocal column is committed anywhere (`rec_q`/`rec_d` are
+//!     gone). `β` fingerprints the `(id, hash)` PAIR; `dict_id` uniqueness pins the matched
+//!     dict row, so `v_hash[i]` is FORCED to that row's true hash (a wrong `v_hash[i]` leaves
+//!     an uncancelled pole and the fraction sum's root `P ≠ 0`).
+//!
+//! Block-disjoint structural enforcement (Inc 2). The committed columns stay length `size`;
+//! the prover feeds the tree their zero-extensions — query columns zero on the high half,
+//! dict columns + `w` zero on the low half. The verifier opens the length-`size` committed
+//! columns at the low `k` bits `r_low` of the GKR leaf point and reconstructs each `2·size`
+//! leaf-MLE via the top-bit factor: `(1 − r_high)·col(r_low)` for a query column (low half)
+//! and `r_high·col(r_low)` for a dict column (high half). This STRUCTURALLY forces each
+//! side's fold columns to zero in the OTHER block (the same enforcement `permutation` uses),
+//! so neither side can leak into the other.
+//!
+//! GAP-1 masking, structural. The reciprocal-era `Σ χ_{n_dict}·w·rec_d` masked out the dict
+//! padding tail `[n_dict, size)` (rows whose relocated `dict_id`/`dict_hash` are ROOT-BOUND
+//! to zero, so `d_fold = 0`) to stop a prover using a padding pole `−w/α` to forge. Here that
+//! mask needs NO co-running `(1 − χ_{n_dict})·w = 0` Identity: the honest `w` is zero on the
+//! tail, and a FORGED nonzero `w` there produces a leaf `−w/α` whose pole at `α − 0` is
+//! UNMATCHED — every real query fold is `obj_id[i] + β·v_hash[i]` with a genuine dict id
+//! `obj_id[i] ≥ 1`, hence nonzero (whp over the post-commit `β`), so no query leaf has
+//! denominator `α`. An unmatched padding pole makes the fraction sum's root `P ≠ 0` and the
+//! proof REJECTS. This is the SAME self-annihilating-padding mechanism [`super::dict`] relies
+//! on for its own dict padding (whose `q_fold ≠ 0` is likewise required), extended here to a
+//! committed query column. (Caller contract: the root-bound `obj_id` column carries genuine
+//! dictionary ids `≥ 1` on its real rows; every real caller supplies exactly that.)
 //!
 //! # Root authentication
 //! The transcript is seeded with the OWNING layer's `commitment_root` (as
@@ -55,28 +80,30 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    prove_sumcheck, verify_column_openings, verify_sumcheck, ColumnOpening, StoreProverContext,
-    SumcheckProof, SumcheckShape, Transcript254,
+    mle_full_eval, powers, verify_column_openings, ColumnOpening, StoreProverContext, Transcript254,
 };
-use super::logup::{masked_multiset_link_claim, reciprocal_claim, reciprocal_witness, rlc_fold};
+use super::logup_gkr::{
+    bind_and_verify_fraction_tree, check_leaf_tie, prove_fraction_sum_zero, FractionInstance,
+    GkrFractionProof, LinearForm, LinearTerm, Src,
+};
 use super::relocate::{
     prove_column_relocation_with_context, verify_column_relocation, RelocationProof,
 };
 use super::commitment::{LayerCommitment, VerifierLayer};
 use super::{invalid, ProofHash};
 
-// Column ordering for the batched hash-lookup sumcheck (one shared `2^k` domain).
+// Column ordering for the batched hash-lookup DATA columns (each committed at the shared
+// `2^k` domain `size`). The reciprocal witnesses `rec_q`/`rec_d` are GONE: the LogUp-GKR
+// migration proves the same log-derivative sum via a block-disjoint fraction tree over
+// uncommitted intermediates, so no reciprocal column is committed anywhere.
+//   * query side (LOW half of the `2·size` leaf vector): the join-key id + its hash;
+//   * dict side (HIGH half): the dictionary id, its hash, and the multiplicity.
 const HL_COL_OBJ_ID: usize = 0;
 const HL_COL_V_HASH: usize = 1;
-const HL_COL_REC_Q: usize = 2;
-const HL_COL_DICT_ID: usize = 3;
-const HL_COL_DICT_HASH: usize = 4;
-const HL_COL_W: usize = 5;
-const HL_COL_REC_D: usize = 6;
-const HL_NUM_COLUMNS: usize = 7;
-// chi_bounds indices: χ_n (real query rows) and χ_{n_dict} (real dict rows).
-const HL_CHI_N: usize = 0;
-const HL_CHI_NDICT: usize = 1;
+const HL_COL_DICT_ID: usize = 2;
+const HL_COL_DICT_HASH: usize = 3;
+const HL_COL_W: usize = 4;
+const HL_NUM_COLUMNS: usize = 5;
 
 const HASH_LOOKUP_DOMAIN: &[u8] = b"pow/dict-hash-lookup/domain-v1";
 const HASH_LOOKUP_ROOT: &[u8] = b"pow/dict-hash-lookup/root";
@@ -88,6 +115,10 @@ const HASH_LOOKUP_ALPHA: &[u8] = b"pow/dict-hash-lookup/reciprocal-alpha";
 fn f0() -> ArkFr {
     ArkFr::zero()
 }
+#[inline]
+fn f1() -> ArkFr {
+    ArkFr::one()
+}
 
 fn padded(values: &[ArkFr], log: usize) -> Vec<ArkFr> {
     let mut out = values.to_vec();
@@ -95,36 +126,68 @@ fn padded(values: &[ArkFr], log: usize) -> Vec<ArkFr> {
     out
 }
 
-/// The batched hash-lookup sumcheck: the two reciprocal (Identity) claims + the masked
-/// LogUp link (ZeroSum) over `[obj_id, v_hash, rec_q, dict_id, dict_hash, w, rec_d]`.
+/// Zero-extend a length-`size` column into the LOW half of a `2·size` leaf vector (the
+/// query block); the high half stays zero. MLE at `(r_low, r_high)` is
+/// `(1 − r_high)·MLE_size(col, r_low)`.
+fn low_half(col: &[ArkFr], leaf_count: usize) -> Vec<ArkFr> {
+    let mut ext = vec![f0(); leaf_count];
+    ext[..col.len()].copy_from_slice(col);
+    ext
+}
+
+/// Zero-extend a length-`size` column into the HIGH half of a `2·size` leaf vector (the
+/// dict block); the low half stays zero. MLE at `(r_low, r_high)` is
+/// `r_high·MLE_size(col, r_low)`.
+fn high_half(col: &[ArkFr], leaf_count: usize) -> Vec<ArkFr> {
+    let mut ext = vec![f0(); leaf_count];
+    ext[leaf_count / 2..].copy_from_slice(col);
+    ext
+}
+
+/// The batched hash-lookup GKR fraction proof: the fraction-sum-zero proof for
+/// `Σ_{i<real_n} 1/(α − q_fold) − Σ_j w/(α − d_fold) = 0`, the claimed evaluations of the
+/// five DATA columns at `r_low` (the low `k` bits of the GKR leaf point), one batched Dory
+/// opening of those columns at `r_low`, and the two freshly committed columns the verifier
+/// binds. NO reciprocal (`rec_q`/`rec_d`) column exists anymore.
 #[derive(Clone, Debug)]
 pub struct HashLookupInnerProof {
-    pub sumcheck: SumcheckProof,
+    pub gkr: GkrFractionProof,
+    pub col_evals: Vec<ArkFr>,
     pub opening: ColumnOpening,
     pub com_v_hash: ArkGT,
     pub com_w: ArkGT,
-    pub com_rec_q: ArkGT,
-    pub com_rec_d: ArkGT,
 }
 
-fn hash_lookup_shape(k: usize, real_n: usize, n_dict: usize, alpha: ArkFr, beta: ArkFr) -> SumcheckShape {
-    // Fold order [id, hash] -> id + β·hash on both sides.
-    let rec_q = reciprocal_claim(HL_COL_REC_Q, &[HL_COL_OBJ_ID, HL_COL_V_HASH], alpha, beta);
-    let rec_d = reciprocal_claim(HL_COL_REC_D, &[HL_COL_DICT_ID, HL_COL_DICT_HASH], alpha, beta);
-    let link = masked_multiset_link_claim(
-        &[super::argument::Operand::Chi(HL_CHI_N)],
-        HL_COL_REC_Q,
-        &[
-            super::argument::Operand::Chi(HL_CHI_NDICT),
-            super::argument::Operand::Column(HL_COL_W),
-        ],
-        HL_COL_REC_D,
-    );
-    SumcheckShape {
-        num_vars: k,
-        num_columns: HL_NUM_COLUMNS,
-        chi_bounds: vec![real_n, n_dict],
-        claims: vec![rec_q, rec_d, link],
+/// The PUBLIC block-disjoint fraction-sum-zero instance over a length-`2·size` leaf vector
+/// (`size = 2^k`): query rows in the low half `[0, size)`, dict rows in the high half
+/// `[size, 2·size)`. Built IDENTICALLY by prover and verifier from public inputs only.
+///   * denominator `q_leaf = α − Σ_d β^d·(query_col_d + dict_col_d)` — since the blocks are
+///     disjoint, this is `α − q_fold` on the low half and `α − d_fold` on the high half,
+///     with the SAME `β^d` fingerprinting a given logical column (id → β^0, hash → β^1) on
+///     both sides;
+///   * numerator `p_leaf = +[i < real_n] − w`: each real query row counts `+1` (public
+///     prefix indicator, low half), each dict row `−w[j]` (committed multiplicity, high
+///     half); every padding query row gets `0` and self-annihilates.
+fn hash_lookup_fraction_instance(alpha: ArkFr, beta: ArkFr, real_n: usize, k: usize) -> FractionInstance {
+    let beta_powers = powers(beta, 2);
+    let q_terms = vec![
+        // Query side (low half): obj_id + β·v_hash.
+        LinearTerm { coeff: f0() - beta_powers[0], src: Src::Column(HL_COL_OBJ_ID) },
+        LinearTerm { coeff: f0() - beta_powers[1], src: Src::Column(HL_COL_V_HASH) },
+        // Dict side (high half): dict_id + β·dict_hash, SAME β powers, so the fold
+        // fingerprints the (id, hash) PAIR identically on both sides.
+        LinearTerm { coeff: f0() - beta_powers[0], src: Src::Column(HL_COL_DICT_ID) },
+        LinearTerm { coeff: f0() - beta_powers[1], src: Src::Column(HL_COL_DICT_HASH) },
+    ];
+    let p_terms = vec![
+        LinearTerm { coeff: f1(), src: Src::Prefix(real_n) },
+        LinearTerm { coeff: f0() - f1(), src: Src::Column(HL_COL_W) },
+    ];
+    FractionInstance {
+        num_vars: k + 1,
+        num_cols: HL_NUM_COLUMNS,
+        p_form: LinearForm { constant: f0(), terms: p_terms },
+        q_form: LinearForm { constant: alpha, terms: q_terms },
     }
 }
 
@@ -197,6 +260,10 @@ pub(crate) fn prove_hash_lookup_inner(
     let k = size.trailing_zeros() as usize;
     let (v_hash, w) = honest_hash_lookup(obj_id, dict_id, dict_hash, real_n, n_dict);
 
+    // Commit the two fresh DATA columns, THEN draw beta/alpha. Caller contract (Inc 0
+    // audit): alpha MUST be drawn after the column commitments are bound so the fraction
+    // leaves are fixed before any per-layer GKR challenge. There is no reciprocal
+    // commitment anymore, so this is the last binding before the fold challenges.
     let com_v_hash = context.commit_column(&v_hash)?;
     let com_w = context.commit_column(&w)?;
     bind_hash_lookup_statement(transcript, real_n, n_dict);
@@ -208,28 +275,27 @@ pub(crate) fn prove_hash_lookup_inner(
     let beta = transcript.challenge_scalar(HASH_LOOKUP_BETA);
     let alpha = transcript.challenge_scalar(HASH_LOOKUP_ALPHA);
 
-    let fold_q = rlc_fold(beta, &[obj_id, &v_hash]);
-    let fold_d = rlc_fold(beta, &[dict_id, dict_hash]);
-    let rec_q = reciprocal_witness(alpha, &fold_q);
-    let rec_d = reciprocal_witness(alpha, &fold_d);
-    let com_rec_q = context.commit_column(&rec_q)?;
-    let com_rec_d = context.commit_column(&rec_d)?;
-    transcript.append_group(b"pow/dict-hash/com-rec-q", &com_rec_q);
-    transcript.append_group(b"pow/dict-hash/com-rec-d", &com_rec_d);
-
-    let shape = hash_lookup_shape(k, real_n, n_dict, alpha, beta);
-    let columns = vec![
-        obj_id.to_vec(),
-        v_hash,
-        rec_q,
-        dict_id.to_vec(),
-        dict_hash.to_vec(),
-        w,
-        rec_d,
+    // Prove the fraction sum over the block-disjoint `2·size` zero-extensions: query
+    // columns fill the low half, dict columns + w the high half. The tree lands at
+    // `r_leaf` (length `k + 1`), whose low `k` bits are the opening point.
+    let inst = hash_lookup_fraction_instance(alpha, beta, real_n, k);
+    let leaf_count = inst.size();
+    let extended = vec![
+        low_half(obj_id, leaf_count),
+        low_half(&v_hash, leaf_count),
+        high_half(dict_id, leaf_count),
+        high_half(dict_hash, leaf_count),
+        high_half(&w, leaf_count),
     ];
-    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = context.prove_column_openings(&columns, &r, transcript)?;
-    Ok(HashLookupInnerProof { sumcheck, opening, com_v_hash, com_w, com_rec_q, com_rec_d })
+    let (gkr, r_leaf) = prove_fraction_sum_zero(&inst, &extended, transcript)?;
+
+    // Single batched Dory opening of the length-`size` DATA columns at `r_low`, bound to
+    // their (root-anchored / freshly committed) commitments on this transcript.
+    let r_low = &r_leaf[..k];
+    let columns = vec![obj_id.to_vec(), v_hash, dict_id.to_vec(), dict_hash.to_vec(), w];
+    let col_evals: Vec<ArkFr> = columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+    let opening = context.prove_column_openings(&columns, r_low, transcript)?;
+    Ok(HashLookupInnerProof { gkr, col_evals, opening, com_v_hash, com_w })
 }
 
 /// Verify the batched hash lookup over columns sharing ONE `2^k` domain. On success the
@@ -244,12 +310,18 @@ pub(crate) fn verify_hash_lookup_inner(
     proof: &HashLookupInnerProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    let k = proof.sumcheck.round_polys.len();
-    if k == 0 || k >= usize::BITS as usize {
+    // The GKR tree has `k + 1` layers (`2·size` leaves for a length-`size = 2^k` domain),
+    // so `k = num_vars - 1` and the committed columns have length `size = 2^k`.
+    let num_vars = proof.gkr.num_vars();
+    if num_vars < 2 || num_vars >= usize::BITS as usize {
         return Err(invalid("hash-lookup proof has an implausible variable count"));
     }
+    let k = num_vars - 1;
     if real_n > (1usize << k) || n_dict > (1usize << k) {
         return Err(invalid("hash-lookup real length exceeds the column domain"));
+    }
+    if proof.col_evals.len() != HL_NUM_COLUMNS {
+        return Err(invalid("hash-lookup proof has the wrong number of column evaluations"));
     }
     bind_hash_lookup_statement(transcript, real_n, n_dict);
     transcript.append_group(b"pow/dict-hash/com-obj-id", com_obj_id);
@@ -259,21 +331,37 @@ pub(crate) fn verify_hash_lookup_inner(
     transcript.append_group(b"pow/dict-hash/com-w", &proof.com_w);
     let beta = transcript.challenge_scalar(HASH_LOOKUP_BETA);
     let alpha = transcript.challenge_scalar(HASH_LOOKUP_ALPHA);
-    transcript.append_group(b"pow/dict-hash/com-rec-q", &proof.com_rec_q);
-    transcript.append_group(b"pow/dict-hash/com-rec-d", &proof.com_rec_d);
 
-    let shape = hash_lookup_shape(k, real_n, n_dict, alpha, beta);
-    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    // Bind the public instance and verify the GKR tree -> the leaf point + claims.
+    let inst = hash_lookup_fraction_instance(alpha, beta, real_n, k);
+    let (r_leaf, p_claim, q_claim) = bind_and_verify_fraction_tree(&inst, &proof.gkr, transcript)?;
+
+    // Open the length-`size` committed columns at `r_low`, bound to their commitments.
+    let r_low = &r_leaf[..k];
+    let r_high = r_leaf[k];
     let commitments = [
         *com_obj_id,
         proof.com_v_hash,
-        proof.com_rec_q,
         *com_dict_id,
         *com_dict_hash,
         proof.com_w,
-        proof.com_rec_d,
     ];
-    verify_column_openings(&commitments, &r, &evals, &proof.opening, transcript)
+    verify_column_openings(&commitments, r_low, &proof.col_evals, &proof.opening, transcript)?;
+
+    // Reconstruct each `2·size` leaf-MLE from the length-`size` opening via the top-bit
+    // zero-extension factor: query columns live in the LOW half (factor `1 − r_high`), dict
+    // columns + w in the HIGH half (factor `r_high`). This is the block-disjoint
+    // enforcement — each side's fold columns reconstruct to zero in the OTHER block, so
+    // neither side can leak into the other — then tie to the GKR-reduced leaf claims.
+    let one_minus_high = f1() - r_high;
+    let leaf_evals = vec![
+        one_minus_high * proof.col_evals[HL_COL_OBJ_ID],
+        one_minus_high * proof.col_evals[HL_COL_V_HASH],
+        r_high * proof.col_evals[HL_COL_DICT_ID],
+        r_high * proof.col_evals[HL_COL_DICT_HASH],
+        r_high * proof.col_evals[HL_COL_W],
+    ];
+    check_leaf_tie(&inst, &leaf_evals, p_claim, q_claim, &r_leaf)
 }
 
 /// The full authenticated `id → hash(IRI)` lookup proof: the root-bound dict columns
@@ -555,6 +643,80 @@ mod tests {
         assert!(
             verify_dict_hash_lookup(&com_obj, obj_log, node_ids.len(), &*layer, &proof, &mut tv).is_err(),
             "a tampered v_hash commitment must reject"
+        );
+    }
+
+    // GAP-1 forge negative. The reciprocal-era `χ_{n_dict}` mask zeroed the dict padding
+    // tail so a prover could not use a padding pole `−w/α` (dict padding rows have
+    // root-bound `dict_id = dict_hash = 0`, so `d_fold = 0`, a pole at `α`) to fake a
+    // lookup. The migrated gadget drops that mask and closes the same forge STRUCTURALLY:
+    // the honest `w` is zero on the tail, and a FORGED nonzero `w` there is a leaf `−w/α`
+    // whose pole is UNMATCHED (every real query fold is `obj_id + β·v_hash` with a genuine
+    // dict id `≥ 1`, hence nonzero whp), so the fraction sum's root `P ≠ 0` and the proof
+    // rejects. This drives the inner prover flow with an explicit padding-tail forgery.
+    #[test]
+    fn hash_lookup_rejects_padding_tail_forged_pole() {
+        let fr = ArkFr::from_u64;
+        // Dict of 3 real entries (ids 1,2,3) padded to size 4: row 3 is padding
+        // (dict_id = dict_hash = 0 -> d_fold = 0 -> a pole at α).
+        let size = 4usize;
+        let k = 2usize;
+        let dict_id = vec![fr(1), fr(2), fr(3), f0()];
+        let dict_hash = vec![fr(10), fr(20), fr(30), f0()];
+        let n_dict = 3usize;
+        // Query two genuine member ids (both ≥ 1) — honestly this verifies.
+        let obj_id = vec![fr(1), fr(2), f0(), f0()];
+        let real_n = 2usize;
+        assert_eq!(obj_id.len(), size);
+
+        let context = StoreProverContext::cpu();
+        let com_obj = commit_column(&obj_id).unwrap();
+        let com_dict_id = commit_column(&dict_id).unwrap();
+        let com_dict_hash = commit_column(&dict_hash).unwrap();
+
+        // Honest witness, then FORGE a nonzero multiplicity on the padding dict row 3.
+        let (v_hash, mut w) = honest_hash_lookup(&obj_id, &dict_id, &dict_hash, real_n, n_dict);
+        assert!(w[3].is_zero(), "honest padding multiplicity must be zero");
+        w[3] = f1(); // the padding-tail pole forgery
+
+        let com_v_hash = context.commit_column(&v_hash).unwrap();
+        let com_w = context.commit_column(&w).unwrap();
+        let mut pt = transcript();
+        bind_hash_lookup_statement(&mut pt, real_n, n_dict);
+        pt.append_group(b"pow/dict-hash/com-obj-id", &com_obj);
+        pt.append_group(b"pow/dict-hash/com-dict-id", &com_dict_id);
+        pt.append_group(b"pow/dict-hash/com-dict-hash", &com_dict_hash);
+        pt.append_group(b"pow/dict-hash/com-v-hash", &com_v_hash);
+        pt.append_group(b"pow/dict-hash/com-w", &com_w);
+        let beta = pt.challenge_scalar(HASH_LOOKUP_BETA);
+        let alpha = pt.challenge_scalar(HASH_LOOKUP_ALPHA);
+
+        let inst = hash_lookup_fraction_instance(alpha, beta, real_n, k);
+        let leaf_count = inst.size();
+        let extended = vec![
+            low_half(&obj_id, leaf_count),
+            low_half(&v_hash, leaf_count),
+            high_half(&dict_id, leaf_count),
+            high_half(&dict_hash, leaf_count),
+            high_half(&w, leaf_count),
+        ];
+        let (gkr, r_leaf) = prove_fraction_sum_zero(&inst, &extended, &mut pt).unwrap();
+        // The forged padding pole is UNMATCHED, so the zero-sum breaks at the root.
+        assert!(!gkr.root_p.is_zero(), "forged padding-tail pole must break the zero-sum");
+
+        let r_low = &r_leaf[..k];
+        let columns = vec![obj_id.clone(), v_hash, dict_id.clone(), dict_hash.clone(), w];
+        let col_evals: Vec<ArkFr> = columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+        let opening = context.prove_column_openings(&columns, r_low, &mut pt).unwrap();
+        let proof = HashLookupInnerProof { gkr, col_evals, opening, com_v_hash, com_w };
+
+        let mut vt = transcript();
+        assert!(
+            verify_hash_lookup_inner(
+                &com_obj, &com_dict_id, &com_dict_hash, real_n, n_dict, &proof, &mut vt,
+            )
+            .is_err(),
+            "a forged padding-tail multiplicity pole must reject"
         );
     }
 }
