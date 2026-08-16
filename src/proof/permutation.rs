@@ -1,11 +1,39 @@
 //! Exact full-row permutation proof for authenticated relations.
 //!
 //! Input and output rows are fingerprinted across every column with a transcript-drawn
-//! RLC challenge. Two reciprocal identities plus one masked LogUp equality prove that
-//! the real output rows are exactly the input row multiset, including duplicates and
-//! tuple correlation. This gadget intentionally proves no ordering property: composing
-//! `OrderBy` must additionally prove the requested ordering and, for SWI-compatible
-//! semantics, stable order among equal keys.
+//! RLC challenge. A single GKR fraction tree ([`super::logup_gkr`]) proves the two row
+//! multisets are equal via the log-derivative identity
+//! `Sum_i 1/(alpha - in_fold_i) - Sum_j 1/(alpha - out_fold_j) = 0`, over the committed
+//! input and output data columns, with NO reciprocal column committed anywhere (the old
+//! `input_reciprocal`/`output_reciprocal` LogUp witnesses and their masked link are
+//! gone). This gadget intentionally proves no ordering property: composing `OrderBy`
+//! must additionally prove the requested ordering and, for SWI-compatible semantics,
+//! stable order among equal keys.
+//!
+//! Block-disjoint leaf layout (LogUp-GKR migration, Inc 2). The fraction leaf vector has
+//! length `2*domain` (the next power of two of the two length-`domain = 2^log_domain`
+//! blocks): the input rows occupy the LOW half `[0, domain)` and the output rows the
+//! HIGH half `[domain, 2*domain)`. The committed columns stay length `domain` (their
+//! commitments are UNCHANGED — `commitment_root` is unaffected); the prover feeds the
+//! tree their zero-extensions — input columns zero on the high half, output columns zero
+//! on the low half. The verifier opens the length-`domain` committed columns at the low
+//! `log_domain` bits `r_low` of the GKR leaf point and reconstructs each `2*domain`
+//! leaf-MLE via the top-bit factor: `(1 - r_high)*in_col(r_low)` for an input column
+//! (low half) and `r_high*out_col(r_low)` for an output column (high half). This
+//! STRUCTURALLY forces the input columns to zero on the output block and vice-versa (the
+//! same zero-extend enforcement `dict` uses for its target leaf): a prover cannot commit
+//! nonzero data outside a block's own half, because the reconstruction from the honest
+//! length-`domain` opening would disagree with the tree's leaf claim — the two sides
+//! cannot leak into each other.
+//!
+//! The two leaf groups are combined by an ADDITIVE public block-indicator numerator
+//! `p = +[i < n] - [domain <= i < domain+n]` (each side's real rows counted once, signed
+//! +1 for input and -1 for output) — NOT a `committed x public` mask — so within-block
+//! padding rows self-annihilate (`p = 0 => 0/q = 0`) and no reciprocal is reintroduced.
+//! At random `alpha` (drawn AFTER the input/output commitments are bound), the identity
+//! holds iff the `beta`-fingerprint multiset of the real output rows equals that of the
+//! real input rows, i.e. iff the output is an exact full-row permutation (duplicates and
+//! tuple correlation included).
 
 use std::io;
 
@@ -14,22 +42,36 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    prove_sumcheck, verify_column_openings, verify_sumcheck, ColumnOpening, StoreProverContext,
-    SumcheckProof, SumcheckShape, Transcript254,
+    mle_full_eval, powers, verify_column_openings, ColumnOpening, StoreProverContext, Transcript254,
 };
 use super::bgp::{RelationCommit, RelationWitness};
 use super::invalid;
-use super::logup::{masked_multiset_link_claim, reciprocal_claim, reciprocal_witness, rlc_fold};
+use super::logup_gkr::{
+    bind_and_verify_fraction_tree, check_leaf_tie, prove_fraction_sum_zero, FractionInstance,
+    GkrFractionProof, LinearForm, LinearTerm, Src,
+};
 
 const PERMUTATION_DOMAIN: &[u8] = b"parture/proof-of-woql/relation-permutation/v0";
 
-/// A full-row permutation proof: the two reciprocal (LogUp) commitments plus the batched
-/// sumcheck and Dory opening that link the input and output row multisets.
+#[inline]
+fn f0() -> ArkFr {
+    ArkFr::zero()
+}
+#[inline]
+fn f1() -> ArkFr {
+    ArkFr::one()
+}
+
+/// A full-row permutation proof: the GKR fraction-sum-zero proof for
+/// `Sum 1/(alpha - in_fold) - Sum 1/(alpha - out_fold) = 0`, the claimed evaluations of
+/// the `2*arity` committed data columns (input then output) at `r_low` (the low
+/// `log_domain` bits of the GKR leaf point), and one batched Dory opening of those
+/// columns at `r_low`. NO reciprocal (`input_reciprocal`/`output_reciprocal`) column
+/// exists anymore.
 #[derive(Clone, Debug)]
 pub struct RelationPermutationProof {
-    pub input_reciprocal_commitment: ArkGT,
-    pub output_reciprocal_commitment: ArkGT,
-    pub sumcheck: SumcheckProof,
+    pub gkr: GkrFractionProof,
+    pub col_evals: Vec<ArkFr>,
     pub opening: ColumnOpening,
 }
 
@@ -96,31 +138,68 @@ fn bind_statement(
     }
 }
 
-fn permutation_shape(
-    log_domain: usize,
-    n: usize,
-    arity: usize,
+/// The PUBLIC block-disjoint fraction-sum-zero instance for a permutation of `n` real
+/// rows over `arity` columns at `2^log_domain`:
+///   * committed columns `[0, arity)` are the input columns (low half `[0, domain)`),
+///     columns `[arity, 2*arity)` the output columns (high half `[domain, 2*domain)`);
+///   * denominator `q_leaf = alpha - Sum_d beta^d*(in_col_d + out_col_d)` — since the
+///     blocks are disjoint, this is `alpha - in_fold` on the low half and
+///     `alpha - out_fold` on the high half, with the SAME `beta^d` fingerprinting a
+///     given column on both sides;
+///   * numerator `p_leaf = +[i < n] - [domain <= i < domain+n]` (additive public block
+///     indicators): the input real rows contribute `+1`, the output real rows `-1`, and
+///     every padding row `0`.
+/// The leaf count is `2*domain = 2^(log_domain+1)`. Built IDENTICALLY by prover and
+/// verifier from public inputs only.
+fn permutation_fraction_instance(
     alpha: ArkFr,
     beta: ArkFr,
-) -> SumcheckShape {
-    let input_columns: Vec<usize> = (0..arity).collect();
-    let output_columns: Vec<usize> = (arity..2 * arity).collect();
-    let input_reciprocal = 2 * arity;
-    let output_reciprocal = input_reciprocal + 1;
-    SumcheckShape {
-        num_vars: log_domain,
-        num_columns: 2 * arity + 2,
-        chi_bounds: vec![n, n],
-        claims: vec![
-            reciprocal_claim(input_reciprocal, &input_columns, alpha, beta),
-            reciprocal_claim(output_reciprocal, &output_columns, alpha, beta),
-            masked_multiset_link_claim(
-                &[super::argument::Operand::Chi(0)],
-                input_reciprocal,
-                &[super::argument::Operand::Chi(1)],
-                output_reciprocal,
-            ),
-        ],
+    n: usize,
+    log_domain: usize,
+    arity: usize,
+) -> FractionInstance {
+    let domain = 1usize << log_domain;
+    let beta_powers = powers(beta, arity);
+    let mut q_terms = Vec::with_capacity(2 * arity);
+    for (d, power) in beta_powers.iter().enumerate() {
+        q_terms.push(LinearTerm {
+            coeff: f0() - *power,
+            src: Src::Column(d),
+        });
+    }
+    for (d, power) in beta_powers.iter().enumerate() {
+        q_terms.push(LinearTerm {
+            coeff: f0() - *power,
+            src: Src::Column(arity + d),
+        });
+    }
+    // p_leaf = +[i<n] - ([i<domain+n] - [i<domain]): +1 on the input rows [0,n) and
+    // -1 on the output rows [domain,domain+n); every other (padding) leaf gets 0.
+    let p_terms = vec![
+        LinearTerm {
+            coeff: f1(),
+            src: Src::Prefix(n),
+        },
+        LinearTerm {
+            coeff: f0() - f1(),
+            src: Src::Prefix(domain + n),
+        },
+        LinearTerm {
+            coeff: f1(),
+            src: Src::Prefix(domain),
+        },
+    ];
+    FractionInstance {
+        num_vars: log_domain + 1,
+        num_cols: 2 * arity,
+        p_form: LinearForm {
+            constant: f0(),
+            terms: p_terms,
+        },
+        q_form: LinearForm {
+            constant: alpha,
+            terms: q_terms,
+        },
     }
 }
 
@@ -162,33 +241,45 @@ pub fn prove_relation_permutation_with_context(
         .map(|column| context.commit_column(column))
         .collect::<io::Result<Vec<_>>>()?;
     let input_view = input.view();
+    // Bind BOTH sides' commitments, THEN draw beta/alpha. Caller contract (Inc 0
+    // audit): alpha MUST be drawn after the column commitments are bound so the
+    // fraction leaves are fixed before any per-layer GKR challenge. There is no
+    // reciprocal commitment anymore, so this is the last binding before the folds.
     bind_statement(transcript, &input_view, &output_commitments);
     let beta = transcript.challenge_scalar(b"pow/permutation/beta");
     let alpha = transcript.challenge_scalar(b"pow/permutation/alpha");
 
-    let input_slices: Vec<&[ArkFr]> = input.columns.iter().map(Vec::as_slice).collect();
-    let output_slices: Vec<&[ArkFr]> = output_columns.iter().map(Vec::as_slice).collect();
-    let input_reciprocal = reciprocal_witness(alpha, &rlc_fold(beta, &input_slices));
-    let output_reciprocal = reciprocal_witness(alpha, &rlc_fold(beta, &output_slices));
-    let input_reciprocal_commitment = context.commit_column(&input_reciprocal)?;
-    let output_reciprocal_commitment = context.commit_column(&output_reciprocal)?;
-    transcript.append_group(b"pow/permutation/input-rec-com", &input_reciprocal_commitment);
-    transcript.append_group(b"pow/permutation/output-rec-com", &output_reciprocal_commitment);
+    // Block-disjoint zero-extension to the 2*domain leaf vector: input columns fill the
+    // low half, output columns the high half; the rest is zero.
+    let leaf_count = 2 * domain;
+    let mut extended: Vec<Vec<ArkFr>> = Vec::with_capacity(2 * arity);
+    for column in &input.columns {
+        let mut ext = vec![ArkFr::zero(); leaf_count];
+        ext[..domain].copy_from_slice(column);
+        extended.push(ext);
+    }
+    for column in &output_columns {
+        let mut ext = vec![ArkFr::zero(); leaf_count];
+        ext[domain..].copy_from_slice(column);
+        extended.push(ext);
+    }
 
-    let shape = permutation_shape(input.log_domain, input.n, arity, alpha, beta);
-    let mut columns = Vec::with_capacity(shape.num_columns);
+    let inst = permutation_fraction_instance(alpha, beta, input.n, input.log_domain, arity);
+    let (gkr, r_leaf) = prove_fraction_sum_zero(&inst, &extended, transcript)?;
+
+    // Single batched Dory opening of the length-`domain` data columns at `r_low`, bound
+    // to their commitments on this transcript.
+    let r_low = &r_leaf[..input.log_domain];
+    let mut columns = Vec::with_capacity(2 * arity);
     columns.extend(input.columns.iter().cloned());
     columns.extend(output_columns.iter().cloned());
-    columns.push(input_reciprocal);
-    columns.push(output_reciprocal);
-    let (sumcheck, point, _) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = context.prove_column_openings(&columns, &point, transcript)?;
+    let col_evals: Vec<ArkFr> = columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+    let opening = context.prove_column_openings(&columns, r_low, transcript)?;
 
     Ok(RelationPermutationResult {
         proof: RelationPermutationProof {
-            input_reciprocal_commitment,
-            output_reciprocal_commitment,
-            sumcheck,
+            gkr,
+            col_evals,
             opening,
         },
         commitments: output_commitments,
@@ -215,28 +306,50 @@ pub fn verify_relation_permutation(
     if output_len != input.n || output_log_domain != input.log_domain {
         return Err(invalid("relation permutation output shape mismatch"));
     }
+    if proof.gkr.num_vars() != input.log_domain + 1 {
+        return Err(invalid("relation permutation fraction layer count mismatch"));
+    }
+    if proof.col_evals.len() != 2 * arity {
+        return Err(invalid("relation permutation column-evaluation count mismatch"));
+    }
+    // Same binding order as the prover: BOTH sides' commitments, THEN beta/alpha.
     bind_statement(transcript, input, output_commitments);
     let beta = transcript.challenge_scalar(b"pow/permutation/beta");
     let alpha = transcript.challenge_scalar(b"pow/permutation/alpha");
-    transcript.append_group(b"pow/permutation/input-rec-com", &proof.input_reciprocal_commitment);
-    transcript.append_group(b"pow/permutation/output-rec-com", &proof.output_reciprocal_commitment);
-    if proof.sumcheck.round_polys.len() != input.log_domain {
-        return Err(invalid("relation permutation sumcheck domain mismatch"));
-    }
-    let shape = permutation_shape(input.log_domain, input.n, arity, alpha, beta);
-    let (point, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
-    let mut commitments = Vec::with_capacity(shape.num_columns);
+
+    // Bind the public instance and verify the GKR tree -> the leaf point + claims.
+    let inst = permutation_fraction_instance(alpha, beta, input.n, input.log_domain, arity);
+    let (r_leaf, p_claim, q_claim) = bind_and_verify_fraction_tree(&inst, &proof.gkr, transcript)?;
+
+    // Open the length-`domain` committed columns at `r_low`, bound to their commitments.
+    let r_low = &r_leaf[..input.log_domain];
+    let r_high = r_leaf[input.log_domain];
+    let mut commitments = Vec::with_capacity(2 * arity);
     commitments.extend(input.commitments.iter().copied());
     commitments.extend(output_commitments.iter().copied());
-    commitments.push(proof.input_reciprocal_commitment);
-    commitments.push(proof.output_reciprocal_commitment);
-    verify_column_openings(&commitments, &point, &evals, &proof.opening, transcript)
+    verify_column_openings(&commitments, r_low, &proof.col_evals, &proof.opening, transcript)?;
+
+    // Reconstruct each `2*domain` leaf-MLE from the length-`domain` opening via the
+    // top-bit zero-extension factor: input columns live in the LOW half (factor
+    // `1 - r_high`), output columns in the HIGH half (factor `r_high`). This is the
+    // block-disjoint enforcement: the input columns reconstruct to zero on the output
+    // block and vice-versa (a prover cannot commit nonzero data in the other half —
+    // the honest opening zero-extends), so neither side can leak into the other.
+    let one_minus_high = f1() - r_high;
+    let mut leaf_evals = Vec::with_capacity(2 * arity);
+    for eval in &proof.col_evals[..arity] {
+        leaf_evals.push(one_minus_high * *eval);
+    }
+    for eval in &proof.col_evals[arity..] {
+        leaf_evals.push(r_high * *eval);
+    }
+    check_leaf_tie(&inst, &leaf_evals, p_claim, q_claim, &r_leaf)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::argument::commit_column;
+    use super::super::argument::{commit_column, prove_column_openings};
 
     fn frs(values: &[u64]) -> Vec<ArkFr> {
         values.iter().map(|value| ArkFr::from_u64(*value)).collect()
@@ -324,6 +437,144 @@ mod tests {
             result.n - 1,
             result.log_domain,
             &result.proof,
+            &mut verifier,
+        )
+        .is_err());
+    }
+
+    // Tampering the GKR fraction proof (root numerator) is rejected: the root claim
+    // `P = 0` is the whole statement, so a nonzero `root_p` fails immediately.
+    #[test]
+    fn tampered_gkr_root_is_rejected() {
+        let input = relation();
+        let mut prover = transcript();
+        let mut result = prove_relation_permutation(&input, &[2, 1, 0], &mut prover).unwrap();
+        result.proof.gkr.root_p = result.proof.gkr.root_p + f1();
+        let mut verifier = transcript();
+        assert!(verify_relation_permutation(
+            &input.view(),
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut verifier,
+        )
+        .is_err());
+    }
+
+    // Tampering a claimed column evaluation is rejected by the Dory opening / leaf tie:
+    // the opening binds `col_evals` to the committed columns at `r_low`.
+    #[test]
+    fn tampered_column_eval_is_rejected() {
+        let input = relation();
+        let mut prover = transcript();
+        let mut result = prove_relation_permutation(&input, &[2, 1, 0], &mut prover).unwrap();
+        result.proof.col_evals[0] = result.proof.col_evals[0] + f1();
+        let mut verifier = transcript();
+        assert!(verify_relation_permutation(
+            &input.view(),
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut verifier,
+        )
+        .is_err());
+    }
+
+    // Drive the honest prover flow with an EXPLICIT (possibly forged) output relation,
+    // then verify. Mirrors the real prover body but takes arbitrary length-`n` output
+    // columns so a test can supply a NON-permutation output multiset.
+    fn prove_with_explicit_output(
+        input: &RelationWitness,
+        output_real: &[Vec<ArkFr>],
+    ) -> (RelationPermutationProof, Vec<ArkGT>) {
+        let arity = input.columns.len();
+        let domain = 1usize << input.log_domain;
+        let mut output_columns = Vec::with_capacity(arity);
+        for column in output_real {
+            let mut padded = column.clone();
+            padded.resize(domain, ArkFr::zero());
+            output_columns.push(padded);
+        }
+        let output_commitments: Vec<ArkGT> = output_columns
+            .iter()
+            .map(|column| commit_column(column).unwrap())
+            .collect();
+        let mut t = transcript();
+        bind_statement(&mut t, &input.view(), &output_commitments);
+        let beta = t.challenge_scalar(b"pow/permutation/beta");
+        let alpha = t.challenge_scalar(b"pow/permutation/alpha");
+        let leaf_count = 2 * domain;
+        let mut extended: Vec<Vec<ArkFr>> = Vec::with_capacity(2 * arity);
+        for column in &input.columns {
+            let mut ext = vec![ArkFr::zero(); leaf_count];
+            ext[..domain].copy_from_slice(column);
+            extended.push(ext);
+        }
+        for column in &output_columns {
+            let mut ext = vec![ArkFr::zero(); leaf_count];
+            ext[domain..].copy_from_slice(column);
+            extended.push(ext);
+        }
+        let inst = permutation_fraction_instance(alpha, beta, input.n, input.log_domain, arity);
+        let (gkr, r_leaf) = prove_fraction_sum_zero(&inst, &extended, &mut t).unwrap();
+        let r_low = &r_leaf[..input.log_domain];
+        let mut columns = input.columns.clone();
+        columns.extend(output_columns.iter().cloned());
+        let col_evals: Vec<ArkFr> = columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+        let opening = prove_column_openings(&columns, r_low, &mut t).unwrap();
+        (
+            RelationPermutationProof {
+                gkr,
+                col_evals,
+                opening,
+            },
+            output_commitments,
+        )
+    }
+
+    // A forged output whose row MULTISET differs from the input (one row dropped, a
+    // fresh one added) yields a nonzero fraction sum, so the tree's root `P != 0` and
+    // verification rejects. Covers the "added/dropped element" soundness case that a
+    // valid `row_order` can never express.
+    #[test]
+    fn forged_non_permutation_output_is_rejected() {
+        let input = relation(); // rows (2,20),(1,11),(1,10)
+        // Forged output: keep (2,20),(1,11) but replace (1,10) with (9,99) — the
+        // multiset now differs (one dropped, one added).
+        let forged = vec![frs(&[2, 1, 9]), frs(&[20, 11, 99])];
+        let (proof, output_commitments) = prove_with_explicit_output(&input, &forged);
+        // The fraction sum is 1/(a-fold(1,10)) - 1/(a-fold(9,99)) != 0.
+        assert!(!proof.gkr.root_p.is_zero(), "forged multiset should not sum to zero");
+        let mut verifier = transcript();
+        assert!(verify_relation_permutation(
+            &input.view(),
+            &output_commitments,
+            input.n,
+            input.log_domain,
+            &proof,
+            &mut verifier,
+        )
+        .is_err());
+    }
+
+    // A forged output that DUPLICATES one input row and DROPS another (same length,
+    // still a non-permutation multiset) is rejected for the same reason.
+    #[test]
+    fn forged_duplicate_row_output_is_rejected() {
+        let input = relation(); // rows (2,20),(1,11),(1,10)
+        // (2,20) twice, (1,11) once, drop (1,10): Sum = 1/(a-f(2,20)) - 1/(a-f(1,10)) != 0.
+        let forged = vec![frs(&[2, 2, 1]), frs(&[20, 20, 11])];
+        let (proof, output_commitments) = prove_with_explicit_output(&input, &forged);
+        assert!(!proof.gkr.root_p.is_zero());
+        let mut verifier = transcript();
+        assert!(verify_relation_permutation(
+            &input.view(),
+            &output_commitments,
+            input.n,
+            input.log_domain,
+            &proof,
             &mut verifier,
         )
         .is_err());

@@ -130,7 +130,12 @@ pub(super) const OUTER_VERSION: u32 = 3;
 // v23 adds the ordered `sys:Array` walk composite node (tag 24).
 // v24: LogUp-GKR `DictProof` migration (see the `VERSION` note) — recursive
 // envelopes embed layer-BGP leaves whose membership proof bytes changed.
-pub(super) const RECURSIVE_VERSION: u32 = 24;
+// v25: LogUp-GKR `RelationPermutationProof` migration (Inc 2) — the recursive
+// `ExactScalarOrder`/`ExactMultiOrder`/`OrderedListWalk`/`OrderedArrayWalk` nodes each
+// embed a full-row permutation proof, which dropped its two committed reciprocal GT
+// commitments and batched sumcheck for a GKR fraction-tree proof + `2*arity`
+// data-column leaf evaluations, so those envelopes' proof bytes changed.
+pub(super) const RECURSIVE_VERSION: u32 = 25;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -444,10 +449,12 @@ wire_struct!(RelationDistinctEntryProof {
     lengths
 });
 wire_struct!(RelationDistinctProof { entries });
+// LogUp-GKR migration (Inc 2): the two committed reciprocal commitments and the
+// batched sumcheck are gone; a GKR fraction-tree proof + the `2*arity` data-column
+// evaluations at the leaf-opening point carry the two-multiset equality.
 wire_struct!(RelationPermutationProof {
-    input_reciprocal_commitment,
-    output_reciprocal_commitment,
-    sumcheck,
+    gkr,
+    col_evals,
     opening
 });
 wire_struct!(ExactScalarOrderProof {
