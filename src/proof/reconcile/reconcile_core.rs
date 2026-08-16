@@ -85,23 +85,35 @@ pub(super) fn object_hash(record: &ProofRecord) -> ArkFr {
 /// (pools every layer's additions, then cancels one addition per removal; rejects a
 /// removal absent from the pool, i.e. a violated §3 invariant).
 pub(super) fn reconcile_present(layers: &[&LayerCommitment]) -> io::Result<Vec<ProofRecord>> {
-    let mut present: Vec<ProofRecord> = Vec::new();
-    for layer in layers {
-        present.extend(layer.additions.iter().cloned());
-    }
+    use std::collections::HashMap;
+    // Tally how many times each canonical triple is removed across the whole chain. The
+    // previous O(additions × removals) linear-scan-and-`Vec::remove` cancelled one addition per
+    // removal by taking the FIRST occurrence and shifting the tail; cancelling exactly
+    // `count[key]` earliest occurrences of each key (walking additions in the SAME pooled order)
+    // yields the byte-identical surviving set in the identical order, in O(additions + removals).
+    let mut to_cancel: HashMap<&CanonicalTriple, usize> = HashMap::new();
     for layer in layers {
         for rem in &layer.removals {
-            match present.iter().position(|r| r.triple == rem.triple) {
-                Some(pos) => {
-                    present.remove(pos);
-                }
-                None => {
-                    return Err(invalid(
-                        "reconcile: a removal is absent from the pooled additions (delta invariant violated)",
-                    ));
+            *to_cancel.entry(&rem.triple).or_insert(0) += 1;
+        }
+    }
+    let mut present: Vec<ProofRecord> = Vec::new();
+    for layer in layers {
+        for add in &layer.additions {
+            if let Some(remaining) = to_cancel.get_mut(&add.triple) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    continue;
                 }
             }
+            present.push(add.clone());
         }
+    }
+    // Any removal left uncancelled had no matching pooled addition (violated §3 invariant).
+    if to_cancel.values().any(|&remaining| remaining > 0) {
+        return Err(invalid(
+            "reconcile: a removal is absent from the pooled additions (delta invariant violated)",
+        ));
     }
     Ok(present)
 }

@@ -152,16 +152,74 @@ pub(crate) fn construction_commitment_scratch_bytes(row_counts: &[usize]) -> io:
     })
 }
 
+/// Hash the SERIALIZED generator vectors of a tier's deterministic setup. Folded into
+/// [`setup_parameter_id`] so the transcript-bound parameter id pins the ACTUAL public
+/// parameters, not merely the recipe (label + seed + tier + layout string) that produced them.
+/// Without this, a dependency/sampler bump that silently changed how `UniformRand` maps the seed
+/// to curve points would leave two builds agreeing on `parameter_id` while holding DIFFERENT
+/// generators — cross-verifier ambiguity. Generators are serialized with the same arkworks
+/// compressed encoding the rest of the commitment code uses. Cached per tier: the serialization
+/// is not free, and `setup_parameter_id` is called on every column-opening prove/verify.
+fn setup_generators_hash(tier: usize) -> io::Result<ProofHash> {
+    static HASH_20: OnceLock<ProofHash> = OnceLock::new();
+    static HASH_22: OnceLock<ProofHash> = OnceLock::new();
+    static HASH_24: OnceLock<ProofHash> = OnceLock::new();
+    let cell = match tier {
+        LEGACY_SETUP_LOG_N => &HASH_20,
+        22 => &HASH_22,
+        SETUP_MAX_LOG_N => &HASH_24,
+        _ => return Err(invalid("Dory setup tier selection returned an unknown tier")),
+    };
+    if let Some(hash) = cell.get() {
+        return Ok(*hash);
+    }
+    let setup = dory_prover_setup(tier)?;
+    let hash = hash_prover_setup_generators(setup)?;
+    Ok(*cell.get_or_init(|| hash))
+}
+
+/// SHA-256 over the domain-separated, length-framed compressed serialization of every generator
+/// the setup holds (`g1_vec`, `g2_vec`, then the blinding `h1`/`h2`/`ht`), in that fixed order.
+fn hash_prover_setup_generators(setup: &ProverSetup<BN254>) -> io::Result<ProofHash> {
+    fn absorb<T: CanonicalSerialize>(hasher: &mut Sha256, value: &T) -> io::Result<()> {
+        let mut bytes = Vec::new();
+        value.serialize_compressed(&mut bytes).map_err(|error| {
+            invalid(format!("Dory setup generator serialization failed: {error}"))
+        })?;
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(&bytes);
+        Ok(())
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"terminus-store/proof-of-woql/dory-parameter-generators/v0");
+    hasher.update((setup.g1_vec.len() as u64).to_be_bytes());
+    for g in &setup.g1_vec {
+        absorb(&mut hasher, g)?;
+    }
+    hasher.update((setup.g2_vec.len() as u64).to_be_bytes());
+    for g in &setup.g2_vec {
+        absorb(&mut hasher, g)?;
+    }
+    absorb(&mut hasher, &setup.h1)?;
+    absorb(&mut hasher, &setup.h2)?;
+    absorb(&mut hasher, &setup.ht)?;
+    Ok(hasher.finalize().into())
+}
+
 /// Stable public identity of the exact parameter tier selected for a domain.
 /// The legacy tier retains its old generator stream; larger tiers are distinct
-/// deterministic parameter sets. Query transcripts bind this identity.
+/// deterministic parameter sets. Query transcripts bind this identity. The id folds a hash of the
+/// tier's ACTUAL serialized generators (see [`setup_generators_hash`]), so it binds the real
+/// parameters rather than only the label/seed/tier/layout recipe that derived them.
 pub(crate) fn setup_parameter_id(num_vars: usize) -> io::Result<ProofHash> {
     let tier = setup_tier_for_num_vars(num_vars)?;
+    let generators_hash = setup_generators_hash(tier)?;
     let mut hasher = Sha256::new();
     hasher.update(b"terminus-store/proof-of-woql/dory-parameter-set/v0");
     hasher.update(setup_seed());
     hasher.update((tier as u64).to_be_bytes());
     hasher.update(b"matrix:sigma-ceil-nu-floor;coeff:row-major-lsb-first");
+    hasher.update(generators_hash);
     Ok(hasher.finalize().into())
 }
 

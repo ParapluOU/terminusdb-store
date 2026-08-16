@@ -421,6 +421,34 @@ fn setup_identity_is_deterministic_and_legacy_tier_is_prefix_compatible() {
     );
 }
 
+/// GOLDEN VECTOR: pins the FULL default-tier generator set (every `g1_vec`/`g2_vec` entry plus the
+/// blinding `h1`/`h2`/`ht`) and the transcript-bound `setup_parameter_id(20)` that now folds a hash
+/// of those generators. A silent sampler change — a dependency/`UniformRand` bump that remaps the
+/// fixed seed to different curve points — flips both pins and fails CI, so two builds can never
+/// agree on the transcript-bound parameter id while holding different generators.
+#[test]
+fn setup_parameter_id_binds_full_generator_set_golden() {
+    let selected = dory_prover_setup(20).unwrap();
+    let mut bytes = Vec::new();
+    for g in &selected.g1_vec {
+        g.0.serialize_compressed(&mut bytes).unwrap();
+    }
+    for g in &selected.g2_vec {
+        g.0.serialize_compressed(&mut bytes).unwrap();
+    }
+    selected.h1.0.serialize_compressed(&mut bytes).unwrap();
+    selected.h2.0.serialize_compressed(&mut bytes).unwrap();
+    selected.ht.serialize_compressed(&mut bytes).unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(&bytes)),
+        "87825ccad5f975d727efc348149692f422c9c0092c80d397d9a26c2307f41ee0"
+    );
+    assert_eq!(
+        hex::encode(setup_parameter_id(20).unwrap()),
+        "acd27a9745a11e71701faac18fbde8a34e37af8ed7f63f6cc24efa24c6086613"
+    );
+}
+
 #[test]
 fn node_value_dictionary_commitments_align_with_shared_commit_column() {
     use crate::proof::argument::commit_column;

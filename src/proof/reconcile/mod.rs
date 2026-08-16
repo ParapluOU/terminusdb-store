@@ -107,7 +107,7 @@ use super::relocate::{
     prove_column_relocation_with_context, verify_column_relocation, RelocationProof,
 };
 use super::union::{prove_bag_union_with_context, verify_bag_union, BagUnionProof};
-use super::{invalid, CanonicalObject, ProofHash, ProofRecord};
+use super::{invalid, CanonicalObject, CanonicalTriple, ProofHash, ProofRecord};
 
 const RECONCILE_DOMAIN: &[u8] = b"parture/proof-of-woql/delta-reconcile/v1-nlayer";
 
