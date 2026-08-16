@@ -348,8 +348,8 @@ const LABEL_DOMAIN: &[u8] = b"pow/sumcheck/domain";
 const LABEL_SHAPE: &[u8] = b"pow/sumcheck/shape";
 const LABEL_ZEROCHECK: &[u8] = b"pow/sumcheck/zerocheck-point";
 const LABEL_RHO: &[u8] = b"pow/sumcheck/batch-rho";
-const LABEL_ROUND_POLY: &[u8] = b"pow/sumcheck/round-poly";
-const LABEL_ROUND_CHALLENGE: &[u8] = b"pow/sumcheck/round-challenge";
+pub(crate) const LABEL_ROUND_POLY: &[u8] = b"pow/sumcheck/round-poly";
+pub(crate) const LABEL_ROUND_CHALLENGE: &[u8] = b"pow/sumcheck/round-challenge";
 const LABEL_DORY_GAMMA: &[u8] = b"pow/dory/batch-gamma";
 
 #[inline]
@@ -538,7 +538,7 @@ impl SumcheckShape {
 
 /// `table[i] = prod_j ( bit_j(i) ? point[j] : 1 - point[j] )`, i.e. the
 /// multilinear Lagrange basis at `point`, length `2^point.len()`.
-fn eq_table(point: &[ArkFr]) -> Vec<ArkFr> {
+pub(crate) fn eq_table(point: &[ArkFr]) -> Vec<ArkFr> {
     let mut table = vec![f1(); 1usize << point.len()];
     let mut size = 1usize;
     for &p in point {
@@ -564,7 +564,7 @@ pub fn mle_full_eval(evals: &[ArkFr], point: &[ArkFr]) -> ArkFr {
 }
 
 /// `eq(a, b) = prod_j ( a_j b_j + (1-a_j)(1-b_j) )`.
-fn eq_eval(a: &[ArkFr], b: &[ArkFr]) -> ArkFr {
+pub(crate) fn eq_eval(a: &[ArkFr], b: &[ArkFr]) -> ArkFr {
     a.iter().zip(b.iter()).fold(f1(), |acc, (x, y)| {
         acc * (*x * *y + (f1() - *x) * (f1() - *y))
     })
@@ -633,7 +633,7 @@ pub fn idx_eval(point: &[ArkFr]) -> ArkFr {
 
 /// Fold a table in place at its current lowest variable: `new[i] =
 /// t[2i]*(1-r) + t[2i+1]*r`, halving the length.
-fn fold_table(table: &mut Vec<ArkFr>, r: ArkFr) {
+pub(crate) fn fold_table(table: &mut Vec<ArkFr>, r: ArkFr) {
     let half = table.len() / 2;
     let one_minus = f1() - r;
     for i in 0..half {
@@ -643,7 +643,7 @@ fn fold_table(table: &mut Vec<ArkFr>, r: ArkFr) {
 }
 
 /// `[base^0, base^1, .., base^{count-1}]`.
-fn powers(base: ArkFr, count: usize) -> Vec<ArkFr> {
+pub(crate) fn powers(base: ArkFr, count: usize) -> Vec<ArkFr> {
     let mut out = Vec::with_capacity(count);
     let mut cur = f1();
     for _ in 0..count {
@@ -655,7 +655,7 @@ fn powers(base: ArkFr, count: usize) -> Vec<ArkFr> {
 
 /// Interpolate a univariate given its evaluations at `0, 1, .., evals.len()-1`
 /// and evaluate it at `x` (Lagrange; the integer points are distinct in `Fr`).
-fn interpolate(evals: &[ArkFr], x: ArkFr) -> io::Result<ArkFr> {
+pub(crate) fn interpolate(evals: &[ArkFr], x: ArkFr) -> io::Result<ArkFr> {
     let degree = evals.len() - 1;
     let mut result = f0();
     for i in 0..=degree {

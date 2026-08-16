@@ -821,6 +821,7 @@ pub mod filter;
 pub mod join;
 pub mod join2;
 pub mod logup;
+pub mod logup_gkr;
 pub mod membership;
 pub mod order;
 pub mod lexsort;
