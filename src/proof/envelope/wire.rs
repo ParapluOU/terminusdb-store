@@ -121,10 +121,17 @@ pub(super) fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
 // `dstar` reciprocal and the batched sumcheck for a GKR fraction-tree proof + the
 // three data-column leaf evaluations, so every envelope carrying a constant-atom
 // (predicate/subject/object) membership has different proof bytes.
-pub(super) const VERSION: u32 = 6;
-pub(super) const UNION_VERSION: u32 = 4;
-pub(super) const ANTI_VERSION: u32 = 6;
-pub(super) const OUTER_VERSION: u32 = 3;
+// v7: LogUp-GKR migration of `membership` (Phase 2c-2b) — `MembershipProof` dropped its
+// two committed reciprocal GT commitments (`rec_u`/`rec_of`) and batched sumcheck for a
+// block-disjoint GKR fraction-tree proof + three data-column leaf evaluations + a
+// co-running `(1 - chi_{n_U})*w = 0` GAP-1 Identity sumcheck. Every envelope carrying a
+// multi-atom BGP join (join2 embeds two memberships) or a hash semi-join has different
+// proof bytes. The UNION/ANTI/OUTER envelopes embed the same BGP-chain / semi-join, so
+// they bump in lockstep.
+pub(super) const VERSION: u32 = 7;
+pub(super) const UNION_VERSION: u32 = 5;
+pub(super) const ANTI_VERSION: u32 = 7;
+pub(super) const OUTER_VERSION: u32 = 4;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
 // v23 adds the ordered `sys:Array` walk composite node (tag 24).
@@ -140,7 +147,10 @@ pub(super) const OUTER_VERSION: u32 = 3;
 // lookup dropped the two committed reciprocal GT commitments (`rec_q`/`rec_d`) and its
 // batched sumcheck for a block-disjoint GKR fraction-tree proof + five data-column leaf
 // evaluations, so those envelopes' proof bytes changed.
-pub(super) const RECURSIVE_VERSION: u32 = 26;
+// v27: LogUp-GKR `MembershipProof` migration (Phase 2c-2b, see the `VERSION` note) —
+// recursive envelopes embed BGP-chain leaves (join2's two memberships) and hash
+// semi-joins whose membership proof bytes changed.
+pub(super) const RECURSIVE_VERSION: u32 = 27;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -623,11 +633,16 @@ wire_struct!(SortedProof {
     rec_d_commitment,
     bit_commitments
 });
+// LogUp-GKR migration (GAP-1 auxiliary-Identity closure): `MembershipProof` dropped the
+// two committed reciprocal GT commitments (`rec_u`/`rec_of`) and the batched sumcheck for
+// a block-disjoint GKR fraction-tree proof + the three data-column leaf evaluations, plus
+// a co-running `(1 - chi_{n_U})*w = 0` Identity sumcheck and its `w` opening.
 wire_struct!(MembershipProof {
-    sumcheck,
+    gkr,
+    col_evals,
     opening,
-    rec_u_commitment,
-    rec_of_commitment
+    id_sumcheck,
+    id_opening
 });
 wire_struct!(CountProof { sumcheck, opening });
 wire_struct!(BinaryJoinCommitments {

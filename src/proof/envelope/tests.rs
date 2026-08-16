@@ -496,16 +496,18 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         use sha2::Digest as _;
         let hash = sha2::Sha256::digest(&bytes);
         let hash_hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        assert_eq!(bytes.len(), 142788, "materialized proof byte length changed");
-        // Hash + length regenerated for the LogUp-GKR migration of `dict` membership: each
-        // constant-predicate atom's `DictProof` dropped the committed `dstar` reciprocal and its
-        // batched sumcheck for a GKR fraction-tree proof + three data-column leaf evaluations, so
-        // the proof bytes (structure AND transcript-derived challenges) shifted while prover↔verifier
-        // still agree. The byte length fell by 32 (2 atoms × one fewer committed GT commitment,
-        // net of the GKR rounds). This is the intended, verified new stable image.
+        assert_eq!(bytes.len(), 150366, "materialized proof byte length changed");
+        // Hash + length regenerated for the LogUp-GKR migration of `membership` (Phase 2c-2b):
+        // the two-atom join's `join2` proof embeds two `MembershipProof`s, each of which dropped
+        // its two committed reciprocal GT commitments (`rec_u`/`rec_of`) and batched sumcheck for
+        // a block-disjoint GKR fraction-tree proof + three data-column leaf evaluations + a
+        // co-running `(1 - chi_{n_U})*w = 0` GAP-1 Identity sumcheck and its `w` opening, so the
+        // proof bytes (structure AND transcript-derived challenges) shifted while prover↔verifier
+        // still agree. The byte length rose (the GKR fraction rounds + the extra Identity sumcheck
+        // and opening outweigh the two dropped GT commitments). Intended, verified new stable image.
         assert_eq!(
             hash_hex,
-            "54c577ba9616c76455d81850d5509b476e9c65111d2eb920d054fe3c8395650b",
+            "cd6b1741d9630bb890e77a3ed7b7cc540f9c33ce7308b016d6c59356803c8618",
             "materialized multi-atom proof transcript/commitments changed (byte-identity regression)"
         );
     }
