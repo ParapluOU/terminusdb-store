@@ -802,8 +802,8 @@ fn validate_construction_heap_budget(
 
 pub(crate) use commitment::decode_legacy_v3;
 pub use commitment::{
-    database_root, node_value_op_value, validate_database_root, CommitmentState, LayerCommitment,
-    VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
+    database_root, node_value_op_value, resolution_root, validate_database_root, CommitmentState,
+    LayerCommitment, VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
 };
 
 pub mod anti;

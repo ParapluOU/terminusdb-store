@@ -110,6 +110,16 @@ pub struct LayerCommitment {
     /// layers, so the range gadget ranges over this committed OP encoding and
     /// ties each triple's object to its dict row by a per-row membership lookup.
     pub node_value_dict_range_commitments: (ArkGT, ArkGT),
+    /// Root of the id-indexed SHA-256 Merkle tree over `node_value_catalog`
+    /// (leaf `p` = the id `parent_node_value_count + p + 1`), for succinct
+    /// id->term resolution (I1). ADDITIVE: NOT bound by `commitment_root`; it is
+    /// a deterministic function of the catalog and is bound instead by the
+    /// `resolution_root` wrapper (and re-checked against the root-bound catalog
+    /// in `validate`). See `super::dict_merkle`.
+    pub nv_merkle_root: ProofHash,
+    /// Root of the id-indexed SHA-256 Merkle tree over `predicate_catalog`
+    /// (separate id namespace). Same additive discipline as `nv_merkle_root`.
+    pub pred_merkle_root: ProofHash,
 }
 
 /// Compact, verifier-only projection of a validated PF4 v4 layer commitment.
@@ -131,6 +141,10 @@ pub struct VerifierCommitment {
     pub predicate_dict_commitments: (ArkGT, ArkGT),
     pub node_value_dict_commitments: (ArkGT, ArkGT),
     pub node_value_dict_range_commitments: (ArkGT, ArkGT),
+    /// Id-indexed node/value and predicate dictionary Merkle roots (I1); see
+    /// [`LayerCommitment::nv_merkle_root`].
+    pub nv_merkle_root: ProofHash,
+    pub pred_merkle_root: ProofHash,
 }
 
 /// Borrowed verifier view shared by full PF4 sidecars and compact artifacts.
@@ -144,6 +158,10 @@ pub struct VerifierCommitmentRef<'a> {
     pub predicate_dict_commitments: &'a (ArkGT, ArkGT),
     pub node_value_dict_commitments: &'a (ArkGT, ArkGT),
     pub node_value_dict_range_commitments: &'a (ArkGT, ArkGT),
+    /// Id-indexed dictionary Merkle roots (I1). `ProofHash` is `Copy`, so these
+    /// are carried by value, keeping the view `Copy`.
+    pub nv_merkle_root: ProofHash,
+    pub pred_merkle_root: ProofHash,
 }
 
 /// Common verifier-facing interface. It intentionally contains no raw-table
@@ -163,6 +181,8 @@ impl VerifierLayer for LayerCommitment {
             predicate_dict_commitments: &self.predicate_dict_commitments,
             node_value_dict_commitments: &self.node_value_dict_commitments,
             node_value_dict_range_commitments: &self.node_value_dict_range_commitments,
+            nv_merkle_root: self.nv_merkle_root,
+            pred_merkle_root: self.pred_merkle_root,
         }
     }
 }
@@ -178,6 +198,8 @@ impl VerifierLayer for VerifierCommitment {
             predicate_dict_commitments: &self.predicate_dict_commitments,
             node_value_dict_commitments: &self.node_value_dict_commitments,
             node_value_dict_range_commitments: &self.node_value_dict_range_commitments,
+            nv_merkle_root: self.nv_merkle_root,
+            pred_merkle_root: self.pred_merkle_root,
         }
     }
 }
@@ -221,10 +243,44 @@ impl VerifierCommitmentRef<'_> {
         {
             return Err(invalid("verifier catalog commitment mismatch"));
         }
+        self.validate_merkle_roots()?;
         if self.recomputed_commitment_root()? != self.state.commitment_root {
             return Err(invalid("verifier commitment root mismatch"));
         }
         Ok(())
+    }
+
+    /// Recompute the two id-indexed dictionary Merkle roots (I1) from the
+    /// now-authenticated catalog and confirm they match the carried roots. Because
+    /// the catalog is bound to `commitment_root` by the Dory dictionary commitments
+    /// checked just above, this transitively authenticates the Merkle roots — a
+    /// tampered root (or a catalog that no longer hashes to it) rejects here.
+    fn validate_merkle_roots(self) -> io::Result<()> {
+        if node_value_merkle_root(
+            self.node_value_catalog,
+            self.state.parent_node_value_count,
+            self.state.node_value_count,
+        )? != self.nv_merkle_root
+            || predicate_merkle_root(
+                self.predicate_catalog,
+                self.state.parent_predicate_count,
+                self.state.predicate_count,
+            )? != self.pred_merkle_root
+        {
+            return Err(invalid("verifier dictionary merkle root mismatch"));
+        }
+        Ok(())
+    }
+
+    /// The two-hash resolution anchor for this layer: it binds `commitment_root`
+    /// (and thereby every id-authentication gadget) to the two dictionary Merkle
+    /// roots that succinct id->term resolution opens against.
+    pub fn resolution_root(self) -> ProofHash {
+        resolution_root(
+            &self.state.commitment_root,
+            &self.nv_merkle_root,
+            &self.pred_merkle_root,
+        )
     }
 
     pub fn recomputed_commitment_root(self) -> io::Result<ProofHash> {
@@ -268,6 +324,8 @@ impl LayerCommitment {
             predicate_dict_commitments: self.predicate_dict_commitments,
             node_value_dict_commitments: self.node_value_dict_commitments,
             node_value_dict_range_commitments: self.node_value_dict_range_commitments,
+            nv_merkle_root: self.nv_merkle_root,
+            pred_merkle_root: self.pred_merkle_root,
         };
         artifact.validate()?;
         Ok(artifact)
@@ -403,6 +461,16 @@ impl LayerCommitment {
         // (later) numeric range gadget, authenticated by the root the same way.
         let node_value_dict_range_commitments =
             commit_node_value_dict_range_with_context(context, &node_value_catalog)?;
+        // Id-indexed dictionary Merkle roots (I1). O(delta): built over exactly the
+        // catalog this layer introduced, keyed by id position. NOT folded into
+        // `commitment_root` (kept byte-identical); bound by `resolution_root`.
+        let nv_merkle_root = node_value_merkle_root(
+            &node_value_catalog,
+            parent_node_value_count,
+            node_value_count,
+        )?;
+        let pred_merkle_root =
+            predicate_merkle_root(&predicate_catalog, parent_predicate_count, predicate_count)?;
 
         let state = CommitmentState {
             parent_state_root,
@@ -427,6 +495,8 @@ impl LayerCommitment {
             predicate_dict_commitments,
             node_value_dict_commitments,
             node_value_dict_range_commitments,
+            nv_merkle_root,
+            pred_merkle_root,
         };
         layer.state.commitment_root = layer.compute_commitment_root()?;
         layer.validate()?;
@@ -566,6 +636,21 @@ impl LayerCommitment {
         {
             return Err(invalid("node/value range commitment mismatch"));
         }
+        // I1: the id-indexed dictionary Merkle roots are a deterministic function of
+        // the (root-bound) catalogs; recompute and confirm the carried roots match.
+        if node_value_merkle_root(
+            &self.node_value_catalog,
+            self.state.parent_node_value_count,
+            self.state.node_value_count,
+        )? != self.nv_merkle_root
+            || predicate_merkle_root(
+                &self.predicate_catalog,
+                self.state.parent_predicate_count,
+                self.state.predicate_count,
+            )? != self.pred_merkle_root
+        {
+            return Err(invalid("dictionary merkle root mismatch"));
+        }
         if self.compute_commitment_root()? != self.state.commitment_root {
             return Err(invalid("commitment root mismatch"));
         }
@@ -650,6 +735,11 @@ impl LayerCommitment {
             let datatype = deserialize_commitment(&r.bytes()?)?;
             (value, datatype)
         };
+        // I1: the two id-indexed dictionary Merkle roots follow the commitments.
+        // `validate()` below recomputes them from the decoded catalog and rejects a
+        // mismatch, so a tampered stored root fails closed.
+        let nv_merkle_root = r.hash()?;
+        let pred_merkle_root = r.hash()?;
         if !r.done() {
             return Err(invalid("trailing commitment file bytes"));
         }
@@ -714,6 +804,8 @@ impl LayerCommitment {
             predicate_dict_commitments,
             node_value_dict_commitments,
             node_value_dict_range_commitments,
+            nv_merkle_root,
+            pred_merkle_root,
         };
         layer.validate()?;
         Ok(layer)
@@ -923,6 +1015,10 @@ impl LayerCommitment {
             let bytes = serialize_commitment(commitment)?;
             put_bytes(&mut out, &bytes);
         }
+        // I1: the two id-indexed dictionary Merkle roots, at the tail of the body
+        // (just before the trailing `commitment_root` + checksum the caller appends).
+        put_hash(&mut out, &self.nv_merkle_root);
+        put_hash(&mut out, &self.pred_merkle_root);
         Ok(out)
     }
 
@@ -966,6 +1062,8 @@ impl LayerCommitment {
                 .ok_or_else(|| invalid("commitment encoded length overflow"))?;
             total = checked_proof_encoded_growth(total, commitment_len)?;
         }
+        // I1: two 32-byte dictionary Merkle roots in the body.
+        total = checked_proof_encoded_growth(total, 64)?;
         // commitment_root + file checksum
         total = checked_proof_encoded_growth(total, 32)?;
         checked_proof_encoded_growth(total, 32)
@@ -1012,6 +1110,21 @@ impl VerifierCommitment {
             != self.node_value_dict_range_commitments
         {
             return Err(invalid("verifier range catalog commitment mismatch"));
+        }
+        // I1: recompute the id-indexed dictionary Merkle roots from the
+        // now-authenticated catalogs and confirm the carried roots match.
+        if node_value_merkle_root(
+            &self.node_value_catalog,
+            self.state.parent_node_value_count,
+            self.state.node_value_count,
+        )? != self.nv_merkle_root
+            || predicate_merkle_root(
+                &self.predicate_catalog,
+                self.state.parent_predicate_count,
+                self.state.predicate_count,
+            )? != self.pred_merkle_root
+        {
+            return Err(invalid("verifier dictionary merkle root mismatch"));
         }
         if self.recomputed_commitment_root()? != self.state.commitment_root {
             return Err(invalid("verifier commitment root mismatch"));
@@ -1064,6 +1177,9 @@ impl VerifierCommitment {
         ]) {
             put_bytes(&mut out, &serialize_commitment(commitment)?);
         }
+        // I1: two id-indexed dictionary Merkle roots, before the trailing root.
+        put_hash(&mut out, &self.nv_merkle_root);
+        put_hash(&mut out, &self.pred_merkle_root);
         put_hash(&mut out, &self.state.commitment_root);
         let checksum = file_checksum(&out);
         out.extend_from_slice(&checksum);
@@ -1129,6 +1245,10 @@ impl VerifierCommitment {
         let predicate_dict_commitments = next_pair()?;
         let node_value_dict_commitments = next_pair()?;
         let node_value_dict_range_commitments = next_pair()?;
+        // I1: the two id-indexed dictionary Merkle roots (recomputed + checked by
+        // `validate` against the decoded catalogs below).
+        let nv_merkle_root = r.hash()?;
+        let pred_merkle_root = r.hash()?;
         if !r.done() {
             return Err(invalid("trailing verifier commitment bytes"));
         }
@@ -1141,6 +1261,8 @@ impl VerifierCommitment {
             predicate_dict_commitments,
             node_value_dict_commitments,
             node_value_dict_range_commitments,
+            nv_merkle_root,
+            pred_merkle_root,
         };
         artifact.validate()?;
         Ok(artifact)

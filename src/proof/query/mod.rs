@@ -36,7 +36,8 @@ use super::bgp::{
     RelationCommit, RelationWitness,
 };
 use super::commitment::{
-    reject_nan_catalog, CommitmentState, LayerCommitment, VerifierCommitmentRef, VerifierLayer,
+    build_node_value_tree, build_predicate_tree, reject_nan_catalog, verify_opening, CommitmentState,
+    DictMerkleTree, LayerCommitment, VerifierCommitmentRef, VerifierLayer,
 };
 use super::dict::{
     hash_object, hash_term, prove_dict_membership_with_context, verify_dict_membership, DictProof,
@@ -143,6 +144,13 @@ pub use layer_bgp::{
 // Crate-internal API (consumed by sibling proof modules such as `envelope`).
 pub(crate) use column_source::require_base_layer_for_query;
 pub(crate) use plan::has_ground_result_unit;
+
+// I1 differential-test baseline: the pre-Merkle catalog-scan resolvers, reachable from the
+// query test module to assert the Merkle path resolves every id identically.
+#[cfg(test)]
+pub(crate) use result::{
+    resolve_node_value_result_objects_via_catalog, resolve_result_values_via_catalog,
+};
 
 // ---------------------------------------------------------------------------
 // Internal hoist: re-expose the cross-module `pub(super)` helpers under this

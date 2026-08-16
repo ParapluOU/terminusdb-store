@@ -2554,3 +2554,112 @@
         };
         assert!(prove_layer_bgp(&lc, &plan).is_err());
     }
+
+    // A base layer carrying both `Node` objects and a string `Value` object, plus two
+    // predicates — enough to exercise every namespace of the resolvers.
+    fn mixed_layer() -> std::sync::Arc<LayerCommitment> {
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (s, p, o) in [
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("a", "likes", "c"),
+        ] {
+            builder
+                .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
+                .unwrap();
+        }
+        // String-valued objects land in the shared node/value dictionary as `Value`s.
+        builder
+            .add_value_triple(ValueTriple::new_string_value(&iri("a"), &iri("label"), "hello"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value(&iri("b"), &iri("label"), "world"))
+            .unwrap();
+        let layer = builder.commit().unwrap();
+        layer.proof_commitment().unwrap()
+    }
+
+    // I1 DIFFERENTIAL TEST: resolving EVERY dictionary id through the new Merkle-opening
+    // path must produce byte-identical terms to the old rebuild-the-catalog scan.
+    #[test]
+    fn merkle_resolution_matches_legacy_catalog_scan_for_every_id() {
+        let lc = mixed_layer();
+        let root = lc.state.commitment_root;
+
+        // Columns holding EVERY node/value id and EVERY predicate id in the catalogs.
+        let mut nv_ids: Vec<u64> = lc.node_value_catalog.iter().map(|r| r.object_id).collect();
+        nv_ids.sort_unstable();
+        let mut pred_ids: Vec<u64> = lc.predicate_catalog.iter().map(|r| r.predicate_id).collect();
+        pred_ids.sort_unstable();
+        assert!(nv_ids.len() >= 5 && !pred_ids.is_empty());
+        let nv_col: Vec<ArkFr> = nv_ids.iter().map(|&id| ArkFr::from_u64(id)).collect();
+        let pred_col: Vec<ArkFr> = pred_ids.iter().map(|&id| ArkFr::from_u64(id)).collect();
+
+        // Node/value-only resolver: Merkle == legacy for every id.
+        let merkle_nv =
+            resolve_node_value_result_objects(&lc, root, std::slice::from_ref(&nv_col)).unwrap();
+        let legacy_nv =
+            resolve_node_value_result_objects_via_catalog(&lc, root, std::slice::from_ref(&nv_col))
+                .unwrap();
+        assert_eq!(merkle_nv, legacy_nv);
+        // The layer really does carry both a Node and a Value term (so the differential
+        // covers both reconstruction branches).
+        assert!(merkle_nv[0]
+            .iter()
+            .any(|o| matches!(o, CanonicalObject::Node(_))));
+        assert!(merkle_nv[0]
+            .iter()
+            .any(|o| matches!(o, CanonicalObject::Value { .. })));
+
+        // Typed resolver over node/value + predicate + a nullable-zero column: Merkle == legacy.
+        let columns = vec![nv_col.clone(), pred_col.clone(), vec![f0(), f0()]];
+        let descriptors = vec![
+            ResultColumnDescriptor {
+                namespace: ResultIdNamespace::NodeValue,
+                nullable: false,
+            },
+            ResultColumnDescriptor {
+                namespace: ResultIdNamespace::Predicate,
+                nullable: false,
+            },
+            ResultColumnDescriptor {
+                namespace: ResultIdNamespace::NodeValue,
+                nullable: true,
+            },
+        ];
+        let merkle = resolve_result_values(&lc, root, &columns, &descriptors).unwrap();
+        let legacy = resolve_result_values_via_catalog(&lc, root, &columns, &descriptors).unwrap();
+        assert_eq!(merkle, legacy);
+        // Predicate ids reconstruct as `Node(iri)` on both paths.
+        assert!(matches!(
+            merkle[1][0],
+            CanonicalResultValue::Object(CanonicalObject::Node(_))
+        ));
+        assert_eq!(merkle[2][0], CanonicalResultValue::Null);
+    }
+
+    // The `resolution_root` wrapper binds `commitment_root` to the two Merkle roots WITHOUT
+    // perturbing `commitment_root` itself (the additive I1 anchor).
+    #[test]
+    fn resolution_root_wraps_without_touching_commitment_root() {
+        let lc = mixed_layer();
+        let view = lc.verifier_view();
+        assert_eq!(
+            view.resolution_root(),
+            crate::proof::resolution_root(
+                &lc.state.commitment_root,
+                &lc.nv_merkle_root,
+                &lc.pred_merkle_root,
+            )
+        );
+        let anchor = view.resolution_root();
+        // Perturbing a Merkle root moves the anchor...
+        assert_ne!(
+            crate::proof::resolution_root(&lc.state.commitment_root, &[9u8; 32], &lc.pred_merkle_root),
+            anchor
+        );
+        // ...but `commitment_root` is computed independently of the Merkle roots and is
+        // unchanged (byte-identity of the base anchor is preserved under I1).
+        assert_eq!(view.recomputed_commitment_root().unwrap(), lc.state.commitment_root);
+    }

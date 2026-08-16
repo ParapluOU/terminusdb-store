@@ -311,11 +311,12 @@ fn node_and_value_layer() -> LayerCommitment {
 }
 
 #[test]
-fn commitment_format_version_is_five() {
-    // v5 == date/dateTime dict entries carry a decoded OP value (see
-    // `node_value_op_value`); the root domain string stays `commitment-root/v4`.
-    assert_eq!(COMMITMENT_FORMAT_VERSION, 5);
-    assert_eq!(VERIFIER_COMMITMENT_FORMAT_VERSION, 2);
+fn commitment_format_version_is_six() {
+    // v6 == the sidecar carries the two id-indexed dictionary Merkle roots (I1); the
+    // `commitment_root` domain/structure is unchanged (`commitment-root/v4`), so a
+    // date-free layer still hashes to a BYTE-IDENTICAL root.
+    assert_eq!(COMMITMENT_FORMAT_VERSION, 6);
+    assert_eq!(VERIFIER_COMMITMENT_FORMAT_VERSION, 3);
 }
 
 #[test]

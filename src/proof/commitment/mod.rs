@@ -75,13 +75,21 @@ const COMMITMENT_MAGIC: &[u8; 8] = b"TSPCW0\0\0";
 // changed, and only for entries that are dates. So a layer WITHOUT dates commits the
 // identical `0`-sentinel value column and hashes to a BYTE-IDENTICAL root under v5, and
 // old v4 anchors for date-free layers stay valid.
-pub const COMMITMENT_FORMAT_VERSION: u32 = 5;
+// Bumped 5 → 6 when the sidecar gained the two id-indexed dictionary Merkle roots
+// (`nv_merkle_root`/`pred_merkle_root`) for succinct id->term resolution (increment I1). The
+// roots are ADDITIVE: they are a deterministic function of the already-committed catalog and
+// are NOT folded into `commitment_root` (the root DOMAIN and STRUCTURE are unchanged, so a
+// layer's `commitment_root` stays BYTE-IDENTICAL to v5). The bump exists only so a pre-I1 v5
+// file — which lacks the two roots in its body — cannot be read under the new layout.
+pub const COMMITMENT_FORMAT_VERSION: u32 = 6;
 const VERIFIER_COMMITMENT_MAGIC: &[u8; 8] = b"TSPCV0\0\0";
 // Bumped in lockstep (1 → 2): a verifier commitment derived from a v4 prover file
 // likewise committed dates at the `0` sentinel and must be rejected. Its recomputed
 // root uses the same unchanged `commitment-root/v4` domain, so a date-free verifier
 // commitment still recomputes a byte-identical root.
-pub const VERIFIER_COMMITMENT_FORMAT_VERSION: u32 = 2;
+// Bumped in lockstep (2 → 3): the compact artifact likewise now carries the two dictionary
+// Merkle roots so a remote verifier can compute `resolution_root` and open ids positionally.
+pub const VERIFIER_COMMITMENT_FORMAT_VERSION: u32 = 3;
 
 /// Number of committed columns per layer: additions (S,P,O) then removals
 /// (S,P,O), in that fixed order.
@@ -101,6 +109,7 @@ const MAX_SETUP_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 mod catalog;
 mod columns;
+mod dict_merkle;
 mod legacy;
 mod op_value;
 mod root;
@@ -117,6 +126,7 @@ pub use state::{
     CommitmentState, LayerCommitment, VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
 };
 pub use root::{database_root, validate_database_root};
+pub use dict_merkle::resolution_root;
 pub use op_value::{node_value_op_value, NODE_DATATYPE_TAG};
 
 // Crate-internal surface (sibling proof modules + storage plumbing, and the
@@ -124,6 +134,9 @@ pub use op_value::{node_value_op_value, NODE_DATATYPE_TAG};
 // was `pub(super)` (proof-visible) as an inline item; one level deeper it reaches
 // proof as `pub(crate)` — internal only, never part of the external `pub` surface.
 pub(crate) use columns::reject_nan_catalog;
+pub(crate) use dict_merkle::{
+    build_node_value_tree, build_predicate_tree, verify_opening, DictMerkleTree,
+};
 pub(crate) use legacy::decode_legacy_v3;
 pub(crate) use setup::{
     construction_commitment_scratch_bytes, matrix_dims, prover_setup, setup_parameter_id,
@@ -139,6 +152,7 @@ pub(crate) use setup::{
 // ---------------------------------------------------------------------------
 use catalog::*;
 use columns::*;
+use dict_merkle::*;
 use legacy::*;
 use op_value::*;
 use root::*;
