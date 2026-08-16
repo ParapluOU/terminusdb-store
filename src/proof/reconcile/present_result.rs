@@ -9,6 +9,7 @@
 //! discipline, generalized across the N-layer chain.
 
 use super::*;
+use ark_ff::PrimeField;
 
 // ===========================================================================
 // Wave 4 — RESULT RESOLUTION: authenticated (hash|id) result bindings → CanonicalObjects.
@@ -19,13 +20,24 @@ use super::*;
 //   1. The prover's claimed result VALUES (real prefix) are tied to the authenticated result
 //      commitment by re-committing (pad to the result domain, `commit_column`, require equality
 //      with the proof's committed output). A forged/altered binding fails this bind.
-//   2. Each value resolves to a `CanonicalObject` against the CHAIN catalogs — a term's canonical
-//      bytes live in the catalog of the layer whose incremental dict range defines it, so the
-//      resolver searches every layer's root-bound `node_value_catalog` / `predicate_catalog`
-//      (each id/hash is unique across the disjoint ranges). The catalogs are authenticated by the
-//      per-layer `validate()` the reconciliation verifier already ran (changed IRI/datatype/lexical
-//      bytes re-hash differently and fail the root-bound dictionary commitment).
-// Mirrors the base `resolve_result_values` discipline, generalized across the N-layer chain.
+//   2. Each value resolves to a `CanonicalObject`:
+//      * an ID column (`NodeValueId`, from the join/BGP/delta-read/walk paths) is resolved by an
+//        id-indexed positional Merkle OPENING (increment I3): every dictionary id lies in exactly
+//        ONE layer's introduced interval `(parent_count, count]`, and which layer is a PUBLIC
+//        function of the id and the chain-validated (abutting, root-bound) counts — so the id is
+//        ROUTED to its introducing layer and opened at the STRUCTURAL position
+//        `id - parent_count - 1` against that layer's root-bound `nv_merkle_root`. This is the
+//        delta-stack analogue of the base-path I1 opening (`query::result`), across the chain;
+//        it costs `O(log N)` per id rather than a whole-dictionary scan and never trusts a
+//        prover-chosen layer (the interval check in `verify_opening` re-forces the routing).
+//      * a HASH column (`NodeValueHash`/`PredicateHash`, from the single-atom filter, whose result
+//        bindings are hashes with NO delivered id) is still resolved by scanning the root-bound
+//        chain catalogs for the matching hash — an id-indexed tree cannot be opened WITHOUT an id,
+//        so a succinct Merkle resolution of the filter path needs the prover to additionally ship
+//        (unauthenticated, hash-checked) id-hint columns, a change coupled to dropping the clear
+//        catalog (I2); see the I3 report. The catalogs are authenticated to the trusted head root
+//        by the per-layer `validate()` the reconciliation verifier already ran.
+// Mirrors the base `resolve_result_values` / I1 opening discipline, generalized across the chain.
 // ===========================================================================
 
 /// How to resolve a result-column value to a `CanonicalObject`.
@@ -39,41 +51,220 @@ pub enum ResolveKind {
     PredicateHash,
 }
 
-pub(super) fn resolve_one(
-    views: &[VerifierCommitmentRef<'_>],
-    value: ArkFr,
-    kind: ResolveKind,
-) -> io::Result<CanonicalObject> {
-    match kind {
-        ResolveKind::NodeValueHash => {
-            for view in views {
-                for rec in view.node_value_catalog {
-                    if hash_object(&rec.triple.object) == value {
-                        return Ok(rec.triple.object.clone());
-                    }
-                }
-            }
-            Err(invalid("resolve: result hash is absent from the chain node/value dictionaries"))
+/// The canonical `u64` an id field element must equal to index a dictionary. Rejects a field
+/// element that is not a small (`< 2^64`) integer, exactly as the base-path resolver does before
+/// trusting a scalar as a dictionary id (`query::result::canonical_dictionary_id`).
+fn canonical_dictionary_id(id: &ArkFr) -> io::Result<u64> {
+    let raw = id.0.into_bigint().as_ref()[0];
+    if ArkFr::from_u64(raw) != *id {
+        return Err(invalid("resolve: result id is outside canonical u64 range"));
+    }
+    Ok(raw)
+}
+
+/// Chain-routed, id-indexed Merkle resolver (increment I3).
+///
+/// For each dictionary id it ROUTES to the unique chain layer whose introduced interval
+/// `(parent_count, count]` contains the id — a PUBLIC function of the id and the chain-validated,
+/// root-bound per-layer counts (`validate_chain_states` forbids overlaps/gaps; each layer's counts
+/// are hashed into its `commitment_root`, chained up to the trusted head) — then opens that layer's
+/// tree at the structural position `id - parent_count - 1` against that layer's root-bound Merkle
+/// root. Each layer's tree is (re)built from its root-bound catalog at most once and cached; the
+/// rebuilt root is re-checked against the carried `nv_merkle_root`/`pred_merkle_root` (already tied
+/// to `commitment_root` by the reconcile verifier's per-layer `validate()`), and `verify_opening`
+/// re-forces the interval + position, so a prover cannot point an id at the wrong layer's tree.
+struct ChainDictResolver<'a> {
+    views: &'a [VerifierCommitmentRef<'a>],
+    nv_trees: Vec<Option<DictMerkleTree>>,
+    pred_trees: Vec<Option<DictMerkleTree>>,
+}
+
+impl<'a> ChainDictResolver<'a> {
+    fn new(views: &'a [VerifierCommitmentRef<'a>]) -> Self {
+        let n = views.len();
+        Self {
+            views,
+            nv_trees: (0..n).map(|_| None).collect(),
+            pred_trees: (0..n).map(|_| None).collect(),
         }
-        ResolveKind::NodeValueId => {
-            for view in views {
-                for rec in view.node_value_catalog {
-                    if ark(rec.object_id) == value {
-                        return Ok(rec.triple.object.clone());
-                    }
+    }
+
+    /// The unique layer index whose node/value interval `(parent, count]` contains `id`. The
+    /// intervals abut disjointly along a chain-validated stack, so exactly one matches a real id;
+    /// none (or, defensively, more than one) fails closed.
+    fn nv_layer(&self, id: u64) -> io::Result<usize> {
+        let mut found: Option<usize> = None;
+        for (i, view) in self.views.iter().enumerate() {
+            if id > view.state.parent_node_value_count && id <= view.state.node_value_count {
+                if found.is_some() {
+                    return Err(invalid(
+                        "resolve: node/value id lies in more than one layer's introduced interval",
+                    ));
                 }
+                found = Some(i);
             }
-            Err(invalid("resolve: result id is absent from the chain node/value dictionaries"))
         }
-        ResolveKind::PredicateHash => {
-            for view in views {
-                for rec in view.predicate_catalog {
-                    if hash_term(&rec.triple.predicate) == value {
-                        return Ok(CanonicalObject::Node(rec.triple.predicate.clone()));
+        found.ok_or_else(|| {
+            invalid("resolve: node/value id lies outside every layer's introduced interval")
+        })
+    }
+
+    /// The unique layer index whose predicate interval `(parent, count]` contains `id`.
+    fn pred_layer(&self, id: u64) -> io::Result<usize> {
+        let mut found: Option<usize> = None;
+        for (i, view) in self.views.iter().enumerate() {
+            if id > view.state.parent_predicate_count && id <= view.state.predicate_count {
+                if found.is_some() {
+                    return Err(invalid(
+                        "resolve: predicate id lies in more than one layer's introduced interval",
+                    ));
+                }
+                found = Some(i);
+            }
+        }
+        found.ok_or_else(|| {
+            invalid("resolve: predicate id lies outside every layer's introduced interval")
+        })
+    }
+
+    /// Build (once) and cache layer `i`'s node/value tree, confirming the rebuilt root equals the
+    /// carried, root-bound `nv_merkle_root`.
+    fn nv_tree(&mut self, i: usize) -> io::Result<&DictMerkleTree> {
+        if self.nv_trees[i].is_none() {
+            let view = self.views[i];
+            let tree = build_node_value_tree(
+                view.node_value_catalog,
+                view.state.parent_node_value_count,
+                view.state.node_value_count,
+            )?;
+            if tree.root() != view.nv_merkle_root {
+                return Err(invalid(
+                    "resolve: rebuilt node/value merkle root does not match the bound root",
+                ));
+            }
+            self.nv_trees[i] = Some(tree);
+        }
+        Ok(self.nv_trees[i].as_ref().unwrap())
+    }
+
+    /// Build (once) and cache layer `i`'s predicate tree, confirming the rebuilt root equals the
+    /// carried, root-bound `pred_merkle_root`.
+    fn pred_tree(&mut self, i: usize) -> io::Result<&DictMerkleTree> {
+        if self.pred_trees[i].is_none() {
+            let view = self.views[i];
+            let tree = build_predicate_tree(
+                view.predicate_catalog,
+                view.state.parent_predicate_count,
+                view.state.predicate_count,
+            )?;
+            if tree.root() != view.pred_merkle_root {
+                return Err(invalid(
+                    "resolve: rebuilt predicate merkle root does not match the bound root",
+                ));
+            }
+            self.pred_trees[i] = Some(tree);
+        }
+        Ok(self.pred_trees[i].as_ref().unwrap())
+    }
+
+    /// Route + open a node/value id to its authenticated term. `expected_hash`, when supplied
+    /// (belt-and-suspenders on the delta path, per the design's "Opening soundness" decision),
+    /// additionally requires `hash_object(term)` to equal the proof-authenticated hash — a
+    /// mismatch rejects.
+    fn resolve_nv_id(
+        &mut self,
+        id: u64,
+        expected_hash: Option<ArkFr>,
+    ) -> io::Result<CanonicalObject> {
+        let i = self.nv_layer(id)?;
+        let view = self.views[i];
+        let tree = self.nv_tree(i)?;
+        let opening = tree.open(id)?;
+        let object = verify_opening(
+            &view.nv_merkle_root,
+            view.state.parent_node_value_count,
+            view.state.node_value_count,
+            id,
+            &opening,
+        )?;
+        if let Some(hash) = expected_hash {
+            if hash_object(&object) != hash {
+                return Err(invalid(
+                    "resolve: opened node/value term hash does not match the proof-authenticated hash",
+                ));
+            }
+        }
+        Ok(object)
+    }
+
+    /// Route + open a predicate id to its authenticated IRI (as a `Node`, mirroring the legacy
+    /// predicate resolver). `expected_hash`, when supplied, requires `hash_term(iri)` to equal the
+    /// proof-authenticated hash.
+    fn resolve_pred_id(
+        &mut self,
+        id: u64,
+        expected_hash: Option<ArkFr>,
+    ) -> io::Result<CanonicalObject> {
+        let i = self.pred_layer(id)?;
+        let view = self.views[i];
+        let tree = self.pred_tree(i)?;
+        let opening = tree.open(id)?;
+        let object = verify_opening(
+            &view.pred_merkle_root,
+            view.state.parent_predicate_count,
+            view.state.predicate_count,
+            id,
+            &opening,
+        )?;
+        if let Some(hash) = expected_hash {
+            let iri = match &object {
+                CanonicalObject::Node(bytes) => bytes.as_slice(),
+                _ => {
+                    return Err(invalid(
+                        "resolve: predicate leaf did not reconstruct as a node IRI",
+                    ))
+                }
+            };
+            if hash_term(iri) != hash {
+                return Err(invalid(
+                    "resolve: opened predicate term hash does not match the proof-authenticated hash",
+                ));
+            }
+        }
+        Ok(object)
+    }
+
+    /// Resolve one authenticated result value by its column kind. `NodeValueId` routes + opens the
+    /// id (I3). `NodeValueHash`/`PredicateHash` (single-atom filter output bindings, delivered as
+    /// hashes with no id) scan the root-bound chain catalogs — an id-indexed tree cannot be opened
+    /// without an id (see the module header / I3 report).
+    fn resolve(&mut self, value: ArkFr, kind: ResolveKind) -> io::Result<CanonicalObject> {
+        match kind {
+            ResolveKind::NodeValueId => self.resolve_nv_id(canonical_dictionary_id(&value)?, None),
+            ResolveKind::NodeValueHash => {
+                for view in self.views {
+                    for rec in view.node_value_catalog {
+                        if hash_object(&rec.triple.object) == value {
+                            return Ok(rec.triple.object.clone());
+                        }
                     }
                 }
+                Err(invalid(
+                    "resolve: result hash is absent from the chain node/value dictionaries",
+                ))
             }
-            Err(invalid("resolve: result hash is absent from the chain predicate dictionaries"))
+            ResolveKind::PredicateHash => {
+                for view in self.views {
+                    for rec in view.predicate_catalog {
+                        if hash_term(&rec.triple.predicate) == value {
+                            return Ok(CanonicalObject::Node(rec.triple.predicate.clone()));
+                        }
+                    }
+                }
+                Err(invalid(
+                    "resolve: result hash is absent from the chain predicate dictionaries",
+                ))
+            }
         }
     }
 }
@@ -105,12 +296,76 @@ pub(super) fn resolve_result_columns(
             ));
         }
     }
-    // (2) Resolve each value against the root-bound chain catalogs.
-    claimed_columns
-        .iter()
-        .zip(kinds)
-        .map(|(col, kind)| col.iter().map(|v| resolve_one(views, *v, *kind)).collect())
-        .collect()
+    // (2) Resolve each value against the root-bound chain dictionaries — id columns by an
+    // id-routed positional Merkle opening (I3), hash columns by a catalog scan.
+    let mut resolver = ChainDictResolver::new(views);
+    let mut resolved = Vec::with_capacity(claimed_columns.len());
+    for (col, kind) in claimed_columns.iter().zip(kinds) {
+        let mut out = Vec::with_capacity(col.len());
+        for value in col {
+            out.push(resolver.resolve(*value, *kind)?);
+        }
+        resolved.push(out);
+    }
+    Ok(resolved)
+}
+
+// ---------------------------------------------------------------------------
+// I3 test-support: direct chain-routed Merkle resolution + the pre-I3 catalog-scan baseline,
+// so the differential test can assert Merkle-routed resolution == the legacy scan for every id.
+// ---------------------------------------------------------------------------
+
+/// Resolve a node/value id directly by chain-routed Merkle opening (optional belt-and-suspenders
+/// hash cross-check). Test-only surface over [`ChainDictResolver`].
+#[cfg(test)]
+pub(crate) fn resolve_node_value_id_via_chain_merkle(
+    views: &[VerifierCommitmentRef<'_>],
+    id: u64,
+    expected_hash: Option<ArkFr>,
+) -> io::Result<CanonicalObject> {
+    ChainDictResolver::new(views).resolve_nv_id(id, expected_hash)
+}
+
+/// Resolve a predicate id directly by chain-routed Merkle opening (optional hash cross-check).
+#[cfg(test)]
+pub(crate) fn resolve_predicate_id_via_chain_merkle(
+    views: &[VerifierCommitmentRef<'_>],
+    id: u64,
+    expected_hash: Option<ArkFr>,
+) -> io::Result<CanonicalObject> {
+    ChainDictResolver::new(views).resolve_pred_id(id, expected_hash)
+}
+
+/// Pre-I3 node/value id resolution: linear scan of the chain catalogs (differential baseline).
+#[cfg(test)]
+pub(crate) fn resolve_node_value_id_via_catalog_scan(
+    views: &[VerifierCommitmentRef<'_>],
+    id: u64,
+) -> io::Result<CanonicalObject> {
+    for view in views {
+        for rec in view.node_value_catalog {
+            if rec.object_id == id {
+                return Ok(rec.triple.object.clone());
+            }
+        }
+    }
+    Err(invalid("resolve: result id is absent from the chain node/value dictionaries"))
+}
+
+/// Pre-I3 predicate id resolution: linear scan of the chain catalogs (differential baseline).
+#[cfg(test)]
+pub(crate) fn resolve_predicate_id_via_catalog_scan(
+    views: &[VerifierCommitmentRef<'_>],
+    id: u64,
+) -> io::Result<CanonicalObject> {
+    for view in views {
+        for rec in view.predicate_catalog {
+            if rec.predicate_id == id {
+                return Ok(CanonicalObject::Node(rec.triple.predicate.clone()));
+            }
+        }
+    }
+    Err(invalid("resolve: result id is absent from the chain predicate dictionaries"))
 }
 
 /// Bind an authenticated combined-dict node/value-id column to its commitment `com` and resolve it

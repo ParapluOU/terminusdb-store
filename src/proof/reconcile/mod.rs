@@ -80,7 +80,10 @@ use super::bgp::{
     prove_bgp_chain_with_result_and_context, verify_bgp_chain, BgpChainProof, JoinStep,
     RelationCommit, RelationWitness,
 };
-use super::commitment::{LayerCommitment, VerifierCommitmentRef, VerifierLayer};
+use super::commitment::{
+    build_node_value_tree, build_predicate_tree, verify_opening, DictMerkleTree, LayerCommitment,
+    VerifierCommitmentRef, VerifierLayer,
+};
 use super::dict::{hash_object, hash_term};
 use super::filter::{
     prove_boolean_product_with_context, prove_compaction_only_with_context,

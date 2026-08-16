@@ -1595,3 +1595,148 @@ fn delta_read_forged_result_binding_rejects() {
     )
     .is_err());
 }
+
+// ============================================================
+// Increment I3 — delta-stack (reconciled-present) id->term resolution via per-layer,
+// id-routed Merkle openings. The differential gate + the routing/root/hash negatives.
+// ============================================================
+
+/// PRIMARY correctness gate: over a base+3-delta stack whose dictionary ids are introduced across
+/// several layers, chain-routed Merkle resolution must equal the legacy catalog-scan resolution for
+/// EVERY node/value AND predicate id — and the happy-path hash cross-check must accept.
+#[test]
+fn i3_chain_merkle_resolution_equals_catalog_scan_for_every_id() {
+    let layers = base_plus_three();
+    let lref = refs(&layers);
+    let views: Vec<VerifierCommitmentRef<'_>> = lref.iter().map(|l| l.verifier_view()).collect();
+    let head = views.last().unwrap();
+
+    // The stack really spreads ids across layers (else the test is vacuous).
+    assert!(views.len() == 4, "base + 3 deltas");
+    let nv_contributors = views
+        .iter()
+        .filter(|v| v.state.node_value_count > v.state.parent_node_value_count)
+        .count();
+    let pred_contributors = views
+        .iter()
+        .filter(|v| v.state.predicate_count > v.state.parent_predicate_count)
+        .count();
+    assert!(nv_contributors >= 2, "node/value ids must be introduced across >=2 layers");
+    assert!(pred_contributors >= 2, "predicate ids must be introduced across >=2 layers");
+
+    // Every node/value id: Merkle == scan; and Merkle with the correct hash accepts.
+    for id in 1..=head.state.node_value_count {
+        let merkle = resolve_node_value_id_via_chain_merkle(&views, id, None).unwrap();
+        let scan = resolve_node_value_id_via_catalog_scan(&views, id).unwrap();
+        assert_eq!(merkle, scan, "node/value id {id}: merkle != scan");
+        // Belt-and-suspenders hash cross-check accepts the authentic term hash.
+        let checked =
+            resolve_node_value_id_via_chain_merkle(&views, id, Some(hash_object(&merkle))).unwrap();
+        assert_eq!(checked, merkle);
+    }
+
+    // Every predicate id: Merkle == scan; and Merkle with the correct predicate hash accepts.
+    for id in 1..=head.state.predicate_count {
+        let merkle = resolve_predicate_id_via_chain_merkle(&views, id, None).unwrap();
+        let scan = resolve_predicate_id_via_catalog_scan(&views, id).unwrap();
+        assert_eq!(merkle, scan, "predicate id {id}: merkle != scan");
+        let iri = match &merkle {
+            CanonicalObject::Node(bytes) => bytes.clone(),
+            _ => panic!("predicate resolves to a node IRI"),
+        };
+        let checked =
+            resolve_predicate_id_via_chain_merkle(&views, id, Some(hash_term(&iri))).unwrap();
+        assert_eq!(checked, merkle);
+    }
+}
+
+/// An id introduced by a delta layer must NOT authenticate against a different layer's root+interval
+/// (the routing is structural): `verify_opening`'s interval check re-forces `id ∈ (parent, count]`
+/// for the layer it is opened against, so a base id opened against a delta layer is rejected, and a
+/// delta id is unroutable when only the base layer is presented.
+#[test]
+fn i3_wrong_layer_routing_is_rejected() {
+    let layers = base_plus_three();
+    let lref = refs(&layers);
+    let views: Vec<VerifierCommitmentRef<'_>> = lref.iter().map(|l| l.verifier_view()).collect();
+    let base = views[0];
+    let d1 = views[1];
+    assert!(d1.state.node_value_count > d1.state.parent_node_value_count, "d1 introduces ids");
+
+    // A base id (2) opens correctly against the base layer...
+    let base_tree = build_node_value_tree(
+        base.node_value_catalog,
+        base.state.parent_node_value_count,
+        base.state.node_value_count,
+    )
+    .unwrap();
+    let opening = base_tree.open(2).unwrap();
+    assert!(verify_opening(
+        &base.nv_merkle_root,
+        base.state.parent_node_value_count,
+        base.state.node_value_count,
+        2,
+        &opening,
+    )
+    .is_ok());
+    // ...but the SAME opening claimed against d1's root+interval is rejected (id 2 <= d1.parent).
+    assert!(verify_opening(
+        &d1.nv_merkle_root,
+        d1.state.parent_node_value_count,
+        d1.state.node_value_count,
+        2,
+        &opening,
+    )
+    .is_err());
+
+    // A delta id is unroutable to (absent from) the base layer alone, exactly as the scan baseline.
+    let delta_id = base.state.node_value_count + 1;
+    assert!(resolve_node_value_id_via_catalog_scan(&[base], delta_id).is_err());
+    assert!(resolve_node_value_id_via_chain_merkle(&[base], delta_id, None).is_err());
+    // With the full chain it resolves against its introducing layer.
+    assert!(resolve_node_value_id_via_chain_merkle(&views, delta_id, None).is_ok());
+}
+
+/// A tampered per-layer Merkle root is rejected: the resolver rebuilds each layer's tree from its
+/// (root-bound) catalog and requires the rebuilt root to equal the carried `nv_merkle_root`.
+#[test]
+fn i3_tampered_layer_root_is_rejected() {
+    let layers = base_plus_three();
+    let lref = refs(&layers);
+    let base = lref[0].verifier_view();
+
+    // Honest: id 1 resolves.
+    assert!(resolve_node_value_id_via_chain_merkle(&[base], 1, None).is_ok());
+
+    // Flip a bit in the carried node/value Merkle root: the rebuilt-root check fails closed.
+    let mut bad_root = base.nv_merkle_root;
+    bad_root[0] ^= 0x01;
+    let tampered = VerifierCommitmentRef { nv_merkle_root: bad_root, ..base };
+    assert!(resolve_node_value_id_via_chain_merkle(&[tampered], 1, None).is_err());
+}
+
+/// Belt-and-suspenders: the opened leaf's term-hash is cross-checked against a proof-authenticated
+/// hash; a mismatch is rejected (node/value AND predicate).
+#[test]
+fn i3_leaf_term_hash_mismatch_is_rejected() {
+    let layers = base_plus_three();
+    let lref = refs(&layers);
+    let views: Vec<VerifierCommitmentRef<'_>> = lref.iter().map(|l| l.verifier_view()).collect();
+
+    // Node/value: id 1's term hashed against id 2's (distinct) hash is rejected.
+    let term1 = resolve_node_value_id_via_chain_merkle(&views, 1, None).unwrap();
+    let term2 = resolve_node_value_id_via_chain_merkle(&views, 2, None).unwrap();
+    assert_ne!(hash_object(&term1), hash_object(&term2));
+    assert!(resolve_node_value_id_via_chain_merkle(&views, 1, Some(hash_object(&term1))).is_ok());
+    assert!(resolve_node_value_id_via_chain_merkle(&views, 1, Some(hash_object(&term2))).is_err());
+
+    // Predicate: an authentic-hash check accepts; a wrong-hash check rejects.
+    let pred1 = match resolve_predicate_id_via_chain_merkle(&views, 1, None).unwrap() {
+        CanonicalObject::Node(bytes) => bytes,
+        _ => panic!("predicate resolves to a node IRI"),
+    };
+    assert!(resolve_predicate_id_via_chain_merkle(&views, 1, Some(hash_term(&pred1))).is_ok());
+    let wrong = hash_pred("http://ex/not-a-real-predicate");
+    assert_ne!(hash_term(&pred1), wrong);
+    assert!(resolve_predicate_id_via_chain_merkle(&views, 1, Some(wrong)).is_err());
+}
