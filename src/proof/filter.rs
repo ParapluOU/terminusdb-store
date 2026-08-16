@@ -38,9 +38,7 @@ use super::argument::{
     SumcheckShape, Term, Transcript254,
 };
 use super::invalid;
-use super::logup::{
-    multiset_link_claim, pseudo_inverse, reciprocal_claim, reciprocal_witness, rlc_fold,
-};
+use super::logup::pseudo_inverse;
 use super::logup_gkr::{
     bind_and_verify_fraction_tree, check_leaf_tie, prove_fraction_sum_zero, FractionInstance,
     GkrFractionProof, LinearForm, LinearTerm, Src,
@@ -762,10 +760,6 @@ pub(crate) fn compact_selected(
     let o_out = outs.pop().unwrap();
     let s_out = outs.pop().unwrap();
     (s_out, o_out, m)
-}
-
-fn slices(cols: &[Vec<ArkFr>]) -> Vec<&[ArkFr]> {
-    cols.iter().map(|c| c.as_slice()).collect()
 }
 
 /// The DENSE kept OUTPUT columns that [`prove_atom_filter`] commits (`com_kept`),
@@ -1544,70 +1538,51 @@ pub fn verify_boolean_product(
 // ===========================================================================
 //
 // The full atom filter ([`prove_atom_filter`]) fuses the SELECTION claims (A, B,
-// which derive `sel` from the constant-equality indicator) with the COMPACTION
-// claims (C, D, E, the LogUp dense-compaction) into one sumcheck welded to a single
-// internally-derived `sel`. Range filters need to compact by a COMBINED selection
+// which derive `sel` from the constant-equality indicator) with the COMPACTION LINK
+// (the LogUp dense-compaction) into one proof welded to a single internally-derived
+// `sel`. Range filters need to compact by a COMBINED selection
 // `sel = equality_sel · range_sel` that is NOT the plain equality indicator, so this
-// entry runs ONLY the compaction claims (C, D, E) over an EXTERNAL, already-committed
-// boolean `sel` column plus the kept SOURCE columns:
-//   * C: `cstar[i] = 1/(alpha − fold_beta(sources[i]))`         (reciprocal, Identity)
-//   * D: `dstar[j] = 1/(alpha − fold_beta(kept_out[j]))`         (reciprocal, Identity)
-//   * E: `Σ_i sel[i]·cstar[i] − Σ_j χ_m[j]·dstar[j] = 0`         (LogUp link, ZeroSum)
-// These are BIT-FOR-BIT the C/D/E claims of the full filter (same fold order, same
-// masks), so the audited compaction soundness carries over unchanged.
+// entry runs ONLY the compaction link over an EXTERNAL, already-committed boolean
+// `sel` column plus the kept SOURCE columns. Post the LogUp-GKR migration the link is
+// the SAME block-disjoint fraction tree the full filter uses ([`filter_link_instance`]),
+// with NO committed reciprocal columns (`cstar`/`dstar`) and no C/D/E sumcheck:
+//   * one GKR fraction-sum-zero proof of
+//     `Σ_i sel_i·(α − in_fold_i)⁻¹ − Σ_j [j < m]·(α − out_fold_j)⁻¹ = 0`
+//     over a `2·domain`-leaf vector (sources low half, kept outputs high half);
+//   * both numerators are LINEAR (a committed `sel` `Src::Column` on the low side,
+//     public `Src::Prefix` block indicators on the high side), so there is NO GAP-1
+//     `committed × public-Chi` product — the audited compaction soundness carries over
+//     unchanged (it is byte-for-byte the same link the full filter now emits).
 //
 // SECURITY TIE (the caller's responsibility): `sel` MUST be boolean and χ_n-masked.
 // This entry does NOT re-prove those properties — they are inherited from whatever
 // pins `com_sel` upstream (for a range atom: `sel = equality_sel · range_sel`, a
 // product of two independently-proven boolean, χ_n-masked columns, tied to THIS
-// `com_sel` by a product Identity). Given that, E proves the multiset
-// `{sources[i] : sel[i]=1}` equals `{kept_out[j] : j < m}` AND pins `m` to the
-// number of selected rows — exactly the audited dense-compaction guarantee.
+// `com_sel` by a product Identity). The `sel`'s 0/1-ness + zero-on-padding are what let
+// the link's committed `sel` numerator stay LINEAR (no auxiliary Identity here); given
+// them, the link proves the multiset `{sources[i] : sel[i]=1}` equals
+// `{kept_out[j] : j < m}` AND pins `m` to the number of selected rows — exactly the
+// audited dense-compaction guarantee.
 
 const CO_LABEL_DOMAIN: &[u8] = b"pow/compaction-only/domain-v1";
 const CO_LABEL_BETA: &[u8] = b"pow/compaction-only/logup-beta";
 const CO_LABEL_ALPHA: &[u8] = b"pow/compaction-only/logup-alpha";
 
-/// A compaction-only proof: the batched sumcheck over the two reciprocal claims
-/// (C, D) and the LogUp link (E), one batched Dory opening of
-/// `[sources.., sel, kept_out.., cstar, dstar]` at `r`, and the two reciprocal
-/// commitments the verifier binds. The kept OUTPUT commitments are returned
-/// separately (the authoritative dense-result columns).
+/// A compaction-only proof (LogUp-GKR): the block-disjoint fraction-sum-zero proof for
+/// `Σ_i sel_i·(α − in_fold_i)⁻¹ − Σ_j [j < m]·(α − out_fold_j)⁻¹ = 0` (the SAME link
+/// [`filter_link_instance`] the full filter emits), the evaluations of the length-`domain`
+/// link columns `[sources.., kept_out.., sel]` at the low `num_vars` bits of the GKR leaf
+/// point, and one batched Dory opening binding them. NO reciprocal (`cstar`/`dstar`) column
+/// is committed. The kept OUTPUT commitments are returned separately (the authoritative
+/// dense-result columns).
 #[derive(Clone, Debug)]
 pub struct CompactionOnlyProof {
-    pub sumcheck: SumcheckProof,
-    pub opening: ColumnOpening,
-    pub cstar_commitment: ArkGT,
-    pub dstar_commitment: ArkGT,
-}
-
-/// The C/D/E compaction shape over `[sources.., sel, kept_out.., cstar, dstar]`, with
-/// `χ_m` (the output length) the single chi bound. Column indices: sources
-/// `0..num_kept`, `sel` at `num_kept`, kept outputs `num_kept+1..2·num_kept+1`,
-/// `cstar` at `2·num_kept+1`, `dstar` at `2·num_kept+2`.
-fn compaction_only_shape(
-    num_vars: usize,
-    output_len: usize,
-    num_kept: usize,
-    alpha: ArkFr,
-    beta: ArkFr,
-) -> SumcheckShape {
-    let sel_col = num_kept;
-    let kept_out_base = num_kept + 1;
-    let cstar = 2 * num_kept + 1;
-    let dstar = 2 * num_kept + 2;
-    let kept_in: Vec<usize> = (0..num_kept).collect();
-    let kept_out: Vec<usize> = (0..num_kept).map(|d| kept_out_base + d).collect();
-    let claim_c = reciprocal_claim(cstar, &kept_in, alpha, beta);
-    let claim_d = reciprocal_claim(dstar, &kept_out, alpha, beta);
-    // chi index 0 is χ_m (the sole chi bound); sel is the (external) input mask.
-    let claim_e = multiset_link_claim(Operand::Column(sel_col), cstar, Operand::Chi(0), dstar);
-    SumcheckShape {
-        num_vars,
-        num_columns: 2 * num_kept + 3,
-        chi_bounds: vec![output_len],
-        claims: vec![claim_c, claim_d, claim_e],
-    }
+    /// GKR fraction tree for `Σ sel·(α−in_fold)⁻¹ − Σ [j<m]·(α−out_fold)⁻¹ = 0`.
+    pub link: GkrFractionProof,
+    /// Evaluations of `[sources.., kept_out.., sel]` at `r_low` (the low `num_vars` bits
+    /// of the GKR leaf point), bound to their commitments by `link_opening`.
+    pub link_col_evals: Vec<ArkFr>,
+    pub link_opening: ColumnOpening,
 }
 
 /// Bind the compaction-only statement: the domain tag, the kept arity, and the source
@@ -1679,34 +1654,54 @@ pub fn prove_compaction_only_with_context(
         com_kept.push(context.commit_column(col)?);
     }
 
-    // Round 1: bind the data commitments, then draw the LogUp challenges.
+    // Round 1: bind the data commitments (sources + sel + kept outputs, all committed and
+    // root-anchored), then draw the LogUp challenges. α/β are drawn AFTER every column
+    // commitment is bound — the primitive's caller contract, so the fraction leaves are
+    // fixed before any per-layer GKR challenge. No reciprocal column is committed anymore.
     bind_compaction_only(transcript, source_commitments, com_sel, &com_kept);
     let beta = transcript.challenge_scalar(CO_LABEL_BETA);
     let alpha = transcript.challenge_scalar(CO_LABEL_ALPHA);
 
-    // Round 2: derived reciprocals, bound AFTER the challenges.
-    let cstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(sources)));
-    let dstar = reciprocal_witness(alpha, &rlc_fold(beta, &slices(&kept_out)));
-    let com_cstar = context.commit_column(&cstar)?;
-    let com_dstar = context.commit_column(&dstar)?;
-    transcript.append_group(b"pow/co/com-cstar", &com_cstar);
-    transcript.append_group(b"pow/co/com-dstar", &com_dstar);
+    // The compaction multiset link as ONE GKR fraction tree over the block-disjoint
+    // 2·domain layout: kept INPUT sources fill the LOW half `[0, domain)`, kept OUTPUT
+    // columns the HIGH half; `sel` (low) is the input numerator, the public prefix the
+    // output numerator. This is byte-for-byte the same `filter_link_instance` the full
+    // filter emits.
+    let domain = size;
+    let leaf_count = 2 * domain;
+    let mut extended: Vec<Vec<ArkFr>> = Vec::with_capacity(2 * num_kept + 1);
+    for source in sources {
+        let mut ext = vec![f0(); leaf_count];
+        ext[..domain].copy_from_slice(source);
+        extended.push(ext);
+    }
+    for column in &kept_out {
+        let mut ext = vec![f0(); leaf_count];
+        ext[domain..].copy_from_slice(column);
+        extended.push(ext);
+    }
+    let mut sel_ext = vec![f0(); leaf_count];
+    sel_ext[..domain].copy_from_slice(sel);
+    extended.push(sel_ext);
 
-    let shape = compaction_only_shape(num_vars, m, num_kept, alpha, beta);
-    let mut columns: Vec<Vec<ArkFr>> = sources.to_vec();
-    columns.push(sel.to_vec());
-    columns.extend(kept_out.iter().cloned());
-    columns.push(cstar);
-    columns.push(dstar);
-    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = context.prove_column_openings(&columns, &r, transcript)?;
+    let link_inst = filter_link_instance(alpha, beta, num_kept, num_vars, m);
+    let (link, r_leaf) = prove_fraction_sum_zero(&link_inst, &extended, transcript)?;
+
+    // Single batched Dory opening of the length-`domain` link columns
+    // `[sources.., kept_out.., sel]` at r_low, bound to their commitments.
+    let r_low = &r_leaf[..num_vars];
+    let mut link_columns: Vec<Vec<ArkFr>> = Vec::with_capacity(2 * num_kept + 1);
+    link_columns.extend(sources.iter().cloned());
+    link_columns.extend(kept_out.iter().cloned());
+    link_columns.push(sel.to_vec());
+    let link_col_evals: Vec<ArkFr> = link_columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+    let link_opening = context.prove_column_openings(&link_columns, r_low, transcript)?;
 
     Ok((
         CompactionOnlyProof {
-            sumcheck,
-            opening,
-            cstar_commitment: com_cstar,
-            dstar_commitment: com_dstar,
+            link,
+            link_col_evals,
+            link_opening,
         },
         com_kept,
         kept_out,
@@ -1733,30 +1728,61 @@ pub fn verify_compaction_only(
     if com_kept.len() != num_kept {
         return Err(invalid("compaction-only kept commitment count mismatch"));
     }
-    let num_vars = proof.sumcheck.round_polys.len();
-    if num_vars == 0 || num_vars >= usize::BITS as usize {
+    // The GKR link has `num_vars + 1` layers (`2·domain` leaves for a length-`domain`
+    // value domain), so `num_vars = link.num_vars() - 1`; the committed link columns have
+    // length `2^num_vars`. The column openings below re-anchor this to the true commitments.
+    let link_vars = proof.link.num_vars();
+    if link_vars < 2 || link_vars >= usize::BITS as usize {
         return Err(invalid("compaction-only proof has an implausible variable count"));
     }
+    let num_vars = link_vars - 1;
     let size = 1usize << num_vars;
     if output_len > size {
         return Err(invalid("compaction-only output length exceeds column length"));
+    }
+    if proof.link_col_evals.len() != 2 * num_kept + 1 {
+        return Err(invalid("compaction-only link column-evaluation count mismatch"));
     }
 
     bind_compaction_only(transcript, source_commitments, com_sel, com_kept);
     let beta = transcript.challenge_scalar(CO_LABEL_BETA);
     let alpha = transcript.challenge_scalar(CO_LABEL_ALPHA);
-    transcript.append_group(b"pow/co/com-cstar", &proof.cstar_commitment);
-    transcript.append_group(b"pow/co/com-dstar", &proof.dstar_commitment);
 
-    let shape = compaction_only_shape(num_vars, output_len, num_kept, alpha, beta);
-    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    // Bind the public block-disjoint instance and verify the GKR fraction tree.
+    let link_inst = filter_link_instance(alpha, beta, num_kept, num_vars, output_len);
+    let (r_leaf, p_claim, q_claim) =
+        bind_and_verify_fraction_tree(&link_inst, &proof.link, transcript)?;
 
-    let mut coms: Vec<ArkGT> = source_commitments.to_vec();
-    coms.push(*com_sel);
-    coms.extend_from_slice(com_kept);
-    coms.push(proof.cstar_commitment);
-    coms.push(proof.dstar_commitment);
-    verify_column_openings(&coms, &r, &evals, &proof.opening, transcript)
+    // Open the length-`domain` link columns `[sources.., kept_out.., sel]` at r_low, bound
+    // to their commitments. The `sel` numerator is `com_sel` — pinned to the 0/1 selector
+    // (zero on padding and non-matches) by the caller's upstream binding.
+    let r_low = &r_leaf[..num_vars];
+    let r_high = r_leaf[num_vars];
+    let mut link_coms: Vec<ArkGT> = source_commitments.to_vec();
+    link_coms.extend_from_slice(com_kept);
+    link_coms.push(*com_sel);
+    verify_column_openings(
+        &link_coms,
+        r_low,
+        &proof.link_col_evals,
+        &proof.link_opening,
+        transcript,
+    )?;
+
+    // Reconstruct each 2·domain leaf-MLE from the length-`domain` opening via the top-bit
+    // zero-extension factor: sources + `sel` live in the LOW half (factor `1 − r_high`),
+    // kept outputs in the HIGH half (factor `r_high`). This structurally forces each side's
+    // columns to zero on the other block — neither can leak.
+    let one_minus_high = f1() - r_high;
+    let mut leaf_evals = Vec::with_capacity(2 * num_kept + 1);
+    for eval in &proof.link_col_evals[..num_kept] {
+        leaf_evals.push(one_minus_high * *eval); // sources (low half)
+    }
+    for eval in &proof.link_col_evals[num_kept..2 * num_kept] {
+        leaf_evals.push(r_high * *eval); // kept outputs (high half)
+    }
+    leaf_evals.push(one_minus_high * proof.link_col_evals[2 * num_kept]); // sel (low half)
+    check_leaf_tie(&link_inst, &leaf_evals, p_claim, q_claim, &r_leaf)
 }
 
 #[cfg(test)]

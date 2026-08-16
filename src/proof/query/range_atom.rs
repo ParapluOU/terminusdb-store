@@ -382,14 +382,16 @@ pub(super) fn verify_ranged_atom(
     // entirely at the common domain `D` (its lookup/datatype-mask/range/combine sumchecks
     // each have `d_log` variables); the constant-equality selection, the combined-selection
     // product, and the compaction all run at the table domain (`a` variables).
+    // The LogUp-GKR lookup / compaction carry `2·domain` leaves, so their fraction tree has
+    // `domain_log + 1` layers (`num_vars()`); the other sub-proofs remain plain sumchecks.
     for (rounds, expected) in [
-        (sub.object_range.lookup.sumcheck.round_polys.len(), d_log),
+        (sub.object_range.lookup.gkr.num_vars(), d_log + 1),
         (sub.object_range.datatype.sumcheck.round_polys.len(), d_log),
         (sub.object_range.range.sumcheck.round_polys.len(), d_log),
         (sub.object_range.combine.sumcheck.round_polys.len(), d_log),
         (sub.equality.sumcheck.round_polys.len(), a),
         (sub.combine.sumcheck.round_polys.len(), a),
-        (sub.compaction.sumcheck.round_polys.len(), a),
+        (sub.compaction.link.num_vars(), a + 1),
     ] {
         if rounds != expected {
             return Err(invalid(
@@ -398,13 +400,13 @@ pub(super) fn verify_ranged_atom(
         }
     }
     if let Some(second) = &sub.second {
-        for rounds in [
-            second.object_range.lookup.sumcheck.round_polys.len(),
-            second.object_range.datatype.sumcheck.round_polys.len(),
-            second.object_range.range.sumcheck.round_polys.len(),
-            second.object_range.combine.sumcheck.round_polys.len(),
+        for (rounds, expected) in [
+            (second.object_range.lookup.gkr.num_vars(), d_log + 1),
+            (second.object_range.datatype.sumcheck.round_polys.len(), d_log),
+            (second.object_range.range.sumcheck.round_polys.len(), d_log),
+            (second.object_range.combine.sumcheck.round_polys.len(), d_log),
         ] {
-            if rounds != d_log {
+            if rounds != expected {
                 return Err(invalid(
                     "second range sub-proof dimension does not match the dictionary domain",
                 ));

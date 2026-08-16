@@ -142,10 +142,22 @@ pub(super) fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
 // RANGE sub-proof (booleanity + recomposition) is unchanged. Every multi-atom BGP join
 // (join2 embeds a `SortedProof` on the sorted key column) has different proof bytes;
 // UNION/ANTI/OUTER embed the same BGP chain / semi-join and bump in lockstep.
-pub(super) const VERSION: u32 = 9;
-pub(super) const UNION_VERSION: u32 = 7;
-pub(super) const ANTI_VERSION: u32 = 9;
-pub(super) const OUTER_VERSION: u32 = 6;
+// v10: LogUp-GKR migration of the RANGE reciprocal-bearing pieces — (A) the compaction-only
+// LINK (`CompactionOnlyProof`, the range/equality/anti/semijoin compaction path) dropped its
+// two committed reciprocal GT commitments (`cstar`/`dstar`) and the C/D/E link sumcheck for a
+// block-disjoint GKR fraction tree + link data-column evaluations + one batched opening; (B)
+// the authenticated dict-value lookup (`DictLookupProof`) dropped its two committed reciprocal
+// GT commitments (`rec_q`/`rec_d`) and the batched multiset-link sumcheck for a block-disjoint
+// GKR fraction tree + seven data-column leaf evaluations + one batched opening, plus a
+// co-running `(1 − χ_{n_dict})·w = 0` GAP-1 Identity sumcheck and its `w` opening. Every range
+// atom embeds BOTH (its `RangeAtomSubproof` carries a `CompactionOnlyProof` and an
+// `ObjectRangeProof`→`DictLookupProof`); the ANTI/OUTER envelopes embed a `CompactionOnlyProof`
+// directly (`LeftAntiJoinProof.compaction`); UNION wraps `LayerBgpEnvelope` branches. So all
+// four bump in lockstep (established convention).
+pub(super) const VERSION: u32 = 10;
+pub(super) const UNION_VERSION: u32 = 8;
+pub(super) const ANTI_VERSION: u32 = 10;
+pub(super) const OUTER_VERSION: u32 = 7;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
 // v23 adds the ordered `sys:Array` walk composite node (tag 24).
@@ -172,7 +184,12 @@ pub(super) const OUTER_VERSION: u32 = 6;
 // `ExactScalarOrder`/`ExactMultiOrder`/`OrderedListWalk`/`OrderedArrayWalk` composites
 // (each embeds a `SortedProof`), whose bytes changed (committed `rec_c`/`rec_d` +
 // multiset-link sumcheck -> GKR fraction tree).
-pub(super) const RECURSIVE_VERSION: u32 = 29;
+// v30: LogUp-GKR migration of the RANGE reciprocal-bearing pieces (see the `VERSION` v10 note)
+// — recursive envelopes embed layer-BGP leaves whose range-atom `CompactionOnlyProof` +
+// `ObjectRangeProof`→`DictLookupProof` bytes changed, and the ordered `OrderedArrayWalk` /
+// list-walk composites embed a `DictLookupProof` directly, whose committed reciprocals
+// (`rec_q`/`rec_d`) + link sumcheck became a GKR fraction tree + GAP-1 Identity.
+pub(super) const RECURSIVE_VERSION: u32 = 30;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -465,11 +482,15 @@ wire_struct!(SelectionOnlyProof {
     w_commitment
 });
 wire_struct!(BooleanProductProof { sumcheck, opening });
+// LogUp-GKR migration of the compaction-only LINK (the range/equality/anti/semijoin
+// compaction path): the two committed reciprocal commitments (`cstar`/`dstar`) and the
+// C/D/E link sumcheck are gone; a GKR fraction-tree proof + the link data-column
+// evaluations at the leaf-opening point + one batched opening carry the "kept outputs ==
+// selected inputs" multiset link (the SAME `filter_link_instance` the full filter emits).
 wire_struct!(CompactionOnlyProof {
-    sumcheck,
-    opening,
-    cstar_commitment,
-    dstar_commitment
+    link,
+    link_col_evals,
+    link_opening
 });
 wire_struct!(RelationEqualityProof {
     indicator,
@@ -726,14 +747,20 @@ wire_struct!(RangeSelectProof {
     opening,
     bit_commitments
 });
+// LogUp-GKR migration of the authenticated dict-value lookup: the two committed reciprocal
+// commitments (`rec_q`/`rec_d`) and the batched multiset-link sumcheck are gone; a
+// block-disjoint GKR fraction-tree proof + the seven data-column leaf evaluations + one
+// batched opening carry the `Σ w/(α−d) − Σ 1/(α−q) = 0` link, plus a co-running
+// `(1 − χ_{n_dict})·w = 0` GAP-1 Identity sumcheck and its `w` opening.
 wire_struct!(DictLookupProof {
-    sumcheck,
+    gkr,
+    col_evals,
     opening,
+    id_sumcheck,
+    id_opening,
     com_v_val,
     com_v_dt,
-    com_w,
-    com_rec_q,
-    com_rec_d
+    com_w
 });
 wire_struct!(HashLookupInnerProof {
     gkr,

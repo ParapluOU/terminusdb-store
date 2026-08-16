@@ -75,7 +75,7 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    prove_sumcheck, verify_column_openings, verify_sumcheck,
+    mle_full_eval, prove_sumcheck, verify_column_openings, verify_sumcheck,
     ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
     SumcheckShape, Term, Transcript254,
 };
@@ -83,7 +83,10 @@ use super::argument::{
 use super::argument::commit_column;
 use super::filter::{self, FilterProof};
 use super::invalid;
-use super::logup::{masked_multiset_link_claim, reciprocal_claim, reciprocal_witness, rlc_fold};
+use super::logup_gkr::{
+    bind_and_verify_fraction_tree, check_leaf_tie, prove_fraction_sum_zero, FractionInstance,
+    GkrFractionProof, LinearForm, LinearTerm, Src,
+};
 use super::sort::{booleanity_claim, low_bits};
 
 // Column layout: V, then the B+1 bit columns b_0..b_B, then sel.
@@ -517,97 +520,176 @@ pub fn verify_range_select(
 //   `(obj_id[i], v_val[i], v_dt[i]) == (dict_id[j], dict_value[j], dict_datatype[j])`
 // for the dict row `j` whose id is `obj_id[i]`, for every real row `i < real_n`.
 //
-// # The lookup (batched multi-column LogUp, mirrors [`super::membership`])
-// Draw a fold challenge `β` (after committing the witness columns) and fingerprint
+// # The lookup (LogUp-GKR, block-disjoint two-side layout + GAP-1 auxiliary Identity)
+// Draw a fold challenge `β` (after committing every data column) and fingerprint
 // each side's `(id, value, datatype)` triple into ONE scalar per row:
 //   * query fold  `q[i]  = obj_id[i]  + β·v_val[i]  + β²·v_dt[i]`
 //   * dict  fold  `d[j]  = dict_id[j] + β·dict_value[j] + β²·dict_datatype[j]`
-// Commit reciprocal witnesses `rec_q[i] = 1/(α − q[i])`, `rec_d[j] = 1/(α − d[j])`
-// (α drawn after `β`), pinned by two Identity [`reciprocal_claim`]s, plus a
-// committed MULTIPLICITY column `w[j]` = #{ real query rows whose id is dict row
-// `j` }. The single ZeroSum [`masked_multiset_link_claim`] links them:
-//   `Σ_i χ_n[i]·rec_q[i]  −  Σ_j χ_{n_dict}[j]·w[j]·rec_d[j] = 0`.
-// BOTH sides are masked (the audited discipline): `χ_n` drops padding query rows,
-// `χ_{n_dict}` drops padding dict rows so they cannot act as free poles.
+// The log-derivative identity pinning `v_val`/`v_dt` (α drawn after β) is
+//   `Σ_{j<n_dict} w[j]/(α − d[j])  −  Σ_{i<real_n} 1/(α − q[i]) = 0`,
+// where the committed MULTIPLICITY column `w[j]` = #{ real query rows whose id is dict
+// row `j` }. This is a multi-column generalization of [`super::membership`] (the DICT
+// side is the "universe" weighted by `w`, the QUERY side is the "image" counted once
+// per real row). It is proved by the GKR fraction tree ([`super::logup_gkr`]) over a
+// `2·domain` leaf vector laid out BLOCK-DISJOINT — NO reciprocal column (`rec_q`/`rec_d`)
+// is committed:
+//   * the DICT rows in the LOW half `[0, domain)` — denom `α − d[j]`, numerator the
+//     committed multiplicity `+w[j]`;
+//   * the QUERY rows in the HIGH half `[domain, 2·domain)` — denom `α − q[i]`, numerator
+//     the ADDITIVE public block indicator `−[domain ≤ i < domain + real_n]`.
+// The committed DATA columns stay length `domain`; the prover feeds the tree their
+// zero-extensions (dict cols + `w` into the low half, query cols into the high half) and
+// the verifier reconstructs each `2·domain` leaf-MLE from the length-`domain` opening via
+// the top-bit factor (`(1 − r_high)` low, `r_high` high) — structurally forcing each
+// side's fold columns to zero in the OTHER block.
+//
+// # GAP-1 (dict padding tail), closed UNCONDITIONALLY with a co-running Identity
+// The reciprocal-era `Σ χ_{n_dict}·w·rec_d` masked the dict padding tail `[n_dict, domain)`
+// out of the link. That mask is soundness-critical: without it a prover can STASH a value
+// in the dict padding (commit `dict_id`/`dict_value`/`dict_datatype` on a row `j ≥ n_dict`
+// crafted to equal a target query fold) and put a nonzero `w[j]` there, letting the padding
+// pole `+w[j]/(α − d[j])` cancel a query pole for a NON-member — forging a lookup of a
+// WRONG value. The forged pole sits at `α − (matchable value)`, so no "no real row has a
+// pole at α" invariant closes it, and the boundary `n_dict` is ARBITRARY (non power of two),
+// so a structural zero-extension of `w` cannot reproduce the mask. A `committed × public-Chi`
+// mask is not a linear GKR leaf, so `χ_{n_dict}` is NOT put in the leaf; instead GAP-1 is
+// closed by a CO-RUNNING auxiliary Identity over the SAME committed `w`:
+//   `(1 − χ_{n_dict}(x)) · w(x) = 0   for every x`,
+// proved via the existing [`super::argument`] sumcheck (a product term the engine supports
+// — NO reciprocal reintroduced). As an Identity it forces `w[x] = 0` at EVERY `x ≥ n_dict`
+// for ARBITRARY `n_dict`, unconditionally; its `w` opening binds the SAME `com_w` on the
+// SAME transcript as the GKR leaf tie, so the multiplicity the tree used is exactly the one
+// pinned to zero on the tail — a forged padding `w` is rejected without any caller invariant.
 //
 // # WHY this forces v_val/v_dt correct (the security tie)
-// At random α the link holds as a rational identity in α iff the query-fold
-// multiset (one pole per real query row) equals the dict-fold multiset (dict row
-// `j` weighted by `w[j]`, real rows only). So every real query pole `q[i]` must be
-// cancelled by some dict pole `d[j]`. With `β` drawn AFTER commit, the fold
+// At random α the link holds as a rational identity in α iff the query-fold multiset (one
+// pole per real query row) equals the dict-fold multiset (dict row `j` weighted by `w[j]`,
+// real rows only via the Identity). So every real query pole `q[i]` must be cancelled by
+// some real dict pole `d[j]`. With `β` drawn AFTER commit, the fold
 // `(id,val,dt) ↦ id + β·val + β²·dt` is injective w.h.p., so `q[i] == d[j]` forces
 // `obj_id[i] = dict_id[j]`, `v_val[i] = dict_value[j]`, `v_dt[i] = dict_datatype[j]`.
 // Because `dict_id` is UNIQUE per row (the dict is an id↔object bijection),
-// `obj_id[i] = dict_id[j]` pins `j` to THE unique dict row for that id — so
-// `v_val[i]`/`v_dt[i]` are forced to be that row's TRUE value/datatype. A prover
-// that commits a WRONG `v_val[i]` (≠ dict_value of `obj_id[i]`) produces a query
-// pole that matches NO dict pole (the only row with id `obj_id[i]` has the true,
-// different value), leaving an uncancelled pole → the identity fails → REJECT.
-// The reciprocals are themselves pinned (Identity claims, committed + opened), so a
-// prover cannot fudge them to fake a balance.
+// `obj_id[i] = dict_id[j]` pins `j` to THE unique dict row for that id — so `v_val[i]`/
+// `v_dt[i]` are forced to be that row's TRUE value/datatype. A prover that commits a WRONG
+// `v_val[i]` produces a query pole that matches NO real dict pole, leaving an uncancelled
+// pole → the root `P ≠ 0` → REJECT.
 
-// Column layout for the lookup sumcheck (one `2^k` domain shared by both sides).
+// Column layout for the lookup fraction instance (one `2^k` domain shared by both sides;
+// each committed column is length `domain` and zero-extended into its half). The reciprocal
+// witnesses `rec_q`/`rec_d` are GONE (LogUp-GKR migration).
 const L_COL_OBJ_ID: usize = 0;
 const L_COL_V_VAL: usize = 1;
 const L_COL_V_DT: usize = 2;
-const L_COL_REC_Q: usize = 3;
-const L_COL_DICT_ID: usize = 4;
-const L_COL_DICT_VALUE: usize = 5;
-const L_COL_DICT_DATATYPE: usize = 6;
-const L_COL_W: usize = 7;
-const L_COL_REC_D: usize = 8;
-const L_NUM_COLUMNS: usize = 9;
-// chi_bounds indices: χ_n (real query rows) and χ_{n_dict} (real dict rows).
-const L_CHI_N: usize = 0;
-const L_CHI_NDICT: usize = 1;
+const L_COL_DICT_ID: usize = 3;
+const L_COL_DICT_VALUE: usize = 4;
+const L_COL_DICT_DATATYPE: usize = 5;
+const L_COL_W: usize = 6;
+const L_NUM_COLUMNS: usize = 7;
 
 const LOOKUP_DOMAIN: &[u8] = b"pow/obj-lookup/domain-v1";
 const LOOKUP_STMT: &[u8] = b"pow/obj-lookup/statement";
 const LOOKUP_BETA: &[u8] = b"pow/obj-lookup/fingerprint-beta";
 const LOOKUP_ALPHA: &[u8] = b"pow/obj-lookup/reciprocal-alpha";
 
-/// A batched authenticated dict-lookup proof: the sumcheck over the two reciprocal
-/// (Identity) claims + the masked LogUp link (ZeroSum), one batched Dory opening of
-/// all nine columns, and the witness commitments the verifier binds. `com_v_val` /
-/// `com_v_dt` are the AUTHENTICATED value/datatype columns the composing gadget
-/// (range on `v_val`, datatype-mask on `v_dt`) reuses as their committed inputs.
+/// A batched authenticated dict-lookup proof (LogUp-GKR): the block-disjoint
+/// fraction-sum-zero proof for `Σ_{j<n_dict} w/(α − d) − Σ_{i<real_n} 1/(α − q) = 0`, the
+/// claimed evaluations of the seven DATA columns at `r_low` (the low `k` bits of the GKR
+/// leaf point), one batched Dory opening of those columns, and the co-running GAP-1 Identity
+/// `(1 − χ_{n_dict})·w = 0` (its own sumcheck + `w` opening, both bound to `com_w` on the
+/// shared transcript). NO reciprocal (`rec_q`/`rec_d`) column exists. `com_v_val` /
+/// `com_v_dt` are the AUTHENTICATED value/datatype columns the composing gadget (range on
+/// `v_val`, datatype-mask on `v_dt`) reuses as their committed inputs.
 #[derive(Clone, Debug)]
 pub struct DictLookupProof {
-    pub sumcheck: SumcheckProof,
+    pub gkr: GkrFractionProof,
+    /// Evaluations of `[obj_id, v_val, v_dt, dict_id, dict_value, dict_datatype, w]` at
+    /// `r_low`, bound to their commitments by `opening`.
+    pub col_evals: Vec<ArkFr>,
     pub opening: ColumnOpening,
+    /// GAP-1 auxiliary Identity `(1 − χ_{n_dict})·w = 0` sumcheck + its `w` opening.
+    pub id_sumcheck: SumcheckProof,
+    pub id_opening: ColumnOpening,
     pub com_v_val: ArkGT,
     pub com_v_dt: ArkGT,
     pub com_w: ArkGT,
-    pub com_rec_q: ArkGT,
-    pub com_rec_d: ArkGT,
 }
 
-fn lookup_shape(k: usize, real_n: usize, n_dict: usize, alpha: ArkFr, beta: ArkFr) -> SumcheckShape {
+/// Zero-extend a length-`size` column into the LOW half of a `2·size` leaf vector; the high
+/// half stays zero. MLE at `(r_low, r_high)` is `(1 − r_high)·MLE_size(col, r_low)`.
+fn low_half(col: &[ArkFr], leaf_count: usize) -> Vec<ArkFr> {
+    let mut ext = vec![f0(); leaf_count];
+    ext[..col.len()].copy_from_slice(col);
+    ext
+}
+
+/// Zero-extend a length-`size` column into the HIGH half of a `2·size` leaf vector; the low
+/// half stays zero. MLE at `(r_low, r_high)` is `r_high·MLE_size(col, r_low)`.
+fn high_half(col: &[ArkFr], leaf_count: usize) -> Vec<ArkFr> {
+    let mut ext = vec![f0(); leaf_count];
+    ext[leaf_count / 2..].copy_from_slice(col);
+    ext
+}
+
+/// The PUBLIC block-disjoint fraction-sum-zero instance over a length-`2·domain` leaf vector
+/// (`domain = 2^k`): DICT rows in the low half `[0, domain)`, QUERY rows in the high half
+/// `[domain, 2·domain)`. Built IDENTICALLY by prover and verifier.
+///   * denominator `q_leaf = α − (dict_id + β·dict_value + β²·dict_datatype)` on the low half
+///     and `α − (obj_id + β·v_val + β²·v_dt)` on the high half — block-disjoint, single α;
+///   * numerator `p_leaf = +w[j]` (committed multiplicity, low half) `− [domain ≤ i < domain
+///     + real_n]` (public prefix block indicator, high half); padding rows self-annihilate
+///     (`p = 0`), and the dict padding tail is pinned `w = 0` by the co-running Identity.
+fn lookup_fraction_instance(alpha: ArkFr, beta: ArkFr, real_n: usize, k: usize) -> FractionInstance {
+    let domain = 1usize << k;
+    let b1 = beta;
+    let b2 = beta * beta;
     // Fold order [id, value, datatype] -> id + β·value + β²·datatype on both sides.
-    let rec_q = reciprocal_claim(
-        L_COL_REC_Q,
-        &[L_COL_OBJ_ID, L_COL_V_VAL, L_COL_V_DT],
-        alpha,
-        beta,
-    );
-    let rec_d = reciprocal_claim(
-        L_COL_REC_D,
-        &[L_COL_DICT_ID, L_COL_DICT_VALUE, L_COL_DICT_DATATYPE],
-        alpha,
-        beta,
-    );
-    // Σ χ_n·rec_q − Σ χ_{n_dict}·w·rec_d = 0. Both sides masked.
-    let link = masked_multiset_link_claim(
-        &[Operand::Chi(L_CHI_N)],
-        L_COL_REC_Q,
-        &[Operand::Chi(L_CHI_NDICT), Operand::Column(L_COL_W)],
-        L_COL_REC_D,
-    );
+    let q_terms = vec![
+        // Dict fold (low half): α − dict_id − β·dict_value − β²·dict_datatype.
+        LinearTerm { coeff: f0() - f1(), src: Src::Column(L_COL_DICT_ID) },
+        LinearTerm { coeff: f0() - b1, src: Src::Column(L_COL_DICT_VALUE) },
+        LinearTerm { coeff: f0() - b2, src: Src::Column(L_COL_DICT_DATATYPE) },
+        // Query fold (high half): α − obj_id − β·v_val − β²·v_dt.
+        LinearTerm { coeff: f0() - f1(), src: Src::Column(L_COL_OBJ_ID) },
+        LinearTerm { coeff: f0() - b1, src: Src::Column(L_COL_V_VAL) },
+        LinearTerm { coeff: f0() - b2, src: Src::Column(L_COL_V_DT) },
+    ];
+    // p = +w (low half) − ([i < domain + real_n] − [i < domain]) = −1 on [domain, domain+real_n).
+    let p_terms = vec![
+        LinearTerm { coeff: f1(), src: Src::Column(L_COL_W) },
+        LinearTerm { coeff: f0() - f1(), src: Src::Prefix(domain + real_n) },
+        LinearTerm { coeff: f1(), src: Src::Prefix(domain) },
+    ];
+    FractionInstance {
+        num_vars: k + 1,
+        num_cols: L_NUM_COLUMNS,
+        p_form: LinearForm { constant: f0(), terms: p_terms },
+        q_form: LinearForm { constant: alpha, terms: q_terms },
+    }
+}
+
+/// The PUBLIC GAP-1 auxiliary Identity `(1 − χ_{n_dict}(x)) · w(x) = 0` over the length-
+/// `domain = 2^k` committed multiplicity column (referenced as `Column(0)`), forcing
+/// `w[x] = 0` at every `x ≥ n_dict`. Written as `+w − χ_{n_dict}·w` (a product term the
+/// [`super::argument`] sumcheck supports — no reciprocal). Built IDENTICALLY by prover and
+/// verifier.
+fn dict_mask_identity_shape(k: usize, n_dict: usize) -> SumcheckShape {
     SumcheckShape {
         num_vars: k,
-        num_columns: L_NUM_COLUMNS,
-        chi_bounds: vec![real_n, n_dict],
-        claims: vec![rec_q, rec_d, link],
+        num_columns: 1,
+        chi_bounds: vec![n_dict],
+        claims: vec![SumcheckClaim {
+            shape: ClaimShape::Identity,
+            expr: Expr {
+                terms: vec![
+                    Term { coeff: f1(), operands: vec![Operand::Column(0)] },
+                    Term {
+                        coeff: f0() - f1(),
+                        operands: vec![Operand::Chi(0), Operand::Column(0)],
+                    },
+                ],
+            },
+            target: f0(),
+        }],
     }
 }
 
@@ -720,7 +802,9 @@ pub(crate) fn prove_dict_value_lookup_with_witness_and_context(
     let k = size.trailing_zeros() as usize;
 
     // Round 1: commit the witness DATA columns, bind the statement and every data
-    // commitment, THEN draw the fold/reciprocal challenges.
+    // commitment, THEN draw the fold/reciprocal challenges. α/β are drawn AFTER every column
+    // commitment is bound (the primitive's caller contract), so the fraction leaves are fixed
+    // before any per-layer GKR challenge. No reciprocal column is committed anymore.
     let com_v_val = context.commit_column(v_val)?;
     let com_v_dt = context.commit_column(v_dt)?;
     let com_w = context.commit_column(w)?;
@@ -735,39 +819,56 @@ pub(crate) fn prove_dict_value_lookup_with_witness_and_context(
     let beta = transcript.challenge_scalar(LOOKUP_BETA);
     let alpha = transcript.challenge_scalar(LOOKUP_ALPHA);
 
-    // Round 2: reciprocal witnesses over the β-fingerprinted folds, bound after α/β.
-    let fold_q = rlc_fold(beta, &[obj_id, v_val, v_dt]);
-    let fold_d = rlc_fold(beta, &[dict_id, dict_value, dict_datatype]);
-    let rec_q = reciprocal_witness(alpha, &fold_q);
-    let rec_d = reciprocal_witness(alpha, &fold_d);
-    let com_rec_q = context.commit_column(&rec_q)?;
-    let com_rec_d = context.commit_column(&rec_d)?;
-    transcript.append_group(b"pow/obj-lookup/com-rec-q", &com_rec_q);
-    transcript.append_group(b"pow/obj-lookup/com-rec-d", &com_rec_d);
+    // (1) The block-disjoint LogUp-GKR fraction tree over the 2·domain zero-extensions:
+    // dict cols + `w` fill the LOW half (denom α − d, numer +w), query cols the HIGH half
+    // (denom α − q, numer additive −[real query row]). The tree lands at `r_leaf` (length
+    // k + 1), whose low k bits are the opening point.
+    let inst = lookup_fraction_instance(alpha, beta, real_n, k);
+    let leaf_count = inst.size();
+    let extended = vec![
+        high_half(obj_id, leaf_count),
+        high_half(v_val, leaf_count),
+        high_half(v_dt, leaf_count),
+        low_half(dict_id, leaf_count),
+        low_half(dict_value, leaf_count),
+        low_half(dict_datatype, leaf_count),
+        low_half(w, leaf_count),
+    ];
+    let (gkr, r_leaf) = prove_fraction_sum_zero(&inst, &extended, transcript)?;
 
-    let shape = lookup_shape(k, real_n, n_dict, alpha, beta);
+    // Single batched Dory opening of the length-`domain` DATA columns at r_low, bound to
+    // their (root-anchored / shared) commitments on this transcript.
+    let r_low = &r_leaf[..k];
     let columns = vec![
         obj_id.to_vec(),
         v_val.to_vec(),
         v_dt.to_vec(),
-        rec_q,
         dict_id.to_vec(),
         dict_value.to_vec(),
         dict_datatype.to_vec(),
         w.to_vec(),
-        rec_d,
     ];
-    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = context.prove_column_openings(&columns, &r, transcript)?;
+    let col_evals: Vec<ArkFr> = columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+    let opening = context.prove_column_openings(&columns, r_low, transcript)?;
+
+    // (2) The GAP-1 auxiliary Identity (1 − χ_{n_dict})·w = 0, pinning w to zero on the dict
+    // padding tail [n_dict, domain) UNCONDITIONALLY (arbitrary n_dict). Proved over the SAME
+    // committed w via the argument.rs sumcheck; its opening binds com_w on the SAME transcript
+    // as the GKR leaf tie, so the tree and the Identity constrain one identical w.
+    let id_shape = dict_mask_identity_shape(k, n_dict);
+    let w_col = vec![w.to_vec()];
+    let (id_sumcheck, r_id, _evals) = prove_sumcheck(&id_shape, &w_col, transcript)?;
+    let id_opening = context.prove_column_openings(&w_col, &r_id, transcript)?;
 
     Ok(DictLookupProof {
-        sumcheck,
+        gkr,
+        col_evals,
         opening,
+        id_sumcheck,
+        id_opening,
         com_v_val,
         com_v_dt,
         com_w,
-        com_rec_q,
-        com_rec_d,
     })
 }
 
@@ -846,12 +947,20 @@ pub fn verify_dict_value_lookup(
     proof: &DictLookupProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    let k = proof.sumcheck.round_polys.len();
-    if k == 0 || k >= usize::BITS as usize {
+    // The GKR tree has `k + 1` layers (`2·domain` leaves for a length-`domain = 2^k` value
+    // domain), so `k = num_vars - 1` and the committed columns have length `2^k`. The column
+    // openings below re-anchor `k` to the true commitments.
+    let num_vars = proof.gkr.num_vars();
+    if num_vars < 2 || num_vars >= usize::BITS as usize {
         return Err(invalid("lookup proof has an implausible variable count"));
     }
-    if real_n > (1usize << k) || n_dict > (1usize << k) {
+    let k = num_vars - 1;
+    let domain = 1usize << k;
+    if real_n > domain || n_dict > domain {
         return Err(invalid("lookup real length exceeds the column domain"));
+    }
+    if proof.col_evals.len() != L_NUM_COLUMNS {
+        return Err(invalid("lookup proof has the wrong number of column evaluations"));
     }
 
     bind_lookup_statement(transcript, real_n, n_dict);
@@ -864,23 +973,50 @@ pub fn verify_dict_value_lookup(
     transcript.append_group(b"pow/obj-lookup/com-w", &proof.com_w);
     let beta = transcript.challenge_scalar(LOOKUP_BETA);
     let alpha = transcript.challenge_scalar(LOOKUP_ALPHA);
-    transcript.append_group(b"pow/obj-lookup/com-rec-q", &proof.com_rec_q);
-    transcript.append_group(b"pow/obj-lookup/com-rec-d", &proof.com_rec_d);
 
-    let shape = lookup_shape(k, real_n, n_dict, alpha, beta);
-    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    // (1) Bind the public instance and verify the GKR tree -> the leaf point + claims.
+    let inst = lookup_fraction_instance(alpha, beta, real_n, k);
+    let (r_leaf, p_claim, q_claim) = bind_and_verify_fraction_tree(&inst, &proof.gkr, transcript)?;
+
+    // Open the length-`domain` committed columns at r_low, bound to their commitments.
+    let r_low = &r_leaf[..k];
+    let r_high = r_leaf[k];
     let commitments = [
         *com_obj_id,
         proof.com_v_val,
         proof.com_v_dt,
-        proof.com_rec_q,
         *com_dict_id,
         *com_dict_value,
         *com_dict_datatype,
         proof.com_w,
-        proof.com_rec_d,
     ];
-    verify_column_openings(&commitments, &r, &evals, &proof.opening, transcript)
+    verify_column_openings(&commitments, r_low, &proof.col_evals, &proof.opening, transcript)?;
+
+    // Reconstruct each 2·domain leaf-MLE from the length-`domain` opening via the top-bit
+    // zero-extension factor: query cols (obj_id, v_val, v_dt) live in the HIGH half (factor
+    // r_high), dict cols + w in the LOW half (factor 1 − r_high). This is the block-disjoint
+    // enforcement (neither side's fold columns leak into the other block); then tie to the
+    // GKR-reduced leaf claims.
+    let one_minus_high = f1() - r_high;
+    let leaf_evals = vec![
+        r_high * proof.col_evals[L_COL_OBJ_ID],
+        r_high * proof.col_evals[L_COL_V_VAL],
+        r_high * proof.col_evals[L_COL_V_DT],
+        one_minus_high * proof.col_evals[L_COL_DICT_ID],
+        one_minus_high * proof.col_evals[L_COL_DICT_VALUE],
+        one_minus_high * proof.col_evals[L_COL_DICT_DATATYPE],
+        one_minus_high * proof.col_evals[L_COL_W],
+    ];
+    check_leaf_tie(&inst, &leaf_evals, p_claim, q_claim, &r_leaf)?;
+
+    // (2) Verify the GAP-1 auxiliary Identity (1 − χ_{n_dict})·w = 0 over the SAME com_w. Its
+    // `w` opening binds to com_w on this transcript, so the multiplicity the tree used is
+    // EXACTLY the one pinned to zero on `[n_dict, domain)` — a forged padding multiplicity is
+    // rejected UNCONDITIONALLY (no unmatched-pole invariant needed).
+    let id_shape = dict_mask_identity_shape(k, n_dict);
+    let (r_id, id_evals) = verify_sumcheck(&id_shape, &proof.id_sumcheck, transcript)?;
+    verify_column_openings(&[proof.com_w], &r_id, &id_evals, &proof.id_opening, transcript)?;
+    Ok(())
 }
 
 // ===========================================================================
