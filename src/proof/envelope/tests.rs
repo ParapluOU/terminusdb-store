@@ -497,9 +497,14 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let hash = sha2::Sha256::digest(&bytes);
         let hash_hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
         assert_eq!(bytes.len(), 142820, "materialized proof byte length changed");
+        // Hash regenerated after the hardening-batch transcript changes (B: `setup_parameter_id`
+        // now folds the generator bytes; C: transcript labels are length-prefixed) — both are
+        // transcript-bound, so every proof's challenge-derived bytes shifted while the proof
+        // STRUCTURE (byte length 142820) is unchanged and prover↔verifier still agree. This tripwire
+        // correctly fired on those intended changes; the value below is the current stable image.
         assert_eq!(
             hash_hex,
-            "5130d5e40bd205e4ecc23e0541e3fe38175bc814c525fd7c7ced20e74e16d89d",
+            "6f78000efc4dd05158d2fc483e0089f70cca6a45c1a78cc9bdca514c9752f99b",
             "materialized multi-atom proof transcript/commitments changed (byte-identity regression)"
         );
     }
