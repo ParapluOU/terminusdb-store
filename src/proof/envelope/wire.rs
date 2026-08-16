@@ -135,10 +135,17 @@ pub(super) fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
 // sub-proof (A, B) is unchanged. Every constant-position atom (predicate/subject/object
 // filter) embeds a `FullFilterProof`, so any BGP with a constant atom has different proof
 // bytes; UNION/ANTI/OUTER embed the same BGP chain and bump in lockstep.
-pub(super) const VERSION: u32 = 8;
-pub(super) const UNION_VERSION: u32 = 6;
-pub(super) const ANTI_VERSION: u32 = 8;
-pub(super) const OUTER_VERSION: u32 = 5;
+// v9: LogUp-GKR migration of the sort SHIFT LogUp — `SortedProof` dropped its two
+// committed reciprocal GT commitments (`rec_c`/`rec_d`) and the multiset-link sumcheck for
+// a block-disjoint GKR fraction-tree proof (`U_shift` is the index-augmented one-step shift
+// of `U`) + the three link data-column leaf evaluations + a second batched opening; the
+// RANGE sub-proof (booleanity + recomposition) is unchanged. Every multi-atom BGP join
+// (join2 embeds a `SortedProof` on the sorted key column) has different proof bytes;
+// UNION/ANTI/OUTER embed the same BGP chain / semi-join and bump in lockstep.
+pub(super) const VERSION: u32 = 9;
+pub(super) const UNION_VERSION: u32 = 7;
+pub(super) const ANTI_VERSION: u32 = 9;
+pub(super) const OUTER_VERSION: u32 = 6;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
 // v23 adds the ordered `sys:Array` walk composite node (tag 24).
@@ -160,7 +167,12 @@ pub(super) const OUTER_VERSION: u32 = 5;
 // v28: LogUp-GKR atom-filter compaction LINK migration (see the `VERSION` v8 note) —
 // recursive envelopes embed layer-BGP leaves whose per-atom `FullFilterProof` bytes
 // changed (committed `cstar`/`dstar` + C/D/E link sumcheck -> GKR fraction tree).
-pub(super) const RECURSIVE_VERSION: u32 = 28;
+// v29: LogUp-GKR sort SHIFT LogUp migration (see the `VERSION` v9 note) — recursive
+// envelopes embed BGP-chain leaves (join2/pairs sort the key column) and the ordered
+// `ExactScalarOrder`/`ExactMultiOrder`/`OrderedListWalk`/`OrderedArrayWalk` composites
+// (each embeds a `SortedProof`), whose bytes changed (committed `rec_c`/`rec_d` +
+// multiset-link sumcheck -> GKR fraction tree).
+pub(super) const RECURSIVE_VERSION: u32 = 29;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -640,13 +652,20 @@ wire_struct!(LeftOuterJoinProof {
     unmatched_len,
     union
 });
+// LogUp-GKR migration of the sort SHIFT LogUp: the two committed reciprocal
+// commitments (`rec_c`/`rec_d`) and the multiset-link sumcheck are gone; a GKR
+// fraction-tree proof + the link data-column evaluations at the leaf point + a second
+// batched opening carry the index-augmented shift link (`U_shift` is the one-step shift
+// of `U` with committed multiplicity `mult_c`). The RANGE sub-proof (booleanity +
+// recomposition) is unchanged.
 wire_struct!(SortedProof {
     sumcheck,
     opening,
     u_shift_commitment,
     mult_c_commitment,
-    rec_c_commitment,
-    rec_d_commitment,
+    link,
+    link_col_evals,
+    link_opening,
     bit_commitments
 });
 // LogUp-GKR migration (GAP-1 auxiliary-Identity closure): `MembershipProof` dropped the

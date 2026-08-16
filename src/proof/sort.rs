@@ -37,7 +37,7 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    prove_sumcheck, verify_column_openings, verify_sumcheck,
+    mle_full_eval, prove_sumcheck, verify_column_openings, verify_sumcheck,
     ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
     SumcheckShape, Term, Transcript254,
 };
@@ -45,6 +45,10 @@ use super::argument::{
 use super::argument::commit_column;
 use super::invalid;
 use super::logup::{multiset_link_claim, reciprocal_witness, rlc_fold};
+use super::logup_gkr::{
+    bind_and_verify_fraction_tree, check_leaf_tie, prove_fraction_sum_zero, FractionInstance,
+    GkrFractionProof, LinearForm, LinearTerm, Src,
+};
 
 const BITS: usize = 64;
 const COL_U: usize = 0;
@@ -55,6 +59,18 @@ const COL_REC_D: usize = 4;
 const COL_BIT_BASE: usize = 5;
 // chi_bounds index for chi_{n-1} (the difference domain).
 const CHI_N1: usize = 0;
+
+// Range-only sumcheck column layout (booleanity + recomposition) AFTER the shift LogUp
+// moved to the GKR fraction tree: [U, U_shift, bit_0..]. U/U_shift keep indices 0/1
+// (= COL_U/COL_U_SHIFT), so `recomposition_claim` reuses those; only the bit base moves.
+const RANGE_COL_BIT_BASE: usize = 2;
+
+// GKR shift-link instance columns (length-`domain` committed, block-disjoint
+// zero-extended into the `2*domain` leaf vector): U (low half, c-side), U_shift (high
+// half, d-side), mult_c (low half, the committed c-side numerator).
+const LINK_COL_U: usize = 0;
+const LINK_COL_U_SHIFT: usize = 1;
+const LINK_COL_MULT_C: usize = 2;
 
 const LABEL_BETA: &[u8] = b"pow/sort/fingerprint-beta";
 const LABEL_ALPHA: &[u8] = b"pow/sort/reciprocal-alpha";
@@ -94,17 +110,29 @@ fn pow2(j: usize) -> ArkFr {
     value
 }
 
-/// A sortedness proof: the batched sumcheck over the shift LogUp + range
-/// (booleanity + recomposition) claims, one batched Dory opening over all
-/// committed columns, and the internal witness commitments the verifier binds.
+/// A sortedness proof. Two sub-proofs bound on one transcript:
+///   * the RANGE sumcheck (booleanity + recomposition), pinning the bit decomposition
+///     of the consecutive gap, plus one batched Dory opening of `[U, U_shift, bit_0..]`
+///     at its point (UNCHANGED by the LogUp-GKR migration);
+///   * the SHIFT LogUp LINK — a [`GkrFractionProof`] over an UNCOMMITTED block-disjoint
+///     fraction layout proving `U_shift` is the index-augmented one-step shift of `U`
+///     with committed multiplicity `mult_c`, plus the link columns' evaluations and one
+///     batched Dory opening at the leaf point. This REPLACES the two committed reciprocal
+///     columns (`rec_c`/`rec_d`) and the multiset-link sumcheck; no reciprocal is
+///     committed anywhere.
 #[derive(Clone, Debug)]
 pub struct SortedProof {
     pub sumcheck: SumcheckProof,
     pub opening: ColumnOpening,
     pub u_shift_commitment: ArkGT,
     pub mult_c_commitment: ArkGT,
-    pub rec_c_commitment: ArkGT,
-    pub rec_d_commitment: ArkGT,
+    /// GKR fraction tree for the shift LogUp
+    /// `Σ [i<n-1]·(α−d_fold)⁻¹ − Σ mult_c·(α−c_fold)⁻¹ = 0`.
+    pub link: GkrFractionProof,
+    /// Evaluations of `[U, U_shift, mult_c]` at `r_low` (the low `k` bits of the GKR
+    /// leaf point), bound to their commitments by `link_opening`.
+    pub link_col_evals: Vec<ArkFr>,
+    pub link_opening: ColumnOpening,
     pub bit_commitments: Vec<ArkGT>,
 }
 
@@ -202,13 +230,14 @@ pub(crate) fn booleanity_claim(
     }
 }
 
-/// `chi_{n-1} * (Sum_j bit_j*2^j - (U_shift - U - 1)) = 0`.
-fn recomposition_claim(bits: usize, mode: SortMode) -> SumcheckClaim {
+/// `chi_{n-1} * (Sum_j bit_j*2^j - (U_shift - U - 1)) = 0`. The bit columns start at
+/// `bit_base` (the range-only sumcheck packs them right after `U`/`U_shift`).
+fn recomposition_claim(bit_base: usize, bits: usize, mode: SortMode) -> SumcheckClaim {
     let mut terms = Vec::with_capacity(bits + 3);
     for j in 0..bits {
         terms.push(Term {
             coeff: pow2(j),
-            operands: vec![Operand::Chi(CHI_N1), Operand::Column(COL_BIT_BASE + j)],
+            operands: vec![Operand::Chi(CHI_N1), Operand::Column(bit_base + j)],
         });
     }
     terms.push(Term {
@@ -227,46 +256,78 @@ fn recomposition_claim(bits: usize, mode: SortMode) -> SumcheckClaim {
     }
 }
 
-fn sort_shape(
-    k: usize,
-    n: usize,
-    bits: usize,
-    alpha: ArkFr,
-    beta: ArkFr,
-    tau: ArkFr,
-    mode: SortMode,
-) -> SumcheckShape {
-    // rec_c: c_fold = idx + beta*U. rec_d: d_fold = (idx+1) + beta*U_shift.
-    let rec_c = reciprocal_with_offset(
-        COL_REC_C,
-        f0(),
-        &[(f1(), Operand::Idx), (beta, Operand::Column(COL_U))],
-        alpha,
-    );
-    let rec_d = reciprocal_with_offset(
-        COL_REC_D,
-        f1(),
-        &[(f1(), Operand::Idx), (beta, Operand::Column(COL_U_SHIFT))],
-        alpha,
-    );
-    // Shift lookup: Sum chi_{n-1}*rec_d - Sum mult_c*rec_c = 0.
-    let shift = multiset_link_claim(
-        Operand::Chi(CHI_N1),
-        COL_REC_D,
-        Operand::Column(COL_MULT_C),
-        COL_REC_C,
-    );
+/// The RANGE sumcheck shape: booleanity + recomposition over `[U, U_shift, bit_0..]`.
+/// This is the old `sort_shape` MINUS the shift LogUp (the two `rec_c`/`rec_d` Identity
+/// claims + the multiset link), which the LogUp-GKR migration moved to the block-disjoint
+/// fraction tree [`sort_link_instance`]. `num_columns` is `RANGE_COL_BIT_BASE + bits`
+/// (= `U`, `U_shift`, and the `bits` bit columns; NO reciprocal or `mult_c` columns).
+fn range_shape(k: usize, n: usize, bits: usize, tau: ArkFr, mode: SortMode) -> SumcheckShape {
     SumcheckShape {
         num_vars: k,
-        num_columns: COL_BIT_BASE + bits,
+        num_columns: RANGE_COL_BIT_BASE + bits,
         chi_bounds: vec![n.saturating_sub(1)],
         claims: vec![
-            rec_c,
-            rec_d,
-            shift,
-            booleanity_claim(CHI_N1, COL_BIT_BASE, bits, tau),
-            recomposition_claim(bits, mode),
+            booleanity_claim(CHI_N1, RANGE_COL_BIT_BASE, bits, tau),
+            recomposition_claim(RANGE_COL_BIT_BASE, bits, mode),
         ],
+    }
+}
+
+/// The PUBLIC block-disjoint fraction-sum-zero instance for the SHIFT LogUp — the
+/// LogUp-GKR replacement for the two committed reciprocals `rec_c`/`rec_d` and the
+/// [`multiset_link_claim`]. It proves EXACTLY the old link
+/// `Σ_x [ Chi_{n-1}(x)·rec_d(x) − mult_c(x)·rec_c(x) ] = 0`, i.e.
+/// ```text
+///     Σ_i [i<n-1]·(α − d_fold_i)⁻¹   −   Σ_i mult_c_i·(α − c_fold_i)⁻¹   =   0
+/// ```
+/// with `c_fold_i = i + β·U_i` and `d_fold_i = (i+1) + β·U_shift_i`, over a `2·domain`
+/// leaf vector (`domain = 2^k`): the c-side rows fill the LOW half `[0, domain)`, the
+/// d-side rows the HIGH half `[domain, 2·domain)`. Column layout (all committed, length
+/// `domain`, block-disjoint zero-extended by the prover): `U` (col 0, low), `U_shift`
+/// (col 1, high), `mult_c` (col 2, low).
+///
+///   * denominator
+///     `q = α + (domain−1) − Idx − β·U − β·U_shift − (domain−1)·[i<domain]`.
+///     The PUBLIC `Idx` ramp supplies the global row index; on the LOW half
+///     (`[i<domain]=1`) the `(domain−1)` terms cancel and `q = α − (i + β·U_i)`; on the
+///     HIGH half (`[i<domain]=0`, `Idx = domain + i_local`) they add `(domain−1)` back, so
+///     `q = α − ((i_local+1) + β·U_shift_i)`. The `β` fingerprints the value on both
+///     sides; the `Idx` makes every c_fold pole DISTINCT.
+///   * numerator `p = −mult_c (low, committed) + ([i < domain+(n−1)] − [i < domain])
+///     (high, public prefix = +Chi_{n-1} on the d block)`: each d-side real row `+1`, each
+///     c-side row `−mult_c_i`, every padding row `0`.
+///
+/// SOUNDNESS. Both numerators are LINEAR (public `Src::Prefix`/`Src::Idx` and `mult_c` as
+/// a committed `Src::Column`); there is NO `committed × public-Chi` product — the c-side
+/// `mult_c` carries NO Chi mask (matching the reciprocal-era link, where only `rec_d` was
+/// Chi-masked) — so no GAP-1 auxiliary Identity is required. `mult_c`'s exact value, its
+/// zero-on-padding, and the genuine positional bijection (`U_shift_i = U_{i+1}`, no
+/// drops/dups) are all forced by the LINK itself: the `Idx`-augmented c_fold poles are
+/// DISTINCT (`i` distinct; `β` post-commit), so `Σ p/q = 0 ⟺` the residue at each c_fold
+/// pole vanishes, uniquely pinning `mult_c_i` to the count of d-rows landing there — 1 on
+/// `[1,n)`, 0 on padding — and forcing each d-row `d_fold_i` to match the UNIQUE
+/// `c_fold_{i+1}`. This is the same distinctness argument the reciprocal era relied on.
+/// Built IDENTICALLY by prover and verifier from public inputs only.
+fn sort_link_instance(alpha: ArkFr, beta: ArkFr, n: usize, k: usize) -> FractionInstance {
+    let domain = 1usize << k;
+    let n1 = n.saturating_sub(1);
+    let domain_minus_1 = ArkFr::from_u64((domain - 1) as u64);
+    let q_terms = vec![
+        LinearTerm { coeff: f0() - f1(), src: Src::Idx },
+        LinearTerm { coeff: f0() - beta, src: Src::Column(LINK_COL_U) },
+        LinearTerm { coeff: f0() - beta, src: Src::Column(LINK_COL_U_SHIFT) },
+        LinearTerm { coeff: f0() - domain_minus_1, src: Src::Prefix(domain) },
+    ];
+    let p_terms = vec![
+        LinearTerm { coeff: f0() - f1(), src: Src::Column(LINK_COL_MULT_C) },
+        LinearTerm { coeff: f1(), src: Src::Prefix(domain + n1) },
+        LinearTerm { coeff: f0() - f1(), src: Src::Prefix(domain) },
+    ];
+    FractionInstance {
+        num_vars: k + 1,
+        num_cols: 3,
+        p_form: LinearForm { constant: f0(), terms: p_terms },
+        q_form: LinearForm { constant: alpha + domain_minus_1, terms: q_terms },
     }
 }
 
@@ -336,8 +397,11 @@ fn prove_sorted_with_witness_and_context(
     let k = n_domain.trailing_zeros() as usize;
     let u_p = padded(u, n_domain);
 
-    // Round 1: commit U_shift, mult_c, and the 64 bit columns (raw-data witnesses),
-    // bind them (with the given com_u).
+    // Commit U_shift, mult_c, and the bit columns (raw-data witnesses), bind them (with
+    // the given com_u), then draw beta/alpha/tau. NO reciprocal column is committed
+    // anymore — the shift LogUp is a GKR fraction tree over UNCOMMITTED intermediates, so
+    // alpha/beta are drawn here, AFTER every data-column commitment (the Inc 0 caller
+    // contract: leaves fixed before any per-layer GKR challenge).
     let u_shift_commitment = context.commit_column(u_shift)?;
     let mult_c_commitment = context.commit_column(mult_c)?;
     let mut bit_commitments = Vec::with_capacity(bits);
@@ -355,32 +419,46 @@ fn prove_sorted_with_witness_and_context(
     let alpha = transcript.challenge_scalar(LABEL_ALPHA);
     let tau = transcript.challenge_scalar(LABEL_TAU);
 
-    // Round 2: reciprocal witnesses over the fingerprinted (index-augmented) rows.
-    let idx_col: Vec<ArkFr> = (0..n_domain).map(|i| ArkFr::from_u64(i as u64)).collect();
-    let idx_plus1: Vec<ArkFr> = (0..n_domain)
-        .map(|i| ArkFr::from_u64(i as u64 + 1))
-        .collect();
-    let rec_c = reciprocal_witness(alpha, &rlc_fold(beta, &[&idx_col, &u_p]));
-    let rec_d = reciprocal_witness(alpha, &rlc_fold(beta, &[&idx_plus1, u_shift]));
-    let rec_c_commitment = context.commit_column(&rec_c)?;
-    let rec_d_commitment = context.commit_column(&rec_d)?;
-    transcript.append_group(b"pow/sort/com-rec-c", &rec_c_commitment);
-    transcript.append_group(b"pow/sort/com-rec-d", &rec_d_commitment);
+    // (RANGE) booleanity + recomposition over [U, U_shift, bit_0..] — UNCHANGED math.
+    let range = range_shape(k, n, bits, tau, mode);
+    let mut range_columns = vec![u_p.clone(), u_shift.to_vec()];
+    range_columns.extend(bit_columns.iter().cloned());
+    let (sumcheck, r, _evals) = prove_sumcheck(&range, &range_columns, transcript)?;
+    let opening = context.prove_column_openings(&range_columns, &r, transcript)?;
 
-    let shape = sort_shape(k, n, bits, alpha, beta, tau, mode);
-    let mut columns = vec![u_p, u_shift.to_vec(), mult_c.to_vec(), rec_c, rec_d];
-    columns.extend(bit_columns.iter().cloned());
+    // (SHIFT LINK) the index-augmented multiset link as ONE GKR fraction tree over the
+    // block-disjoint 2*domain layout: the c-side (U) fills the low half, the d-side
+    // (U_shift) the high half, and mult_c (low) is the committed c-side numerator. The
+    // prover feeds the tree the columns' block-disjoint zero-extensions; the committed
+    // columns stay length-`domain` (their commitments are UNCHANGED).
+    let leaf_count = 2 * n_domain;
+    let mut u_ext = vec![f0(); leaf_count];
+    u_ext[..n_domain].copy_from_slice(&u_p);
+    let mut u_shift_ext = vec![f0(); leaf_count];
+    u_shift_ext[n_domain..].copy_from_slice(u_shift);
+    let mut mult_c_ext = vec![f0(); leaf_count];
+    mult_c_ext[..n_domain].copy_from_slice(mult_c);
+    let extended = vec![u_ext, u_shift_ext, mult_c_ext];
 
-    let (sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let opening = context.prove_column_openings(&columns, &r, transcript)?;
+    let link_inst = sort_link_instance(alpha, beta, n, k);
+    let (link, r_leaf) = prove_fraction_sum_zero(&link_inst, &extended, transcript)?;
+
+    // Single batched Dory opening of the length-`domain` link columns [U, U_shift, mult_c]
+    // at r_low, bound to their commitments on this transcript.
+    let r_low = &r_leaf[..k];
+    let link_columns = vec![u_p, u_shift.to_vec(), mult_c.to_vec()];
+    let link_col_evals: Vec<ArkFr> =
+        link_columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+    let link_opening = context.prove_column_openings(&link_columns, r_low, transcript)?;
 
     Ok(SortedProof {
         sumcheck,
         opening,
         u_shift_commitment,
         mult_c_commitment,
-        rec_c_commitment,
-        rec_d_commitment,
+        link,
+        link_col_evals,
+        link_opening,
         bit_commitments,
     })
 }
@@ -543,6 +621,12 @@ fn verify_sorted_bits(
             "sort proof has the wrong number of bit commitments",
         ));
     }
+    if proof.link.num_vars() != k + 1 {
+        return Err(invalid("sort shift-link fraction layer count mismatch"));
+    }
+    if proof.link_col_evals.len() != 3 {
+        return Err(invalid("sort shift-link column-evaluation count mismatch"));
+    }
 
     mode.bind(transcript);
     transcript.append_group(b"pow/sort/com-u", com_u);
@@ -554,21 +638,39 @@ fn verify_sorted_bits(
     let beta = transcript.challenge_scalar(LABEL_BETA);
     let alpha = transcript.challenge_scalar(LABEL_ALPHA);
     let tau = transcript.challenge_scalar(LABEL_TAU);
-    transcript.append_group(b"pow/sort/com-rec-c", &proof.rec_c_commitment);
-    transcript.append_group(b"pow/sort/com-rec-d", &proof.rec_d_commitment);
 
-    let shape = sort_shape(k, n, bits, alpha, beta, tau, mode);
-    let (r, evals) = verify_sumcheck(&shape, &proof.sumcheck, transcript)?;
+    // (RANGE) verify booleanity + recomposition, open [U, U_shift, bit_0..] at r.
+    let range = range_shape(k, n, bits, tau, mode);
+    let (r, evals) = verify_sumcheck(&range, &proof.sumcheck, transcript)?;
+    let mut range_coms = vec![*com_u, proof.u_shift_commitment];
+    range_coms.extend(proof.bit_commitments.iter().copied());
+    verify_column_openings(&range_coms, &r, &evals, &proof.opening, transcript)?;
 
-    let mut commitments = vec![
-        *com_u,
-        proof.u_shift_commitment,
-        proof.mult_c_commitment,
-        proof.rec_c_commitment,
-        proof.rec_d_commitment,
+    // (SHIFT LINK) bind the public block-disjoint instance and verify the GKR tree.
+    let link_inst = sort_link_instance(alpha, beta, n, k);
+    let (r_leaf, p_claim, q_claim) =
+        bind_and_verify_fraction_tree(&link_inst, &proof.link, transcript)?;
+
+    // Open the length-`domain` link columns [U, U_shift, mult_c] at r_low, bound to their
+    // commitments. `mult_c` is a PLAIN committed numerator (NO Chi mask); its exact value,
+    // zero-on-padding, and the genuine positional bijection are forced by the link's
+    // DISTINCT Idx-augmented c_fold poles — no co-located sub-proof or GAP-1 Identity.
+    let r_low = &r_leaf[..k];
+    let r_high = r_leaf[k];
+    let link_coms = vec![*com_u, proof.u_shift_commitment, proof.mult_c_commitment];
+    verify_column_openings(&link_coms, r_low, &proof.link_col_evals, &proof.link_opening, transcript)?;
+
+    // Reconstruct each 2*domain leaf-MLE from the length-`domain` opening via the top-bit
+    // zero-extension factor: U + mult_c live in the LOW half (factor 1 − r_high), U_shift
+    // in the HIGH half (factor r_high) — structurally forcing each side's columns to zero
+    // on the other block (no cross-block leak).
+    let one_minus_high = f1() - r_high;
+    let leaf_evals = vec![
+        one_minus_high * proof.link_col_evals[LINK_COL_U],
+        r_high * proof.link_col_evals[LINK_COL_U_SHIFT],
+        one_minus_high * proof.link_col_evals[LINK_COL_MULT_C],
     ];
-    commitments.extend(proof.bit_commitments.iter().copied());
-    verify_column_openings(&commitments, &r, &evals, &proof.opening, transcript)
+    check_leaf_tie(&link_inst, &leaf_evals, p_claim, q_claim, &r_leaf)
 }
 
 // ===========================================================================
@@ -920,6 +1022,88 @@ mod tests {
         // Near-full padded capacity: 15 real rows in a domain of 16.
         let u: Vec<ArkFr> = (0..15u64).map(|i| fr(i * 3 + 1)).collect();
         assert!(run(&u, 15).is_ok());
+    }
+
+    // ---- Shift LogUp LINK (GKR) soundness negatives -----------------------
+    //
+    // The RANGE sub-proof (booleanity + recomposition) proves ONLY that the committed
+    // consecutive gaps are positive; it never touches `mult_c` and never checks that
+    // `U_shift` is the true one-step shift of `U`. That binding is the GKR shift link.
+    // These forges keep RANGE honest (bits recompose to the committed `U_shift - U - 1`)
+    // so rejection must come from the new fraction tree, not the sumcheck.
+
+    #[test]
+    fn forged_shift_multiplicity_is_rejected_via_link() {
+        // `mult_c` is a PLAIN committed numerator; its exact value / zero-on-padding are
+        // forced ONLY by the link's distinct Idx-augmented c_fold poles. Feed honest
+        // `U_shift` + honest bits (RANGE passes) and a spread of adversarial multiplicity
+        // masks — an unmatched c-side pole (extra / wrong / padding-row `mult_c`) or a
+        // dropped d-side match (all-zero) makes the fraction sum nonzero, so the tree
+        // root `P != 0` rejects.
+        let u = frs(&[2, 9, 20]); // n=3 -> domain 4, a padding row at index 3
+        let n = u.len();
+        let n_domain = sort_domain(n).unwrap();
+        let com_u = commit_u(&u, n);
+        let (u_shift, honest_mult, honest_bits) =
+            honest_witness(&u, n, n_domain, BITS, SortMode::Strict);
+        // Sanity: the honest multiplicity verifies.
+        let ok = prove_strictly_sorted_with_witness(
+            &u, n, &com_u, &u_shift, &honest_mult, &honest_bits, &mut transcript(),
+        )
+        .unwrap();
+        assert!(verify_strictly_sorted(&com_u, n, &ok, &mut transcript()).is_ok());
+
+        let mut extra_zero_row = honest_mult.clone();
+        extra_zero_row[0] = f1(); // c_fold[0] pole with no d-side match
+        let mut padding_pole = honest_mult.clone();
+        padding_pole[n_domain - 1] = f1(); // a pole on the padding row [n, domain)
+        for forged in [
+            vec![f1(); n_domain],  // all ones: several unmatched c-side poles
+            vec![f0(); n_domain],  // all zero: both d-side rows unmatched (drop)
+            extra_zero_row,
+            padding_pole,
+        ] {
+            let proof = prove_strictly_sorted_with_witness(
+                &u, n, &com_u, &u_shift, &forged, &honest_bits, &mut transcript(),
+            )
+            .unwrap();
+            assert!(
+                verify_strictly_sorted(&com_u, n, &proof, &mut transcript()).is_err(),
+                "forged multiplicity must be rejected by the shift link"
+            );
+        }
+    }
+
+    #[test]
+    fn forged_shift_next_is_rejected_via_link() {
+        // A `U_shift` that keeps every consecutive gap POSITIVE (so RANGE accepts, with
+        // bits recomposing to the committed forged `U_shift - U - 1`) but is NOT the true
+        // one-step shift of `U`: only the index-augmented GKR shift link can reject it,
+        // because the range gadget proves the gaps positive, NOT `U_shift[i] = U[i+1]`.
+        let u = frs(&[1, 10, 100, 1000]);
+        let n = u.len(); // n=4 == domain, no padding
+        let n_domain = sort_domain(n).unwrap();
+        let com_u = commit_u(&u, n);
+        let (_honest_shift, honest_mult, _) =
+            honest_witness(&u, n, n_domain, BITS, SortMode::Strict);
+        // True shift is [10, 100, 1000, 0]; corrupt the middle to 50 — still a positive
+        // gap (50 - 10 = 40) so RANGE passes, but 50 != U[2] = 100 so the shift is wrong.
+        let forged_shift = frs(&[10, 50, 1000, 0]);
+        let mut forged_bits = vec![vec![f0(); n_domain]; BITS];
+        for i in 0..n - 1 {
+            let value_bits = low_bits(forged_shift[i] - u[i] - f1(), BITS);
+            for (j, slot) in forged_bits.iter_mut().enumerate() {
+                slot[i] = value_bits[j];
+            }
+        }
+        let proof = prove_strictly_sorted_with_witness(
+            &u, n, &com_u, &forged_shift, &honest_mult, &forged_bits, &mut transcript(),
+        )
+        .unwrap();
+        assert!(
+            verify_strictly_sorted(&com_u, n, &proof, &mut transcript()).is_err(),
+            "a non-shift U_shift with positive gaps must be rejected by the shift link"
+        );
     }
 
     // ---- Positional successor lookup (range-free shift) -------------------
