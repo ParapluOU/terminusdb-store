@@ -69,9 +69,8 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{
-    commit_column, prove_sumcheck, verify_column_openings, verify_sumcheck, ClaimShape,
-    ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof, SumcheckShape,
-    Term, Transcript254,
+    commit_column, mle_full_eval, powers, verify_column_openings, ColumnOpening,
+    StoreProverContext, Transcript254,
 };
 use super::anti::{
     prove_inner_join_with_keys_and_context, verify_inner_join_with_keys, InnerJoinProof,
@@ -94,7 +93,10 @@ use super::filter::{
 use super::dicthash::{
     honest_hash_lookup, prove_hash_lookup_inner, verify_hash_lookup_inner, HashLookupInnerProof,
 };
-use super::logup::{reciprocal_claim, reciprocal_witness, rlc_fold};
+use super::logup_gkr::{
+    bind_and_verify_fraction_tree, check_leaf_tie, eq_at_index, prove_fraction_sum_zero,
+    FractionInstance, GkrFractionProof, LinearForm, LinearTerm, Src,
+};
 use super::permutation::{
     prove_relation_permutation_with_context, verify_relation_permutation, RelationPermutationProof,
 };

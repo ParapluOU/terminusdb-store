@@ -57,9 +57,14 @@ pub struct ReconcileProof {
     pub com_present_s: ArkGT,
     pub com_present_p: ArkGT,
     pub com_present_o: ArkGT,
-    /// One reciprocal commitment per group, then present's, in link order.
-    pub com_rec: Vec<ArkGT>,
-    pub link_sumcheck: SumcheckProof,
+    /// The multi-block LogUp-GKR fraction-sum-zero proof for the signed reconcile link
+    /// `Σ_g sign_g · Σ_{row < len_g} 1/(alpha − rlc_β(S_g,P_g,O_g)) = 0` (committed reciprocals
+    /// dropped: `G` blocks tiled into a `working_log + high_bits`-var tree, block selected by
+    /// `eq_at_index`, all numerators PUBLIC signed prefixes).
+    pub link_gkr: GkrFractionProof,
+    /// Evaluations of the `3·G` committed link columns (`[S, P, O]` per group in link order,
+    /// committed groups then present) at `r_low` (the low `working_log` bits of the GKR leaf point).
+    pub link_col_evals: Vec<ArkFr>,
     pub link_opening: ColumnOpening,
     pub present_len: usize,
 }
@@ -377,32 +382,40 @@ pub(crate) fn prove_reconcile_core(
             transcript.append_group(b"pow/reconcile/link-val", com);
         }
     }
+    // beta/alpha drawn AFTER every link data-column (the S/P/O hash columns bound at `link-val`
+    // above) commitment is bound — the logup_gkr caller contract (leaves fixed before any per-layer
+    // GKR challenge). There is NO reciprocal commitment anymore, so this is the last binding before
+    // the folds.
     let beta = transcript.challenge_scalar(b"pow/reconcile/link-beta");
     let alpha = transcript.challenge_scalar(b"pow/reconcile/link-alpha");
 
-    let mut rec_data: Vec<Vec<ArkFr>> = Vec::with_capacity(g);
-    let mut com_rec: Vec<ArkGT> = Vec::with_capacity(g);
-    for values in &value_data {
-        let fold = rlc_fold(beta, &[values[0].as_slice(), values[1].as_slice(), values[2].as_slice()]);
-        let rec = reciprocal_witness(alpha, &fold);
-        com_rec.push(context.commit_column(&rec)?);
-        rec_data.push(rec);
-    }
-    for com in &com_rec {
-        transcript.append_group(b"pow/reconcile/link-rec", com);
-    }
-
-    // Assemble the 4G link columns [S, P, O, rec] per group.
-    let mut columns: Vec<Vec<ArkFr>> = Vec::with_capacity(4 * g);
+    // The signed multi-block fraction-sum-zero instance. Its 3G committed link columns
+    // ([S, P, O] per group, already at 2^working_log) are zero-extended block-disjointly into the
+    // 2^num_vars leaf vector: group `g`'s columns fill block `g`; padding blocks stay zero.
+    let inst = reconcile_link_instance(alpha, beta, &lens, &signs, working_log)?;
+    let leaf_count = inst.size();
+    let mut columns: Vec<Vec<ArkFr>> = Vec::with_capacity(3 * g);
     for i in 0..g {
         columns.push(value_data[i][0].clone());
         columns.push(value_data[i][1].clone());
         columns.push(value_data[i][2].clone());
-        columns.push(rec_data[i].clone());
     }
-    let shape = link_shape(working_log, &lens, &signs, alpha, beta);
-    let (link_sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let link_opening = context.prove_column_openings(&columns, &r, transcript)?;
+    let mut extended: Vec<Vec<ArkFr>> = Vec::with_capacity(inst.num_cols);
+    for (block, cols3) in columns.chunks(3).enumerate() {
+        let base = block * k_size;
+        for column in cols3 {
+            let mut ext = vec![f0(); leaf_count];
+            ext[base..base + k_size].copy_from_slice(column);
+            extended.push(ext);
+        }
+    }
+    let (link_gkr, r_leaf) = prove_fraction_sum_zero(&inst, &extended, transcript)?;
+
+    // Single batched Dory opening of the 3G length-2^working_log link columns at r_low (the low
+    // `working_log` bits of the GKR leaf point), bound to their commitments on this transcript.
+    let r_low = &r_leaf[..working_log];
+    let link_col_evals: Vec<ArkFr> = columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+    let link_opening = context.prove_column_openings(&columns, r_low, transcript)?;
 
     Ok((
         ReconcileProof {
@@ -413,8 +426,8 @@ pub(crate) fn prove_reconcile_core(
             com_present_s,
             com_present_p,
             com_present_o,
-            com_rec,
-            link_sumcheck,
+            link_gkr,
+            link_col_evals,
             link_opening,
             present_len,
         },
@@ -468,27 +481,82 @@ pub(super) fn prove_group_hash(
     Ok((GroupHashProof { obj_reloc, com_obj_at_k, lookup }, v_hash))
 }
 
-/// The G-way link sumcheck shape: one reciprocal (Identity) claim per group pinning
-/// `rec = 1/(alpha − fold[S,P,O])`, plus the signed masked multiset-equality link.
-pub(super) fn link_shape(k: usize, lens: &[usize], signs: &[ArkFr], alpha: ArkFr, beta: ArkFr) -> SumcheckShape {
-    let g = lens.len();
-    let mut claims = Vec::with_capacity(g + 1);
-    for i in 0..g {
-        claims.push(reciprocal_claim(i * 4 + 3, &[i * 4, i * 4 + 1, i * 4 + 2], alpha, beta));
+/// The PUBLIC multi-block fraction-sum-zero instance for the signed reconcile link, built
+/// IDENTICALLY by prover and verifier from public counts/signs. `G = lens.len()` groups
+/// (each layer's additions group `sign +1`, removals group `sign −1`, then present `sign −1`),
+/// each with 3 committed canonical hash columns `[S, P, O]` at `2^working_log` per block. The
+/// `G` blocks are padded to `G_pad = next_pow2(G)` and tiled into a `working_log + high_bits`-var
+/// tree; the low `working_log` bits index within a block, the top `high_bits` select the block.
+///
+/// Column layout (`num_cols = G·3`): group `g`'s fold columns `[S_g, P_g, O_g]` at instance
+/// indices `[g·3, g·3+3)`. Each column is block-placed (nonzero only in its own leaf block), so on
+/// the leaves of block `g` the denominator `q_leaf = alpha − Σ_{block} Σ_{d<3} beta^d·col`
+/// reduces to `alpha − (S_g + beta·P_g + beta²·O_g)` (= `alpha − rlc_β(S,P,O)`, the exact fold the
+/// retired `reciprocal_claim` pinned) and to the constant `alpha` on padding blocks. The numerator
+/// `p_leaf` is the SIGNED PUBLIC block indicator `sign_g·([i < base_g + len_g] − [i < base_g])`
+/// (`base_g = g·2^working_log`) — no committed multiplicity (the reciprocal column is gone), so
+/// there is NO `committed × public-Chi` mask (no GAP-1, no auxiliary Identity); within-block and
+/// padding-block rows self-annihilate (`p = 0`).
+pub(super) fn reconcile_link_instance(
+    alpha: ArkFr,
+    beta: ArkFr,
+    lens: &[usize],
+    signs: &[ArkFr],
+    working_log: usize,
+) -> io::Result<FractionInstance> {
+    let groups = lens.len();
+    let group_pad = groups
+        .checked_next_power_of_two()
+        .ok_or_else(|| invalid("reconcile: link group count overflow"))?;
+    let high_bits = group_pad.trailing_zeros() as usize;
+    let num_vars = working_log
+        .checked_add(high_bits)
+        .filter(|nv| *nv < usize::BITS as usize)
+        .ok_or_else(|| invalid("reconcile: link leaf domain overflow"))?;
+    let domain = 1usize << working_log;
+    let arity = 3usize;
+    let num_cols = groups * arity;
+    let beta_powers = powers(beta, arity);
+
+    // q_leaf = alpha - Σ_{block g} Σ_{d<3} beta^d·col_{g,d} (blocks disjoint).
+    let mut q_terms = Vec::with_capacity(num_cols);
+    for block in 0..groups {
+        for (d, power) in beta_powers.iter().enumerate() {
+            q_terms.push(LinearTerm {
+                coeff: f0() - *power,
+                src: Src::Column(block * arity + d),
+            });
+        }
     }
-    let terms = (0..g)
-        .map(|i| Term {
-            coeff: signs[i],
-            operands: vec![Operand::Chi(i), Operand::Column(i * 4 + 3)],
-        })
-        .collect();
-    claims.push(SumcheckClaim { shape: ClaimShape::ZeroSum, expr: Expr { terms }, target: f0() });
-    SumcheckShape {
-        num_vars: k,
-        num_columns: 4 * g,
-        chi_bounds: lens.to_vec(),
-        claims,
+
+    // p_leaf: each group's first len_g rows count with sign_g; everything else (within-block
+    // padding + padding blocks) 0. All prefix bounds are PUBLIC (root-authenticated counts).
+    let mut p_terms = Vec::with_capacity(2 * groups);
+    for (g, (&len_g, &sign_g)) in lens.iter().zip(signs.iter()).enumerate() {
+        let base = g * domain;
+        let hi = base + len_g.min(domain);
+        p_terms.push(LinearTerm {
+            coeff: sign_g,
+            src: Src::Prefix(hi),
+        });
+        p_terms.push(LinearTerm {
+            coeff: f0() - sign_g,
+            src: Src::Prefix(base),
+        });
     }
+
+    Ok(FractionInstance {
+        num_vars,
+        num_cols,
+        p_form: LinearForm {
+            constant: f0(),
+            terms: p_terms,
+        },
+        q_form: LinearForm {
+            constant: alpha,
+            terms: q_terms,
+        },
+    })
 }
 
 /// Verify an N-layer reconciliation. On success returns the authenticated reconciled
@@ -611,10 +679,10 @@ pub(crate) fn verify_reconcile_core(
         verify_group_hash(&desc.p_com, desc.col_log, desc.real_len, working_log, &proof.combined_pred, &gp.p, transcript)?;
     }
 
-    // Verify the G-way masked LogUp link.
+    // Verify the G-way signed multi-block LogUp-GKR link.
     let g = descs.len() + 1;
-    if proof.com_rec.len() != g {
-        return Err(invalid("reconcile: reciprocal commitment count mismatch"));
+    if proof.link_col_evals.len() != 3 * g {
+        return Err(invalid("reconcile: link column-eval count mismatch"));
     }
     let mut lens: Vec<usize> = descs.iter().map(|d| d.real_len).collect();
     lens.push(present_len);
@@ -632,25 +700,42 @@ pub(crate) fn verify_reconcile_core(
             transcript.append_group(b"pow/reconcile/link-val", com);
         }
     }
+    // Same binding order as the prover: all link data-column commitments, THEN beta/alpha.
     let beta = transcript.challenge_scalar(b"pow/reconcile/link-beta");
     let alpha = transcript.challenge_scalar(b"pow/reconcile/link-alpha");
-    for com in &proof.com_rec {
-        transcript.append_group(b"pow/reconcile/link-rec", com);
-    }
 
-    if proof.link_sumcheck.round_polys.len() != working_log {
-        return Err(invalid("reconcile: link sumcheck domain mismatch"));
+    // Bind the public instance and verify the multi-block GKR tree -> leaf point + reduced claims.
+    let inst = reconcile_link_instance(alpha, beta, &lens, &signs, working_log)?;
+    if proof.link_gkr.num_vars() != inst.num_vars {
+        return Err(invalid("reconcile: link fraction layer count mismatch"));
     }
-    let shape = link_shape(working_log, &lens, &signs, alpha, beta);
-    let (r, evals) = verify_sumcheck(&shape, &proof.link_sumcheck, transcript)?;
-    let mut commitments = Vec::with_capacity(4 * g);
+    let (r_leaf, p_claim, q_claim) =
+        bind_and_verify_fraction_tree(&inst, &proof.link_gkr, transcript)?;
+
+    // Open the 3G length-2^working_log committed link columns at r_low, bound to their commitments
+    // on this transcript.
+    let r_low = &r_leaf[..working_log];
+    let r_high = &r_leaf[working_log..];
+    let mut commitments = Vec::with_capacity(3 * g);
     for i in 0..g {
         commitments.push(value_com[i][0]);
         commitments.push(value_com[i][1]);
         commitments.push(value_com[i][2]);
-        commitments.push(proof.com_rec[i]);
     }
-    verify_column_openings(&commitments, &r, &evals, &proof.link_opening, transcript)?;
+    verify_column_openings(&commitments, r_low, &proof.link_col_evals, &proof.link_opening, transcript)?;
+
+    // Reconstruct each block's leaf-MLE from its length-2^working_log opening via the PUBLIC block
+    // selector eq_at_index(block, r_high) (the multilinear [block == g] indicator over the high
+    // bits). Group g's columns are tensor-scaled into block g only, STRUCTURALLY forcing them to
+    // zero in every other block (no cross-group leak), then the leaf tie checks the tree's claims.
+    let mut leaf_evals = Vec::with_capacity(inst.num_cols);
+    for block in 0..g {
+        let selector = eq_at_index(block, r_high);
+        for column in 0..3 {
+            leaf_evals.push(selector * proof.link_col_evals[block * 3 + column]);
+        }
+    }
+    check_leaf_tie(&inst, &leaf_evals, p_claim, q_claim, &r_leaf)?;
 
     Ok(ReconcileVerified {
         com_present_s: proof.com_present_s,
