@@ -107,7 +107,7 @@ use crate::proof::range::{
 use crate::proof::union::{prove_bag_union_with_context, BagUnionResult};
 use crate::proof::relocate::{prove_column_relocation_with_context, verify_column_relocation, RelocationProof};
 use crate::proof::sort::SortedProof;
-use crate::proof::union::{verify_bag_union, BagUnionProof};
+use crate::proof::union::{output_log_domain, verify_bag_union, BagUnionProof};
 use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
 #[derive(Clone, Debug)]
 pub struct RecursiveRelationEnvelope {
@@ -783,7 +783,7 @@ pub(super) fn verify_closure_rounds(
             .n
             .checked_add(object_commit.n)
             .ok_or_else(|| invalid("transitive closure union length overflow"))?;
-        let union_log = round.union.sumcheck.round_polys.len();
+        let union_log = output_log_domain(union_len)?;
         let mut t_union = closure_transcript(&root, &digest, step, b"round-union");
         verify_bag_union(
             &[accumulator_commit.clone(), object_commit],
@@ -1153,7 +1153,7 @@ pub(super) fn verify_closure_pairs_rounds(
             .n
             .checked_add(extended_commit.n)
             .ok_or_else(|| invalid("all-pairs closure union length overflow"))?;
-        let union_log = round.union.sumcheck.round_polys.len();
+        let union_log = output_log_domain(union_len)?;
         let mut t_union = closure_transcript(&root, &digest, step, b"pairs-round-union");
         verify_bag_union(
             &[accumulator_commit.clone(), extended_commit],

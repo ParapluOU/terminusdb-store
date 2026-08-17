@@ -165,9 +165,19 @@ pub(super) fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
 // has different proof bytes; the UNION/ANTI/OUTER envelopes embed the same BGP chain / semi-join,
 // so all four bump in lockstep.
 pub(super) const VERSION: u32 = 11;
-pub(super) const UNION_VERSION: u32 = 9;
+// v10: LogUp-GKR bag-union (`Or`) migration (Inc 4) — `BagUnionProof` dropped its `N+1`
+// committed reciprocal GT commitments (`reciprocal_commitments`) and the masked multiset-link
+// sumcheck for ONE multi-block GKR fraction tree (`gkr`: `N+1` blocks tiled into a
+// `k+high_bits`-var tree, block selected by the top `high_bits` via `eq_at_index`) + the
+// `(N+1)·arity` committed-column leaf evaluations (`col_evals`) + one batched opening. All
+// numerators are PUBLIC additive prefix block indicators (no committed multiplicity => no
+// GAP-1, no auxiliary Identity). `commitment_root` is byte-identical (reciprocals never touched
+// it). The `LeftOuterJoinProof` (OUTER) embeds a `BagUnionProof` directly and the recursive
+// transitive-closure union nodes embed it too, so OUTER/RECURSIVE bump in lockstep; ANTI does
+// NOT embed a union (unchanged).
+pub(super) const UNION_VERSION: u32 = 10;
 pub(super) const ANTI_VERSION: u32 = 11;
-pub(super) const OUTER_VERSION: u32 = 8;
+pub(super) const OUTER_VERSION: u32 = 9;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
 // v23 adds the ordered `sys:Array` walk composite node (tag 24).
@@ -202,7 +212,12 @@ pub(super) const OUTER_VERSION: u32 = 8;
 // v31: LogUp-GKR keyed-join LINK migration (see the `VERSION` v11 note) — recursive envelopes
 // embed BGP-chain leaves (join2's two keyed-join links), whose four committed reciprocals +
 // batched membership sumcheck became two `JoinLinkProof` GKR fraction trees + GAP-1 Identities.
-pub(super) const RECURSIVE_VERSION: u32 = 31;
+// v32: LogUp-GKR bag-union (`Or`) migration (Inc 4, see the `UNION_VERSION` v10 note) — the
+// bounded transitive-closure (`star`/`plus`) round nodes each embed a `BagUnionProof`, which
+// dropped its `N+1` committed reciprocal GT commitments and multiset-link sumcheck for one
+// multi-block GKR fraction tree + `(N+1)·arity` column leaf evaluations + a batched opening, so
+// those recursive envelopes' proof bytes changed.
+pub(super) const RECURSIVE_VERSION: u32 = 32;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -606,8 +621,8 @@ wire_struct!(RelocationProof {
 wire_struct!(BagUnionProof {
     relocations,
     relocated_commitments,
-    reciprocal_commitments,
-    sumcheck,
+    gkr,
+    col_evals,
     opening
 });
 wire_struct!(LeftAntiJoinProof {
