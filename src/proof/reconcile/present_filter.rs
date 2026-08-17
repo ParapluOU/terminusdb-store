@@ -50,6 +50,12 @@ pub struct PresentReadResult {
     /// Two columns of authenticated binding HASHES (output variables), length `len`.
     pub columns: Vec<Vec<ArkFr>>,
     pub len: usize,
+    /// UNTRUSTED per-column dictionary id-hints (I2a) — one hint column per output `columns`
+    /// entry, aligned row-for-row, letting the verifier resolve each hash binding by an id-routed
+    /// Merkle opening under a MANDATORY belt-hash instead of a catalog scan. Empty on the
+    /// id-carrying result paths (join / BGP), which resolve the value directly as an id. NOT
+    /// committed and NOT part of `commitment_root` — the belt-hash is the only thing that binds it.
+    pub id_hints: Vec<Vec<u64>>,
 }
 
 /// Map a filter position to `(filter column, filter commitment, [output columns], [output commitments])`.
@@ -76,6 +82,23 @@ pub(super) fn filter_selection<'a>(
             [artifacts.present_s.as_slice(), artifacts.present_p.as_slice()],
             [artifacts.com_present_s, artifacts.com_present_p],
         ),
+    }
+}
+
+/// The two OUTPUT-column dictionary id columns (as field elements) parallel to
+/// [`filter_selection`]'s output hash columns, for sourcing the I2a resolution id-hints. Uses the
+/// artifacts' `present_id_*` columns (`present_id_s`/`present_id_o` are node/value combined-dict
+/// ids, `present_id_p` a predicate id), which are indexed identically to `present_s`/`present_o`/
+/// `present_p`, so compacting them by the SAME filter selection yields row-aligned hints whose
+/// opened term hashes back to the output hash (the belt-hash the verifier re-checks).
+pub(super) fn filter_id_sources(artifacts: &ReconcileArtifacts, position: FilterPosition) -> [&[ArkFr]; 2] {
+    match position {
+        // output [S, O]
+        FilterPosition::Predicate => [artifacts.present_id_s.as_slice(), artifacts.present_id_o.as_slice()],
+        // output [P, O]
+        FilterPosition::Subject => [artifacts.present_id_p.as_slice(), artifacts.present_id_o.as_slice()],
+        // output [S, P]
+        FilterPosition::Object => [artifacts.present_id_s.as_slice(), artifacts.present_id_p.as_slice()],
     }
 }
 
@@ -140,13 +163,33 @@ pub(super) fn prove_present_filter(
     transcript: &mut Transcript254,
 ) -> io::Result<(PresentFilterProof, PresentReadResult)> {
     let (filter_col, com_filter, sources, source_coms) = filter_selection(artifacts, position);
+    let id_sources = filter_id_sources(artifacts, position);
     let source_vecs: Vec<Vec<ArkFr>> = sources.iter().map(|c| c.to_vec()).collect();
     let (part, out_cols) = prove_filter_part(
         context, filter_col, &com_filter, constant_hash, artifacts.present_len, &source_vecs, &source_coms, transcript,
     )?;
     let out_len = part.out_len;
     let columns: Vec<Vec<ArkFr>> = out_cols.iter().map(|c| c[..out_len].to_vec()).collect();
-    Ok((part, PresentReadResult { columns, len: out_len }))
+    // I2a: prover id-hints for the (hash-typed) output columns. The selection is exactly the
+    // `prove_filter_part` indicator `sel[i] = (i < present_len) && filter_col[i] == constant_hash`,
+    // and `compact_columns` emits selected rows in ASCENDING index order — so gathering the id
+    // sources at the same ascending selected indices aligns each hint row-for-row with `columns`.
+    // UNTRUSTED: the resolution belt-hash (`hash_object`/`hash_term`(opened term) == output hash)
+    // is what binds them; a wrong hint is rejected at resolve time.
+    let selected: Vec<usize> = (0..artifacts.present_len)
+        .filter(|&i| filter_col[i] == constant_hash)
+        .collect();
+    let id_hints: Vec<Vec<u64>> = id_sources
+        .iter()
+        .map(|src| {
+            selected
+                .iter()
+                .map(|&i| canonical_dictionary_id(&src[i]))
+                .collect::<io::Result<Vec<u64>>>()
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    debug_assert!(id_hints.iter().all(|h| h.len() == out_len));
+    Ok((part, PresentReadResult { columns, len: out_len, id_hints }))
 }
 
 pub(super) fn verify_present_filter(

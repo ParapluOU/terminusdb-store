@@ -578,7 +578,7 @@ fn single_atom_predicate_resolved() {
     let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
     let head_root = lref.last().unwrap().state.commitment_root;
     let resolved = verify_and_resolve_single_atom(
-        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns,
+        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns, &result.id_hints,
     )
     .unwrap();
     let ground = materialized_filter_resolved(&lref, FilterPosition::Predicate, c);
@@ -630,7 +630,7 @@ fn resolved_typed_value_objects() {
     let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
     let head_root = lref.last().unwrap().state.commitment_root;
     let resolved = verify_and_resolve_single_atom(
-        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns,
+        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns, &result.id_hints,
     )
     .unwrap();
     // present = {a1 "hello", a2 "world", a5 "foo", a6 b6}: the O column resolves 3 Values + 1 Node.
@@ -654,7 +654,7 @@ fn resolve_forged_binding_rejects() {
     let mut forged = result.columns.clone();
     forged[0][0] = ark(123_456_789); // a fabricated subject binding
     assert!(verify_and_resolve_single_atom(
-        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &forged,
+        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &forged, &result.id_hints,
     )
     .is_err());
 }
@@ -670,6 +670,167 @@ fn resolve_forged_join_binding_rejects() {
     forged[2][0] = ark(424_242); // a fabricated ?z binding
     assert!(verify_and_resolve_two_atom_join(
         &lref, head_root, cp, cq, &rec, &join, &forged,
+    )
+    .is_err());
+}
+
+// ============================================================
+// Merkle-dict I2a — single-atom filter hash->term resolution via id-routed Merkle openings
+// under a MANDATORY belt-hash (prover id-hints, catalog-scan retired on this path).
+// ============================================================
+
+/// The catalog-scan oracle resolution of a single-atom filter's published output columns — the
+/// pre-I2a filter path, kept as the differential baseline the Merkle+belt-hash path must match.
+fn i2a_catalog_scan_resolved(
+    lref: &[&LayerCommitment],
+    position: FilterPosition,
+    result: &PresentReadResult,
+) -> Vec<Vec<CanonicalObject>> {
+    let kinds = filter_output_kinds(position);
+    let views: Vec<VerifierCommitmentRef<'_>> = lref.iter().map(|l| l.verifier_view()).collect();
+    result
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(col_idx, col)| {
+            col.iter()
+                .map(|&value| match kinds[col_idx] {
+                    ResolveKind::NodeValueHash => {
+                        resolve_node_value_hash_via_catalog_scan(&views, value).unwrap()
+                    }
+                    ResolveKind::PredicateHash => {
+                        resolve_predicate_hash_via_catalog_scan(&views, value).unwrap()
+                    }
+                    ResolveKind::NodeValueId => unreachable!("filter output is never an id kind"),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn i2a_run_differential(position: FilterPosition, constant: ArkFr, expect_rows: usize) {
+    let layers = filter_stack();
+    let lref = refs(&layers);
+    let (rec, filt, result) = prove_read_single_atom(&lref, position, constant).unwrap();
+    let head_root = lref.last().unwrap().state.commitment_root;
+    // Every hint column aligns with its output column (real prefix).
+    assert_eq!(result.id_hints.len(), result.columns.len());
+    assert!(result.id_hints.iter().all(|h| h.len() == result.len));
+    assert_eq!(result.len, expect_rows);
+    // Production path: id-routed Merkle openings under the mandatory belt-hash.
+    let merkle = verify_and_resolve_single_atom(
+        &lref, head_root, position, constant, &rec, &filt, &result.columns, &result.id_hints,
+    )
+    .unwrap();
+    // Legacy catalog-scan oracle over the SAME published columns.
+    let legacy = i2a_catalog_scan_resolved(&lref, position, &result);
+    // EXACT (per column & per row) equality — a far stronger check than bag equality.
+    assert_eq!(merkle, legacy, "I2a Merkle+belt-hash must reproduce the catalog scan exactly");
+    // Sanity: real terms, not hashes.
+    assert!(merkle.iter().flatten().all(|o| matches!(
+        o,
+        CanonicalObject::Node(_) | CanonicalObject::Value { .. }
+    )));
+}
+
+#[test]
+fn i2a_filter_merkle_belt_hash_equals_catalog_scan() {
+    // Predicate=p2: 4 rows; subjects a3,a4,a8 (base) + a6 (delta) and objects c3,c4,c8 (base) +
+    // c6 (delta) exercise cross-layer id routing on BOTH node/value output columns.
+    i2a_run_differential(FilterPosition::Predicate, hash_pred("http://ex/p1"), 2);
+    i2a_run_differential(FilterPosition::Predicate, hash_pred("http://ex/p2"), 4);
+    // Subject=a2: output [P, O] exercises the PredicateHash column (id-routed predicate tree).
+    i2a_run_differential(FilterPosition::Subject, hash_node("http://ex/a2"), 1);
+    // Object=c3: output [S, P] exercises node/value + predicate output columns.
+    i2a_run_differential(FilterPosition::Object, hash_node("http://ex/c3"), 1);
+}
+
+#[test]
+fn i2a_wrong_id_hint_rejected_by_belt_hash() {
+    // A wrong id-hint pointing at a DIFFERENT real dict entry in the SAME layer: routing +
+    // opening SUCCEED, but the opened term's hash != the authenticated output hash, so the
+    // MANDATORY belt-hash rejects. This is the sole soundness guard on the untrusted hint.
+    let layers = filter_stack();
+    let lref = refs(&layers);
+    let c = hash_pred("http://ex/p2"); // subjects a3,a4,a8,a6
+    let (rec, filt, mut result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+    let head_root = lref.last().unwrap().state.commitment_root;
+    // Point row 0's subject hint (a3) at row 1's real subject id (a4) — both base-layer entries.
+    assert_ne!(result.id_hints[0][0], result.id_hints[0][1]);
+    result.id_hints[0][0] = result.id_hints[0][1];
+    assert!(verify_and_resolve_single_atom(
+        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns, &result.id_hints,
+    )
+    .is_err());
+}
+
+#[test]
+fn i2a_cross_layer_id_hint_rejected_by_belt_hash() {
+    // A base-layer subject's hint pointed at a DELTA-layer real id: routing sends it to the head
+    // layer's tree and opens a valid (but different) term, and the belt-hash rejects. Confirms
+    // the guard holds even when the wrong id lives in another layer's interval.
+    let layers = filter_stack();
+    let lref = refs(&layers);
+    let c = hash_pred("http://ex/p2");
+    let (rec, filt, mut result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+    let head_root = lref.last().unwrap().state.commitment_root;
+    // Subject hints in ascending present order = [a3(base), a4(base), a8(base), a6(delta)].
+    let base_subject = result.id_hints[0][0];
+    let delta_subject = result.id_hints[0][3];
+    assert_ne!(base_subject, delta_subject);
+    result.id_hints[0][0] = delta_subject; // base row now claims the delta id
+    assert!(verify_and_resolve_single_atom(
+        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns, &result.id_hints,
+    )
+    .is_err());
+}
+
+#[test]
+fn i2a_out_of_range_id_hint_rejected_by_routing() {
+    // An id-hint outside EVERY layer's introduced interval fails closed at routing (`nv_layer`),
+    // before any opening — the interval partition is a public function of the chain-validated
+    // counts, never a prover choice.
+    let layers = filter_stack();
+    let lref = refs(&layers);
+    let c = hash_pred("http://ex/p2");
+    let (rec, filt, mut result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+    let head_root = lref.last().unwrap().state.commitment_root;
+    result.id_hints[0][0] = 10_000_000; // far beyond head_node_value_count
+    assert!(verify_and_resolve_single_atom(
+        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns, &result.id_hints,
+    )
+    .is_err());
+}
+
+#[test]
+fn i2a_tampered_value_rejected_by_recommitment_bind() {
+    // The belt-hash is only meaningful because `value` is the proof-authenticated present hash:
+    // a tampered published output value fails the step-1 re-commitment bind to `com_out` BEFORE
+    // resolution, so the prover cannot swap in a `value` that matches a chosen id-hint's term.
+    let layers = filter_stack();
+    let lref = refs(&layers);
+    let c = hash_pred("http://ex/p2");
+    let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+    let head_root = lref.last().unwrap().state.commitment_root;
+    let mut tampered = result.columns.clone();
+    tampered[1][0] = ark(987_654_321); // a fabricated object-column hash
+    assert!(verify_and_resolve_single_atom(
+        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &tampered, &result.id_hints,
+    )
+    .is_err());
+}
+
+#[test]
+fn i2a_missing_id_hints_fail_closed() {
+    // The hash-kind resolve path REQUIRES id-hints — an empty hint set fails closed (never a
+    // silent catalog scan).
+    let layers = filter_stack();
+    let lref = refs(&layers);
+    let c = hash_pred("http://ex/p2");
+    let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
+    let head_root = lref.last().unwrap().state.commitment_root;
+    assert!(verify_and_resolve_single_atom(
+        &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns, &[],
     )
     .is_err());
 }

@@ -31,12 +31,14 @@ use ark_ff::PrimeField;
 //        it costs `O(log N)` per id rather than a whole-dictionary scan and never trusts a
 //        prover-chosen layer (the interval check in `verify_opening` re-forces the routing).
 //      * a HASH column (`NodeValueHash`/`PredicateHash`, from the single-atom filter, whose result
-//        bindings are hashes with NO delivered id) is still resolved by scanning the root-bound
-//        chain catalogs for the matching hash — an id-indexed tree cannot be opened WITHOUT an id,
-//        so a succinct Merkle resolution of the filter path needs the prover to additionally ship
-//        (unauthenticated, hash-checked) id-hint columns, a change coupled to dropping the clear
-//        catalog (I2); see the I3 report. The catalogs are authenticated to the trusted head root
-//        by the per-layer `validate()` the reconciliation verifier already ran.
+//        bindings are proof-authenticated hashes with NO delivered id) is ALSO resolved by an
+//        id-routed positional Merkle opening (increment I2a): the prover ships an UNTRUSTED id-hint
+//        per result row, which we route + open exactly like an id column, THEN require a MANDATORY
+//        belt-hash — `hash_object`/`hash_term` of the opened term must equal the authenticated
+//        present hash (`value`). A wrong id-hint (a different real entry, or a padding slot) opens
+//        to a term whose hash ≠ `value` and is rejected, so the hint needs no authentication; the
+//        catalog scan is gone (the clear catalog is now read ONLY by `validate()`'s re-MSM until I2b
+//        drops it). The Merkle roots are root-bound exactly as on the id path.
 // Mirrors the base `resolve_result_values` / I1 opening discipline, generalized across the chain.
 // ===========================================================================
 
@@ -53,8 +55,10 @@ pub enum ResolveKind {
 
 /// The canonical `u64` an id field element must equal to index a dictionary. Rejects a field
 /// element that is not a small (`< 2^64`) integer, exactly as the base-path resolver does before
-/// trusting a scalar as a dictionary id (`query::result::canonical_dictionary_id`).
-fn canonical_dictionary_id(id: &ArkFr) -> io::Result<u64> {
+/// trusting a scalar as a dictionary id (`query::result::canonical_dictionary_id`). `pub(super)`
+/// so the filter prover (`present_filter`) can recover the `u64` id-hints it ships (I2a) from the
+/// artifacts' `present_id_*` field columns.
+pub(super) fn canonical_dictionary_id(id: &ArkFr) -> io::Result<u64> {
     let raw = id.0.into_bigint().as_ref()[0];
     if ArkFr::from_u64(raw) != *id {
         return Err(invalid("resolve: result id is outside canonical u64 range"));
@@ -234,36 +238,39 @@ impl<'a> ChainDictResolver<'a> {
         Ok(object)
     }
 
-    /// Resolve one authenticated result value by its column kind. `NodeValueId` routes + opens the
-    /// id (I3). `NodeValueHash`/`PredicateHash` (single-atom filter output bindings, delivered as
-    /// hashes with no id) scan the root-bound chain catalogs — an id-indexed tree cannot be opened
-    /// without an id (see the module header / I3 report).
-    fn resolve(&mut self, value: ArkFr, kind: ResolveKind) -> io::Result<CanonicalObject> {
+    /// Resolve one authenticated result value by its column kind and (for the hash kinds) an
+    /// UNTRUSTED prover `id_hint` (I2a).
+    ///
+    /// * `NodeValueId` — the value IS the combined-dict id; route + open it (I3). No separate
+    ///   authenticated term-hash exists on this path, so no belt-hash (`None`).
+    /// * `NodeValueHash` / `PredicateHash` — the single-atom filter output binding, delivered as
+    ///   the proof-authenticated present hash (`present_o`/`present_s`/`present_p`) with NO id. The
+    ///   prover ships an id-hint; we ROUTE it to its layer's tree and open it under a MANDATORY
+    ///   belt-hash `expected_hash = value`. Soundness rests entirely on that belt-hash: a wrong
+    ///   id-hint (a different real entry, or a padding slot) opens to a term whose
+    ///   `hash_object`/`hash_term` (dict.rs — the SAME function that built `value`) ≠ `value` and
+    ///   is REJECTED (Blake2b collision-resistance), so the untrusted hint needs no authentication.
+    ///   The catalog scan is gone; every hash-kind resolve is now an id-routed Merkle opening.
+    fn resolve(
+        &mut self,
+        value: ArkFr,
+        kind: ResolveKind,
+        id_hint: Option<u64>,
+    ) -> io::Result<CanonicalObject> {
         match kind {
             ResolveKind::NodeValueId => self.resolve_nv_id(canonical_dictionary_id(&value)?, None),
             ResolveKind::NodeValueHash => {
-                for view in self.views {
-                    for rec in view.node_value_catalog {
-                        if hash_object(&rec.triple.object) == value {
-                            return Ok(rec.triple.object.clone());
-                        }
-                    }
-                }
-                Err(invalid(
-                    "resolve: result hash is absent from the chain node/value dictionaries",
-                ))
+                let id = id_hint.ok_or_else(|| {
+                    invalid("resolve: node/value hash result requires a prover id-hint (I2a)")
+                })?;
+                // Belt-hash MANDATORY (`Some(value)`): `value` is the proof-authenticated present hash.
+                self.resolve_nv_id(id, Some(value))
             }
             ResolveKind::PredicateHash => {
-                for view in self.views {
-                    for rec in view.predicate_catalog {
-                        if hash_term(&rec.triple.predicate) == value {
-                            return Ok(CanonicalObject::Node(rec.triple.predicate.clone()));
-                        }
-                    }
-                }
-                Err(invalid(
-                    "resolve: result hash is absent from the chain predicate dictionaries",
-                ))
+                let id = id_hint.ok_or_else(|| {
+                    invalid("resolve: predicate hash result requires a prover id-hint (I2a)")
+                })?;
+                self.resolve_pred_id(id, Some(value))
             }
         }
     }
@@ -272,6 +279,12 @@ impl<'a> ChainDictResolver<'a> {
 /// Resolve authenticated result columns to `CanonicalObject`s. `claimed_columns` are the
 /// prover's real-prefix result values; they are bound to `com_out` (the proof's committed
 /// result, at `2^domain_log`) by re-commitment before resolution.
+///
+/// `id_hints`, when supplied, is one UNTRUSTED prover id-hint column per result column (aligned
+/// row-for-row). It is MANDATORY for the hash kinds (`NodeValueHash`/`PredicateHash`, the
+/// single-atom filter path) and ignored for `NodeValueId` (the value IS the id). The resolution
+/// belt-hash binds each hint to the authenticated result hash, so the hint is not committed and
+/// not part of `commitment_root` (I2a).
 pub(super) fn resolve_result_columns(
     views: &[VerifierCommitmentRef<'_>],
     claimed_columns: &[Vec<ArkFr>],
@@ -279,9 +292,15 @@ pub(super) fn resolve_result_columns(
     result_len: usize,
     domain_log: usize,
     kinds: &[ResolveKind],
+    id_hints: Option<&[Vec<u64>]>,
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
     if claimed_columns.len() != com_out.len() || claimed_columns.len() != kinds.len() {
         return Err(invalid("resolve: result column shape mismatch"));
+    }
+    if let Some(hints) = id_hints {
+        if hints.len() != claimed_columns.len() {
+            return Err(invalid("resolve: id-hint column count mismatch"));
+        }
     }
     // (1) Bind the claimed values to the authenticated result commitments.
     for (col, com) in claimed_columns.iter().zip(com_out.iter()) {
@@ -296,14 +315,30 @@ pub(super) fn resolve_result_columns(
             ));
         }
     }
-    // (2) Resolve each value against the root-bound chain dictionaries — id columns by an
-    // id-routed positional Merkle opening (I3), hash columns by a catalog scan.
+    // (2) Resolve each value against the root-bound chain dictionaries by an id-routed positional
+    // Merkle opening — id columns route the value-as-id (I3); hash columns route the prover's
+    // (belt-hash-bound) id-hint (I2a). No catalog scan.
     let mut resolver = ChainDictResolver::new(views);
     let mut resolved = Vec::with_capacity(claimed_columns.len());
-    for (col, kind) in claimed_columns.iter().zip(kinds) {
+    for (col_idx, (col, kind)) in claimed_columns.iter().zip(kinds).enumerate() {
+        // Per-column id-hints: MANDATORY for the hash kinds (the belt-hash binds them), unused
+        // for id kinds (`NodeValueId`, where the value already IS the id).
+        let col_hints: Option<&Vec<u64>> = match kind {
+            ResolveKind::NodeValueHash | ResolveKind::PredicateHash => {
+                let hints = id_hints.ok_or_else(|| {
+                    invalid("resolve: hash-kind result column requires prover id-hints (I2a)")
+                })?;
+                let h = &hints[col_idx];
+                if h.len() != col.len() {
+                    return Err(invalid("resolve: id-hint column length mismatch"));
+                }
+                Some(h)
+            }
+            ResolveKind::NodeValueId => None,
+        };
         let mut out = Vec::with_capacity(col.len());
-        for value in col {
-            out.push(resolver.resolve(*value, *kind)?);
+        for (row, value) in col.iter().enumerate() {
+            out.push(resolver.resolve(*value, *kind, col_hints.map(|h| h[row]))?);
         }
         resolved.push(out);
     }
@@ -368,6 +403,41 @@ pub(crate) fn resolve_predicate_id_via_catalog_scan(
     Err(invalid("resolve: result id is absent from the chain predicate dictionaries"))
 }
 
+/// Pre-I2a node/value HASH resolution: linear scan of the chain catalogs for the matching
+/// `hash_object` — the legacy filter-path oracle the I2a differential test asserts the new
+/// Merkle+belt-hash resolution reproduces exactly.
+#[cfg(test)]
+pub(crate) fn resolve_node_value_hash_via_catalog_scan(
+    views: &[VerifierCommitmentRef<'_>],
+    value: ArkFr,
+) -> io::Result<CanonicalObject> {
+    for view in views {
+        for rec in view.node_value_catalog {
+            if hash_object(&rec.triple.object) == value {
+                return Ok(rec.triple.object.clone());
+            }
+        }
+    }
+    Err(invalid("resolve: result hash is absent from the chain node/value dictionaries"))
+}
+
+/// Pre-I2a predicate HASH resolution: linear scan of the chain catalogs for the matching
+/// `hash_term` (the predicate-column differential baseline).
+#[cfg(test)]
+pub(crate) fn resolve_predicate_hash_via_catalog_scan(
+    views: &[VerifierCommitmentRef<'_>],
+    value: ArkFr,
+) -> io::Result<CanonicalObject> {
+    for view in views {
+        for rec in view.predicate_catalog {
+            if hash_term(&rec.triple.predicate) == value {
+                return Ok(CanonicalObject::Node(rec.triple.predicate.clone()));
+            }
+        }
+    }
+    Err(invalid("resolve: result hash is absent from the chain predicate dictionaries"))
+}
+
 /// Bind an authenticated combined-dict node/value-id column to its commitment `com` and resolve it
 /// to `CanonicalObject`s over the CHAIN catalogs — the value-resolution surface a reconciled walk
 /// composite needs for its delivered element column (ReadDocument 6c-ii). `ids` are the prover's
@@ -390,6 +460,7 @@ pub(crate) fn resolve_node_value_id_column(
         ids.len(),
         log_domain,
         &[ResolveKind::NodeValueId],
+        None,
     )?;
     resolved
         .pop()
@@ -410,7 +481,9 @@ pub(super) fn filter_output_kinds(position: FilterPosition) -> [ResolveKind; 2] 
 
 /// Verify a single-atom read AND resolve its result to `CanonicalObject`s (the readable answer,
 /// authenticated against the chain — no query re-run). `claimed_columns` are the prover's
-/// published result values (from [`PresentReadResult`]).
+/// published result values (from [`PresentReadResult`]); `id_hints` are the prover's UNTRUSTED
+/// per-column id-hints (also from [`PresentReadResult`]), which the MANDATORY resolution belt-hash
+/// binds to the authenticated result hashes (I2a).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_resolve_single_atom(
     layers: &[&LayerCommitment],
@@ -420,13 +493,22 @@ pub fn verify_and_resolve_single_atom(
     reconcile: &ReconcileProof,
     filter: &PresentFilterProof,
     claimed_columns: &[Vec<ArkFr>],
+    id_hints: &[Vec<u64>],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
     let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
     let out_len = verify_present_filter(&verified, position, constant_hash, filter, &mut transcript)?;
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     let kinds = filter_output_kinds(position);
-    resolve_result_columns(&views, claimed_columns, &filter.com_out, out_len, verified.working_log, &kinds)
+    resolve_result_columns(
+        &views,
+        claimed_columns,
+        &filter.com_out,
+        out_len,
+        verified.working_log,
+        &kinds,
+        Some(id_hints),
+    )
 }
 
 /// Verify a two-atom join read AND resolve its `[?x, ?y, ?z]` bindings to `CanonicalObject`s.
@@ -445,8 +527,8 @@ pub fn verify_and_resolve_two_atom_join(
     let head_nv = layers.last().unwrap().verifier_view().state.node_value_count as usize;
     let out_len = verify_present_join(reconcile, &verified, head_nv, const_p, const_q, join, &mut transcript)?;
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
-    // Join output [id_x, id_y, id_z] are all node/value combined-dict ids.
+    // Join output [id_x, id_y, id_z] are all node/value combined-dict ids (no id-hints needed).
     let kinds = [ResolveKind::NodeValueId, ResolveKind::NodeValueId, ResolveKind::NodeValueId];
-    resolve_result_columns(&views, claimed_columns, &join.com_join_out, out_len, join.join_log, &kinds)
+    resolve_result_columns(&views, claimed_columns, &join.com_join_out, out_len, join.join_log, &kinds, None)
 }
 

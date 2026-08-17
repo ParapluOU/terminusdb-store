@@ -132,7 +132,8 @@ pub(super) fn prove_present_join(
             join_out_len: join.n,
             join_log: join.log_domain,
         },
-        PresentReadResult { columns: out_cols, len: join.n },
+        // Join output columns are combined-dict ids (resolved directly as ids); no I2a id-hints.
+        PresentReadResult { columns: out_cols, len: join.n, id_hints: Vec::new() },
     ))
 }
 

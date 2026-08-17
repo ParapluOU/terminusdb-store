@@ -623,7 +623,8 @@ pub(crate) fn prove_present_bgp(
             result_log_domain,
             result_arity: result_com_count,
         },
-        PresentReadResult { columns, len: result_m },
+        // BGP output columns are combined-dict ids (resolved directly as ids); no I2a id-hints.
+        PresentReadResult { columns, len: result_m, id_hints: Vec::new() },
     ))
 }
 
@@ -869,6 +870,6 @@ pub fn verify_and_resolve_bgp(
     )?;
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     let kinds = vec![ResolveKind::NodeValueId; result_coms.len()];
-    resolve_result_columns(&views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds)
+    resolve_result_columns(&views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None)
 }
 
