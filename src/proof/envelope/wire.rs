@@ -217,7 +217,14 @@ pub(super) const OUTER_VERSION: u32 = 9;
 // dropped its `N+1` committed reciprocal GT commitments and multiset-link sumcheck for one
 // multi-block GKR fraction tree + `(N+1)·arity` column leaf evaluations + a batched opening, so
 // those recursive envelopes' proof bytes changed.
-pub(super) const RECURSIVE_VERSION: u32 = 32;
+// v33: LogUp-GKR migration of the positional-successor primitive (`SuccessorProof`) — the ordered
+// `rdf:List` walk composite (`OrderedListWalk`, tag) embeds a `SuccessorProof`, which dropped its
+// two committed reciprocal GT commitments (`rec_c`/`rec_d`) and the whole shift-link sumcheck (+
+// its batched opening) for a GKR fraction-tree proof (the SAME `sort_link_instance` as the already-
+// migrated `SortedProof`) + the three link data-column leaf evaluations + one batched opening, so
+// those recursive envelopes' proof bytes changed. (No `VERSION`/UNION/ANTI/OUTER bump: the list
+// walk is a recursive-only composite; the top-level BGP/join/semi-join envelopes never embed it.)
+pub(super) const RECURSIVE_VERSION: u32 = 33;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -638,12 +645,16 @@ wire_struct!(LeftAntiJoinProof {
 });
 wire_struct!(InnerJoinProof { anti, unmatched_left_commitments, unmatched_len });
 // The positional-successor primitive (`proof::sort`) consumed by the ordered `rdf:List` walk.
+// LogUp-GKR migration of the shift LogUp: the two committed reciprocal commitments
+// (`rec_c`/`rec_d`) and the multiset-link sumcheck (the whole `sumcheck`/`opening`) are gone;
+// a GKR fraction-tree proof (the SAME `sort_link_instance` as `SortedProof`) + the three link
+// data-column evaluations at the leaf point + one batched opening carry the range-free shift
+// link (`next` is the index-augmented one-step shift of `base` with committed `mult`).
 wire_struct!(crate::proof::sort::SuccessorProof {
-    sumcheck,
-    opening,
     mult_commitment,
-    rec_c_commitment,
-    rec_d_commitment
+    link,
+    link_col_evals,
+    link_opening
 });
 wire_struct!(TransitiveClosureRound {
     inner,

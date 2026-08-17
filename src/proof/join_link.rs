@@ -354,3 +354,162 @@ pub(crate) fn verify_join_link(
     verify_column_openings(&[*com_mult], &r_id, &id_evals, &proof.id_opening, transcript)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proof::argument::commit_column;
+    use dory_pcs::primitives::transcript::Transcript;
+
+    fn tr() -> Transcript254 {
+        Transcript254::new(b"parture-join-link-test")
+    }
+
+    /// Bind the committed columns and draw this link's `beta`/`alpha` AFTER them (the
+    /// primitive's caller contract). Prover and verifier call it identically.
+    fn prime(coms: &[ArkGT], t: &mut Transcript254) -> (ArkFr, ArkFr) {
+        for c in coms {
+            t.append_group(b"pow/join-link-test/com", c);
+        }
+        let beta = t.challenge_scalar(b"pow/join-link-test/beta");
+        let alpha = t.challenge_scalar(b"pow/join-link-test/alpha");
+        (alpha, beta)
+    }
+
+    /// A `#[cfg(test)]` mirror of [`prove_join_link_with_context`] for `s = 1` that accepts
+    /// an EXPLICIT low-half ramp, so a test can feed a FORGED ramp (production always feeds
+    /// the canonical `[0,1,..,domain-1]`). Everything else is identical to production.
+    #[allow(clippy::too_many_arguments)]
+    fn prove_local(
+        src_0: &[ArkFr],
+        mult: &[ArkFr],
+        cand_0: &[ArkFr],
+        cand_1: &[ArkFr],
+        n_src: usize,
+        m_j: usize,
+        alpha: ArkFr,
+        beta: ArkFr,
+        ramp_low: &[ArkFr],
+        transcript: &mut Transcript254,
+    ) -> io::Result<JoinLinkProof> {
+        let context = StoreProverContext::cpu();
+        let domain = mult.len();
+        let k = domain.trailing_zeros() as usize;
+        let leaf_count = 2 * domain;
+        let inst = join_link_instance(alpha, beta, 1, m_j, k);
+        let mut ramp = vec![f0(); leaf_count];
+        ramp[..domain].copy_from_slice(ramp_low);
+        let extended = vec![
+            low_half(src_0, leaf_count),
+            low_half(mult, leaf_count),
+            ramp,
+            high_half(cand_0, leaf_count),
+            high_half(cand_1, leaf_count),
+        ];
+        let (gkr, r_leaf) = prove_fraction_sum_zero(&inst, &extended, transcript)?;
+        let r_low = &r_leaf[..k];
+        let columns = vec![src_0.to_vec(), mult.to_vec(), cand_0.to_vec(), cand_1.to_vec()];
+        let col_evals: Vec<ArkFr> = columns.iter().map(|c| mle_full_eval(c, r_low)).collect();
+        let opening = context.prove_column_openings(&columns, r_low, transcript)?;
+        let id_shape = mult_mask_identity_shape(k, n_src);
+        let mult_col = vec![mult.to_vec()];
+        let (id_sumcheck, r_id, _e) = prove_sumcheck(&id_shape, &mult_col, transcript)?;
+        let id_opening = context.prove_column_openings(&mult_col, &r_id, transcript)?;
+        Ok(JoinLinkProof { gkr, col_evals, opening, id_sumcheck, id_opening })
+    }
+
+    #[test]
+    fn forged_ramp_is_rejected_by_leaf_tie() {
+        // The source index ramp (`beta^s·i`) is a PUBLIC half-scoped pseudo-column: the prover
+        // feeds `[0,1,..,domain-1]` into the tree, but it is NEVER committed or opened — the
+        // verifier RECONSTRUCTS its leaf-MLE as `(1 - r_high)·idx_eval(r_low)` and uses ONLY
+        // that in the leaf tie. This test shows a prover cannot control the ramp.
+        let fr = |v: u64| ArkFr::from_u64(v);
+        // s = 1 keyed join, domain 4. Candidates read source rows 0, 2, 0 (VALUE + pointer
+        // rho); mult is the per-source fan-out; ramp is the honest index [0,1,2,3].
+        let src_0 = [fr(10), fr(20), fr(30), fr(0)];
+        let mult = [fr(2), fr(0), fr(1), fr(0)];
+        let cand_0 = [fr(10), fr(30), fr(10), fr(0)]; // candidate VALUES
+        let cand_1 = [fr(0), fr(2), fr(0), fr(0)]; // candidate POINTERS rho (= matched source row)
+        let n_src = 3usize;
+        let m_j = 3usize;
+        let k = 2usize;
+        let honest_ramp = [fr(0), fr(1), fr(2), fr(3)];
+
+        let com_src_0 = commit_column(&src_0).unwrap();
+        let com_mult = commit_column(&mult).unwrap();
+        let com_cand_0 = commit_column(&cand_0).unwrap();
+        let com_cand_1 = commit_column(&cand_1).unwrap();
+        let coms = [com_src_0, com_mult, com_cand_0, com_cand_1];
+
+        let verify = |proof: &JoinLinkProof, a: ArkFr, b: ArkFr, vt: &mut Transcript254| {
+            verify_join_link(
+                &[com_src_0], &com_mult, &[com_cand_0, com_cand_1], n_src, m_j, a, b, k, proof, vt,
+            )
+        };
+
+        // Contrast: the honest ramp [0,1,2,3] verifies.
+        let mut pt = tr();
+        let (alpha, beta) = prime(&coms, &mut pt);
+        let honest =
+            prove_local(&src_0, &mult, &cand_0, &cand_1, n_src, m_j, alpha, beta, &honest_ramp, &mut pt)
+                .unwrap();
+        let mut vt = tr();
+        let (av, bv) = prime(&coms, &mut vt);
+        verify(&honest, av, bv, &mut vt).unwrap();
+
+        // (A) A naive FORGED ramp (index 2 changed 2 -> 5): the source pole for row 2 shifts,
+        // so candidate 1 (which pointed there) no longer matches — the multiset UNBALANCES, so
+        // the fraction-tree root `P != 0` and verify rejects. The verifier never trusts the fed
+        // ramp; because the ramp is not committed/opened, a naive substitution is caught at the
+        // ROOT check before the tie is reached.
+        let forged_ramp = [fr(0), fr(1), fr(5), fr(3)];
+        let mut pf = tr();
+        let (fa, fb) = prime(&coms, &mut pf);
+        let forged =
+            prove_local(&src_0, &mult, &cand_0, &cand_1, n_src, m_j, fa, fb, &forged_ramp, &mut pf)
+                .unwrap();
+        let mut vf = tr();
+        let (fav, fbv) = prime(&coms, &mut vf);
+        assert!(
+            verify(&forged, fav, fbv, &mut vf).is_err(),
+            "a fed ramp != the true index ramp must be rejected"
+        );
+
+        // (B) LEAF-TIE isolation: even a ramp compensated to keep the tree BALANCED cannot pass,
+        // because the verifier reconstructs the ramp INDEPENDENTLY. Re-derive the HONEST tree's
+        // reduced leaf claims, then show the tie ACCEPTS only the verifier's own reconstruction
+        // `(1 - r_high)·idx_eval(r_low)` and REJECTS any other ramp value with the leaf-tie error.
+        let mut bt = tr();
+        let (ba, bb) = prime(&coms, &mut bt);
+        let inst = join_link_instance(ba, bb, 1, m_j, k);
+        let (r_leaf, p_claim, q_claim) =
+            bind_and_verify_fraction_tree(&inst, &honest.gkr, &mut bt).unwrap();
+        let r_low = &r_leaf[..k];
+        let r_high = r_leaf[k];
+        let one_minus_high = f1() - r_high;
+        let build_leaf = |ramp_eval: ArkFr| -> Vec<ArkFr> {
+            vec![
+                one_minus_high * honest.col_evals[0], // src_0 (low)
+                one_minus_high * honest.col_evals[1], // mult (low)
+                ramp_eval,                            // ramp (public, low)
+                r_high * honest.col_evals[2],         // cand_0 (high)
+                r_high * honest.col_evals[3],         // cand_1 (high)
+            ]
+        };
+        // The verifier's OWN ramp reconstruction satisfies the tie.
+        let true_ramp_eval = one_minus_high * idx_eval(r_low);
+        check_leaf_tie(&inst, &build_leaf(true_ramp_eval), p_claim, q_claim, &r_leaf).unwrap();
+        // ANY other ramp value (here a +1 shift) breaks the tie: the reconstructed q_leaf no
+        // longer equals the tree's q_claim.
+        let wrong_ramp_eval = one_minus_high * (idx_eval(r_low) + f1());
+        assert_ne!(true_ramp_eval, wrong_ramp_eval);
+        let err = check_leaf_tie(&inst, &build_leaf(wrong_ramp_eval), p_claim, q_claim, &r_leaf)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("leaf tie"),
+            "a ramp != idx_eval(r_low) must be rejected by the leaf tie, got: {}",
+            err
+        );
+    }
+}

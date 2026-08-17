@@ -127,6 +127,10 @@ pub(crate) fn reciprocal_claim(
 /// When the reciprocals are pinned to `1/(alpha - fingerprint)`, this proves the
 /// two fingerprinted multisets are equal, which at random `alpha`/`beta` forces
 /// equal rows AND equal count.
+// Retained after the LogUp-GKR migration retired its last consumer (the sort/successor
+// shift-link `SortedProof`/`SuccessorProof`): this is the reciprocal-era reference for the
+// still-pending reconcile-link (masked/signed) migration; logup.rs is retired wholesale then.
+#[allow(dead_code)]
 pub(crate) fn multiset_link_claim(
     in_mult: Operand,
     in_rec: usize,
@@ -142,6 +146,7 @@ pub(crate) fn multiset_link_claim(
 /// SOURCE/UNIVERSE side by its `chi_{real_len}` keeps padding rows
 /// `[real_len, domain)` from acting as free poles a prover could exploit to inject
 /// fabricated members or split a duplicate stashed in the padding tail.
+#[allow(dead_code)] // see multiset_link_claim: reciprocal-era reference for the reconcile migration
 pub(crate) fn masked_multiset_link_claim(
     in_mask: &[Operand],
     in_rec: usize,

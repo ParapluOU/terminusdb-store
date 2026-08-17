@@ -2017,6 +2017,77 @@ mod object_range_tests {
     }
 
     #[test]
+    fn dict_padding_w_forge_is_rejected_via_identity() {
+        // Defense-in-depth for the GAP-1 closure: the co-running auxiliary Identity
+        // `(1 - χ_{n_dict})·w = 0` pins the committed multiplicity `w` to ZERO on the dict
+        // PADDING tail `[n_dict, domain)` UNCONDITIONALLY (arbitrary, non-power-of-two
+        // `n_dict`). The existing lookup negatives reject a forged padding-`w` via an UNMATCHED
+        // pole at `α` (the 0-sentinel dict tail); THIS test isolates the Identity by crafting
+        // the padding row to DUPLICATE a real dict entry, so the fraction tree still BALANCES
+        // (root `P = 0`, leaf tie + all openings pass) and the ONLY check left to reject the
+        // stashed padding weight is the Identity.
+        let d = |v: u64| ArkFr::from_u64(v);
+        // Synthetic dict (domain 4, n_dict = 2 real rows): row 2 is a PADDING row (>= n_dict)
+        // crafted to EQUAL real row 0's (id, value, datatype); row 3 is the 0-sentinel.
+        let dict_id = [d(100), d(200), d(100), d(0)];
+        let dict_value = [d(11), d(22), d(11), d(0)];
+        let dict_datatype = [d(1), d(1), d(1), d(0)];
+        let n_dict = 2usize;
+        let com_id = commit(&dict_id);
+        let com_value = commit(&dict_value);
+        let com_datatype = commit(&dict_datatype);
+
+        // One real query row reading dict id 100 (matched by BOTH real row 0 and dup row 2).
+        let obj_id = [d(100), d(0), d(0), d(0)];
+        let real_n = 1usize;
+        let com_obj_id = commit(&obj_id);
+
+        let (v_val, v_dt, honest_w) =
+            honest_dict_lookup(&obj_id, &dict_id, &dict_value, &dict_datatype, real_n, n_dict);
+        // Honest weight lands on the REAL row 0; the padding tail [n_dict, domain) is zero.
+        assert_eq!(honest_w, vec![d(1), d(0), d(0), d(0)]);
+
+        // Contrast: the honest witness verifies.
+        let mut pt = transcript();
+        let honest = prove_dict_value_lookup_with_witness(
+            &obj_id, &com_obj_id, &v_val, &v_dt, &honest_w, &dict_id, &dict_value, &dict_datatype,
+            &com_id, &com_value, &com_datatype, real_n, n_dict, &mut pt,
+        )
+        .unwrap();
+        let mut vt = transcript();
+        verify_dict_value_lookup(
+            &com_obj_id, &com_id, &com_value, &com_datatype, real_n, n_dict, &honest, &mut vt,
+        )
+        .unwrap();
+
+        // FORGE: move the fan-out off real row 0 onto the crafted duplicate padding row 2. The
+        // query pole is STILL matched (dup row 2 has the identical fold), so the multiset sum
+        // is still zero and the tree/leaf tie pass — but `w` now carries weight at index 2,
+        // which is `>= n_dict`, violating the Identity.
+        let forged_w = [d(0), d(0), d(1), d(0)];
+        let mut pt2 = transcript();
+        let forged = prove_dict_value_lookup_with_witness(
+            &obj_id, &com_obj_id, &v_val, &v_dt, &forged_w, &dict_id, &dict_value, &dict_datatype,
+            &com_id, &com_value, &com_datatype, real_n, n_dict, &mut pt2,
+        )
+        .unwrap();
+        let mut vt2 = transcript();
+        let err = verify_dict_value_lookup(
+            &com_obj_id, &com_id, &com_value, &com_datatype, real_n, n_dict, &forged, &mut vt2,
+        )
+        .unwrap_err();
+        // The tree root (`P = 0`) and the leaf tie PASSED (the dup padding row balanced the
+        // multiset); rejection came from the auxiliary `(1 - χ_{n_dict})·w = 0` Identity, NOT
+        // from the root check or the leaf tie.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("root numerator") && !msg.contains("leaf tie"),
+            "expected the (1 - χ_n_dict)·w = 0 Identity to reject the padding-row w, got: {}",
+            msg
+        );
+    }
+
+    #[test]
     fn lookup_rejects_wrong_v_dt() {
         // Same, but forging the DATATYPE of a real obj_id -> unmatched pole -> reject.
         let fx = build_dict_fixture();
