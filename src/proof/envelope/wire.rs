@@ -73,6 +73,7 @@ use crate::proof::filter::{
 };
 use crate::proof::group::{GroupExtremaEntryProof, GroupExtremaKind, GroupExtremaProof};
 use crate::proof::join2::{BinaryJoinCommitments, BinaryJoinProof, BinaryPairsProof};
+use crate::proof::join_link::JoinLinkProof;
 use crate::proof::membership::MembershipProof;
 use crate::proof::multiorder::{prove_exact_multi_order_with_context, verify_exact_multi_order, ExactMultiOrderProof};
 use crate::proof::lexsort::LexicographicSortedProof;
@@ -154,10 +155,19 @@ pub(super) fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
 // `ObjectRangeProof`→`DictLookupProof`); the ANTI/OUTER envelopes embed a `CompactionOnlyProof`
 // directly (`LeftAntiJoinProof.compaction`); UNION wraps `LayerBgpEnvelope` branches. So all
 // four bump in lockstep (established convention).
-pub(super) const VERSION: u32 = 10;
-pub(super) const UNION_VERSION: u32 = 8;
-pub(super) const ANTI_VERSION: u32 = 10;
-pub(super) const OUTER_VERSION: u32 = 7;
+// v11: LogUp-GKR migration of the keyed-join LINKS (Inc 3) — `BinaryPairsProof` (embedded in
+// every `BinaryJoinProof`, i.e. every multi-atom BGP join stage) dropped its four committed
+// reciprocal GT commitments (`rec_src_l`/`rec_cand_l`/`rec_src_r`/`rec_cand_r`) and the batched
+// membership sumcheck for two block-disjoint GKR fraction-tree links (`JoinLinkProof` × LEFT/
+// RIGHT: each a GKR tree + committed-column leaf evaluations + one batched opening + a co-running
+// `(1 − χ_{n_R|n_S})·mult = 0` GAP-1 Identity sumcheck and its `mult` opening). The embedded
+// `SortedProof`/`membership`/`count` are unchanged (already migrated). Every multi-atom BGP join
+// has different proof bytes; the UNION/ANTI/OUTER envelopes embed the same BGP chain / semi-join,
+// so all four bump in lockstep.
+pub(super) const VERSION: u32 = 11;
+pub(super) const UNION_VERSION: u32 = 9;
+pub(super) const ANTI_VERSION: u32 = 11;
+pub(super) const OUTER_VERSION: u32 = 8;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
 // v23 adds the ordered `sys:Array` walk composite node (tag 24).
@@ -189,7 +199,10 @@ pub(super) const OUTER_VERSION: u32 = 7;
 // `ObjectRangeProof`→`DictLookupProof` bytes changed, and the ordered `OrderedArrayWalk` /
 // list-walk composites embed a `DictLookupProof` directly, whose committed reciprocals
 // (`rec_q`/`rec_d`) + link sumcheck became a GKR fraction tree + GAP-1 Identity.
-pub(super) const RECURSIVE_VERSION: u32 = 30;
+// v31: LogUp-GKR keyed-join LINK migration (see the `VERSION` v11 note) — recursive envelopes
+// embed BGP-chain leaves (join2's two keyed-join links), whose four committed reciprocals +
+// batched membership sumcheck became two `JoinLinkProof` GKR fraction trees + GAP-1 Identities.
+pub(super) const RECURSIVE_VERSION: u32 = 31;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -715,15 +728,23 @@ wire_struct!(BinaryJoinCommitments {
     w_l,
     w_r
 });
+// LogUp-GKR migration of the keyed-join links (Inc 3): `BinaryPairsProof` dropped its four
+// committed reciprocal GT commitments (`rec_src_l`/`rec_cand_l`/`rec_src_r`/`rec_cand_r`) and
+// the batched membership sumcheck for two block-disjoint GKR fraction-tree links (each a
+// `JoinLinkProof`: GKR tree + committed-column leaf evaluations + one batched opening + a
+// co-running `(1 - chi_{n_R|n_S})*mult = 0` GAP-1 Identity sumcheck and its `mult` opening).
+wire_struct!(JoinLinkProof {
+    gkr,
+    col_evals,
+    opening,
+    id_sumcheck,
+    id_opening
+});
 wire_struct!(BinaryPairsProof {
-    membership_sumcheck,
-    membership_opening,
     mult_l_commitment,
     mult_r_commitment,
-    rec_src_l_commitment,
-    rec_cand_l_commitment,
-    rec_src_r_commitment,
-    rec_cand_r_commitment,
+    link_l,
+    link_r,
     sorted
 });
 wire_struct!(BinaryJoinProof {

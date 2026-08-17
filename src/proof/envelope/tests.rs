@@ -496,20 +496,21 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         use sha2::Digest as _;
         let hash = sha2::Sha256::digest(&bytes);
         let hash_hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        assert_eq!(bytes.len(), 165762, "materialized proof byte length changed");
-        // Hash + length regenerated for the LogUp-GKR migration of the sort SHIFT LogUp: the
-        // two-atom join's `join2` proof embeds a `SortedProof` on the sorted key column, which
-        // dropped its two committed reciprocal GT commitments (`rec_c`/`rec_d`) and the multiset-
-        // link sumcheck for a block-disjoint GKR fraction-tree proof (`U_shift` is the index-
-        // augmented one-step shift of `U` with committed multiplicity `mult_c`) + the three link
-        // data-column leaf evaluations + a second batched opening. The RANGE sub-proof (booleanity
-        // + recomposition) is unchanged. The proof bytes (structure AND transcript-derived
-        // challenges) shifted while prover↔verifier still agree; the byte length rose (158104 ->
-        // 165762: the GKR rounds + the extra link opening/evals outweigh the two dropped GT
-        // commitments). Intended, verified new stable image.
+        assert_eq!(bytes.len(), 177241, "materialized proof byte length changed");
+        // Hash + length regenerated for the LogUp-GKR migration of the KEYED-JOIN LINKS (Inc 3):
+        // the two-atom join's `join2` proof (`BinaryPairsProof`) dropped its FOUR committed
+        // reciprocal GT commitments (`rec_src_l`/`rec_cand_l`/`rec_src_r`/`rec_cand_r`) and the
+        // batched membership sumcheck for two block-disjoint GKR fraction-tree links (each a
+        // `JoinLinkProof`: GKR tree + committed-column leaf evaluations + one batched opening + a
+        // co-running `(1 − χ_{n_R|n_S})·mult = 0` GAP-1 Identity sumcheck and its `mult` opening).
+        // The embedded `SortedProof`/`membership`/`count` are unchanged (already migrated). The
+        // proof bytes (structure AND transcript-derived challenges) shifted while prover↔verifier
+        // still agree; the byte length rose (165762 -> 177241: the two GKR trees' rounds + the two
+        // link openings/evals + two Identity sumchecks outweigh the four dropped GT commitments).
+        // Intended, verified new stable image.
         assert_eq!(
             hash_hex,
-            "daecc97daef98ca8f81b98d10424d454df7a73a684edeab102f6415869d53a92",
+            "cda5dc8e1141bfb1423e808d5c574308850ef4650ba89da4f4ab93bafb908afa",
             "materialized multi-atom proof transcript/commitments changed (byte-identity regression)"
         );
     }

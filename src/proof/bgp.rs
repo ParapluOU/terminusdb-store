@@ -1119,9 +1119,9 @@ mod tests {
 
     #[test]
     fn stage_join_domain_must_equal_relocation_target_domain() {
-        // Honest chain, then drop one round polynomial from stage 0's pairs-membership
-        // sumcheck so the join's reported num_vars no longer equals the relocation
-        // TARGET domain d_j_log. The EXPLICIT per-stage domain check must reject it
+        // Honest chain, then drop one GKR layer from stage 0's LEFT keyed-join link so the
+        // join's reported num_vars (= link_l.gkr.num_vars() - 1) no longer equals the
+        // relocation TARGET domain d_j_log. The EXPLICIT per-stage domain check must reject it
         // (and it fires before the relocations / join, so the specific error surfaces).
         let (rels, plan) = path_chain();
         let views: Vec<RelationCommit> = rels.iter().map(|r| r.view()).collect();
@@ -1136,8 +1136,9 @@ mod tests {
         tampered.stages[0]
             .join
             .pairs
-            .membership_sumcheck
-            .round_polys
+            .link_l
+            .gkr
+            .layers
             .pop();
         let mut vt2 = transcript();
         let err = verify_bgp_chain(&views, &plan, &tampered, &mut vt2).unwrap_err();

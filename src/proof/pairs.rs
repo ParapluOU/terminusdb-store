@@ -41,35 +41,12 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::{Field, Group};
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::{
-    prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
-    SumcheckShape, Term, Transcript254,
-};
+use super::argument::{StoreProverContext, Transcript254};
 #[cfg(test)]
 use super::argument::commit_column;
 use super::invalid;
-use super::logup::{masked_multiset_link_claim, reciprocal_witness, rlc_fold};
+use super::join_link::{prove_join_link_with_context, verify_join_link, JoinLinkProof};
 use super::sort::{prove_strictly_sorted_with_context, verify_strictly_sorted, SortedProof};
-
-const COL_SF: usize = 0;
-const COL_OF: usize = 1;
-const COL_X: usize = 2;
-const COL_Y: usize = 3;
-const COL_Z: usize = 4;
-const COL_RHO_L: usize = 5;
-const COL_RHO_R: usize = 6;
-const COL_MULT_L_IN: usize = 7;
-const COL_MULT_R_IN: usize = 8;
-const COL_REC_SRC_L: usize = 9;
-const COL_REC_CAND_L: usize = 10;
-const COL_REC_SRC_R: usize = 11;
-const COL_REC_CAND_R: usize = 12;
-const NUM_COLUMNS: usize = 13;
-// chi_bounds indices: chi_{m_J} (candidate/output real length) and chi_{n_F} (source
-// real length; masks padding F-rows out of the SOURCE side of each link).
-const CHI_MJ: usize = 0;
-const CHI_NF: usize = 1;
 
 const LABEL_BETA_L: &[u8] = b"pow/pairs/left-beta";
 const LABEL_ALPHA_L: &[u8] = b"pow/pairs/left-alpha";
@@ -80,24 +57,19 @@ const LABEL_ALPHA_R: &[u8] = b"pow/pairs/right-alpha";
 fn f0() -> ArkFr {
     ArkFr::zero()
 }
-#[inline]
-fn f1() -> ArkFr {
-    ArkFr::one()
-}
 
-/// A distinct-valid-pairs proof: the batched index-augmented membership sumcheck
-/// (left + right) with its batched Dory opening, the multiplicity + reciprocal
-/// commitments, and the combined-index strict-monotonicity subproof.
+/// A distinct-valid-pairs proof (LogUp-GKR): the two committed source-multiplicity
+/// commitments, the LEFT + RIGHT keyed-join links (each a block-disjoint GKR fraction
+/// tree + committed-column opening + co-running `(1 - chi_{n_F})*mult = 0` Identity;
+/// see [`JoinLinkProof`]), and the combined-index strict-monotonicity subproof. The
+/// four committed reciprocal columns (`rec_src_l`/`rec_cand_l`/`rec_src_r`/`rec_cand_r`)
+/// and the batched membership sumcheck are GONE.
 #[derive(Clone, Debug)]
 pub struct PairsProof {
-    pub membership_sumcheck: SumcheckProof,
-    pub membership_opening: ColumnOpening,
     pub mult_l_in_commitment: ArkGT,
     pub mult_r_in_commitment: ArkGT,
-    pub rec_src_l_commitment: ArkGT,
-    pub rec_cand_l_commitment: ArkGT,
-    pub rec_src_r_commitment: ArkGT,
-    pub rec_cand_r_commitment: ArkGT,
+    pub link_l: JoinLinkProof,
+    pub link_r: JoinLinkProof,
     pub sorted: SortedProof,
 }
 
@@ -120,100 +92,6 @@ fn padded(column: &[ArkFr], n: usize) -> Vec<ArkFr> {
     let mut out = column.to_vec();
     out.resize(n, f0());
     out
-}
-
-/// `rec_col * (alpha - Sum coeff*operand) - 1 = 0`, an Identity claim pinning a
-/// committed reciprocal over an arbitrary multilinear fold (columns and `Idx`).
-fn reciprocal_fold_claim(rec_col: usize, fold: &[(ArkFr, Operand)], alpha: ArkFr) -> SumcheckClaim {
-    let mut terms = vec![Term {
-        coeff: alpha,
-        operands: vec![Operand::Column(rec_col)],
-    }];
-    for (coeff, operand) in fold {
-        terms.push(Term {
-            coeff: f0() - *coeff,
-            operands: vec![Operand::Column(rec_col), *operand],
-        });
-    }
-    terms.push(Term {
-        coeff: f0() - f1(),
-        operands: Vec::new(),
-    });
-    SumcheckClaim {
-        shape: ClaimShape::Identity,
-        expr: Expr { terms },
-        target: f0(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn membership_shape(
-    k: usize,
-    m_j: usize,
-    n_f: usize,
-    alpha_l: ArkFr,
-    beta_l: ArkFr,
-    alpha_r: ArkFr,
-    beta_r: ArkFr,
-) -> SumcheckShape {
-    let beta_l2 = beta_l * beta_l;
-    let beta_r2 = beta_r * beta_r;
-    // LEFT: source (Sf, Of, idx); candidate (X, Y, rho_l).
-    let src_l = reciprocal_fold_claim(
-        COL_REC_SRC_L,
-        &[
-            (f1(), Operand::Column(COL_SF)),
-            (beta_l, Operand::Column(COL_OF)),
-            (beta_l2, Operand::Idx),
-        ],
-        alpha_l,
-    );
-    let cand_l = reciprocal_fold_claim(
-        COL_REC_CAND_L,
-        &[
-            (f1(), Operand::Column(COL_X)),
-            (beta_l, Operand::Column(COL_Y)),
-            (beta_l2, Operand::Column(COL_RHO_L)),
-        ],
-        alpha_l,
-    );
-    let link_l = masked_multiset_link_claim(
-        &[Operand::Chi(CHI_MJ)],
-        COL_REC_CAND_L,
-        &[Operand::Chi(CHI_NF), Operand::Column(COL_MULT_L_IN)],
-        COL_REC_SRC_L,
-    );
-    // RIGHT: source (Sf, Of, idx); candidate (Y, Z, rho_r).
-    let src_r = reciprocal_fold_claim(
-        COL_REC_SRC_R,
-        &[
-            (f1(), Operand::Column(COL_SF)),
-            (beta_r, Operand::Column(COL_OF)),
-            (beta_r2, Operand::Idx),
-        ],
-        alpha_r,
-    );
-    let cand_r = reciprocal_fold_claim(
-        COL_REC_CAND_R,
-        &[
-            (f1(), Operand::Column(COL_Y)),
-            (beta_r, Operand::Column(COL_Z)),
-            (beta_r2, Operand::Column(COL_RHO_R)),
-        ],
-        alpha_r,
-    );
-    let link_r = masked_multiset_link_claim(
-        &[Operand::Chi(CHI_MJ)],
-        COL_REC_CAND_R,
-        &[Operand::Chi(CHI_NF), Operand::Column(COL_MULT_R_IN)],
-        COL_REC_SRC_R,
-    );
-    SumcheckShape {
-        num_vars: k,
-        num_columns: NUM_COLUMNS,
-        chi_bounds: vec![m_j, n_f],
-        claims: vec![src_l, cand_l, link_l, src_r, cand_r, link_r],
-    }
 }
 
 /// Source multiplicity `mult[a] = #{ k < m_j : rho[k] == a }` over the domain.
@@ -470,13 +348,13 @@ pub(crate) fn prove_distinct_valid_pairs_with_witness_and_context(
     if n_f > n || m_j > n {
         return Err(invalid("pairs real length exceeds the domain"));
     }
-    let k = n.trailing_zeros() as usize;
-    let idx_p: Vec<ArkFr> = (0..n).map(|i| ArkFr::from_u64(i as u64)).collect();
-
     let mult_l_in_commitment = context.commit_column(mult_l_in)?;
     let mult_r_in_commitment = context.commit_column(mult_r_in)?;
 
-    // Round 1: bind the given columns + multiplicities, draw fresh challenges.
+    // Round 1: bind the given columns + multiplicities, draw fresh challenges. NO reciprocal
+    // column is committed anymore (both links are GKR fraction trees over uncommitted
+    // intermediates), so alpha/beta are drawn here AFTER every data-column commitment — the
+    // primitive's caller contract (leaves fixed before any per-layer GKR challenge).
     transcript.append_group(b"pow/pairs/com-sf", com_sf);
     transcript.append_group(b"pow/pairs/com-of", com_of);
     transcript.append_group(b"pow/pairs/com-x", com_x);
@@ -491,38 +369,31 @@ pub(crate) fn prove_distinct_valid_pairs_with_witness_and_context(
     let beta_r = transcript.challenge_scalar(LABEL_BETA_R);
     let alpha_r = transcript.challenge_scalar(LABEL_ALPHA_R);
 
-    // Round 2: reciprocal witnesses over the 3-column fingerprints.
-    let rec_src_l = reciprocal_witness(alpha_l, &rlc_fold(beta_l, &[sf_p, of_p, &idx_p]));
-    let rec_cand_l = reciprocal_witness(alpha_l, &rlc_fold(beta_l, &[x_p, y_p, rho_l_p]));
-    let rec_src_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &[sf_p, of_p, &idx_p]));
-    let rec_cand_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &[y_p, z_p, rho_r_p]));
-    let rec_src_l_commitment = context.commit_column(&rec_src_l)?;
-    let rec_cand_l_commitment = context.commit_column(&rec_cand_l)?;
-    let rec_src_r_commitment = context.commit_column(&rec_src_r)?;
-    let rec_cand_r_commitment = context.commit_column(&rec_cand_r)?;
-    transcript.append_group(b"pow/pairs/com-rec-src-l", &rec_src_l_commitment);
-    transcript.append_group(b"pow/pairs/com-rec-cand-l", &rec_cand_l_commitment);
-    transcript.append_group(b"pow/pairs/com-rec-src-r", &rec_src_r_commitment);
-    transcript.append_group(b"pow/pairs/com-rec-cand-r", &rec_cand_r_commitment);
-
-    let shape = membership_shape(k, m_j, n_f, alpha_l, beta_l, alpha_r, beta_r);
-    let columns = vec![
-        sf_p.to_vec(),
-        of_p.to_vec(),
-        x_p.to_vec(),
-        y_p.to_vec(),
-        z_p.to_vec(),
-        rho_l_p.to_vec(),
-        rho_r_p.to_vec(),
-        mult_l_in.to_vec(),
-        mult_r_in.to_vec(),
-        rec_src_l,
-        rec_cand_l,
-        rec_src_r,
-        rec_cand_r,
-    ];
-    let (membership_sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let membership_opening = context.prove_column_openings(&columns, &r, transcript)?;
+    // LEFT link: index-augmented membership of candidate (X, Y, rho_l) in source
+    // {(Sf, Of, idx)} weighted by mult_l (source masked chi_{n_F}, candidate masked chi_{m_J}).
+    let link_l = prove_join_link_with_context(
+        context,
+        &[sf_p, of_p],
+        mult_l_in,
+        &[x_p, y_p, rho_l_p],
+        n_f,
+        m_j,
+        alpha_l,
+        beta_l,
+        transcript,
+    )?;
+    // RIGHT link: candidate (Y, Z, rho_r) in source {(Sf, Of, idx)} weighted by mult_r.
+    let link_r = prove_join_link_with_context(
+        context,
+        &[sf_p, of_p],
+        mult_r_in,
+        &[y_p, z_p, rho_r_p],
+        n_f,
+        m_j,
+        alpha_r,
+        beta_r,
+        transcript,
+    )?;
 
     // Combined-index strict monotonicity: i_eval = C*rho_l + rho_r.
     let radix = ArkFr::from_u64(combined_index_radix(n_f)? as u64);
@@ -534,14 +405,10 @@ pub(crate) fn prove_distinct_valid_pairs_with_witness_and_context(
         prove_strictly_sorted_with_context(context, &i_eval, m_j, &com_i_eval, transcript)?;
 
     Ok(PairsProof {
-        membership_sumcheck,
-        membership_opening,
         mult_l_in_commitment,
         mult_r_in_commitment,
-        rec_src_l_commitment,
-        rec_cand_l_commitment,
-        rec_src_r_commitment,
-        rec_cand_r_commitment,
+        link_l,
+        link_r,
         sorted,
     })
 }
@@ -561,10 +428,14 @@ pub fn verify_distinct_valid_pairs(
     proof: &PairsProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    let k = proof.membership_sumcheck.round_polys.len();
-    if k == 0 || k >= usize::BITS as usize {
+    // The domain is re-derived from the LEFT link's GKR tree (k + 1 layers over a
+    // 2*domain leaf vector); the RIGHT link's own layer count is cross-checked to `k`
+    // inside `verify_join_link`, and both links re-anchor `k` via their column openings.
+    let num_vars = proof.link_l.gkr.num_vars();
+    if num_vars < 2 || num_vars >= usize::BITS as usize {
         return Err(invalid("pairs proof has an implausible variable count"));
     }
+    let k = num_vars - 1;
     if n_f > (1usize << k) || m_j > (1usize << k) {
         return Err(invalid("real length exceeds the pairs domain"));
     }
@@ -582,32 +453,31 @@ pub fn verify_distinct_valid_pairs(
     let alpha_l = transcript.challenge_scalar(LABEL_ALPHA_L);
     let beta_r = transcript.challenge_scalar(LABEL_BETA_R);
     let alpha_r = transcript.challenge_scalar(LABEL_ALPHA_R);
-    transcript.append_group(b"pow/pairs/com-rec-src-l", &proof.rec_src_l_commitment);
-    transcript.append_group(b"pow/pairs/com-rec-cand-l", &proof.rec_cand_l_commitment);
-    transcript.append_group(b"pow/pairs/com-rec-src-r", &proof.rec_src_r_commitment);
-    transcript.append_group(b"pow/pairs/com-rec-cand-r", &proof.rec_cand_r_commitment);
 
-    let shape = membership_shape(k, m_j, n_f, alpha_l, beta_l, alpha_r, beta_r);
-    let (r, evals) = verify_sumcheck(&shape, &proof.membership_sumcheck, transcript)?;
-    verify_column_openings(
-        &[
-            *com_sf,
-            *com_of,
-            *com_x,
-            *com_y,
-            *com_z,
-            *com_rho_l,
-            *com_rho_r,
-            proof.mult_l_in_commitment,
-            proof.mult_r_in_commitment,
-            proof.rec_src_l_commitment,
-            proof.rec_cand_l_commitment,
-            proof.rec_src_r_commitment,
-            proof.rec_cand_r_commitment,
-        ],
-        &r,
-        &evals,
-        &proof.membership_opening,
+    // LEFT link: candidate (X, Y, rho_l) in source {(Sf, Of, idx)} weighted by mult_l.
+    verify_join_link(
+        &[*com_sf, *com_of],
+        &proof.mult_l_in_commitment,
+        &[*com_x, *com_y, *com_rho_l],
+        n_f,
+        m_j,
+        alpha_l,
+        beta_l,
+        k,
+        &proof.link_l,
+        transcript,
+    )?;
+    // RIGHT link: candidate (Y, Z, rho_r) in source {(Sf, Of, idx)} weighted by mult_r.
+    verify_join_link(
+        &[*com_sf, *com_of],
+        &proof.mult_r_in_commitment,
+        &[*com_y, *com_z, *com_rho_r],
+        n_f,
+        m_j,
+        alpha_r,
+        beta_r,
+        k,
+        &proof.link_r,
         transcript,
     )?;
 

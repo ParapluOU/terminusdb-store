@@ -33,16 +33,12 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::{Field, Group};
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::argument::{
-    prove_sumcheck, verify_column_openings, verify_sumcheck,
-    ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
-    SumcheckShape, Term, Transcript254,
-};
+use super::argument::{StoreProverContext, Transcript254};
 #[cfg(test)]
 use super::argument::commit_column;
 use super::count::{prove_count_identity_with_context, verify_count_identity, CountProof};
 use super::invalid;
-use super::logup::{masked_multiset_link_claim, reciprocal_witness, rlc_fold};
+use super::join_link::{prove_join_link_with_context, verify_join_link, JoinLinkProof};
 use super::membership::{
     prove_membership_with_mult_with_witness_and_context, verify_membership_with_mult,
     MembershipProof,
@@ -57,10 +53,6 @@ fn f0() -> ArkFr {
     ArkFr::zero()
 }
 #[inline]
-fn f1() -> ArkFr {
-    ArkFr::one()
-}
-#[inline]
 fn fr(v: usize) -> ArkFr {
     ArkFr::from_u64(v as u64)
 }
@@ -69,72 +61,6 @@ fn padded(column: &[ArkFr], n: usize) -> Vec<ArkFr> {
     let mut out = column.to_vec();
     out.resize(n, f0());
     out
-}
-
-// chi_bounds indices for the distinct-valid-pairs shape.
-const CHI_MJ: usize = 0;
-const CHI_NR: usize = 1;
-const CHI_NS: usize = 2;
-
-/// The dynamic column layout of the binary distinct-valid-pairs sumcheck. `p` =
-/// #r_other columns, `q` = #s_other columns. Order:
-/// `[r_key, r_other.., s_key, s_other.., r_other_out.., key, s_other_out.., rho_l,
-///   rho_r, mult_l, mult_r, rec_src_l, rec_cand_l, rec_src_r, rec_cand_r]`.
-#[derive(Clone, Copy)]
-struct Layout {
-    p: usize,
-    q: usize,
-}
-
-impl Layout {
-    fn r_key(&self) -> usize {
-        0
-    }
-    fn r_other(&self, d: usize) -> usize {
-        1 + d
-    }
-    fn s_key(&self) -> usize {
-        1 + self.p
-    }
-    fn s_other(&self, d: usize) -> usize {
-        2 + self.p + d
-    }
-    fn r_other_out(&self, d: usize) -> usize {
-        2 + self.p + self.q + d
-    }
-    fn key(&self) -> usize {
-        2 + 2 * self.p + self.q
-    }
-    fn s_other_out(&self, d: usize) -> usize {
-        3 + 2 * self.p + self.q + d
-    }
-    fn rho_l(&self) -> usize {
-        3 + 2 * self.p + 2 * self.q
-    }
-    fn rho_r(&self) -> usize {
-        4 + 2 * self.p + 2 * self.q
-    }
-    fn mult_l(&self) -> usize {
-        5 + 2 * self.p + 2 * self.q
-    }
-    fn mult_r(&self) -> usize {
-        6 + 2 * self.p + 2 * self.q
-    }
-    fn rec_src_l(&self) -> usize {
-        7 + 2 * self.p + 2 * self.q
-    }
-    fn rec_cand_l(&self) -> usize {
-        8 + 2 * self.p + 2 * self.q
-    }
-    fn rec_src_r(&self) -> usize {
-        9 + 2 * self.p + 2 * self.q
-    }
-    fn rec_cand_r(&self) -> usize {
-        10 + 2 * self.p + 2 * self.q
-    }
-    fn num_columns(&self) -> usize {
-        11 + 2 * self.p + 2 * self.q
-    }
 }
 
 /// The shared power-of-two domain (`>= 2`) onto which every join column is padded.
@@ -159,116 +85,6 @@ pub(crate) fn combined_index_radix(n_r: usize, n_s: usize) -> io::Result<usize> 
         .checked_next_power_of_two()
         .ok_or_else(|| invalid("combined-index radix overflow"))
         .map(|c| c.max(1))
-}
-
-/// `rec_col * (alpha - Σ coeff*operand) - 1 = 0`.
-fn reciprocal_fold_claim(rec_col: usize, fold: &[(ArkFr, Operand)], alpha: ArkFr) -> SumcheckClaim {
-    let mut terms = vec![Term {
-        coeff: alpha,
-        operands: vec![Operand::Column(rec_col)],
-    }];
-    for (coeff, operand) in fold {
-        terms.push(Term {
-            coeff: f0() - *coeff,
-            operands: vec![Operand::Column(rec_col), *operand],
-        });
-    }
-    terms.push(Term {
-        coeff: f0() - f1(),
-        operands: Vec::new(),
-    });
-    SumcheckClaim {
-        shape: ClaimShape::Identity,
-        expr: Expr { terms },
-        target: f0(),
-    }
-}
-
-/// `beta`-power fold `[(1, ops[0]), (beta, ops[1]), ..]`.
-fn power_fold(beta: ArkFr, operands: &[Operand]) -> Vec<(ArkFr, Operand)> {
-    let mut out = Vec::with_capacity(operands.len());
-    let mut power = f1();
-    for op in operands {
-        out.push((power, *op));
-        power = power * beta;
-    }
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
-fn binary_pairs_shape(
-    layout: &Layout,
-    num_vars: usize,
-    m_j: usize,
-    n_r: usize,
-    n_s: usize,
-    alpha_l: ArkFr,
-    beta_l: ArkFr,
-    alpha_r: ArkFr,
-    beta_r: ArkFr,
-) -> SumcheckShape {
-    // LEFT fold order: [r_other_0.., r_key, idx] for the source; the candidate uses
-    // [r_other_out_0.., key, rho_l] with the SAME powers.
-    let mut left_src_ops: Vec<Operand> = (0..layout.p)
-        .map(|d| Operand::Column(layout.r_other(d)))
-        .collect();
-    left_src_ops.push(Operand::Column(layout.r_key()));
-    left_src_ops.push(Operand::Idx);
-    let mut left_cand_ops: Vec<Operand> = (0..layout.p)
-        .map(|d| Operand::Column(layout.r_other_out(d)))
-        .collect();
-    left_cand_ops.push(Operand::Column(layout.key()));
-    left_cand_ops.push(Operand::Column(layout.rho_l()));
-
-    // RIGHT fold order: [s_key, s_other_0.., idx] and [key, s_other_out_0.., rho_r].
-    let mut right_src_ops: Vec<Operand> = vec![Operand::Column(layout.s_key())];
-    right_src_ops.extend((0..layout.q).map(|d| Operand::Column(layout.s_other(d))));
-    right_src_ops.push(Operand::Idx);
-    let mut right_cand_ops: Vec<Operand> = vec![Operand::Column(layout.key())];
-    right_cand_ops.extend((0..layout.q).map(|d| Operand::Column(layout.s_other_out(d))));
-    right_cand_ops.push(Operand::Column(layout.rho_r()));
-
-    let src_l = reciprocal_fold_claim(
-        layout.rec_src_l(),
-        &power_fold(beta_l, &left_src_ops),
-        alpha_l,
-    );
-    let cand_l = reciprocal_fold_claim(
-        layout.rec_cand_l(),
-        &power_fold(beta_l, &left_cand_ops),
-        alpha_l,
-    );
-    // Source side masked by chi_{n_R} (audit fix: don't regress source masking).
-    let link_l = masked_multiset_link_claim(
-        &[Operand::Chi(CHI_MJ)],
-        layout.rec_cand_l(),
-        &[Operand::Chi(CHI_NR), Operand::Column(layout.mult_l())],
-        layout.rec_src_l(),
-    );
-
-    let src_r = reciprocal_fold_claim(
-        layout.rec_src_r(),
-        &power_fold(beta_r, &right_src_ops),
-        alpha_r,
-    );
-    let cand_r = reciprocal_fold_claim(
-        layout.rec_cand_r(),
-        &power_fold(beta_r, &right_cand_ops),
-        alpha_r,
-    );
-    let link_r = masked_multiset_link_claim(
-        &[Operand::Chi(CHI_MJ)],
-        layout.rec_cand_r(),
-        &[Operand::Chi(CHI_NS), Operand::Column(layout.mult_r())],
-        layout.rec_src_r(),
-    );
-
-    SumcheckShape {
-        num_vars,
-        num_columns: layout.num_columns(),
-        chi_bounds: vec![m_j, n_r, n_s],
-        claims: vec![src_l, cand_l, link_l, src_r, cand_r, link_r],
-    }
 }
 
 /// Source multiplicity `mult[a] = #{ k < m_j : rho[k] == a }` over `[0, real)`.
@@ -312,17 +128,19 @@ pub struct BinaryJoinCommitments {
     pub w_r: ArkGT,
 }
 
-/// A distinct-valid-pairs proof for the binary join.
+/// A distinct-valid-pairs proof for the binary join (LogUp-GKR): the two committed
+/// source-multiplicity commitments, the LEFT + RIGHT keyed-join links (each a
+/// block-disjoint GKR fraction tree + committed-column opening + co-running
+/// `(1 - chi_{n_R|n_S})*mult = 0` Identity; see [`JoinLinkProof`]), and the
+/// combined-index strict-monotonicity subproof. The four committed reciprocal columns
+/// (`rec_src_l`/`rec_cand_l`/`rec_src_r`/`rec_cand_r`) and the batched membership
+/// sumcheck are GONE.
 #[derive(Clone, Debug)]
 pub struct BinaryPairsProof {
-    pub membership_sumcheck: SumcheckProof,
-    pub membership_opening: ColumnOpening,
     pub mult_l_commitment: ArkGT,
     pub mult_r_commitment: ArkGT,
-    pub rec_src_l_commitment: ArkGT,
-    pub rec_cand_l_commitment: ArkGT,
-    pub rec_src_r_commitment: ArkGT,
-    pub rec_cand_r_commitment: ArkGT,
+    pub link_l: JoinLinkProof,
+    pub link_r: JoinLinkProof,
     pub sorted: SortedProof,
 }
 
@@ -365,17 +183,14 @@ fn prove_binary_pairs_with_context(
     transcript: &mut Transcript254,
 ) -> io::Result<BinaryPairsProof> {
     let n = cols.r_key.len();
-    let layout = Layout {
-        p: cols.r_other.len(),
-        q: cols.s_other.len(),
-    };
-    let num_vars = n.trailing_zeros() as usize;
-    let idx: Vec<ArkFr> = (0..n).map(fr).collect();
 
     let mult_l_commitment = context.commit_column(mult_l_in)?;
     let mult_r_commitment = context.commit_column(mult_r_in)?;
 
-    // Round 1: bind the data columns + multiplicities, draw fresh challenges.
+    // Round 1: bind the data columns + multiplicities, draw fresh challenges. NO reciprocal
+    // column is committed anymore (both links are GKR fraction trees over uncommitted
+    // intermediates), so alpha/beta are drawn here AFTER every data-column commitment — the
+    // primitive's caller contract (leaves fixed before any per-layer GKR challenge).
     bind_pairs_data(transcript, com);
     transcript.append_group(b"pow/join2/com-mult-l", &mult_l_commitment);
     transcript.append_group(b"pow/join2/com-mult-r", &mult_r_commitment);
@@ -384,53 +199,27 @@ fn prove_binary_pairs_with_context(
     let beta_r = transcript.challenge_scalar(b"pow/join2/right-beta");
     let alpha_r = transcript.challenge_scalar(b"pow/join2/right-alpha");
 
-    // Round 2: reciprocal witnesses over the folds.
+    // LEFT link: candidate (r_other_out.., key, rho_l) in source {(r_other.., r_key, idx)}
+    // weighted by mult_l (source masked chi_{n_R}, candidate masked chi_{m_J}).
     let mut left_src: Vec<&[ArkFr]> = slices(&cols.r_other);
     left_src.push(&cols.r_key);
-    left_src.push(&idx);
     let mut left_cand: Vec<&[ArkFr]> = slices(&cols.r_other_out);
     left_cand.push(&cols.key);
     left_cand.push(&cols.rho_l);
+    let link_l = prove_join_link_with_context(
+        context, &left_src, mult_l_in, &left_cand, n_r, m_j, alpha_l, beta_l, transcript,
+    )?;
+
+    // RIGHT link: candidate (key, s_other_out.., rho_r) in source {(s_key, s_other.., idx)}
+    // weighted by mult_r.
     let mut right_src: Vec<&[ArkFr]> = vec![cols.s_key.as_slice()];
     right_src.extend(slices(&cols.s_other));
-    right_src.push(&idx);
     let mut right_cand: Vec<&[ArkFr]> = vec![cols.key.as_slice()];
     right_cand.extend(slices(&cols.s_other_out));
     right_cand.push(&cols.rho_r);
-
-    let rec_src_l = reciprocal_witness(alpha_l, &rlc_fold(beta_l, &left_src));
-    let rec_cand_l = reciprocal_witness(alpha_l, &rlc_fold(beta_l, &left_cand));
-    let rec_src_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &right_src));
-    let rec_cand_r = reciprocal_witness(alpha_r, &rlc_fold(beta_r, &right_cand));
-    let rec_src_l_commitment = context.commit_column(&rec_src_l)?;
-    let rec_cand_l_commitment = context.commit_column(&rec_cand_l)?;
-    let rec_src_r_commitment = context.commit_column(&rec_src_r)?;
-    let rec_cand_r_commitment = context.commit_column(&rec_cand_r)?;
-    transcript.append_group(b"pow/join2/com-rec-src-l", &rec_src_l_commitment);
-    transcript.append_group(b"pow/join2/com-rec-cand-l", &rec_cand_l_commitment);
-    transcript.append_group(b"pow/join2/com-rec-src-r", &rec_src_r_commitment);
-    transcript.append_group(b"pow/join2/com-rec-cand-r", &rec_cand_r_commitment);
-
-    let shape = binary_pairs_shape(
-        &layout, num_vars, m_j, n_r, n_s, alpha_l, beta_l, alpha_r, beta_r,
-    );
-    let mut columns = vec![cols.r_key.clone()];
-    columns.extend(cols.r_other.iter().cloned());
-    columns.push(cols.s_key.clone());
-    columns.extend(cols.s_other.iter().cloned());
-    columns.extend(cols.r_other_out.iter().cloned());
-    columns.push(cols.key.clone());
-    columns.extend(cols.s_other_out.iter().cloned());
-    columns.push(cols.rho_l.clone());
-    columns.push(cols.rho_r.clone());
-    columns.push(mult_l_in.to_vec());
-    columns.push(mult_r_in.to_vec());
-    columns.push(rec_src_l);
-    columns.push(rec_cand_l);
-    columns.push(rec_src_r);
-    columns.push(rec_cand_r);
-    let (membership_sumcheck, r, _evals) = prove_sumcheck(&shape, &columns, transcript)?;
-    let membership_opening = context.prove_column_openings(&columns, &r, transcript)?;
+    let link_r = prove_join_link_with_context(
+        context, &right_src, mult_r_in, &right_cand, n_s, m_j, alpha_r, beta_r, transcript,
+    )?;
 
     // Combined-index strict monotonicity, homomorphic com(i_eval).
     let radix_fr = fr(radix);
@@ -442,14 +231,10 @@ fn prove_binary_pairs_with_context(
         prove_strictly_sorted_with_context(context, &i_eval, m_j, &com_i_eval, transcript)?;
 
     Ok(BinaryPairsProof {
-        membership_sumcheck,
-        membership_opening,
         mult_l_commitment,
         mult_r_commitment,
-        rec_src_l_commitment,
-        rec_cand_l_commitment,
-        rec_src_r_commitment,
-        rec_cand_r_commitment,
+        link_l,
+        link_r,
         sorted,
     })
 }
@@ -491,21 +276,23 @@ fn verify_binary_pairs(
     proof: &BinaryPairsProof,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    let num_vars = proof.membership_sumcheck.round_polys.len();
-    if num_vars == 0 || num_vars >= usize::BITS as usize {
+    // The domain is re-derived from the LEFT link's GKR tree (k + 1 layers over a
+    // 2*domain leaf vector); the RIGHT link's own layer count is cross-checked to `k`
+    // inside `verify_join_link`, and both links re-anchor `k` via their column openings.
+    let num_vars = proof.link_l.gkr.num_vars();
+    if num_vars < 2 || num_vars >= usize::BITS as usize {
         return Err(invalid(
             "binary pairs proof has an implausible variable count",
         ));
     }
-    let n = 1usize << num_vars;
+    let k = num_vars - 1;
+    let n = 1usize << k;
     if n_r > n || n_s > n || m_j > n {
         return Err(invalid("binary join real length exceeds the domain"));
     }
-    let layout = Layout {
-        p: com.r_other.len(),
-        q: com.s_other.len(),
-    };
-    if com.r_other_out.len() != layout.p || com.s_other_out.len() != layout.q {
+    let p = com.r_other.len();
+    let q = com.s_other.len();
+    if com.r_other_out.len() != p || com.s_other_out.len() != q {
         return Err(invalid("binary join output arity mismatch"));
     }
 
@@ -516,32 +303,28 @@ fn verify_binary_pairs(
     let alpha_l = transcript.challenge_scalar(b"pow/join2/left-alpha");
     let beta_r = transcript.challenge_scalar(b"pow/join2/right-beta");
     let alpha_r = transcript.challenge_scalar(b"pow/join2/right-alpha");
-    transcript.append_group(b"pow/join2/com-rec-src-l", &proof.rec_src_l_commitment);
-    transcript.append_group(b"pow/join2/com-rec-cand-l", &proof.rec_cand_l_commitment);
-    transcript.append_group(b"pow/join2/com-rec-src-r", &proof.rec_src_r_commitment);
-    transcript.append_group(b"pow/join2/com-rec-cand-r", &proof.rec_cand_r_commitment);
 
-    let shape = binary_pairs_shape(
-        &layout, num_vars, m_j, n_r, n_s, alpha_l, beta_l, alpha_r, beta_r,
-    );
-    let (r, evals) = verify_sumcheck(&shape, &proof.membership_sumcheck, transcript)?;
+    // LEFT link: candidate (r_other_out.., key, rho_l) in source {(r_other.., r_key, idx)}.
+    let mut left_src_coms: Vec<ArkGT> = com.r_other.clone();
+    left_src_coms.push(com.r_key);
+    let mut left_cand_coms: Vec<ArkGT> = com.r_other_out.clone();
+    left_cand_coms.push(com.key);
+    left_cand_coms.push(com.rho_l);
+    verify_join_link(
+        &left_src_coms, &proof.mult_l_commitment, &left_cand_coms, n_r, m_j, alpha_l, beta_l, k,
+        &proof.link_l, transcript,
+    )?;
 
-    let mut coms = vec![com.r_key];
-    coms.extend(com.r_other.iter().copied());
-    coms.push(com.s_key);
-    coms.extend(com.s_other.iter().copied());
-    coms.extend(com.r_other_out.iter().copied());
-    coms.push(com.key);
-    coms.extend(com.s_other_out.iter().copied());
-    coms.push(com.rho_l);
-    coms.push(com.rho_r);
-    coms.push(proof.mult_l_commitment);
-    coms.push(proof.mult_r_commitment);
-    coms.push(proof.rec_src_l_commitment);
-    coms.push(proof.rec_cand_l_commitment);
-    coms.push(proof.rec_src_r_commitment);
-    coms.push(proof.rec_cand_r_commitment);
-    verify_column_openings(&coms, &r, &evals, &proof.membership_opening, transcript)?;
+    // RIGHT link: candidate (key, s_other_out.., rho_r) in source {(s_key, s_other.., idx)}.
+    let mut right_src_coms: Vec<ArkGT> = vec![com.s_key];
+    right_src_coms.extend(com.s_other.iter().copied());
+    let mut right_cand_coms: Vec<ArkGT> = vec![com.key];
+    right_cand_coms.extend(com.s_other_out.iter().copied());
+    right_cand_coms.push(com.rho_r);
+    verify_join_link(
+        &right_src_coms, &proof.mult_r_commitment, &right_cand_coms, n_s, m_j, alpha_r, beta_r, k,
+        &proof.link_r, transcript,
+    )?;
 
     let radix_fr = fr(radix);
     let com_i_eval = com.rho_l.scale(&radix_fr).add(&com.rho_r);
@@ -687,13 +470,14 @@ pub struct BinaryJoinProof {
 }
 
 impl BinaryJoinProof {
-    /// The number of variables the join's pairs-membership sumcheck operates
-    /// over, i.e. `log2` of the join domain `d_j`. The chain verifier
-    /// cross-checks this against each stage's relocation TARGET domain so a stage
-    /// cannot run its join over a different domain than the one its input columns
-    /// were relocated into.
+    /// `log2` of the join domain `d_j`. The chain verifier cross-checks this against
+    /// each stage's relocation TARGET domain so a stage cannot run its join over a
+    /// different domain than the one its input columns were relocated into. Derived
+    /// from the LEFT keyed-join link's GKR tree, which has `k + 1` layers over a
+    /// `2*domain = 2^{k+1}` leaf vector, so `num_vars = (k + 1) - 1 = k = log2(domain)`
+    /// (the same value the old committed-reciprocal membership sumcheck reported).
     pub fn num_vars(&self) -> usize {
-        self.pairs.membership_sumcheck.round_polys.len()
+        self.pairs.link_l.gkr.num_vars().saturating_sub(1)
     }
 }
 
