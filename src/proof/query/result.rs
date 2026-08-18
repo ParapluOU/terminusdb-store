@@ -320,9 +320,9 @@ pub fn resolve_result_values_with_openings(
     trusted_resolution_root: ProofHash,
     columns: &[Vec<ArkFr>],
     descriptors: &[ResultColumnDescriptor],
-    openings: &ResolutionOpenings,
+    openings: Option<&ResolutionOpenings>,
 ) -> io::Result<Vec<Vec<CanonicalResultValue>>> {
-    resolve_result_values_impl(source, trusted_resolution_root, columns, descriptors, Some(openings))
+    resolve_result_values_impl(source, trusted_resolution_root, columns, descriptors, openings)
 }
 
 fn resolve_result_values_impl(

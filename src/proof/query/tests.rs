@@ -3292,7 +3292,7 @@
         ];
         let bearing = resolve_result_values(&lc, root, &columns, &descriptors).unwrap();
         let termless =
-            resolve_result_values_with_openings(&tl, root, &columns, &descriptors, &openings)
+            resolve_result_values_with_openings(&tl, root, &columns, &descriptors, Some(&openings))
                 .unwrap();
         assert_eq!(bearing, termless);
         assert!(matches!(
