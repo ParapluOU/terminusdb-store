@@ -316,7 +316,9 @@ fn commitment_format_version_is_six() {
     // `commitment_root` domain/structure is unchanged (`commitment-root/v4`), so a
     // date-free layer still hashes to a BYTE-IDENTICAL root.
     assert_eq!(COMMITMENT_FORMAT_VERSION, 6);
-    assert_eq!(VERIFIER_COMMITMENT_FORMAT_VERSION, 3);
+    // v4 == the compact artifact gained the I2b S1 `terms_present` flag byte and made
+    // the two clear catalogs optional (term-less variant). `commitment_root` unchanged.
+    assert_eq!(VERIFIER_COMMITMENT_FORMAT_VERSION, 4);
 }
 
 #[test]
@@ -1231,4 +1233,134 @@ fn catalog_gap_fails_closed() {
         vec![],
     )
     .is_err());
+}
+
+// A store-backed base + one delta child, returned as owned LayerCommitments.
+// The head is a genuine delta (parent_state_root == Some) — the only reliable way
+// to get a valid delta sidecar for the term-less producer's base/rollup-only gate.
+fn store_base_and_delta() -> (std::sync::Arc<LayerCommitment>, std::sync::Arc<LayerCommitment>) {
+    use crate::layer::ValueTriple;
+    use crate::store::sync::open_sync_memory_store;
+    let iri = |s: &str| format!("http://ex/{s}");
+    let store = open_sync_memory_store();
+    let builder = store.create_base_layer().unwrap();
+    for (s, o) in [("a1", "b1"), ("a2", "b2"), ("a3", "b3")] {
+        builder
+            .add_value_triple(ValueTriple::new_node(&iri(s), &iri("p1"), &iri(o)))
+            .unwrap();
+    }
+    let base = builder.commit().unwrap();
+    let base_lc = base.proof_commitment().unwrap();
+    let child = base.open_write().unwrap();
+    child
+        .add_value_triple(ValueTriple::new_node(&iri("a4"), &iri("p1"), &iri("b4")))
+        .unwrap();
+    let head = child.commit().unwrap();
+    let head_lc = head.proof_commitment().unwrap();
+    (base_lc, head_lc)
+}
+
+#[test]
+fn termless_base_artifact_roundtrips_and_drops_catalogs() {
+    let layer = sample();
+
+    // Term-bearing (default) baseline.
+    let bearing = layer.verifier_commitment().unwrap();
+    assert!(bearing.terms_present);
+    let bearing_bytes = bearing.encode().unwrap();
+
+    // Term-less producer emits a catalog-less artifact.
+    let termless = layer.verifier_commitment_termless().unwrap();
+    assert!(!termless.terms_present);
+    assert!(termless.predicate_catalog.is_empty());
+    assert!(termless.node_value_catalog.is_empty());
+
+    // It round-trips through encode -> decode -> validate.
+    let termless_bytes = termless.encode().unwrap();
+    let decoded = VerifierCommitment::decode(&termless_bytes).unwrap();
+    assert!(!decoded.terms_present);
+    assert!(decoded.predicate_catalog.is_empty());
+    assert!(decoded.node_value_catalog.is_empty());
+    decoded.validate().unwrap();
+
+    // The catalog-less encoding is strictly smaller (the O(dict) bytes are gone).
+    assert!(termless_bytes.len() < bearing_bytes.len());
+
+    // recomputed_commitment_root() holds from the STORED commitments (no catalog),
+    // and commitment_root is BYTE-IDENTICAL to the term-bearing artifact of the same
+    // layer — the flag lives in the framing, not in commitment_root.
+    assert_eq!(
+        decoded.recomputed_commitment_root().unwrap(),
+        decoded.state.commitment_root
+    );
+    assert_eq!(termless.state.commitment_root, bearing.state.commitment_root);
+    assert_eq!(termless.state.commitment_root, layer.state.commitment_root);
+
+    // resolution_root is likewise identical (same commitment_root + Merkle roots).
+    assert_eq!(termless.resolution_root(), bearing.resolution_root());
+}
+
+#[test]
+fn termless_producer_rejects_a_delta_layer() {
+    let (base_lc, head_lc) = store_base_and_delta();
+    // The base (parent_state_root == None) produces a term-less artifact.
+    assert!(base_lc.state.parent_state_root.is_none());
+    let termless = base_lc.verifier_commitment_termless().unwrap();
+    assert!(!termless.terms_present);
+    termless.validate().unwrap();
+
+    // The delta head (parent_state_root == Some) is rejected: term-less delta
+    // querying needs cross-layer re-mint over faithful hashes (blocked on I4).
+    assert!(head_lc.state.parent_state_root.is_some());
+    assert!(head_lc.verifier_commitment_termless().is_err());
+    // The term-BEARING producer still accepts the delta (unchanged behavior).
+    assert!(head_lc.verifier_commitment().is_ok());
+}
+
+#[test]
+fn termless_validate_rejects_smuggled_catalog() {
+    let layer = sample();
+    let mut smuggled = layer.verifier_commitment_termless().unwrap();
+    // Splice a catalog row into a term-less artifact: validate must fail closed
+    // (a term-less artifact carries no catalog; the flag stays false).
+    let bearing = layer.verifier_commitment().unwrap();
+    smuggled.node_value_catalog = vec![bearing.node_value_catalog[0].clone()];
+    assert!(smuggled.validate().is_err());
+}
+
+#[test]
+fn termless_decode_rejects_bad_flag_byte() {
+    let termless = sample().verifier_commitment_termless().unwrap();
+    let mut bytes = termless.encode().unwrap();
+    // The flag byte sits immediately after the 8-byte magic + 4-byte version.
+    let flag_offset = VERIFIER_COMMITMENT_MAGIC.len() + 4;
+    bytes[flag_offset] = 2; // neither 0 nor 1
+                            // Repair the trailing file checksum so the rejection is driven by the
+                            // flag parse, not the outer checksum.
+    let payload_len = bytes.len() - 32;
+    let repaired = file_checksum(&bytes[..payload_len]);
+    bytes[payload_len..].copy_from_slice(&repaired);
+    assert!(VerifierCommitment::decode(&bytes).is_err());
+}
+
+#[test]
+fn term_bearing_artifact_is_v4_and_reports_terms_present() {
+    // The term-bearing path is behaviorally unchanged except for the v3->v4 bump +
+    // flag byte: it still ships + round-trips its catalogs, now under v4.
+    let layer = sample();
+    let artifact = layer.verifier_commitment().unwrap();
+    assert!(artifact.terms_present);
+    let bytes = artifact.encode().unwrap();
+    // version u32 (big-endian) lives right after the magic; must read 4.
+    let v = u32::from_be_bytes(
+        bytes[VERIFIER_COMMITMENT_MAGIC.len()..VERIFIER_COMMITMENT_MAGIC.len() + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(v, VERIFIER_COMMITMENT_FORMAT_VERSION);
+    assert_eq!(v, 4);
+    let decoded = VerifierCommitment::decode(&bytes).unwrap();
+    assert!(decoded.terms_present);
+    assert_eq!(decoded.predicate_catalog, layer.predicate_catalog);
+    assert_eq!(decoded.node_value_catalog, layer.node_value_catalog);
 }

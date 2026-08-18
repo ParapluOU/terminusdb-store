@@ -134,6 +134,20 @@ pub struct LayerCommitment {
 #[derive(Clone, Debug)]
 pub struct VerifierCommitment {
     pub state: CommitmentState,
+    /// TERM-BEARING (`true`) vs TERM-LESS (`false`) framing (Merkle-dict I2b S1).
+    /// When `true`, the two clear catalogs below are present and `validate()`
+    /// re-MSMs them + recomputes the Merkle roots, exactly as before (v3
+    /// behavior). When `false`, the catalogs are ABSENT (empty) — the O(dict)
+    /// term bytes are dropped; every fixed-size commitment + both id-indexed
+    /// Merkle roots are retained, so the artifact is O(1) in dictionary size and
+    /// still recomputes `commitment_root`/`resolution_root`. A term-less artifact
+    /// is BASE/ROLLUP ONLY (a delta needs cross-layer re-mint over faithful
+    /// hashes, blocked on I4) and is NOT yet queryable — S2–S4 add the
+    /// fail-close guards, opening-based resolution, and per-constant belt-hash.
+    /// This flag lives in the verifier-artifact FRAMING only; it is NOT folded
+    /// into `commitment_root` (which stays byte-identical to the term-bearing
+    /// artifact of the same layer).
+    pub terms_present: bool,
     pub predicate_catalog: Vec<ProofRecord>,
     pub node_value_catalog: Vec<ProofRecord>,
     pub column_commitments: [ArkGT; COLUMN_COUNT],
@@ -151,6 +165,11 @@ pub struct VerifierCommitment {
 #[derive(Clone, Copy)]
 pub struct VerifierCommitmentRef<'a> {
     pub state: &'a CommitmentState,
+    /// Mirrors [`VerifierCommitment::terms_present`]: `false` ⇒ the two catalog
+    /// slices below are empty and `validate()` skips the catalog re-MSM + Merkle
+    /// recompute. A [`LayerCommitment`] view is always `true` (it carries the
+    /// full catalogs); only a term-less artifact's view is `false`.
+    pub terms_present: bool,
     pub predicate_catalog: &'a [ProofRecord],
     pub node_value_catalog: &'a [ProofRecord],
     pub column_commitments: &'a [ArkGT; COLUMN_COUNT],
@@ -185,6 +204,8 @@ impl VerifierLayer for LayerCommitment {
     fn verifier_view(&self) -> VerifierCommitmentRef<'_> {
         VerifierCommitmentRef {
             state: &self.state,
+            // A full prover sidecar always carries its clear catalogs.
+            terms_present: true,
             predicate_catalog: &self.predicate_catalog,
             node_value_catalog: &self.node_value_catalog,
             column_commitments: &self.column_commitments,
@@ -202,6 +223,7 @@ impl VerifierLayer for VerifierCommitment {
     fn verifier_view(&self) -> VerifierCommitmentRef<'_> {
         VerifierCommitmentRef {
             state: &self.state,
+            terms_present: self.terms_present,
             predicate_catalog: &self.predicate_catalog,
             node_value_catalog: &self.node_value_catalog,
             column_commitments: &self.column_commitments,
@@ -230,31 +252,52 @@ impl<T: VerifierLayer + ?Sized> VerifierLayer for std::sync::Arc<T> {
 impl VerifierCommitmentRef<'_> {
     pub fn validate(self) -> io::Result<()> {
         self.state.validate()?;
-        let subject_catalog = subject_catalog_from_objects(self.node_value_catalog)?;
-        validate_complete_catalog(
-            &[],
-            &[],
-            &[],
-            [
-                &subject_catalog,
-                self.predicate_catalog,
-                self.node_value_catalog,
-            ],
-            self.state.parent_node_value_count,
-            self.state.parent_predicate_count,
-            self.state.node_value_count,
-            self.state.predicate_count,
-        )?;
-        if commit_predicate_dictionary(self.predicate_catalog)?
-            != *self.predicate_dict_commitments
-            || commit_node_value_dictionary(self.node_value_catalog)?
-                != *self.node_value_dict_commitments
-            || commit_node_value_dict_range(self.node_value_catalog)?
-                != *self.node_value_dict_range_commitments
-        {
-            return Err(invalid("verifier catalog commitment mismatch"));
+        if self.terms_present {
+            let subject_catalog = subject_catalog_from_objects(self.node_value_catalog)?;
+            validate_complete_catalog(
+                &[],
+                &[],
+                &[],
+                [
+                    &subject_catalog,
+                    self.predicate_catalog,
+                    self.node_value_catalog,
+                ],
+                self.state.parent_node_value_count,
+                self.state.parent_predicate_count,
+                self.state.node_value_count,
+                self.state.predicate_count,
+            )?;
+            if commit_predicate_dictionary(self.predicate_catalog)?
+                != *self.predicate_dict_commitments
+                || commit_node_value_dictionary(self.node_value_catalog)?
+                    != *self.node_value_dict_commitments
+                || commit_node_value_dict_range(self.node_value_catalog)?
+                    != *self.node_value_dict_range_commitments
+            {
+                return Err(invalid("verifier catalog commitment mismatch"));
+            }
+            self.validate_merkle_roots()?;
+        } else {
+            // TERM-LESS (Merkle-dict I2b S1): the clear catalogs are dropped, so the
+            // catalog re-MSM (the only check tying the 6 committed Dory dict columns to
+            // real terms) and the catalog-based Merkle-root RECOMPUTE are BOTH skipped.
+            // The two Merkle roots are instead bound by the external `resolution_root`
+            // anchor a verifier checks (β re-anchor). We still fail closed on two
+            // structural invariants: the catalogs must genuinely be absent, and a
+            // term-less artifact is BASE/ROLLUP only (a delta needs cross-layer re-mint
+            // over faithful hashes = blocked on I4). Everything catalog-free below is
+            // KEPT — critically `recomputed_commitment_root()` (which recomputes from the
+            // STORED commitments + counts, NOT the catalog).
+            if !self.predicate_catalog.is_empty() || !self.node_value_catalog.is_empty() {
+                return Err(invalid("term-less verifier commitment must not carry catalogs"));
+            }
+            if self.state.parent_state_root.is_some() {
+                return Err(invalid(
+                    "term-less verifier commitment must be a base/rollup layer",
+                ));
+            }
         }
-        self.validate_merkle_roots()?;
         if self.recomputed_commitment_root()? != self.state.commitment_root {
             return Err(invalid("verifier commitment root mismatch"));
         }
@@ -336,8 +379,49 @@ impl LayerCommitment {
         self.validate()?;
         let artifact = VerifierCommitment {
             state: self.state.clone(),
+            terms_present: true,
             predicate_catalog: self.predicate_catalog.clone(),
             node_value_catalog: self.node_value_catalog.clone(),
+            column_commitments: self.column_commitments,
+            materialized_column_commitments: self.materialized_column_commitments,
+            predicate_dict_commitments: self.predicate_dict_commitments,
+            node_value_dict_commitments: self.node_value_dict_commitments,
+            node_value_dict_range_commitments: self.node_value_dict_range_commitments,
+            nv_merkle_root: self.nv_merkle_root,
+            pred_merkle_root: self.pred_merkle_root,
+        };
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    /// Merkle-dict I2b S1: project this sidecar into the TERM-LESS public
+    /// artifact — every fixed-size commitment + both id-indexed dictionary Merkle
+    /// roots + the state, but WITHOUT the two O(dict) clear catalogs. The result
+    /// is O(1) in dictionary size (killing the 256 MiB catalog shipping) and
+    /// round-trips through `encode`/`decode`/`validate`, but it is NOT yet
+    /// queryable: resolution/range/order/group/re-mint all still read the (now
+    /// absent) catalog and are wired to fail-close only in S2–S4.
+    ///
+    /// BASE/ROLLUP ONLY. A delta layer (`parent_state_root == Some`) is rejected:
+    /// term-less delta querying needs cross-layer re-mint over faithful hashes,
+    /// which is blocked on I4; the base is the only directly-query-provable layer.
+    ///
+    /// `commitment_root` is byte-identical to the term-bearing artifact of the
+    /// same layer — the `terms_present` flag lives in the artifact FRAMING, not in
+    /// `commitment_root`.
+    pub fn verifier_commitment_termless(&self) -> io::Result<VerifierCommitment> {
+        self.validate()?;
+        if self.state.parent_state_root.is_some() {
+            return Err(invalid(
+                "term-less verifier commitment requires a base/rollup layer \
+                 (delta needs cross-layer re-mint over faithful hashes, blocked on I4)",
+            ));
+        }
+        let artifact = VerifierCommitment {
+            state: self.state.clone(),
+            terms_present: false,
+            predicate_catalog: Vec::new(),
+            node_value_catalog: Vec::new(),
             column_commitments: self.column_commitments,
             materialized_column_commitments: self.materialized_column_commitments,
             predicate_dict_commitments: self.predicate_dict_commitments,
@@ -1108,50 +1192,71 @@ impl VerifierCommitment {
         {
             return Err(invalid("verifier commitment count exceeds PF4 limit"));
         }
-        let subject_catalog = subject_catalog_from_objects(&self.node_value_catalog)?;
-        validate_complete_catalog(
-            &[],
-            &[],
-            &[],
-            [
-                &subject_catalog,
-                &self.predicate_catalog,
-                &self.node_value_catalog,
-            ],
-            self.state.parent_node_value_count,
-            self.state.parent_predicate_count,
-            self.state.node_value_count,
-            self.state.predicate_count,
-        )?;
-        if commit_predicate_dictionary(&self.predicate_catalog)?
-            != self.predicate_dict_commitments
-        {
-            return Err(invalid("verifier predicate catalog commitment mismatch"));
-        }
-        if commit_node_value_dictionary(&self.node_value_catalog)?
-            != self.node_value_dict_commitments
-        {
-            return Err(invalid("verifier node/value catalog commitment mismatch"));
-        }
-        if commit_node_value_dict_range(&self.node_value_catalog)?
-            != self.node_value_dict_range_commitments
-        {
-            return Err(invalid("verifier range catalog commitment mismatch"));
-        }
-        // I1: recompute the id-indexed dictionary Merkle roots from the
-        // now-authenticated catalogs and confirm the carried roots match.
-        if node_value_merkle_root(
-            &self.node_value_catalog,
-            self.state.parent_node_value_count,
-            self.state.node_value_count,
-        )? != self.nv_merkle_root
-            || predicate_merkle_root(
-                &self.predicate_catalog,
+        if self.terms_present {
+            let subject_catalog = subject_catalog_from_objects(&self.node_value_catalog)?;
+            validate_complete_catalog(
+                &[],
+                &[],
+                &[],
+                [
+                    &subject_catalog,
+                    &self.predicate_catalog,
+                    &self.node_value_catalog,
+                ],
+                self.state.parent_node_value_count,
                 self.state.parent_predicate_count,
+                self.state.node_value_count,
                 self.state.predicate_count,
-            )? != self.pred_merkle_root
-        {
-            return Err(invalid("verifier dictionary merkle root mismatch"));
+            )?;
+            if commit_predicate_dictionary(&self.predicate_catalog)?
+                != self.predicate_dict_commitments
+            {
+                return Err(invalid("verifier predicate catalog commitment mismatch"));
+            }
+            if commit_node_value_dictionary(&self.node_value_catalog)?
+                != self.node_value_dict_commitments
+            {
+                return Err(invalid("verifier node/value catalog commitment mismatch"));
+            }
+            if commit_node_value_dict_range(&self.node_value_catalog)?
+                != self.node_value_dict_range_commitments
+            {
+                return Err(invalid("verifier range catalog commitment mismatch"));
+            }
+            // I1: recompute the id-indexed dictionary Merkle roots from the
+            // now-authenticated catalogs and confirm the carried roots match.
+            if node_value_merkle_root(
+                &self.node_value_catalog,
+                self.state.parent_node_value_count,
+                self.state.node_value_count,
+            )? != self.nv_merkle_root
+                || predicate_merkle_root(
+                    &self.predicate_catalog,
+                    self.state.parent_predicate_count,
+                    self.state.predicate_count,
+                )? != self.pred_merkle_root
+            {
+                return Err(invalid("verifier dictionary merkle root mismatch"));
+            }
+        } else {
+            // TERM-LESS (Merkle-dict I2b S1): catalogs dropped ⇒ SKIP the catalog
+            // re-MSM (the 3 `commit_*` checks above — the only verifier check tying the
+            // committed Dory dict columns to real terms) and the catalog-based Merkle
+            // recompute. The two Merkle roots are instead bound by `resolution_root`
+            // (the external anchor). Fail closed on the two structural invariants: no
+            // catalog may be smuggled in, and a term-less artifact is BASE/ROLLUP only
+            // (a delta needs cross-layer re-mint over faithful hashes = blocked on I4).
+            // Every catalog-free check is KEPT — the count-limit above and the
+            // `recomputed_commitment_root()` below (recomputed from the STORED
+            // commitments + counts, NOT the catalog).
+            if !self.predicate_catalog.is_empty() || !self.node_value_catalog.is_empty() {
+                return Err(invalid("term-less verifier commitment must not carry catalogs"));
+            }
+            if self.state.parent_state_root.is_some() {
+                return Err(invalid(
+                    "term-less verifier commitment must be a base/rollup layer",
+                ));
+            }
         }
         if self.recomputed_commitment_root()? != self.state.commitment_root {
             return Err(invalid("verifier commitment root mismatch"));
@@ -1175,6 +1280,10 @@ impl VerifierCommitment {
         let mut out = Vec::new();
         out.extend_from_slice(VERIFIER_COMMITMENT_MAGIC);
         put_u32(&mut out, VERIFIER_COMMITMENT_FORMAT_VERSION);
+        // I2b S1: the term-bearing/term-less framing flag (byte just after the
+        // version). Term-bearing (`1`) writes the two catalog blocks below;
+        // term-less (`0`) skips them (the O(dict) term bytes are dropped).
+        out.push(self.terms_present as u8);
         out.push(self.state.parent_state_root.is_some() as u8);
         if let Some(root) = self.state.parent_state_root {
             put_hash(&mut out, &root);
@@ -1190,8 +1299,10 @@ impl VerifierCommitment {
         ] {
             put_u64(&mut out, count);
         }
-        put_records(&mut out, &self.predicate_catalog);
-        put_records(&mut out, &self.node_value_catalog);
+        if self.terms_present {
+            put_records(&mut out, &self.predicate_catalog);
+            put_records(&mut out, &self.node_value_catalog);
+        }
         for commitment in self.column_commitments.iter().chain(
             self.materialized_column_commitments.iter(),
         ).chain([
@@ -1217,7 +1328,8 @@ impl VerifierCommitment {
     }
 
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.len() < VERIFIER_COMMITMENT_MAGIC.len() + 4 + 64
+        // + 1 for the I2b S1 `terms_present` flag byte after the version.
+        if bytes.len() < VERIFIER_COMMITMENT_MAGIC.len() + 4 + 1 + 64
             || bytes.len() > MAX_PROOF_LAYER_BYTES
         {
             return Err(invalid("truncated verifier commitment"));
@@ -1235,6 +1347,12 @@ impl VerifierCommitment {
         if r.u32()? != VERIFIER_COMMITMENT_FORMAT_VERSION {
             return Err(invalid("unsupported verifier commitment version"));
         }
+        // I2b S1: the term-bearing/term-less framing flag.
+        let terms_present = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("bad verifier terms-present flag")),
+        };
         let parent_state_root = match r.u8()? {
             0 => None,
             1 => Some(r.hash()?),
@@ -1251,9 +1369,23 @@ impl VerifierCommitment {
             predicate_count: r.u64()?,
             commitment_root,
         };
-        let predicate_catalog = read_records(&mut r, PersistedTableKind::PredicateCatalog)?;
-        let node_value_catalog = read_records(&mut r, PersistedTableKind::ObjectCatalog)?;
-        validate_decoded_heap_budget(&[], &[], &[], &predicate_catalog, &node_value_catalog)?;
+        // Term-bearing carries the two catalog blocks; term-less omits them (the
+        // decoded catalogs stay empty and `validate()` skips the catalog checks).
+        let (predicate_catalog, node_value_catalog) = if terms_present {
+            let predicate_catalog =
+                read_records(&mut r, PersistedTableKind::PredicateCatalog)?;
+            let node_value_catalog = read_records(&mut r, PersistedTableKind::ObjectCatalog)?;
+            validate_decoded_heap_budget(
+                &[],
+                &[],
+                &[],
+                &predicate_catalog,
+                &node_value_catalog,
+            )?;
+            (predicate_catalog, node_value_catalog)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut column_commitments = [<ArkGT as Group>::identity(); COLUMN_COUNT];
         for value in &mut column_commitments {
             *value = deserialize_commitment(&r.bytes()?)?;
@@ -1281,6 +1413,7 @@ impl VerifierCommitment {
         }
         let artifact = Self {
             state,
+            terms_present,
             predicate_catalog,
             node_value_catalog,
             column_commitments,

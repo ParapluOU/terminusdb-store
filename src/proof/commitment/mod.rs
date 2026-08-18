@@ -89,7 +89,14 @@ const VERIFIER_COMMITMENT_MAGIC: &[u8; 8] = b"TSPCV0\0\0";
 // commitment still recomputes a byte-identical root.
 // Bumped in lockstep (2 → 3): the compact artifact likewise now carries the two dictionary
 // Merkle roots so a remote verifier can compute `resolution_root` and open ids positionally.
-pub const VERIFIER_COMMITMENT_FORMAT_VERSION: u32 = 3;
+// Bumped 3 → 4 (Merkle-dict I2b S1): the compact artifact gained a `terms_present` flag byte
+// (right after this version) and made the two clear catalogs OPTIONAL. Term-bearing (flag=1)
+// is byte-for-byte the v3 body with the flag prepended; term-less (flag=0) DROPS the two
+// catalog blocks entirely (O(1) in dictionary size). The `commitment_root` DOMAIN/STRUCTURE
+// is unchanged and the flag is NOT folded into it, so a layer's `commitment_root` stays
+// BYTE-IDENTICAL across term-bearing and term-less; the bump exists so a pre-S1 v3 file
+// (which lacks the flag byte) cannot be read under the new layout.
+pub const VERIFIER_COMMITMENT_FORMAT_VERSION: u32 = 4;
 
 /// Number of committed columns per layer: additions (S,P,O) then removals
 /// (S,P,O), in that fixed order.
