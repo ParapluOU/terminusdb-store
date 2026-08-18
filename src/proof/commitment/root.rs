@@ -104,9 +104,16 @@ pub(super) fn compute_commitment_root_from_parts(
 /// The ordering (instance first, then schema) is fixed and domain-separated, so
 /// the two roots can never be transposed without changing the anchor. An
 /// instance-only proof never engages the schema root: its trust anchor remains
-/// the instance `commitment_root`, byte-identically to today. The combined root
-/// is engaged only when a query reads the schema graph (Subsumption), and only
-/// to authenticate that BOTH sub-commitments belong to the trusted database.
+/// the instance-graph anchor. The combined root is engaged only when a query
+/// reads the schema graph (Subsumption), and only to authenticate that BOTH
+/// sub-commitments belong to the trusted database.
+///
+/// β RE-ANCHOR: this is a pure two-hash combiner over two 32-byte per-graph
+/// anchors. [`validate_database_root`] now feeds it each graph's
+/// `resolution_root` (not its `commitment_root`), so the combined anchor binds
+/// all four dictionary Merkle roots (instance + schema) directly. Callers that
+/// build the expected `database_root` out of band must combine the two per-graph
+/// `resolution_root`s accordingly.
 pub fn database_root(instance_root: &ProofHash, schema_root: &ProofHash) -> ProofHash {
     let mut hasher = Sha256::new();
     hasher.update(b"parture/proof-of-woql/db-root/v1");
@@ -134,13 +141,19 @@ pub fn validate_database_root(
     let schema_view = schema.verifier_view();
     instance_view.validate()?;
     schema_view.validate()?;
+    // β re-anchor: the combined database anchor now binds each graph's `resolution_root`
+    // (which binds that graph's `commitment_root` AND its two dictionary Merkle roots) rather
+    // than only its `commitment_root`. Both views were `validate()`d just above (each graph's
+    // Merkle roots recomputed from its root-bound catalog), so both per-graph resolution_roots
+    // are fully authenticated; the trusted `database_root` therefore binds all four Merkle
+    // roots (instance + schema) directly, not merely transitively via the catalogs.
     if &database_root(
-        &instance_view.state.commitment_root,
-        &schema_view.state.commitment_root,
+        &instance_view.resolution_root(),
+        &schema_view.resolution_root(),
     ) != trusted_database_root
     {
         return Err(invalid(
-            "database root does not combine the trusted instance and schema commitment roots",
+            "database root does not combine the trusted instance and schema resolution roots",
         ));
     }
     Ok(())

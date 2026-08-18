@@ -297,7 +297,10 @@ pub(super) fn verify_delta_read_core(
     // (2) Whole parent chain + trusted head anchor (splice/reorder/drop/foreign-proof).
     let states: Vec<&crate::proof::commitment::CommitmentState> = views.iter().map(|v| v.state).collect();
     validate_chain_states(&states)?;
-    if states.last().unwrap().commitment_root != trusted_head_root {
+    // β re-anchor: the trusted head anchor is the HEAD layer's `resolution_root` (binds
+    // `commitment_root` AND its two dictionary Merkle roots directly). Every layer view was
+    // `validate()`d above, so the head view's resolution_root is fully authenticated.
+    if views.last().unwrap().resolution_root() != trusted_head_root {
         return Err(invalid("delta-read: head root does not match the trusted anchor"));
     }
     let head = *views.last().unwrap();

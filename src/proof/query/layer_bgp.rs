@@ -329,7 +329,7 @@ pub fn prove_layer_bgp_with_result_and_context(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_layer_bgp(
     source: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     plan: &LayerBgpPlan,
     predicate_ids: &[u64],
     result_coms: &[ArkGT],
@@ -338,10 +338,11 @@ pub fn verify_layer_bgp(
 ) -> io::Result<()> {
     let layer = source.verifier_view();
     require_base_layer_for_query(layer.state)?;
-    // Anchor to an EXTERNALLY-trusted root FIRST (FIX 4), before any sub-proof.
-    if layer.state.commitment_root != expected_root {
+    // β re-anchor (FIX 4): pin to an EXTERNALLY-trusted `resolution_root` FIRST, before any
+    // sub-proof — it binds `commitment_root` AND the two dictionary Merkle roots directly.
+    if layer.resolution_root() != trusted_resolution_root {
         return Err(invalid(
-            "layer commitment_root does not match the externally-trusted expected root",
+            "layer resolution_root does not match the externally-trusted resolution root",
         ));
     }
     if layer.recomputed_commitment_root()? != layer.state.commitment_root {

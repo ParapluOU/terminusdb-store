@@ -607,7 +607,12 @@ pub(crate) fn verify_reconcile_core(
     // (2) Whole parent chain + trusted head anchor.
     let states: Vec<&crate::proof::commitment::CommitmentState> = views.iter().map(|v| v.state).collect();
     validate_chain_states(&states)?;
-    if states.last().unwrap().commitment_root != trusted_head_root {
+    // β re-anchor: the trusted head anchor is now the HEAD layer's `resolution_root` (binds
+    // `commitment_root` AND its two dictionary Merkle roots directly). Every layer view was
+    // `validate()`d above (Merkle roots recomputed from each root-bound catalog), so the head
+    // view's resolution_root is fully authenticated. A fabricated head Merkle root cannot hash
+    // to the trusted anchor.
+    if views.last().unwrap().resolution_root() != trusted_head_root {
         return Err(invalid("reconcile: head root does not match the trusted anchor"));
     }
     let head = states.last().unwrap();

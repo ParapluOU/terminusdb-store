@@ -136,7 +136,10 @@ impl LayerBgpEnvelope {
     ) -> io::Result<Self> {
         verify_layer_bgp(
             layer,
-            expected_root,
+            // β re-anchor: the leaf verify anchors on `resolution_root`. Inside the envelope
+            // the layer is already bound to the trusted anchor via `self.layer_root`/the outer
+            // boundary; derive its resolution_root from the same layer.
+            layer.resolution_root(),
             plan,
             &predicate_ids,
             &result_commitments,
@@ -160,7 +163,7 @@ impl LayerBgpEnvelope {
         } else {
             resolve_typed_result_objects(
                 layer,
-                expected_root,
+                layer.resolution_root(),
                 &result_columns,
                 &result_id_namespaces(plan)?,
             )?
@@ -197,7 +200,7 @@ impl LayerBgpEnvelope {
         }
         verify_layer_bgp(
             layer,
-            expected_root,
+            layer.resolution_root(),
             plan,
             &self.predicate_ids,
             &self.result_commitments,
@@ -222,7 +225,7 @@ impl LayerBgpEnvelope {
         } else {
             let resolved = resolve_typed_result_objects(
                 layer,
-                expected_root,
+                layer.resolution_root(),
                 &self.result_columns,
                 &result_id_namespaces(plan)?,
             )?;

@@ -1295,7 +1295,7 @@ impl RecursiveRelationEnvelope {
         let result_values = if ground_result {
             Vec::new()
         } else {
-            resolve_result_values(layer, layer.state.commitment_root, &columns, &result_descriptors)?
+            resolve_result_values(layer, layer.resolution_root(), &columns, &result_descriptors)?
         };
         Ok(Self {
             layer_root: layer.state.commitment_root,
@@ -1387,7 +1387,14 @@ impl RecursiveRelationEnvelope {
 
         let instance_root = instance.state.commitment_root;
         let schema_root = schema.state.commitment_root;
-        let db_root = crate::proof::commitment::database_root(&instance_root, &schema_root);
+        // β re-anchor: the cross-root anchor bound into the transcript (and checked by the verifier's
+        // `validate_database_root`) now combines each graph's `resolution_root`, matching the verifier.
+        // `instance_root`/`schema_root` (commitment roots) are still used below for the per-child
+        // identity/relocation binding (Option P), so keep them.
+        let db_root = crate::proof::commitment::database_root(
+            &instance.resolution_root(),
+            &schema.resolution_root(),
+        );
         let mut transcript = Transcript254::new(b"parture-cross-root-envelope");
         transcript.append_bytes(b"pow/cross-root/db-root", &db_root);
         transcript.append_bytes(b"pow/cross-root/query", &plan.query_digest);
@@ -3083,7 +3090,7 @@ impl RecursiveRelationEnvelope {
         } else {
             let values = resolve_result_values(
                 layer,
-                expected_root,
+                layer.resolution_root(),
                 &self.result_columns,
                 &expected_descriptors,
             )?;

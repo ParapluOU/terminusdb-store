@@ -177,7 +177,7 @@ impl BagUnionEnvelope {
                     return Err(invalid("bag-union branch result namespace mismatch"));
                 }
             }
-            resolve_typed_result_objects(layer, expected_root, &result_columns, &namespaces)?
+            resolve_typed_result_objects(layer, layer.resolution_root(), &result_columns, &namespaces)?
         };
         Ok(Self {
             layer_root: expected_root,
@@ -261,7 +261,7 @@ impl BagUnionEnvelope {
             }
             let resolved = resolve_typed_result_objects(
                 layer,
-                expected_root,
+                layer.resolution_root(),
                 &self.result_columns,
                 &namespaces,
             )?;

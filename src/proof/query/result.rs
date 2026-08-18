@@ -48,19 +48,23 @@ pub fn verify_result_columns(
 }
 
 /// Resolve proven Store ID columns through the layer's authenticated node/value
-/// dictionary, via id-indexed Merkle openings (I1). `validate()` first authenticates the
-/// clear catalog AND the root-bound `nv_merkle_root` (a tampered catalog or root fails
-/// closed there); each delivered id is then opened positionally against that root, so
-/// resolution is an authenticated `O(k·log N)` step rather than a linear catalog scan.
+/// dictionary, via id-indexed Merkle openings (I1). β re-anchor: the EXTERNAL trust anchor
+/// is now the `resolution_root` (which binds `commitment_root` AND `nv_merkle_root` AND
+/// `pred_merkle_root`), so the Merkle root this resolution opens against is bound DIRECTLY
+/// by the trusted anchor, not merely transitively via the catalog. `validate()` then
+/// authenticates the clear catalog AND recomputes the root-bound `nv_merkle_root` (a
+/// tampered catalog or root fails closed there); each delivered id is then opened
+/// positionally against that root, so resolution is an authenticated `O(k·log N)` step
+/// rather than a linear catalog scan.
 pub fn resolve_node_value_result_objects(
     source: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     columns: &[Vec<ArkFr>],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
     let layer = source.verifier_view();
-    if layer.state.commitment_root != expected_root {
+    if layer.resolution_root() != trusted_resolution_root {
         return Err(invalid(
-            "layer commitment_root does not match the externally-trusted expected root",
+            "layer resolution_root does not match the externally-trusted resolution root",
         ));
     }
     layer.validate()?;
@@ -161,7 +165,7 @@ fn resolve_predicate_id_via_merkle(
 /// subject/object IDs only against the node/value catalog.
 pub fn resolve_typed_result_objects(
     layer: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     columns: &[Vec<ArkFr>],
     namespaces: &[ResultIdNamespace],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
@@ -172,7 +176,7 @@ pub fn resolve_typed_result_objects(
             nullable: false,
         })
         .collect();
-    resolve_result_values(layer, expected_root, columns, &descriptors)?
+    resolve_result_values(layer, trusted_resolution_root, columns, &descriptors)?
         .into_iter()
         .map(|column| {
             column
@@ -199,7 +203,7 @@ pub fn resolve_typed_result_objects(
 /// error in a nonnullable column and is never looked up in either dictionary catalog.
 pub fn resolve_result_values(
     source: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     columns: &[Vec<ArkFr>],
     descriptors: &[ResultColumnDescriptor],
 ) -> io::Result<Vec<Vec<CanonicalResultValue>>> {
@@ -207,9 +211,9 @@ pub fn resolve_result_values(
     if columns.len() != descriptors.len() {
         return Err(invalid("result column descriptor shape mismatch"));
     }
-    if layer.state.commitment_root != expected_root {
+    if layer.resolution_root() != trusted_resolution_root {
         return Err(invalid(
-            "layer commitment_root does not match the externally-trusted expected root",
+            "layer resolution_root does not match the externally-trusted resolution root",
         ));
     }
     layer.validate()?;
@@ -370,11 +374,11 @@ pub fn result_id_namespaces(plan: &LayerBgpPlan) -> io::Result<Vec<ResultIdNames
 /// columns and the root-authenticated node/value dictionary.
 pub fn verify_node_value_result_objects(
     layer: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     columns: &[Vec<ArkFr>],
     objects: &[Vec<CanonicalObject>],
 ) -> io::Result<()> {
-    let resolved = resolve_node_value_result_objects(layer, expected_root, columns)?;
+    let resolved = resolve_node_value_result_objects(layer, trusted_resolution_root, columns)?;
     if resolved != objects {
         return Err(invalid(
             "delivered result objects do not match the authenticated Store IDs",
@@ -395,13 +399,13 @@ pub fn verify_node_value_result_objects(
 #[cfg(test)]
 pub(crate) fn resolve_node_value_result_objects_via_catalog(
     source: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     columns: &[Vec<ArkFr>],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
     let layer = source.verifier_view();
-    if layer.state.commitment_root != expected_root {
+    if layer.resolution_root() != trusted_resolution_root {
         return Err(invalid(
-            "layer commitment_root does not match the externally-trusted expected root",
+            "layer resolution_root does not match the externally-trusted resolution root",
         ));
     }
     layer.validate()?;
@@ -439,7 +443,7 @@ pub(crate) fn resolve_node_value_result_objects_via_catalog(
 #[cfg(test)]
 pub(crate) fn resolve_result_values_via_catalog(
     source: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     columns: &[Vec<ArkFr>],
     descriptors: &[ResultColumnDescriptor],
 ) -> io::Result<Vec<Vec<CanonicalResultValue>>> {
@@ -447,9 +451,9 @@ pub(crate) fn resolve_result_values_via_catalog(
     if columns.len() != descriptors.len() {
         return Err(invalid("result column descriptor shape mismatch"));
     }
-    if layer.state.commitment_root != expected_root {
+    if layer.resolution_root() != trusted_resolution_root {
         return Err(invalid(
-            "layer commitment_root does not match the externally-trusted expected root",
+            "layer resolution_root does not match the externally-trusted resolution root",
         ));
     }
     layer.validate()?;

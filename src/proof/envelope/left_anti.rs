@@ -175,7 +175,7 @@ impl LeftAntiJoinEnvelope {
         } else {
             resolve_typed_result_objects(
                 layer,
-                expected_root,
+                layer.resolution_root(),
                 &result_columns,
                 &result_id_namespaces(left_plan)?,
             )?
@@ -264,7 +264,7 @@ impl LeftAntiJoinEnvelope {
         } else {
             let resolved = resolve_typed_result_objects(
                 layer,
-                expected_root,
+                layer.resolution_root(),
                 &self.result_columns,
                 &result_id_namespaces(left_plan)?,
             )?;

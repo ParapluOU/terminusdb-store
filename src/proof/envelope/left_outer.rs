@@ -210,7 +210,7 @@ impl LeftOuterJoinEnvelope {
         let result_descriptors = outer_descriptors(left_plan, right_plan, &key_pairs)?;
         let result_values = resolve_result_values(
             layer,
-            expected_root,
+            layer.resolution_root(),
             &result_columns,
             &result_descriptors,
         )?;
@@ -283,7 +283,7 @@ impl LeftOuterJoinEnvelope {
         )?;
         let values = resolve_result_values(
             layer,
-            expected_root,
+            layer.resolution_root(),
             &self.result_columns,
             &expected_descriptors,
         )?;

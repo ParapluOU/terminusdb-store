@@ -381,10 +381,18 @@ pub fn verify_reconciled_transitive_closure(
     let seed_id = resolve_combined_node_id(&views, seed_iri);
     let digest = reconciled_closure_digest(edge_predicate, seed_id, reflexive);
     let mut nodes = 0usize;
+    // β re-anchor: the closure gadget binds the head's COMMITMENT root (matching
+    // `prove_reconciled_transitive_closure`); `trusted_head_root` is now a `resolution_root`
+    // used ONLY for the head-pin equality inside `verify_reconcile_core` above.
+    let head_commitment_root = layers
+        .last()
+        .ok_or_else(|| invalid("reconciled closure needs a head layer"))?
+        .state
+        .commitment_root;
     verify_closure_rounds(
         &edge_commit,
         seed_id,
-        trusted_head_root,
+        head_commitment_root,
         digest,
         reflexive,
         false,

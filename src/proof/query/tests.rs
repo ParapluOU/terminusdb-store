@@ -77,7 +77,7 @@
         // by membership) -- never an out-of-band id.
         verify_layer_filter(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             P1,
             resolved_id,
             &com_sout,
@@ -103,7 +103,7 @@
         let wrong = resolved_id.wrapping_add(1);
         assert!(verify_layer_filter(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             P1,
             wrong,
             &com_sout,
@@ -123,7 +123,7 @@
         let p2_id = resolve_predicate_id(&lc, P2).unwrap();
         assert!(verify_layer_filter(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             P1,
             p2_id,
             &com_sout,
@@ -150,7 +150,7 @@
         // Wrong S_out commitment (use the O_out one) -> filter opening fails.
         assert!(verify_layer_filter(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             P1,
             resolved_id,
             &com_oout,
@@ -162,7 +162,7 @@
         // Honest still verifies.
         verify_layer_filter(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             P1,
             resolved_id,
             &com_sout,
@@ -508,7 +508,7 @@
         // Verifier sees ONLY the IRI + revealed id + result commitments.
         verify_layer_graph_pattern2(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             KNOWS,
             id,
             &com_x,
@@ -539,7 +539,7 @@
         // Wrong result commitment (pass Com Z for Com X) -> mismatch with proof output.
         assert!(verify_layer_graph_pattern2(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             KNOWS,
             id,
             &com_z,
@@ -552,7 +552,7 @@
         // Wrong claimed count.
         assert!(verify_layer_graph_pattern2(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             KNOWS,
             id,
             &com_x,
@@ -565,7 +565,7 @@
         // Honest verifies.
         verify_layer_graph_pattern2(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             KNOWS,
             id,
             &com_x,
@@ -594,7 +594,7 @@
         bad.join_commitments.x = fake_x;
         assert!(verify_layer_graph_pattern2(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             KNOWS,
             id,
             &fake_x,
@@ -614,7 +614,7 @@
         assert_eq!(m_j, 0);
         verify_layer_graph_pattern2(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             KNOWS,
             id,
             &com_x,
@@ -633,7 +633,7 @@
             ("b", "knows", "c"),
             ("c", "knows", "d"),
         ]);
-        let good_root = lc.state.commitment_root;
+        let good_root = lc.resolution_root();
         let (proof, com_x, com_y, com_z, m_j, id) = prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         // Corrupt the anchor: a layer whose stored root does not bind its columns.
         let mut tampered = (*lc).clone();
@@ -646,6 +646,40 @@
         .is_err());
     }
 
+    // β RE-ANCHOR: the external trust anchor is now `resolution_root`, which binds the two
+    // dictionary Merkle roots DIRECTLY. A prover that fabricates `nv_merkle_root` (so resolution
+    // opens ids to arbitrary terms) leaves `commitment_root` BYTE-IDENTICAL — the pre-β
+    // commitment_root anchor would NOT notice, and `verify_layer_graph_pattern2` never recomputes
+    // the Merkle roots from the catalog. The resolution_root anchor catches it: the fabricated
+    // Merkle root cannot hash to the trusted resolution_root.
+    #[test]
+    fn graph_pattern2_tampered_nv_merkle_root_diverges_resolution_and_is_rejected() {
+        let lc = build_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("c", "knows", "d"),
+        ]);
+        let trusted = lc.resolution_root();
+        let (proof, com_x, com_y, com_z, m_j, id) = prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
+        let mut tampered = (*lc).clone();
+        tampered.nv_merkle_root[0] ^= 0xff;
+        // `commitment_root` is unchanged (β keeps it byte-identical — the Merkle roots are NOT
+        // folded into it)...
+        assert_eq!(tampered.state.commitment_root, lc.state.commitment_root);
+        // ...but `resolution_root` diverges, so the anchor rejects the fabricated Merkle root even
+        // though this verify path never re-derives the Merkle root from the catalog.
+        assert_ne!(tampered.resolution_root(), trusted);
+        assert!(verify_layer_graph_pattern2(
+            &tampered, trusted, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof
+        )
+        .is_err());
+        // The untampered layer under the same trusted resolution_root still verifies.
+        verify_layer_graph_pattern2(
+            &lc, trusted, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn graph_pattern2_wrong_expected_root_is_rejected() {
         // FIX 4 (external-root anchor): an honest proof against an honest layer must
@@ -656,7 +690,7 @@
             ("c", "knows", "d"),
         ]);
         let (proof, com_x, com_y, com_z, m_j, id) = prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
-        let mut wrong_root = lc.state.commitment_root;
+        let mut wrong_root = lc.resolution_root();
         wrong_root[0] ^= 0xff;
         assert!(verify_layer_graph_pattern2(
             &lc, wrong_root, KNOWS, id, &com_x, &com_y, &com_z, m_j, &proof
@@ -665,7 +699,7 @@
         // The correct external root still verifies.
         verify_layer_graph_pattern2(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             KNOWS,
             id,
             &com_x,
@@ -715,7 +749,7 @@
         let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &result.predicate_ids,
             &result.result_commitments,
@@ -755,26 +789,26 @@
         let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
         let columns = result.real_columns();
         let objects =
-            resolve_node_value_result_objects(&lc, lc.state.commitment_root, &columns).unwrap();
+            resolve_node_value_result_objects(&lc, lc.resolution_root(), &columns).unwrap();
 
         assert_eq!(objects.len(), 2);
         assert_eq!(objects[0][0], CanonicalObject::Node(iri("a").into_bytes()));
         assert_eq!(objects[1][0], CanonicalObject::Node(iri("b").into_bytes()));
-        verify_node_value_result_objects(&lc, lc.state.commitment_root, &columns, &objects).unwrap();
+        verify_node_value_result_objects(&lc, lc.resolution_root(), &columns, &objects).unwrap();
 
         let mut tampered = objects.clone();
         tampered[1][0] = CanonicalObject::Node(iri("c").into_bytes());
         assert!(
             verify_node_value_result_objects(
                 &lc,
-                lc.state.commitment_root,
+                lc.resolution_root(),
                 &columns,
                 &tampered,
             )
             .is_err()
         );
 
-        let mut wrong_root = lc.state.commitment_root;
+        let mut wrong_root = lc.resolution_root();
         wrong_root[0] ^= 0xff;
         assert!(resolve_node_value_result_objects(&lc, wrong_root, &columns).is_err());
 
@@ -786,7 +820,7 @@
         assert!(
             resolve_node_value_result_objects(
                 &tampered_catalog,
-                lc.state.commitment_root,
+                lc.resolution_root(),
                 &columns,
             )
             .is_err()
@@ -824,7 +858,7 @@
         ];
         let values = resolve_result_values(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &columns,
             &descriptors,
         )
@@ -843,7 +877,7 @@
         nonnullable[2].nullable = false;
         assert!(resolve_result_values(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &columns,
             &nonnullable,
         )
@@ -853,7 +887,7 @@
         forged[2][0] = ArkFr::from_u64(u64::MAX);
         assert!(resolve_result_values(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &forged,
             &descriptors,
         )
@@ -933,7 +967,7 @@
         // Verifier sees ONLY the IRIs + revealed ids + result commitments.
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &ids,
             &result_coms,
@@ -968,7 +1002,7 @@
             prove_layer_graph_pattern2(&lc, KNOWS).unwrap();
         verify_layer_graph_pattern2(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             KNOWS,
             gp_id,
             &com_x,
@@ -989,7 +1023,7 @@
             }],
         };
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
-        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+        verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
 
         assert_eq!(m, gp_m);
         assert_eq!(coms, vec![com_x, com_y, com_z]);
@@ -1009,7 +1043,7 @@
         };
 
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
-        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+        verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
 
         assert_eq!(m, 2);
         assert!(proof.chain.is_none());
@@ -1046,7 +1080,7 @@
         let result = prove_layer_bgp_with_result(&lc, &plan).unwrap();
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &result.predicate_ids,
             &result.result_commitments,
@@ -1068,7 +1102,7 @@
         );
         let resolved = resolve_typed_result_objects(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &result.real_columns(),
             &result_id_namespaces(&plan).unwrap(),
         )
@@ -1118,7 +1152,7 @@
         let (mut proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
         proof.chain = None;
         assert!(
-            verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof,)
+            verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof,)
                 .is_err()
         );
     }
@@ -1144,13 +1178,13 @@
         };
         let (proof, result_coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
         // A DIFFERENT externally-trusted root must reject even an honest proof.
-        let mut wrong_root = lc.state.commitment_root;
+        let mut wrong_root = lc.resolution_root();
         wrong_root[0] ^= 0xff;
         assert!(verify_layer_bgp(&lc, wrong_root, &plan, &ids, &result_coms, m, &proof).is_err());
         // The correct external root still verifies.
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &ids,
             &result_coms,
@@ -1184,7 +1218,7 @@
         );
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &result.predicate_ids,
             &result.result_commitments,
@@ -1306,7 +1340,7 @@
     // INDEPENDENTLY-recomputed filtered+joined result (count + committed columns).
     fn check_const_bgp(lc: &LayerCommitment, plan: &LayerBgpPlan, expected_m: usize) {
         let (proof, coms, m, ids) = prove_layer_bgp(lc, plan).unwrap();
-        verify_layer_bgp(lc, lc.state.commitment_root, plan, &ids, &coms, m, &proof).unwrap();
+        verify_layer_bgp(lc, lc.resolution_root(), plan, &ids, &coms, m, &proof).unwrap();
         assert_eq!(m, expected_m);
         let subject_ids: Vec<Option<u64>> = proof.atoms.iter().map(|a| a.subject_id).collect();
         let object_ids: Vec<Option<u64>> = proof.atoms.iter().map(|a| a.object_id).collect();
@@ -1521,7 +1555,7 @@
         check_const_bgp(&lc, &plan, 2);
 
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
-        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+        verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
 
         // Wrong revealed constant id: the verifier feeds the SAME id to both the membership
         // and the filter, and binds it into the statement transcript -> a substituted id
@@ -1530,7 +1564,7 @@
         bad_id.atoms[1].object_id = Some(proof.atoms[1].object_id.unwrap().wrapping_add(1));
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &ids,
             &coms,
@@ -1547,7 +1581,7 @@
         sub_id.atoms[1].object_id = Some(b_id);
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &ids,
             &coms,
@@ -1557,12 +1591,12 @@
         .is_err());
 
         // Wrong externally-trusted root rejects even an honest proof.
-        let mut wrong_root = lc.state.commitment_root;
+        let mut wrong_root = lc.resolution_root();
         wrong_root[0] ^= 0xff;
         assert!(verify_layer_bgp(&lc, wrong_root, &plan, &ids, &coms, m, &proof).is_err());
 
         // Honest still verifies.
-        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+        verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
     }
 
     #[test]
@@ -1602,7 +1636,7 @@
         );
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &result.predicate_ids,
             &result.result_commitments,
@@ -1622,7 +1656,7 @@
         wrong_atom.dictionary_absence.as_mut().unwrap().atom_index = 0;
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &result.predicate_ids,
             &result.result_commitments,
@@ -1635,7 +1669,7 @@
         wrong_commitments.pop();
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &result.predicate_ids,
             &wrong_commitments,
@@ -1689,7 +1723,7 @@
             assert_eq!(result.result_columns.len(), 1);
             verify_layer_bgp(
                 &lc,
-                lc.state.commitment_root,
+                lc.resolution_root(),
                 &plan,
                 &result.predicate_ids,
                 &result.result_commitments,
@@ -1708,7 +1742,7 @@
                 });
                 assert!(verify_layer_bgp(
                     &lc,
-                    lc.state.commitment_root,
+                    lc.resolution_root(),
                     &plan,
                     &result.predicate_ids,
                     &result.result_commitments,
@@ -1721,7 +1755,7 @@
                 forged_present.dictionary_absence = None;
                 assert!(verify_layer_bgp(
                     &lc,
-                    lc.state.commitment_root,
+                    lc.resolution_root(),
                     &plan,
                     &result.predicate_ids,
                     &result.result_commitments,
@@ -1777,7 +1811,7 @@
             assert_eq!(result.result_commitments.len(), 1);
             verify_layer_bgp(
                 &lc,
-                lc.state.commitment_root,
+                lc.resolution_root(),
                 &plan,
                 &result.predicate_ids,
                 &result.result_commitments,
@@ -1790,7 +1824,7 @@
             forged_atom.atoms[0].m = 1 - forged_atom.atoms[0].m;
             assert!(verify_layer_bgp(
                 &lc,
-                lc.state.commitment_root,
+                lc.resolution_root(),
                 &plan,
                 &result.predicate_ids,
                 &result.result_commitments,
@@ -1800,7 +1834,7 @@
             .is_err());
             assert!(verify_layer_bgp(
                 &lc,
-                lc.state.commitment_root,
+                lc.resolution_root(),
                 &plan,
                 &result.predicate_ids,
                 &result.result_commitments,
@@ -1851,7 +1885,7 @@
             assert_eq!(result.result_len, expected_len);
             verify_layer_bgp(
                 &lc,
-                lc.state.commitment_root,
+                lc.resolution_root(),
                 &plan,
                 &result.predicate_ids,
                 &result.result_commitments,
@@ -1863,7 +1897,7 @@
             forged.atoms[1].m = 1 - forged.atoms[1].m;
             assert!(verify_layer_bgp(
                 &lc,
-                lc.state.commitment_root,
+                lc.resolution_root(),
                 &plan,
                 &result.predicate_ids,
                 &result.result_commitments,
@@ -2015,7 +2049,7 @@
         assert_eq!(result.result_len, 2);
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &literal_plan,
             &result.predicate_ids,
             &result.result_commitments,
@@ -2026,7 +2060,7 @@
         let real = result.real_columns();
         let resolved = resolve_typed_result_objects(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &real,
             &result_id_namespaces(&literal_plan).unwrap(),
         )
@@ -2053,7 +2087,7 @@
         assert_eq!(node_result.result_len, 1);
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &node_plan,
             &node_result.predicate_ids,
             &node_result.result_commitments,
@@ -2066,7 +2100,7 @@
         // as a node or unconstrained proof even though all three use the same Store IDs.
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &node_plan,
             &result.predicate_ids,
             &result.result_commitments,
@@ -2081,7 +2115,7 @@
         };
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &any_plan,
             &result.predicate_ids,
             &result.result_commitments,
@@ -2105,7 +2139,7 @@
         assert_eq!(empty.result_len, 0);
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &empty_plan,
             &empty.predicate_ids,
             &empty.result_commitments,
@@ -2134,7 +2168,7 @@
         assert_eq!(all_literals.result_commitments.len(), 3);
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &predicate_plan,
             &all_literals.predicate_ids,
             &all_literals.result_commitments,
@@ -2161,7 +2195,7 @@
         assert_eq!(joined.result_commitments.len(), 3);
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &join_plan,
             &joined.predicate_ids,
             &joined.result_commitments,
@@ -2283,7 +2317,7 @@
     fn check_age_range(lc: &LayerCommitment, op: RangeOp, c: u64, expected_m: usize) {
         let plan = age_range_plan(op, c);
         let (proof, coms, m, ids) = prove_layer_bgp(lc, &plan).unwrap();
-        verify_layer_bgp(lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+        verify_layer_bgp(lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
 
         let (exp_cols, domain, exp_m) = expected_age_name_join(lc, op, c);
         assert_eq!(m, exp_m, "op {:?} c {}", op, c);
@@ -2333,7 +2367,7 @@
         let plan = age_range_plan(RangeOp::Gt, 1000);
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
         assert_eq!(m, 0);
-        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+        verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
         let (_cols, _domain, exp_m) = expected_age_name_join(&lc, RangeOp::Gt, 1000);
         assert_eq!(exp_m, 0);
     }
@@ -2351,7 +2385,7 @@
         });
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
         assert_eq!(m, 3);
-        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+        verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
 
         // The upper bound is part of the public statement and its own authenticated
         // selection. Changing it cannot verify against the original proof.
@@ -2366,7 +2400,7 @@
             .c = fr(41);
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &wrong_bound,
             &ids,
             &coms,
@@ -2379,7 +2413,7 @@
         missing_second.atoms[0].range.as_mut().unwrap().second = None;
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &ids,
             &coms,
@@ -2409,7 +2443,7 @@
         assert_eq!(commitments.len(), 1);
         verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan,
             &ids,
             &commitments,
@@ -2422,7 +2456,7 @@
         equality_removed.atoms[0].subject_object_equal = false;
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &equality_removed,
             &ids,
             &commitments,
@@ -2447,11 +2481,11 @@
         let lc = build_age_name_layer();
         let plan = age_range_plan(RangeOp::Gt, 18);
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
-        let mut wrong_root = lc.state.commitment_root;
+        let mut wrong_root = lc.resolution_root();
         wrong_root[0] ^= 0xff;
         assert!(verify_layer_bgp(&lc, wrong_root, &plan, &ids, &coms, m, &proof).is_err());
         // The correct external root still verifies.
-        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+        verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
     }
 
     #[test]
@@ -2465,7 +2499,7 @@
         let plan_wrong_c = age_range_plan(RangeOp::Gt, 19);
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan_wrong_c,
             &ids,
             &coms,
@@ -2495,7 +2529,7 @@
         };
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan_wrong_dt,
             &ids,
             &coms,
@@ -2508,7 +2542,7 @@
         let plan_wrong_op = age_range_plan(RangeOp::Ge, 18);
         assert!(verify_layer_bgp(
             &lc,
-            lc.state.commitment_root,
+            lc.resolution_root(),
             &plan_wrong_op,
             &ids,
             &coms,
@@ -2518,7 +2552,7 @@
         .is_err());
 
         // Honest still verifies.
-        verify_layer_bgp(&lc, lc.state.commitment_root, &plan, &ids, &coms, m, &proof).unwrap();
+        verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
     }
 
     #[test]
@@ -2585,7 +2619,7 @@
     #[test]
     fn merkle_resolution_matches_legacy_catalog_scan_for_every_id() {
         let lc = mixed_layer();
-        let root = lc.state.commitment_root;
+        let root = lc.resolution_root();
 
         // Columns holding EVERY node/value id and EVERY predicate id in the catalogs.
         let mut nv_ids: Vec<u64> = lc.node_value_catalog.iter().map(|r| r.object_id).collect();

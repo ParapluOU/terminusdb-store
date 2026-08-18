@@ -288,8 +288,8 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         );
         let env = RecursiveRelationEnvelope::prove_cross_root(&instance, &schema, &plan).unwrap();
         let db_root = crate::proof::commitment::database_root(
-            &instance.state.commitment_root,
-            &schema.state.commitment_root,
+            &instance.resolution_root(),
+            &schema.resolution_root(),
         );
         env.verify_cross_root(&instance, &schema, db_root, &plan).unwrap();
         assert_eq!(env.result_len, 1, "only px (class Cxxxx) matches; the Aearly row is excluded");
@@ -317,8 +317,8 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         );
         let env = RecursiveRelationEnvelope::prove_cross_root(&instance, &schema, &plan).unwrap();
         let db_root = crate::proof::commitment::database_root(
-            &instance.state.commitment_root,
-            &schema.state.commitment_root,
+            &instance.resolution_root(),
+            &schema.resolution_root(),
         );
         env.verify_cross_root(&instance, &schema, db_root, &plan).unwrap();
         assert_eq!(
@@ -339,8 +339,8 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         );
         let env = RecursiveRelationEnvelope::prove_cross_root(&instance, &schema, &plan).unwrap();
         let db_root = crate::proof::commitment::database_root(
-            &instance.state.commitment_root,
-            &schema.state.commitment_root,
+            &instance.resolution_root(),
+            &schema.resolution_root(),
         );
         env.verify_cross_root(&instance, &schema, db_root, &plan).unwrap();
 
@@ -365,8 +365,8 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         );
         let mut env = RecursiveRelationEnvelope::prove_cross_root(&instance, &schema, &plan).unwrap();
         let db_root = crate::proof::commitment::database_root(
-            &instance.state.commitment_root,
-            &schema.state.commitment_root,
+            &instance.resolution_root(),
+            &schema.resolution_root(),
         );
         // Corrupt the join's matched key-column commitment: the inner-join projection no longer binds.
         if let RecursiveRelationProof::CrossRootHashJoin { com_closure_at_d, .. } = &mut env.proof {
@@ -3295,7 +3295,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     fn assert_reconciled_edge_parity() {
         let stack = closure_delta_stack();
         let lref = arc_refs(&stack);
-        let head_root = lref.last().unwrap().state.commitment_root;
+        let head_root = lref.last().unwrap().resolution_root();
         let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
             lref.iter().map(|l| l.verifier_view()).collect();
 
@@ -3387,7 +3387,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     fn assert_reconciled_closure_parity() {
         let stack = closure_delta_stack();
         let lref = arc_refs(&stack);
-        let head_root = lref.last().unwrap().state.commitment_root;
+        let head_root = lref.last().unwrap().resolution_root();
         let rest = rdf_rest_iri();
 
         let materialized = materialized_closure_set(&closure_rolled_up(), &rest, &iri("cell0"));
@@ -3432,7 +3432,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     fn assert_reconciled_closure_soundness() {
         let stack = closure_delta_stack();
         let lref = arc_refs(&stack);
-        let head_root = lref.last().unwrap().state.commitment_root;
+        let head_root = lref.last().unwrap().resolution_root();
         let rest = rdf_rest_iri();
         let seed = iri("cell0");
 
@@ -3457,7 +3457,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         )
         .is_err());
         assert!(super::reconciled::verify_reconciled_transitive_closure(
-            &lref, lref[0].state.commitment_root, rest.as_bytes(), seed.as_bytes(), true, &proof,
+            &lref, lref[0].resolution_root(), rest.as_bytes(), seed.as_bytes(), true, &proof,
         )
         .is_err());
 
@@ -3564,7 +3564,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     fn assert_reconciled_list_walk_parity() {
         let stack = list_delta_stack();
         let lref = arc_refs(&stack);
-        let head_root = lref.last().unwrap().state.commitment_root;
+        let head_root = lref.last().unwrap().resolution_root();
         let subj = CanonicalObject::Node(iri("doc").into_bytes());
         let pred = iri("tracks");
 
@@ -3600,7 +3600,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     fn assert_reconciled_list_walk_soundness() {
         let stack = list_delta_stack();
         let lref = arc_refs(&stack);
-        let head_root = lref.last().unwrap().state.commitment_root;
+        let head_root = lref.last().unwrap().resolution_root();
         let subj = CanonicalObject::Node(iri("doc").into_bytes());
         let pred = iri("tracks");
         let pbytes = pred.as_bytes();
@@ -3795,7 +3795,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
             let s = iri(doc);
             let stack = array_delta_stack(&s, &p, &cells);
             let lref = arc_refs(&stack);
-            let head_root = lref.last().unwrap().state.commitment_root;
+            let head_root = lref.last().unwrap().resolution_root();
             let subj = CanonicalObject::Node(s.clone().into_bytes());
 
             let (proof, prover_elements) =
@@ -3839,7 +3839,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let subj = CanonicalObject::Node(s.clone().into_bytes());
         let stack = array_delta_stack(&s, &p, &[(0, "a"), (1, "b"), (2, "c")]);
         let lref = arc_refs(&stack);
-        let head_root = lref.last().unwrap().state.commitment_root;
+        let head_root = lref.last().unwrap().resolution_root();
         let (proof, _) =
             super::array_walk::prove_ordered_array_walk_reconciled(&lref, &subj, p.as_bytes()).unwrap();
         super::array_walk::verify_ordered_array_walk_reconciled(
@@ -3855,7 +3855,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let subj2 = CanonicalObject::Node(s2.clone().into_bytes());
         let stack2 = array_delta_stack(&s2, &p, &[(0, "m"), (1, "n")]);
         let lref2 = arc_refs(&stack2);
-        let hr2 = lref2.last().unwrap().state.commitment_root;
+        let hr2 = lref2.last().unwrap().resolution_root();
         let verifies = |order: Vec<usize>| {
             super::array_walk::prove_ordered_array_walk_reconciled_forged(&lref2, &subj2, p.as_bytes(), order)
                 .and_then(|(proof, _)| {

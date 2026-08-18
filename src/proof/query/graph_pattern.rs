@@ -172,7 +172,7 @@ pub fn prove_layer_graph_pattern2_with_source(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_layer_graph_pattern2(
     source: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     predicate_term: &[u8],
     predicate_id: u64,
     com_x: &ArkGT,
@@ -183,7 +183,7 @@ pub fn verify_layer_graph_pattern2(
 ) -> io::Result<()> {
     verify_layer_graph_pattern2_with_source(
         source,
-        expected_root,
+        trusted_resolution_root,
         ColumnSource::Materialized,
         predicate_term,
         predicate_id,
@@ -199,7 +199,7 @@ pub fn verify_layer_graph_pattern2(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_layer_graph_pattern2_with_source(
     source: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     column_source: ColumnSource,
     predicate_term: &[u8],
     predicate_id: u64,
@@ -210,10 +210,11 @@ pub fn verify_layer_graph_pattern2_with_source(
     proof: &GraphPattern2Proof,
 ) -> io::Result<()> {
     let layer = source.verifier_view();
-    // FIX 4: pin to an EXTERNALLY-trusted root FIRST.
-    if layer.state.commitment_root != expected_root {
+    // β re-anchor (FIX 4): pin to an EXTERNALLY-trusted `resolution_root` FIRST — it binds
+    // `commitment_root` AND the two dictionary Merkle roots directly.
+    if layer.resolution_root() != trusted_resolution_root {
         return Err(invalid(
-            "layer commitment_root does not match the externally-trusted expected root",
+            "layer resolution_root does not match the externally-trusted resolution root",
         ));
     }
     if layer.recomputed_commitment_root()? != layer.state.commitment_root {

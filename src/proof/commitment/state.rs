@@ -168,6 +168,17 @@ pub struct VerifierCommitmentRef<'a> {
 /// accessors, keeping prover witness data outside verification APIs.
 pub trait VerifierLayer {
     fn verifier_view(&self) -> VerifierCommitmentRef<'_>;
+
+    /// The two-hash `resolution_root` anchor for this layer (β re-anchor): it
+    /// binds `commitment_root` (and thereby every id-authentication gadget) to
+    /// the two id-indexed dictionary Merkle roots. This is the EXTERNAL trust
+    /// anchor a verifier is handed and checks against — binding the Merkle roots
+    /// DIRECTLY, not merely transitively through the catalog. A convenience
+    /// wrapper over [`VerifierCommitmentRef::resolution_root`] so any layer type
+    /// (owned sidecar, compact artifact, borrowed view, `Arc`) exposes it.
+    fn resolution_root(&self) -> ProofHash {
+        self.verifier_view().resolution_root()
+    }
 }
 
 impl VerifierLayer for LayerCommitment {
@@ -311,6 +322,14 @@ impl PartialEq for LayerCommitment {
 impl Eq for LayerCommitment {}
 
 impl LayerCommitment {
+    /// β re-anchor: the layer's two-hash `resolution_root` anchor (binds `commitment_root`
+    /// AND both id-indexed dictionary Merkle roots). Inherent convenience so callers/tests
+    /// reach it on an owned `LayerCommitment` (or an `Arc<LayerCommitment>` via `Deref`)
+    /// without importing the [`VerifierLayer`] trait.
+    pub fn resolution_root(&self) -> ProofHash {
+        self.verifier_view().resolution_root()
+    }
+
     /// Deterministically project this fully validated PF4 v4 sidecar into the
     /// bounded public artifact needed by a remote verifier.
     pub fn verifier_commitment(&self) -> io::Result<VerifierCommitment> {
@@ -1071,6 +1090,14 @@ impl LayerCommitment {
 }
 
 impl VerifierCommitment {
+    /// β re-anchor: the artifact's two-hash `resolution_root` anchor (binds `commitment_root`
+    /// AND both id-indexed dictionary Merkle roots). Inherent convenience mirroring
+    /// [`LayerCommitment::resolution_root`], so remote verifiers reach it without importing the
+    /// [`VerifierLayer`] trait.
+    pub fn resolution_root(&self) -> ProofHash {
+        self.verifier_view().resolution_root()
+    }
+
     /// Validate the complete clear catalogs against their Dory commitments,
     /// then recompute the PF4 v4 root from all retained public commitments.
     pub fn validate(&self) -> io::Result<()> {

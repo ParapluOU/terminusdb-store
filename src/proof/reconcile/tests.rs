@@ -64,7 +64,7 @@ fn base_plus_one_reconciles_and_counts() {
     let layers = base_plus_one();
     let lref = refs(&layers);
     let (proof, present) = prove_reconcile(&lref).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let m = verify_reconcile(&lref, head_root, &proof).unwrap();
     let ground = materialized_rows(&lref);
     assert_eq!(m, ground.len());
@@ -120,7 +120,7 @@ fn n_layer_reconciles_and_counts() {
     let layers = base_plus_three();
     let lref = refs(&layers);
     let (proof, present) = prove_reconcile(&lref).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let m = verify_reconcile(&lref, head_root, &proof).unwrap();
     let ground = materialized_rows(&lref);
     assert_eq!(m, ground.len(), "reconciled count must equal materialized count");
@@ -150,7 +150,7 @@ fn new_predicate_delta_reconciles() {
     let layers = vec![base_lc, head_lc];
     let lref = refs(&layers);
     let (proof, present) = prove_reconcile(&lref).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let m = verify_reconcile(&lref, head_root, &proof).unwrap();
     let ground = materialized_rows(&lref);
     assert_eq!(m, ground.len());
@@ -166,8 +166,8 @@ fn wrong_or_swapped_head_root_rejects() {
     let lref = refs(&layers);
     let (proof, _) = prove_reconcile(&lref).unwrap();
     // Anchor to a non-head layer root.
-    assert!(verify_reconcile(&lref, lref[0].state.commitment_root, &proof).is_err());
-    let mut bogus = lref.last().unwrap().state.commitment_root;
+    assert!(verify_reconcile(&lref, lref[0].resolution_root(), &proof).is_err());
+    let mut bogus = lref.last().unwrap().resolution_root();
     bogus[0] ^= 0xff;
     assert!(verify_reconcile(&lref, bogus, &proof).is_err());
 }
@@ -177,7 +177,7 @@ fn dropped_middle_layer_rejects() {
     let layers = base_plus_three();
     let lref = refs(&layers);
     let (proof, _) = prove_reconcile(&lref).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Drop D2 (index 2): the parent-state-root chain no longer links D3 to D1.
     let dropped = vec![lref[0], lref[1], lref[3]];
     assert!(verify_reconcile(&dropped, head_root, &proof).is_err());
@@ -188,7 +188,7 @@ fn reordered_middle_layers_reject() {
     let layers = base_plus_three();
     let lref = refs(&layers);
     let (proof, _) = prove_reconcile(&lref).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Swap D1 and D2: the chain breaks.
     let reordered = vec![lref[0], lref[2], lref[1], lref[3]];
     assert!(verify_reconcile(&reordered, head_root, &proof).is_err());
@@ -201,7 +201,7 @@ fn spliced_foreign_layer_rejects() {
     let lref = refs(&layers);
     let oref = refs(&other);
     let (proof, _) = prove_reconcile(&lref).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Replace D2 with a foreign delta from an unrelated stack.
     let spliced = vec![lref[0], lref[1], oref[1], lref[3]];
     assert!(verify_reconcile(&spliced, head_root, &proof).is_err());
@@ -212,7 +212,7 @@ fn tampered_present_row_rejects() {
     let layers = base_plus_three();
     let lref = refs(&layers);
     let (mut proof, _) = prove_reconcile(&lref).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     proof.com_present_s = commit_col(&vec![ark(999); 1usize << proof.working_log]);
     assert!(verify_reconcile(&lref, head_root, &proof).is_err());
 }
@@ -224,7 +224,7 @@ fn hidden_removal_in_any_layer_rejects() {
     let layers = base_plus_three();
     let lref = refs(&layers);
     let (mut proof, _) = prove_reconcile(&lref).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Find a removal group (sign −1) and corrupt its subject hash lookup.
     let column_commitments: Vec<&[ArkGT; 6]> = lref.iter().map(|l| &l.column_commitments).collect();
     let adds: Vec<usize> = lref.iter().map(|l| l.additions.len()).collect();
@@ -241,7 +241,7 @@ fn injected_removal_count_rejects() {
     let layers = base_plus_three();
     let lref = refs(&layers);
     let (proof, _) = prove_reconcile(&lref).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let mut forged = proof.clone();
     forged.present_len -= 1;
     assert!(verify_reconcile(&lref, head_root, &forged).is_err());
@@ -252,7 +252,7 @@ fn tampered_combined_dict_rejects() {
     let layers = base_plus_three();
     let lref = refs(&layers);
     let (mut proof, _) = prove_reconcile(&lref).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     proof.combined_nv.com_hash = commit_col(&vec![ark(7); 1usize << proof.combined_nv.log]);
     assert!(verify_reconcile(&lref, head_root, &proof).is_err());
 }
@@ -328,7 +328,7 @@ fn run_filter(position: FilterPosition, constant: ArkFr, expect: usize) {
     let layers = filter_stack();
     let lref = refs(&layers);
     let (rec, filt, result) = prove_read_single_atom(&lref, position, constant).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let m = verify_read_single_atom(&lref, head_root, position, constant, &rec, &filt).unwrap();
     let ground = materialized_filter(&lref, position, constant);
     assert_eq!(m, ground.len(), "count must equal materialized filter");
@@ -365,7 +365,7 @@ fn filter_fabricated_result_row_rejects() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p1");
     let (rec, mut filt, _) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Replace an output column commitment with a fabricated one: the compaction binding fails.
     filt.com_out[0] = commit_col(&vec![ark(4242); 1usize << rec.working_log]);
     assert!(verify_read_single_atom(&lref, head_root, FilterPosition::Predicate, c, &rec, &filt).is_err());
@@ -377,7 +377,7 @@ fn filter_dropped_row_rejects() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p2"); // 4 matching rows
     let (rec, filt, _) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let mut forged = filt.clone();
     forged.out_len -= 1; // claim one fewer matching row
     assert!(verify_read_single_atom(&lref, head_root, FilterPosition::Predicate, c, &rec, &forged).is_err());
@@ -389,7 +389,7 @@ fn filter_wrong_constant_rejects() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p1");
     let (rec, filt, _) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Verifying the p1 proof against the p2 constant must reject (selection is p1-bound).
     let wrong = hash_pred("http://ex/p2");
     assert!(verify_read_single_atom(&lref, head_root, FilterPosition::Predicate, wrong, &rec, &filt).is_err());
@@ -450,7 +450,7 @@ fn two_atom_join_over_present() {
     let lref = refs(&layers);
     let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
     let (rec, join, result) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let n = verify_read_two_atom_join(&lref, head_root, cp, cq, &rec, &join).unwrap();
     let ground = materialized_join(&lref, "http://ex/p1", "http://ex/p2");
     assert_eq!(n, ground.len(), "join count must equal materialized join");
@@ -464,7 +464,7 @@ fn join_fabricated_row_rejects() {
     let lref = refs(&layers);
     let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
     let (rec, mut join, _) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Fabricate an output column: the inner-join matched-projection binding fails.
     join.com_join_out[0] = commit_col(&vec![ark(777); 1usize << join.join_log]);
     assert!(verify_read_two_atom_join(&lref, head_root, cp, cq, &rec, &join).is_err());
@@ -476,7 +476,7 @@ fn join_dropped_row_rejects() {
     let lref = refs(&layers);
     let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
     let (rec, join, _) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let mut forged = join.clone();
     forged.join_out_len -= 1; // claim one fewer solution
     assert!(verify_read_two_atom_join(&lref, head_root, cp, cq, &rec, &forged).is_err());
@@ -488,7 +488,7 @@ fn join_wrong_predicate_rejects() {
     let lref = refs(&layers);
     let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
     let (rec, join, _) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Verify against a wrong second predicate: the second atom's selection is p2-bound.
     let wrong = hash_pred("http://ex/pX");
     assert!(verify_read_two_atom_join(&lref, head_root, cp, wrong, &rec, &join).is_err());
@@ -502,7 +502,7 @@ fn join_tampered_present_id_rejects() {
     let lref = refs(&layers);
     let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
     let (rec, mut join, _) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     join.auth_s.com_id = commit_col(&vec![ark(3); 1usize << rec.working_log]);
     assert!(verify_read_two_atom_join(&lref, head_root, cp, cq, &rec, &join).is_err());
 }
@@ -576,7 +576,7 @@ fn single_atom_predicate_resolved() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p2"); // 4 rows
     let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let resolved = verify_and_resolve_single_atom(
         &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns, &result.id_hints,
     )
@@ -593,7 +593,7 @@ fn two_atom_join_resolved() {
     let lref = refs(&layers);
     let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
     let (rec, join, result) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let resolved = verify_and_resolve_two_atom_join(
         &lref, head_root, cp, cq, &rec, &join, &result.columns,
     )
@@ -628,7 +628,7 @@ fn resolved_typed_value_objects() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p1");
     let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let resolved = verify_and_resolve_single_atom(
         &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns, &result.id_hints,
     )
@@ -650,7 +650,7 @@ fn resolve_forged_binding_rejects() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p2");
     let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let mut forged = result.columns.clone();
     forged[0][0] = ark(123_456_789); // a fabricated subject binding
     assert!(verify_and_resolve_single_atom(
@@ -665,7 +665,7 @@ fn resolve_forged_join_binding_rejects() {
     let lref = refs(&layers);
     let (cp, cq) = (hash_pred("http://ex/p1"), hash_pred("http://ex/p2"));
     let (rec, join, result) = prove_read_two_atom_join(&lref, cp, cq).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let mut forged = result.columns.clone();
     forged[2][0] = ark(424_242); // a fabricated ?z binding
     assert!(verify_and_resolve_two_atom_join(
@@ -712,7 +712,7 @@ fn i2a_run_differential(position: FilterPosition, constant: ArkFr, expect_rows: 
     let layers = filter_stack();
     let lref = refs(&layers);
     let (rec, filt, result) = prove_read_single_atom(&lref, position, constant).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Every hint column aligns with its output column (real prefix).
     assert_eq!(result.id_hints.len(), result.columns.len());
     assert!(result.id_hints.iter().all(|h| h.len() == result.len));
@@ -754,7 +754,7 @@ fn i2a_wrong_id_hint_rejected_by_belt_hash() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p2"); // subjects a3,a4,a8,a6
     let (rec, filt, mut result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Point row 0's subject hint (a3) at row 1's real subject id (a4) — both base-layer entries.
     assert_ne!(result.id_hints[0][0], result.id_hints[0][1]);
     result.id_hints[0][0] = result.id_hints[0][1];
@@ -773,7 +773,7 @@ fn i2a_cross_layer_id_hint_rejected_by_belt_hash() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p2");
     let (rec, filt, mut result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Subject hints in ascending present order = [a3(base), a4(base), a8(base), a6(delta)].
     let base_subject = result.id_hints[0][0];
     let delta_subject = result.id_hints[0][3];
@@ -794,7 +794,7 @@ fn i2a_out_of_range_id_hint_rejected_by_routing() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p2");
     let (rec, filt, mut result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     result.id_hints[0][0] = 10_000_000; // far beyond head_node_value_count
     assert!(verify_and_resolve_single_atom(
         &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns, &result.id_hints,
@@ -811,7 +811,7 @@ fn i2a_tampered_value_rejected_by_recommitment_bind() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p2");
     let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let mut tampered = result.columns.clone();
     tampered[1][0] = ark(987_654_321); // a fabricated object-column hash
     assert!(verify_and_resolve_single_atom(
@@ -828,7 +828,7 @@ fn i2a_missing_id_hints_fail_closed() {
     let lref = refs(&layers);
     let c = hash_pred("http://ex/p2");
     let (rec, filt, result) = prove_read_single_atom(&lref, FilterPosition::Predicate, c).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     assert!(verify_and_resolve_single_atom(
         &lref, head_root, FilterPosition::Predicate, c, &rec, &filt, &result.columns, &[],
     )
@@ -919,7 +919,7 @@ fn three_atom_bgp_over_present() {
     ];
     let joins = [scalar_join(1, 0), scalar_join(2, 0)]; // acc.y==r2.y ; acc.z==r3.z
     let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let n = verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).unwrap();
     assert_eq!(n, 9, "3-atom chain over the delta stack must have 9 solutions");
     assert_eq!(result.len, 9);
@@ -945,7 +945,7 @@ fn multi_constant_bgp_over_present() {
     ];
     let joins = [scalar_join(0, 0)]; // acc.y == r2.y
     let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let n = verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).unwrap();
     assert_eq!(n, 1, "subject-constant 2-atom join has exactly one solution");
     let resolved = verify_and_resolve_bgp(
@@ -968,7 +968,7 @@ fn single_atom_object_constant_bgp() {
     let lref = refs(&layers);
     let atoms = [atom(var(), "http://ex/p1", node_const("http://ex/y1"))];
     let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let n = verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap();
     assert_eq!(n, 3);
     let resolved = verify_and_resolve_bgp(
@@ -1018,7 +1018,7 @@ fn repeated_variable_bgp_over_present() {
     };
     let atoms = [self_atom];
     let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let n = verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap();
     assert_eq!(n, 3, "three present self-loops match Triple(?s, pself, ?s)");
     let resolved = verify_and_resolve_bgp(
@@ -1046,7 +1046,7 @@ fn bgp_fabricated_relation_commitment_rejects() {
     ];
     let joins = [scalar_join(1, 0), scalar_join(2, 0)];
     let (rec, mut bgp, _) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Fabricate atom 0's first kept column: the compaction binding fails.
     bgp.atoms[0].com_kept[0] = commit_col(&vec![ark(4242); 1usize << rec.working_log]);
     assert!(verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).is_err());
@@ -1063,7 +1063,7 @@ fn bgp_dropped_row_rejects() {
     ];
     let joins = [scalar_join(1, 0), scalar_join(2, 0)];
     let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Claim one fewer matching row in atom 0's compaction.
     let mut forged = bgp.clone();
     forged.atoms[0].m -= 1;
@@ -1080,7 +1080,7 @@ fn bgp_wrong_constant_rejects() {
     ];
     let joins = [scalar_join(1, 0)];
     let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Verify against a different first predicate: the selection is p1-bound.
     let wrong = [
         atom(var(), "http://ex/pX", var()),
@@ -1101,7 +1101,7 @@ fn bgp_tampered_present_id_rejects() {
     ];
     let joins = [scalar_join(1, 0)];
     let (rec, mut bgp, _) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     bgp.auth_s.com_id = commit_col(&vec![ark(3); 1usize << rec.working_log]);
     assert!(verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).is_err());
 }
@@ -1118,7 +1118,7 @@ fn bgp_forged_result_binding_rejects() {
     ];
     let joins = [scalar_join(1, 0), scalar_join(2, 0)];
     let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let mut forged = result.columns.clone();
     forged[3][0] = ark(987_654_321); // fabricated ?w binding
     assert!(verify_and_resolve_bgp(
@@ -1143,7 +1143,7 @@ fn bgp_non_satisfying_join_tuple_is_excluded() {
     ];
     let joins = [scalar_join(1, 0), scalar_join(2, 0)];
     let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let n = verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).unwrap();
     let ground =
         materialized_3chain_resolved(&lref, "http://ex/p1", "http://ex/p2", "http://ex/p3");
@@ -1257,7 +1257,7 @@ fn run_age_range(op: RangeOp, c: u64, expect: usize) {
     let lref = refs(&layers);
     let atoms = [range_atom(op, c, None)];
     let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let n = verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap();
     let ground = materialized_age_range(&lref, |v| cmp_op(op, v, c));
     assert_eq!(n, ground.len(), "op {:?} c {}: count must equal materialized", op, c);
@@ -1300,7 +1300,7 @@ fn range_in_range_over_present() {
     let lref = refs(&layers);
     let atoms = [range_atom(RangeOp::Ge, 18, Some((RangeOp::Lt, 30)))];
     let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let n = verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap();
     let ground = materialized_age_range(&lref, |v| v >= 18 && v < 30);
     assert_eq!(n, 3);
@@ -1344,7 +1344,7 @@ fn range_join_over_present() {
     ];
     let joins = [scalar_join(0, 0)]; // acc.x == name.x
     let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let n = verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).unwrap();
     let ground = materialized_age_name_join(&lref, |v| v >= 18);
     assert_eq!(n, 5);
@@ -1361,7 +1361,7 @@ fn range_wrong_bound_rejects() {
     let lref = refs(&layers);
     let atoms = [range_atom(RangeOp::Ge, 18, None)];
     let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Verify the >=18 proof against a >=19 bound: the range selection is 18-bound.
     let wrong = [range_atom(RangeOp::Ge, 19, None)];
     assert!(verify_read_bgp(&lref, head_root, &wrong, &[], &rec, &bgp).is_err());
@@ -1373,7 +1373,7 @@ fn range_wrong_op_rejects() {
     let lref = refs(&layers);
     let atoms = [range_atom(RangeOp::Ge, 18, None)];
     let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let wrong = [range_atom(RangeOp::Gt, 18, None)];
     assert!(verify_read_bgp(&lref, head_root, &wrong, &[], &rec, &bgp).is_err());
 }
@@ -1386,7 +1386,7 @@ fn range_tampered_value_column_rejects() {
     let lref = refs(&layers);
     let atoms = [range_atom(RangeOp::Ge, 18, None)];
     let (rec, mut bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let rd = bgp.range_dict.as_mut().expect("a range dict was built");
     rd.com_value_at_k = commit_col(&vec![ark(7); 1usize << rd.log.max(rec.working_log)]);
     assert!(verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).is_err());
@@ -1398,7 +1398,7 @@ fn range_fabricated_row_rejects() {
     let lref = refs(&layers);
     let atoms = [range_atom(RangeOp::Ge, 18, None)];
     let (rec, mut bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     // Fabricate a kept output column: the compaction binding fails.
     bgp.atoms[0].com_kept[0] = commit_col(&vec![ark(4242); 1usize << rec.working_log]);
     assert!(verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).is_err());
@@ -1410,7 +1410,7 @@ fn range_dropped_row_rejects() {
     let lref = refs(&layers);
     let atoms = [range_atom(RangeOp::Ge, 18, None)];
     let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let mut forged = bgp.clone();
     forged.atoms[0].m -= 1; // claim one fewer in-range row
     assert!(verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &forged).is_err());
@@ -1424,7 +1424,7 @@ fn range_plan_mismatch_rejects() {
     let lref = refs(&layers);
     let atoms = [range_atom(RangeOp::Ge, 18, None)];
     let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let plain = [atom(var(), "http://ex/age", var())];
     assert!(verify_read_bgp(&lref, head_root, &plain, &[], &rec, &bgp).is_err());
 }
@@ -1441,7 +1441,7 @@ fn honest_stack_asserts_present_set_and_dict_hash_unique() {
     let lref = refs(&layers);
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     assert!(bgp.present_distinct.is_some(), "present duplicate-freeness must be asserted");
     // The combined catalog hash-uniqueness assertion holds on an honest stack.
     let views: Vec<VerifierCommitmentRef<'_>> = lref.iter().map(|l| l.verifier_view()).collect();
@@ -1542,7 +1542,7 @@ fn tampered_present_distinct_rejects() {
     let lref = refs(&layers);
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (rec, mut bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     bgp.present_distinct.as_mut().unwrap().com_sorted =
         commit_col(&vec![ark(1); 1usize << rec.working_log]);
     assert!(verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).is_err());
@@ -1556,7 +1556,7 @@ fn dropped_present_distinct_rejects() {
     let lref = refs(&layers);
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (rec, mut bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     bgp.present_distinct = None;
     assert!(verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).is_err());
 }
@@ -1606,7 +1606,7 @@ fn added_triple_predicate_constant() {
     // row is not provable as an added row.
     let layers = delta_read_stack();
     let lref = refs(&layers);
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (proof, result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
     let n = verify_delta_read(&lref, head_root, DeltaSource::Additions, &atoms, &[], &proof).unwrap();
@@ -1626,7 +1626,7 @@ fn added_triple_inherited_row_excluded() {
     // AddedTriple(?s, p2, ?o) is empty: an inherited/materialized row is NOT an AddedTriple.
     let layers = delta_read_stack();
     let lref = refs(&layers);
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let atoms = [atom(var(), "http://ex/p2", var())];
     let (proof, result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
     let n = verify_delta_read(&lref, head_root, DeltaSource::Additions, &atoms, &[], &proof).unwrap();
@@ -1643,7 +1643,7 @@ fn added_triple_subject_constant() {
     // AddedTriple(a5, p1, ?o): keep the object; exactly {b5}.
     let layers = delta_read_stack();
     let lref = refs(&layers);
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let atoms = [atom(node_const("http://ex/a5"), "http://ex/p1", var())];
     let (proof, result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
     let n = verify_delta_read(&lref, head_root, DeltaSource::Additions, &atoms, &[], &proof).unwrap();
@@ -1661,7 +1661,7 @@ fn deleted_triple_predicate_constant() {
     // reference ANCESTOR (base-defined) terms — resolved via the combined chain dictionaries.
     let layers = delta_read_stack();
     let lref = refs(&layers);
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (proof, result) = prove_delta_read(&lref, DeltaSource::Removals, &atoms, &[]).unwrap();
     let n = verify_delta_read(&lref, head_root, DeltaSource::Removals, &atoms, &[], &proof).unwrap();
@@ -1684,9 +1684,9 @@ fn delta_read_wrong_head_root_rejects() {
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (proof, _) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
     // Anchor to a non-head (base) root.
-    assert!(verify_delta_read(&lref, lref[0].state.commitment_root, DeltaSource::Additions, &atoms, &[], &proof).is_err());
+    assert!(verify_delta_read(&lref, lref[0].resolution_root(), DeltaSource::Additions, &atoms, &[], &proof).is_err());
     // Corrupt the head root.
-    let mut bogus = lref.last().unwrap().state.commitment_root;
+    let mut bogus = lref.last().unwrap().resolution_root();
     bogus[0] ^= 0xff;
     assert!(verify_delta_read(&lref, bogus, DeltaSource::Additions, &atoms, &[], &proof).is_err());
 }
@@ -1698,7 +1698,7 @@ fn delta_read_fabricated_group_hash_rejects() {
     // row cannot be proved.
     let layers = delta_read_stack();
     let lref = refs(&layers);
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (mut proof, _) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
     proof.group.s.lookup.com_v_hash = commit_col(&vec![ark(4242); 1usize << proof.working_log]);
@@ -1709,7 +1709,7 @@ fn delta_read_fabricated_group_hash_rejects() {
 fn delta_read_dropped_row_rejects() {
     let layers = delta_read_stack();
     let lref = refs(&layers);
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (proof, _) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
     let mut forged = proof.clone();
@@ -1722,7 +1722,7 @@ fn delta_read_wrong_constant_rejects() {
     // A p1 proof must not verify against a p2 query (the selection is p1-bound).
     let layers = delta_read_stack();
     let lref = refs(&layers);
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (proof, _) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
     let wrong = [atom(var(), "http://ex/p2", var())];
@@ -1735,7 +1735,7 @@ fn delta_read_source_mismatch_rejects() {
     // transcript-domain-separated AND binds a different set of root columns.
     let layers = delta_read_stack();
     let lref = refs(&layers);
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (proof, _) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
     assert!(verify_delta_read(&lref, head_root, DeltaSource::Removals, &atoms, &[], &proof).is_err());
@@ -1746,7 +1746,7 @@ fn delta_read_forged_result_binding_rejects() {
     // A prover who publishes an altered result value fails the re-commitment bind.
     let layers = delta_read_stack();
     let lref = refs(&layers);
-    let head_root = lref.last().unwrap().state.commitment_root;
+    let head_root = lref.last().unwrap().resolution_root();
     let atoms = [atom(var(), "http://ex/p1", var())];
     let (proof, result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
     let mut forged = result.columns.clone();

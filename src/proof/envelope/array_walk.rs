@@ -1471,7 +1471,14 @@ pub fn verify_ordered_array_walk_reconciled(
     predicate: &[u8],
     proof: &OrderedArrayWalkReconciledProof,
 ) -> io::Result<Vec<CanonicalObject>> {
-    let root = trusted_head_root;
+    // β re-anchor: the transcript/gadget-binding `root` is the head's COMMITMENT root (matching
+    // `prove_ordered_array_walk_reconciled`); `trusted_head_root` is now a `resolution_root` used
+    // ONLY for the head-pin equality inside `verify_reconcile_core` below.
+    let root = layers
+        .last()
+        .ok_or_else(|| invalid("reconciled ordered-array-walk needs a head layer"))?
+        .state
+        .commitment_root;
     let digest = reconciled_array_walk_digest(subject, predicate)?;
     let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
         layers.iter().map(|l| l.verifier_view()).collect();

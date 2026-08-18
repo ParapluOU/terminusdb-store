@@ -124,7 +124,7 @@ pub fn prove_layer_filter_with_source(
 /// never trusts the id out of band and never rescans the table.
 pub fn verify_layer_filter(
     source: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     predicate_term: &[u8],
     predicate_id: u64,
     com_sout: &ArkGT,
@@ -134,7 +134,7 @@ pub fn verify_layer_filter(
 ) -> io::Result<()> {
     verify_layer_filter_with_source(
         source,
-        expected_root,
+        trusted_resolution_root,
         ColumnSource::Materialized,
         predicate_term,
         predicate_id,
@@ -151,7 +151,7 @@ pub fn verify_layer_filter(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_layer_filter_with_source(
     source: &impl VerifierLayer,
-    expected_root: ProofHash,
+    trusted_resolution_root: ProofHash,
     column_source: ColumnSource,
     predicate_term: &[u8],
     predicate_id: u64,
@@ -162,12 +162,15 @@ pub fn verify_layer_filter_with_source(
 ) -> io::Result<()> {
     let layer = source.verifier_view();
     require_base_layer_for_query(layer.state)?;
-    // FIX 4: pin to an EXTERNALLY-trusted root FIRST (mirroring import_pack's
-    // external-root check), so the proof is bound to a root the verifier already
-    // trusts rather than whatever LayerCommitment the prover supplied.
-    if layer.state.commitment_root != expected_root {
+    // β re-anchor (FIX 4): pin to an EXTERNALLY-trusted `resolution_root` FIRST, which
+    // binds `commitment_root` AND the two dictionary Merkle roots (a fabricated Merkle
+    // root that would resolve ids to arbitrary terms cannot hash to the trusted anchor).
+    // The `recomputed_commitment_root` check below then binds `commitment_root` to the
+    // committed columns/dictionary. Together they anchor the proof to a root the verifier
+    // already trusts rather than whatever LayerCommitment the prover supplied.
+    if layer.resolution_root() != trusted_resolution_root {
         return Err(invalid(
-            "layer commitment_root does not match the externally-trusted expected root",
+            "layer resolution_root does not match the externally-trusted resolution root",
         ));
     }
     if layer.recomputed_commitment_root()? != layer.state.commitment_root {

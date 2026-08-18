@@ -1398,7 +1398,14 @@ pub fn verify_ordered_list_walk_reconciled(
     predicate: &[u8],
     proof: &OrderedListWalkReconciledProof,
 ) -> io::Result<Vec<CanonicalObject>> {
-    let root = trusted_head_root;
+    // β re-anchor: the transcript/gadget-binding `root` is the head's COMMITMENT root (matching
+    // `prove_ordered_list_walk_reconciled`); `trusted_head_root` is now a `resolution_root` used
+    // ONLY for the head-pin equality inside `verify_reconcile_core` below.
+    let root = layers
+        .last()
+        .ok_or_else(|| invalid("reconciled ordered-list-walk needs a head layer"))?
+        .state
+        .commitment_root;
     let digest = reconciled_list_walk_digest(subject, predicate)?;
     let closure_digest = child_digest(&digest, b"closure");
 
