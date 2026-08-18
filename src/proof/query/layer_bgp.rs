@@ -348,18 +348,42 @@ pub fn attach_termless_bgp_openings(
     plan: &LayerBgpPlan,
     result: &mut LayerBgpResult,
 ) -> io::Result<()> {
-    require_base_layer_for_query(&layer.state)?;
+    let openings = build_termless_bgp_openings(
+        layer,
+        plan,
+        &result.proof,
+        &result.predicate_ids,
+        &result.real_columns(),
+    )?;
+    result.proof.openings = Some(openings);
+    Ok(())
+}
+
+/// Merkle-dict I2b S5: build the term-less resolution witness from a proven BGP's raw pieces (the
+/// [`LayerBgpProof`], its public `predicate_ids`, and the REAL/unpadded result columns), against a
+/// TERM-BEARING `layer` (the prover's — it still holds the catalog). Factored out of
+/// [`attach_termless_bgp_openings`] so the woql2/FFI producer, which holds a `ProvedBgp` rather
+/// than a `LayerBgpResult`, can mint the same witness. See `attach_termless_bgp_openings` for the
+/// soundness note (uncommitted; over-inclusion safe; under-inclusion fails closed).
+pub fn build_termless_bgp_openings(
+    layer: &impl VerifierLayer,
+    plan: &LayerBgpPlan,
+    proof: &LayerBgpProof,
+    predicate_ids: &[u64],
+    real_result_columns: &[Vec<ArkFr>],
+) -> io::Result<ResolutionOpenings> {
+    require_base_layer_for_query(layer.verifier_view().state)?;
     let mut nv_ids: Vec<u64> = Vec::new();
     let mut pred_ids: Vec<u64> = Vec::new();
 
     // (a) Matched-constant ids (S4 belt-hash). A variable predicate carries the canonical zero
     // placeholder (skip); subject/object constants come from the per-atom proof.
-    for &pid in &result.predicate_ids {
+    for &pid in predicate_ids {
         if pid != 0 {
             pred_ids.push(pid);
         }
     }
-    for atom in &result.proof.atoms {
+    for atom in &proof.atoms {
         if let Some(id) = atom.subject_id {
             nv_ids.push(id);
         }
@@ -370,14 +394,14 @@ pub fn attach_termless_bgp_openings(
 
     // (b) Resolved-result ids (S3 resolution). A ground-result UNIT / dictionary-absence carries
     // no dictionary result ids.
-    if !has_ground_result_unit(plan) && result.proof.dictionary_absence.is_none() {
+    if !has_ground_result_unit(plan) && proof.dictionary_absence.is_none() {
         let namespaces = result_id_namespaces(plan)?;
-        if namespaces.len() != result.result_columns.len() {
+        if namespaces.len() != real_result_columns.len() {
             return Err(invalid(
                 "term-less openings: result column count does not match the plan namespaces",
             ));
         }
-        for (column, namespace) in result.real_columns().iter().zip(&namespaces) {
+        for (column, namespace) in real_result_columns.iter().zip(&namespaces) {
             for id in column {
                 match namespace {
                     ResultIdNamespace::NodeValue => {
@@ -399,10 +423,7 @@ pub fn attach_termless_bgp_openings(
     pred_ids.retain(|&id| id != 0);
 
     // The builder routes each id to the unique interval that contains it and dedups internally.
-    let view = layer.verifier_view();
-    let openings = build_resolution_openings(&[view], &nv_ids, &pred_ids)?;
-    result.proof.openings = Some(openings);
-    Ok(())
+    build_resolution_openings(&[layer.verifier_view()], &nv_ids, &pred_ids)
 }
 
 /// Verify a k-atom layer BGP proof. Anchors to `commitment_root` FIRST (exactly like

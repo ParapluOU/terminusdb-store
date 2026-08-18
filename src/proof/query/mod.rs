@@ -145,8 +145,9 @@ pub use result::{
 #[cfg(test)]
 pub(crate) use result::resolve_node_value_result_objects_with_openings;
 pub use layer_bgp::{
-    attach_termless_bgp_openings, prove_layer_bgp, prove_layer_bgp_with_result,
-    prove_layer_bgp_with_result_and_context, verify_layer_bgp, verify_layer_bgp_result_log_domain,
+    attach_termless_bgp_openings, build_termless_bgp_openings, prove_layer_bgp,
+    prove_layer_bgp_with_result, prove_layer_bgp_with_result_and_context, verify_layer_bgp,
+    verify_layer_bgp_result_log_domain,
 };
 // Merkle-dict I2b S4: the per-matched-constant belt-hash entry that consumes the prover-shipped
 // constant openings for a TERM-LESS artifact. `#[cfg(test)]` + `pub(crate)` — the openings-
