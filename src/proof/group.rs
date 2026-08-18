@@ -152,6 +152,9 @@ fn validate_statement(input: &RelationCommit, key: usize, value: usize, datatype
 
 fn extremum_encoding(source: &impl VerifierLayer, id: u64, datatype: CanonicalDatatype) -> io::Result<ArkFr> {
     let layer = source.verifier_view();
+    // Merkle-dict I2b S2 fail-close: encodes the chosen extremum id's dict VALUE — untied to
+    // terms on a TERM-LESS artifact. (Belt; `verify_group_extrema` also guards at entry.)
+    layer.require_terms_present("group extremum value encoding")?;
     let record = layer.node_value_catalog.iter().find(|r| r.object_id == id)
         .ok_or_else(|| invalid("group-extrema result id absent from node/value dictionary"))?;
     match &record.triple.object {
@@ -289,6 +292,9 @@ pub fn verify_group_extrema(
     if proof.entries.len() != result_rows.len() { return Err(invalid("group-extrema proof/result count mismatch")); }
     bind(transcript, input, key_column, value_column, datatype, kind, result_rows);
     let view = layer.verifier_view();
+    // Merkle-dict I2b S2 fail-close: GroupBy + Min/Max ranges over the order-preserving dict
+    // VALUE column, tied to real terms only by the catalog re-MSM a TERM-LESS artifact drops.
+    view.require_terms_present("group extrema (GroupBy + Min/Max over dictionary values)")?;
     view.validate()?;
     super::commitment::reject_nan_catalog(
         &view.node_value_catalog,
@@ -381,6 +387,31 @@ mod tests {
         assert_eq!(result.n, 2);
         let mut vt = Transcript254::new(b"group-min-test");
         verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &layer, &result.proof, &mut vt).unwrap();
+    }
+
+    /// Merkle-dict I2b S2 (N1): a valid group-extrema proof rejects on a TERM-LESS view of the
+    /// same base layer — GroupBy Min/Max ranges over the dictionary VALUE column, untied to real
+    /// terms without the catalog re-MSM. Term-bearing verify still succeeds.
+    #[test]
+    fn group_extrema_verify_fails_closed_on_termless_view() {
+        let (layer, values, nodes) = fixture();
+        let id = |v| values.iter().find(|x| x.0 == v).unwrap().1;
+        let keys = [nodes[0], nodes[0], nodes[1], nodes[1]];
+        let vals = [id(30), id(10), id(5), id(20)];
+        let input = RelationWitness::commit(vec![
+            keys.iter().map(|x| ArkFr::from_u64(*x)).collect(),
+            vals.iter().map(|x| ArkFr::from_u64(*x)).collect(),
+        ], 4).unwrap();
+        let rows = [(nodes[0], id(10)), (nodes[1], id(5))];
+        let mut pt = Transcript254::new(b"group-min-test");
+        let result = prove_group_extrema(&input, 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &layer, &mut pt).unwrap();
+        let mut vt = Transcript254::new(b"group-min-test");
+        verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &layer, &result.proof, &mut vt).unwrap();
+
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let mut tv = Transcript254::new(b"group-min-test");
+        let err = verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &termless, &result.proof, &mut tv).unwrap_err();
+        assert!(err.to_string().contains("terms-bearing"), "{err}");
     }
 
     #[test]

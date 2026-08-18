@@ -1364,3 +1364,51 @@ fn term_bearing_artifact_is_v4_and_reports_terms_present() {
     assert_eq!(decoded.predicate_catalog, layer.predicate_catalog);
     assert_eq!(decoded.node_value_catalog, layer.node_value_catalog);
 }
+
+/// Merkle-dict I2b S2 (N1) — the `Err`-on-access BELT: every value/datatype/catalog column
+/// accessor + `require_terms_present` fails CLOSED on a TERM-LESS view (returning `Err`, never
+/// empty-catalog columns a range/order/group gadget could silently mis-read), and is a strict
+/// no-op on a term-bearing view. Also exercises the `terms_present()` `VerifierLayer` accessor.
+#[test]
+fn termless_view_fails_closed_on_value_datatype_catalog_accessors() {
+    let layer = sample();
+
+    // Term-BEARING view: the belt is a strict no-op (everything Ok).
+    let bearing = layer.verifier_commitment().unwrap();
+    assert!(bearing.terms_present());
+    let bv = bearing.verifier_view();
+    assert!(bv.terms_present);
+    bv.require_terms_present("x").unwrap();
+    bv.node_value_dictionary_value_column().unwrap();
+    bv.node_value_dictionary_datatype_column().unwrap();
+    bv.node_value_dictionary_columns().unwrap();
+    bv.predicate_dictionary_columns().unwrap();
+    // The LayerCommitment prover sidecar delegates to the same gated accessors and is always
+    // term-bearing — no prover regression.
+    assert!(layer.terms_present());
+    layer.node_value_dictionary_value_column().unwrap();
+    layer.node_value_dictionary_datatype_column().unwrap();
+
+    // TERM-LESS view: every gated accessor Errs, and the error names the fail-close reason.
+    let termless = layer.verifier_commitment_termless().unwrap();
+    assert!(!termless.terms_present());
+    let v = termless.verifier_view();
+    assert!(!v.terms_present);
+    assert!(v
+        .require_terms_present("numeric range filter")
+        .unwrap_err()
+        .to_string()
+        .contains("terms-bearing"));
+    assert!(v
+        .node_value_dictionary_value_column()
+        .unwrap_err()
+        .to_string()
+        .contains("terms-bearing"));
+    assert!(v
+        .node_value_dictionary_datatype_column()
+        .unwrap_err()
+        .to_string()
+        .contains("terms-bearing"));
+    assert!(v.node_value_dictionary_columns().is_err());
+    assert!(v.predicate_dictionary_columns().is_err());
+}

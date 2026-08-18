@@ -369,6 +369,9 @@ pub fn verify_exact_scalar_order(
         return Err(invalid("exact scalar order requires one supported numeric column"));
     }
     let layer = source.verifier_view();
+    // Merkle-dict I2b S2 fail-close: the ordering key is each id's order-preserving dict VALUE,
+    // tied to real terms only by the catalog re-MSM a TERM-LESS artifact drops. Reject up front.
+    layer.require_terms_present("exact scalar OrderBy (dictionary-value sort key)")?;
     layer.validate()?;
     super::commitment::reject_nan_catalog(
         layer.node_value_catalog,
@@ -570,6 +573,57 @@ mod tests {
             &mut wrong_len,
         )
         .is_err());
+    }
+
+    /// Merkle-dict I2b S2 (N1): a valid scalar-order proof rejects on a TERM-LESS view of the
+    /// same base layer — the dictionary-VALUE sort key is untied to real terms without the
+    /// catalog re-MSM. Term-bearing verify still succeeds (the guard is a no-op there).
+    #[test]
+    fn scalar_order_verify_fails_closed_on_termless_view() {
+        let layer = layer();
+        let ids = [id_for(&layer, 30), id_for(&layer, 10), id_for(&layer, 20)];
+        let input =
+            RelationWitness::commit(vec![ids.iter().map(|id| ArkFr::from_u64(*id)).collect()], 3)
+                .unwrap();
+        let mut prover = transcript();
+        let result = prove_exact_scalar_order_with_context(
+            &StoreProverContext::cpu(),
+            &layer,
+            &input,
+            CanonicalDatatype::UInt32,
+            OrderDirection::Ascending,
+            &mut prover,
+        )
+        .unwrap();
+        let mut verifier = transcript();
+        verify_exact_scalar_order(
+            &layer,
+            &input.view(),
+            CanonicalDatatype::UInt32,
+            OrderDirection::Ascending,
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut verifier,
+        )
+        .unwrap();
+
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let mut tv = transcript();
+        let err = verify_exact_scalar_order(
+            &termless,
+            &input.view(),
+            CanonicalDatatype::UInt32,
+            OrderDirection::Ascending,
+            &result.commitments,
+            result.n,
+            result.log_domain,
+            &result.proof,
+            &mut tv,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("terms-bearing"), "{err}");
     }
 
     #[test]

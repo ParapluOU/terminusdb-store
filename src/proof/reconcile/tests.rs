@@ -72,6 +72,26 @@ fn base_plus_one_reconciles_and_counts() {
     assert!(bag_eq(present.rows.clone(), ground));
 }
 
+/// Merkle-dict I2b S2 (N1): the hoisted no-re-mint choke point (`assert_combined_catalog_hash_
+/// unique`, run by BOTH reconcile cores before any reconciled filter/join/range/resolution)
+/// fails CLOSED on a TERM-LESS view — its empty catalog would silently drop out of the
+/// hash-uniqueness multiset (fail-OPEN re-mint) and omit its rows from the combined range dict.
+/// This single guard fail-closes the entire delta/reconciled family. Term-bearing is a no-op.
+#[test]
+fn reconcile_remint_guard_fails_closed_on_termless_view() {
+    use crate::proof::commitment::VerifierLayer;
+    let base_lc = &base_plus_one()[0];
+
+    // Term-BEARING single-layer view: no duplicate hashes, the check passes.
+    let bearing = base_lc.verifier_commitment().unwrap();
+    assert_combined_catalog_hash_unique(&[bearing.verifier_view()]).unwrap();
+
+    // TERM-LESS base view: the re-mint choke rejects up front.
+    let termless = base_lc.verifier_commitment_termless().unwrap();
+    let err = assert_combined_catalog_hash_unique(&[termless.verifier_view()]).unwrap_err();
+    assert!(err.to_string().contains("terms-bearing"), "{err}");
+}
+
 // --- Base + 3 deltas: adds AND removes across layers, add-then-remove,
 //     remove-of-inherited, and a delta with a BRAND-NEW predicate. ---
 fn base_plus_three() -> Vec<Arc<LayerCommitment>> {

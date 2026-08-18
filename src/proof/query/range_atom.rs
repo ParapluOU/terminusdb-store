@@ -369,6 +369,11 @@ pub(super) fn verify_ranged_atom(
     m: usize,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
+    // Merkle-dict I2b S2 fail-close: a numeric range filter reads the order-preserving
+    // VALUE/DATATYPE dict columns (via the root-bound commitments) whose tie to real terms is
+    // the catalog re-MSM that a TERM-LESS artifact drops. Reject before any range work — the
+    // committed value/datatype columns would otherwise be prover-chosen and select the wrong rows.
+    layer.require_terms_present("numeric range filter (verify_ranged_atom)")?;
     let n_dict = root_bound_n_dict(&layer)?;
     reject_nan_catalog(layer.node_value_catalog, range.datatype)?;
     let (d_log, dict_log) = range_common_domain(a, n_dict)?;

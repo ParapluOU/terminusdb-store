@@ -198,6 +198,18 @@ pub trait VerifierLayer {
     fn resolution_root(&self) -> ProofHash {
         self.verifier_view().resolution_root()
     }
+
+    /// Merkle-dict I2b S2: is this layer's verifier artifact TERM-BEARING (`true`) or
+    /// TERM-LESS (`false`)? A term-less artifact dropped its two clear catalogs, so the
+    /// `validate()` catalog re-MSM — the ONLY check tying the 6 committed Dory dict columns
+    /// (esp. the order-preserving VALUE + DATATYPE columns) to the REAL terms — is skipped.
+    /// Every value/datatype/catalog-reading gadget (range, order, group, `dictionary_absence`,
+    /// delta re-mint) MUST fail-close when this is `false` (see `require_terms_present`); on a
+    /// term-less view those columns are prover-chosen and a gadget would produce a
+    /// wrong-but-verifying result. A full prover sidecar ([`LayerCommitment`]) is always `true`.
+    fn terms_present(&self) -> bool {
+        self.verifier_view().terms_present
+    }
 }
 
 impl VerifierLayer for LayerCommitment {
@@ -348,8 +360,53 @@ impl VerifierCommitmentRef<'_> {
         )
     }
 
+    /// Merkle-dict I2b S2 fail-close BELT. Reject any read that would consume the (now
+    /// prover-untied) value/datatype/catalog data on a TERM-LESS artifact. This is the
+    /// exhaustiveness backstop behind the per-gadget entry guards: on a term-less view the
+    /// clear catalogs are empty and the catalog re-MSM is skipped, so `validate()` no longer
+    /// ties the committed VALUE/DATATYPE columns to real terms — any range/order/group/absence/
+    /// re-mint reader here would silently read an empty catalog (or prover-chosen columns) and
+    /// return a wrong-but-verifying result. Fail closed instead. `what` names the reader for the
+    /// error. (Term-bearing is a no-op; a full [`LayerCommitment`] view is always term-bearing.)
+    pub fn require_terms_present(self, what: &str) -> io::Result<()> {
+        if !self.terms_present {
+            return Err(invalid(format!(
+                "{what} requires a terms-bearing artifact \
+                 (term-less Merkle-dict I2b artifact fail-closes value/datatype/catalog reads)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Rebuild the padded node/value-dictionary `(hash, id)` columns. Merkle-dict I2b S2:
+    /// `Err` on a TERM-LESS view (belt) — these columns feed range/order/group, never the
+    /// commitment-based constant-membership path, so gating them term-less is precise.
     pub fn node_value_dictionary_columns(self) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>)> {
+        self.require_terms_present("node/value dictionary (hash,id) column reconstruction")?;
         node_value_dict_columns_from_catalog(self.node_value_catalog)
+    }
+
+    /// Rebuild the padded predicate-dictionary `(hash, id)` columns. Merkle-dict I2b S2:
+    /// `Err` on a TERM-LESS view (belt).
+    pub fn predicate_dictionary_columns(self) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>)> {
+        self.require_terms_present("predicate dictionary (hash,id) column reconstruction")?;
+        predicate_dict_columns_from_catalog(self.predicate_catalog)
+    }
+
+    /// Rebuild the padded order-preserving node/value VALUE column that
+    /// `node_value_dict_range_commitments.0` commits. Merkle-dict I2b S2: `Err` on a TERM-LESS
+    /// view — this OP-value column is read ONLY by numeric range/order/group, whose soundness
+    /// rests on the catalog re-MSM a term-less artifact drops. THE core belt accessor.
+    pub fn node_value_dictionary_value_column(self) -> io::Result<Vec<ArkFr>> {
+        self.require_terms_present("order-preserving VALUE column (numeric range/order/group)")?;
+        node_value_dict_value_column(self.node_value_catalog)
+    }
+
+    /// Rebuild the padded node/value DATATYPE column that `node_value_dict_range_commitments.1`
+    /// commits. Merkle-dict I2b S2: `Err` on a TERM-LESS view — same reasoning as the VALUE column.
+    pub fn node_value_dictionary_datatype_column(self) -> io::Result<Vec<ArkFr>> {
+        self.require_terms_present("DATATYPE column (numeric range/order/group)")?;
+        node_value_dict_datatype_column(self.node_value_catalog)
     }
 }
 
@@ -1022,32 +1079,36 @@ impl LayerCommitment {
 
     /// Rebuild the padded predicate-dictionary columns `(hash, id)` that
     /// `predicate_dict_commitments` commits, so a Q3 membership proof can open
-    /// them. Same padding/order as the committed columns.
+    /// them. Same padding/order as the committed columns. Merkle-dict I2b S2:
+    /// delegates to the single gated [`VerifierCommitmentRef`] belt accessor (a
+    /// prover sidecar is always term-bearing, so the gate is a no-op here).
     pub fn predicate_dictionary_columns(&self) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>)> {
-        predicate_dict_columns_from_catalog(&self.predicate_catalog)
+        self.verifier_view().predicate_dictionary_columns()
     }
 
     /// Rebuild the padded node/value-dictionary columns `(hash, id)` that
     /// `node_value_dict_commitments` commits, so a Q3 membership proof can open
     /// them for a subject/object constant. Same padding/order as the committed
-    /// columns.
+    /// columns. Merkle-dict I2b S2: delegates to the gated belt accessor.
     pub fn node_value_dictionary_columns(&self) -> io::Result<(Vec<ArkFr>, Vec<ArkFr>)> {
-        node_value_dict_columns_from_catalog(&self.node_value_catalog)
+        self.verifier_view().node_value_dictionary_columns()
     }
 
     /// Rebuild the padded node/value-dictionary VALUE column that
     /// `node_value_dict_range_commitments.0` commits, so a range proof can open
     /// it. Same padding/order/length as `node_value_dictionary_columns`.
+    /// Merkle-dict I2b S2: delegates to the gated belt accessor.
     pub fn node_value_dictionary_value_column(&self) -> io::Result<Vec<ArkFr>> {
-        node_value_dict_value_column(&self.node_value_catalog)
+        self.verifier_view().node_value_dictionary_value_column()
     }
 
     /// Rebuild the padded node/value-dictionary DATATYPE column that
     /// `node_value_dict_range_commitments.1` commits, so the range gadget can
     /// open it and mask rows to the queried datatype. Same padding/order/length
-    /// as `node_value_dictionary_columns`.
+    /// as `node_value_dictionary_columns`. Merkle-dict I2b S2: delegates to the
+    /// gated belt accessor.
     pub fn node_value_dictionary_datatype_column(&self) -> io::Result<Vec<ArkFr>> {
-        node_value_dict_datatype_column(&self.node_value_catalog)
+        self.verifier_view().node_value_dictionary_datatype_column()
     }
 
     /// The six dictionary commitments, in fixed bound order: predicate hash,

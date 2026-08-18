@@ -67,7 +67,12 @@ fn validate_shape(arity: usize, datatypes: &[CanonicalDatatype], key_indices: &[
 }
 
 fn resolve_values(source: &impl VerifierLayer, columns: &[Vec<ArkFr>], n: usize, datatypes: &[CanonicalDatatype], domain: usize) -> io::Result<Vec<Vec<ArkFr>>> {
-    let view = source.verifier_view(); view.validate()?;
+    let view = source.verifier_view();
+    // Merkle-dict I2b S2 fail-close: multi-column OrderBy resolves each key id to its dict VALUE
+    // (`node_value_op_value`) for the lexicographic comparison — tied to real terms only by the
+    // catalog re-MSM a TERM-LESS artifact drops. Reject before reading the (empty) catalog.
+    view.require_terms_present("exact multi-column OrderBy (dictionary-value sort keys)")?;
+    view.validate()?;
     columns.iter().zip(datatypes).map(|(column, datatype)| {
         if column.len() < n { return Err(invalid("multi-order output column too short")); }
         let mut values = Vec::with_capacity(domain);
@@ -150,6 +155,22 @@ mod tests {
         let entry = CanonicalObject::from_store_object(&ValueTriple::new_value("", "", u32::make_entry(&value)).object);
         ArkFr::from_u64(layer.node_value_catalog.iter().find(|r| r.triple.object == entry).unwrap().object_id)
     }
+    /// Merkle-dict I2b S2 (N1): a valid multi-column order proof rejects on a TERM-LESS view of
+    /// the same base layer — `resolve_values` decodes each key id's dictionary VALUE, untied to
+    /// real terms without the catalog re-MSM. Term-bearing verify still succeeds.
+    #[test]
+    fn multi_order_verify_fails_closed_on_termless_view() {
+        let layer = fixture();
+        let input = RelationWitness::commit(vec![vec![id(&layer,2),id(&layer,1),id(&layer,1)], vec![id(&layer,8),id(&layer,3),id(&layer,9)]], 3).unwrap();
+        let types = [CanonicalDatatype::UInt32, CanonicalDatatype::UInt32];
+        let dirs = [OrderDirection::Descending, OrderDirection::Ascending];
+        let result = prove_exact_multi_order_with_context(&StoreProverContext::cpu(), &layer, &input, &types, &[1,0], &dirs, &mut Transcript254::new(b"multiorder-test")).unwrap();
+        verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &[1,0], &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-test")).unwrap();
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let err = verify_exact_multi_order(&termless, &input.view(), &result.columns, &types, &[1,0], &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-test")).unwrap_err();
+        assert!(err.to_string().contains("terms-bearing"), "{err}");
+    }
+
     #[test]
     fn exact_two_key_mixed_order_and_direction_tamper() {
         let layer = fixture();

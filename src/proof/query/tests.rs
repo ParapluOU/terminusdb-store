@@ -2348,6 +2348,62 @@
         check_age_range(&lc, RangeOp::Le, 18, 3);
     }
 
+    /// Merkle-dict I2b S2 (N1): the two base-BGP catalog/value sub-paths fail CLOSED on a
+    /// TERM-LESS view of the same base layer, while the point-lookup/join core stays
+    /// term-less-queryable. (1) A valid RANGE BGP rejects — the committed VALUE/DATATYPE dict
+    /// columns are untied to real terms without the catalog re-MSM. (2) A valid dictionary-ABSENCE
+    /// BGP rejects — an empty term-less catalog would fail-OPEN, certifying a present term absent.
+    /// Both verify fine term-bearing (guards are no-ops there).
+    #[test]
+    fn layer_bgp_range_and_absence_fail_closed_on_termless_view() {
+        // (1) RANGE.
+        let lc = build_age_name_layer();
+        let plan = age_range_plan(RangeOp::Gt, 18);
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
+        let termless = lc.verifier_commitment_termless().unwrap();
+        let err =
+            verify_layer_bgp(&termless, lc.resolution_root(), &plan, &ids, &coms, m, &proof)
+                .unwrap_err();
+        assert!(err.to_string().contains("terms-bearing"), "range: {err}");
+
+        // (2) ABSENCE.
+        let alc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
+        let aplan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
+            atoms: vec![atom(KNOWS), atom(b"http://ex/absent")],
+            joins: vec![JoinStep {
+                acc_key: 1,
+                rel_key: 0,
+                additional_keys: Vec::new(),
+            }],
+        };
+        let ares = prove_layer_bgp_with_result(&alc, &aplan).unwrap();
+        assert!(ares.proof.dictionary_absence.is_some());
+        verify_layer_bgp(
+            &alc,
+            alc.resolution_root(),
+            &aplan,
+            &ares.predicate_ids,
+            &ares.result_commitments,
+            ares.result_len,
+            &ares.proof,
+        )
+        .unwrap();
+        let atermless = alc.verifier_commitment_termless().unwrap();
+        let aerr = verify_layer_bgp(
+            &atermless,
+            alc.resolution_root(),
+            &aplan,
+            &ares.predicate_ids,
+            &ares.result_commitments,
+            ares.result_len,
+            &ares.proof,
+        )
+        .unwrap_err();
+        assert!(aerr.to_string().contains("terms-bearing"), "absence: {aerr}");
+    }
+
     #[test]
     fn layer_bgp_object_range_dict_domain_exceeds_table_end_to_end() {
         // D = 16 (dict) strictly exceeds the table domain 8: the object column relocates

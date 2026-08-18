@@ -895,6 +895,11 @@ impl RecursiveRelationEnvelope {
         cell_log_domain: usize,
     ) -> io::Result<()> {
         let view = layer.verifier_view();
+        // Merkle-dict I2b S2 fail-close: the ordered-array-walk density certificate authenticates
+        // each cell's `sys:index` id to its order-preserving dictionary VALUE/DATATYPE and decodes
+        // it to a position — the exact value/datatype read a TERM-LESS artifact severs from real
+        // terms. A pure-resolve ReadDocument works term-less, but this value-decoding walk must not.
+        view.require_terms_present("ordered-array-walk density (index value/datatype decode)")?;
         let n_dict = view.node_value_catalog.len();
         let (_, dict_id) = view.node_value_dictionary_columns()?;
         if dict_id.is_empty() || !dict_id.len().is_power_of_two() {

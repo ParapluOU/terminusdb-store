@@ -407,6 +407,19 @@ pub(super) fn assert_hashes_unique(mut hashes: Vec<ArkFr>, what: &str) -> io::Re
 /// chain catalogs, which are authenticated to the trusted head root by the reconciliation's
 /// per-layer `validate()`; so a re-minted (duplicate-hash) dictionary is soundly rejected.
 pub(super) fn assert_combined_catalog_hash_unique(views: &[VerifierCommitmentRef<'_>]) -> io::Result<()> {
+    // Merkle-dict I2b S2 fail-close (delta / whole-reconcile). This is the hoisted no-re-mint
+    // choke point for BOTH reconcile cores (`verify_reconcile_core`, `verify_delta_read`), run
+    // right after each view's `validate()` and before ANY reconciled id-space filter/join/range/
+    // resolution trusts the term↔id bijection. A TERM-LESS view carries an EMPTY catalog, so its
+    // canonical hashes silently drop out of the uniqueness multiset (a re-minted term would be
+    // MISSED — fail-open) AND the combined range dict would omit its rows. Term-less is
+    // base/rollup-only (a term-less delta already fails `validate()`), so this rejects the only
+    // residual case: a term-less BASE at the bottom of a reconciled chain. One guard here
+    // fail-closes the entire delta/reconciled family (re-mint, present range/filter/join, chain
+    // resolution, the reconciled list/array walks).
+    for view in views {
+        view.require_terms_present("reconciled / delta query (re-mint over chain catalogs)")?;
+    }
     let node_value: Vec<ArkFr> = views
         .iter()
         .flat_map(|view| view.node_value_catalog.iter().map(|rec| hash_object(&rec.triple.object)))

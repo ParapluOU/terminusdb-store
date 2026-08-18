@@ -324,6 +324,9 @@ pub(super) fn grouped_node_rows(
     input: &RecursiveRelationEnvelope,
     key_columns: &[usize],
 ) -> io::Result<std::collections::BTreeMap<Vec<Vec<u8>>, (Vec<u64>, Vec<usize>)>> {
+    // Merkle-dict I2b S2 fail-close: aggregation over the clear catalog (verifier-recompute) —
+    // resolves group-key node ids to their catalog terms, which a TERM-LESS artifact drops.
+    layer.verifier_view().require_terms_present("GroupBy key resolution (aggregation)")?;
     if key_columns.is_empty()
         || key_columns.len() > 2
         || (key_columns.len() == 2 && key_columns[0] == key_columns[1])
@@ -393,6 +396,9 @@ pub(super) fn derived_group_sum_columns(
     value_column: usize,
     datatype: CanonicalDatatype,
 ) -> io::Result<Vec<Vec<ArkFr>>> {
+    // Merkle-dict I2b S2 fail-close: sums each row's dictionary VALUE (verifier-recompute over
+    // the clear catalog), which a TERM-LESS artifact drops.
+    layer.verifier_view().require_terms_present("GroupBy Sum over dictionary values")?;
     let values = input
         .result_columns
         .get(value_column)
@@ -478,6 +484,9 @@ pub(super) fn derived_collection_sum_column(
     template: CollectionSumTemplate,
     datatype: CanonicalDatatype,
 ) -> io::Result<Vec<Vec<ArkFr>>> {
+    // Merkle-dict I2b S2 fail-close: the `Column` template sums each row's dictionary VALUE
+    // (verifier-recompute over the clear catalog), which a TERM-LESS artifact drops.
+    layer.verifier_view().require_terms_present("collection Sum over dictionary values")?;
     let mut sum = GroupSumValue::zero(datatype)?;
     match template {
         CollectionSumTemplate::Column(column) => {
@@ -522,6 +531,9 @@ pub(super) fn derived_collection_extrema_column(
     datatype: CanonicalDatatype,
     kind: GroupExtremaKind,
 ) -> io::Result<Vec<Vec<ArkFr>>> {
+    // Merkle-dict I2b S2 fail-close: collection Min/Max over the order-preserving dictionary
+    // VALUE (`node_value_op_value`), untied to terms on a TERM-LESS artifact.
+    layer.verifier_view().require_terms_present("collection Min/Max over dictionary values")?;
     // Defense-in-depth: `node_value_op_value` also encodes Float32/64, whose total-order NaN
     // placement diverges from Prolog's IEEE comparison. Assert the integral OP subset here so a
     // future loosening of the `shape_bounded` gate cannot silently admit floating extrema.
@@ -575,6 +587,9 @@ pub(super) fn derived_group_extrema_columns(
     datatype: CanonicalDatatype,
     kind: GroupExtremaKind,
 ) -> io::Result<Vec<Vec<ArkFr>>> {
+    // Merkle-dict I2b S2 fail-close: GroupBy Min/Max over the order-preserving dictionary VALUE
+    // (`node_value_op_value`), untied to terms on a TERM-LESS artifact.
+    layer.verifier_view().require_terms_present("GroupBy Min/Max over dictionary values")?;
     // Defense-in-depth: reject floating (NaN-divergent) extrema at derivation time, independent
     // of the `shape_bounded` integral gate. `integral_catalog_value` also enforces this per value.
     if !integral_op_datatype(datatype) {

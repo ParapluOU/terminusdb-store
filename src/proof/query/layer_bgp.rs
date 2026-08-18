@@ -352,6 +352,12 @@ pub fn verify_layer_bgp(
     }
     let k = validate_bgp_plan(plan)?;
     if let Some(claimed_absence) = proof.dictionary_absence {
+        // Merkle-dict I2b S2 fail-close: `dictionary_absence` proves a constant is ABSENT by
+        // scanning the clear catalog. A TERM-LESS artifact carries EMPTY catalogs, so every
+        // constant would appear absent (a fail-OPEN forgery: certify a present term as absent).
+        // Reject before scanning. (Term-less is base/rollup-only, but the base BGP path IS
+        // term-less-queryable for point lookups/joins, so this branch is reachable and must guard.)
+        layer.require_terms_present("dictionary-absence proof (catalog nonmembership scan)")?;
         // Recommit every clear catalog/table before using catalog nonmembership. This
         // turns the scan below into an opening of the externally trusted layer root,
         // rather than trusting an unauthenticated convenience catalog.
