@@ -142,8 +142,13 @@ pub use op_value::{node_value_op_value, NODE_DATATYPE_TAG};
 // proof as `pub(crate)` — internal only, never part of the external `pub` surface.
 pub(crate) use columns::reject_nan_catalog;
 pub(crate) use dict_merkle::{
-    build_node_value_tree, build_predicate_tree, verify_opening, DictMerkleTree,
+    build_node_value_tree, build_predicate_tree, verify_opening, DictMerkleTree, DictOpening,
+    ResolutionOpenings,
 };
+// Merkle-dict I2b S3: the prover-side term-less-opening BUILDER is test-only (openings are minted
+// only by in-crate tests until S5 wires the shipping prover — the coupling gate).
+#[cfg(test)]
+pub(crate) use dict_merkle::build_resolution_openings;
 pub(crate) use legacy::decode_legacy_v3;
 pub(crate) use setup::{
     construction_commitment_scratch_bytes, matrix_dims, prover_setup, setup_parameter_id,

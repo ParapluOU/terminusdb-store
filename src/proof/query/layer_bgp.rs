@@ -350,6 +350,16 @@ pub fn verify_layer_bgp(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
+    // Merkle-dict I2b (interim S4) fail-close: reject a TERM-LESS artifact before ANY constant
+    // work. S1 made `VerifierCommitment::decode` accept `terms_present=0`; such an artifact
+    // dropped its clear catalogs, so `validate()` skips the catalog re-MSM that ties the
+    // committed node/value + predicate dict HASH columns to the real terms. Its `com_nv_hash`/
+    // `com_pred_hash` are then prover-chosen, so the `verify_dict_membership` constant-match in
+    // the atom loop below — AND the all-ground / ground-result-unit (ASK) early `Ok` — would
+    // authenticate a fabricated IRI->id mapping (the deferred I2b object-constant forge). Gate it
+    // HERE, before the `dictionary_absence` branch, the atom loop, and the ASK Ok. The base BGP
+    // path is NOT term-less-queryable until S4's per-constant belt-hash. (No-op term-bearing.)
+    layer.require_terms_present("layer BGP constant-match / ground-result unit")?;
     let k = validate_bgp_plan(plan)?;
     if let Some(claimed_absence) = proof.dictionary_absence {
         // Merkle-dict I2b S2 fail-close: `dictionary_absence` proves a constant is ABSENT by

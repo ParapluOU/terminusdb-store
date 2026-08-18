@@ -81,8 +81,13 @@ use super::bgp::{
 };
 use super::commitment::{
     build_node_value_tree, build_predicate_tree, verify_opening, DictMerkleTree, LayerCommitment,
-    VerifierCommitmentRef, VerifierLayer,
+    ResolutionOpenings, VerifierCommitmentRef, VerifierLayer,
 };
+// Merkle-dict I2b S3 differential/negative tests: the prover-side opening builder is test-only
+// in the reconcile module (the term-less chain-resolver path is exercised via the `_with_openings`
+// test helpers over a term-less base view).
+#[cfg(test)]
+use super::commitment::build_resolution_openings;
 use super::dict::{hash_object, hash_term};
 use super::filter::{
     prove_boolean_product_with_context, prove_compaction_only_with_context,

@@ -81,15 +81,22 @@ struct ChainDictResolver<'a> {
     views: &'a [VerifierCommitmentRef<'a>],
     nv_trees: Vec<Option<DictMerkleTree>>,
     pred_trees: Vec<Option<DictMerkleTree>>,
+    /// Merkle-dict I2b S3: prover-shipped, UNCOMMITTED openings for a TERM-LESS view in the
+    /// chain (the dropped catalog can no longer rebuild its tree). `None` on the ordinary
+    /// term-bearing delta path (every `LayerCommitment` view carries its catalog). When a
+    /// routed view is term-less, the resolver opens from these instead of rebuilding, still
+    /// verifying against that view's root-bound Merkle root (β re-anchor).
+    openings: Option<&'a ResolutionOpenings>,
 }
 
 impl<'a> ChainDictResolver<'a> {
-    fn new(views: &'a [VerifierCommitmentRef<'a>]) -> Self {
+    fn new(views: &'a [VerifierCommitmentRef<'a>], openings: Option<&'a ResolutionOpenings>) -> Self {
         let n = views.len();
         Self {
             views,
             nv_trees: (0..n).map(|_| None).collect(),
             pred_trees: (0..n).map(|_| None).collect(),
+            openings,
         }
     }
 
@@ -182,15 +189,36 @@ impl<'a> ChainDictResolver<'a> {
     ) -> io::Result<CanonicalObject> {
         let i = self.nv_layer(id)?;
         let view = self.views[i];
-        let tree = self.nv_tree(i)?;
-        let opening = tree.open(id)?;
-        let object = verify_opening(
-            &view.nv_merkle_root,
-            view.state.parent_node_value_count,
-            view.state.node_value_count,
-            id,
-            &opening,
-        )?;
+        // TERM-BEARING (the ordinary delta path): rebuild + open the routed layer's tree.
+        // TERM-LESS (Merkle-dict I2b S3): the catalog is dropped, so open the prover-shipped
+        // opening instead (fail-closed if absent). Both verify against the SAME root-bound
+        // `nv_merkle_root`, and `verify_opening` re-forces the interval + structural position,
+        // so a wrong opening cannot authenticate at the routed layer.
+        let object = if view.terms_present {
+            let tree = self.nv_tree(i)?;
+            let opening = tree.open(id)?;
+            verify_opening(
+                &view.nv_merkle_root,
+                view.state.parent_node_value_count,
+                view.state.node_value_count,
+                id,
+                &opening,
+            )?
+        } else {
+            let opening = self
+                .openings
+                .ok_or_else(|| {
+                    invalid("term-less node/value resolution requires prover-shipped Merkle openings")
+                })?
+                .node_value_opening(id)?;
+            verify_opening(
+                &view.nv_merkle_root,
+                view.state.parent_node_value_count,
+                view.state.node_value_count,
+                id,
+                opening,
+            )?
+        };
         if let Some(hash) = expected_hash {
             if hash_object(&object) != hash {
                 return Err(invalid(
@@ -211,15 +239,33 @@ impl<'a> ChainDictResolver<'a> {
     ) -> io::Result<CanonicalObject> {
         let i = self.pred_layer(id)?;
         let view = self.views[i];
-        let tree = self.pred_tree(i)?;
-        let opening = tree.open(id)?;
-        let object = verify_opening(
-            &view.pred_merkle_root,
-            view.state.parent_predicate_count,
-            view.state.predicate_count,
-            id,
-            &opening,
-        )?;
+        // Term-bearing rebuilds+opens the routed layer's tree; term-less (S3) opens the
+        // prover-shipped opening (fail-closed if absent) — both against `pred_merkle_root`.
+        let object = if view.terms_present {
+            let tree = self.pred_tree(i)?;
+            let opening = tree.open(id)?;
+            verify_opening(
+                &view.pred_merkle_root,
+                view.state.parent_predicate_count,
+                view.state.predicate_count,
+                id,
+                &opening,
+            )?
+        } else {
+            let opening = self
+                .openings
+                .ok_or_else(|| {
+                    invalid("term-less predicate resolution requires prover-shipped Merkle openings")
+                })?
+                .predicate_opening(id)?;
+            verify_opening(
+                &view.pred_merkle_root,
+                view.state.parent_predicate_count,
+                view.state.predicate_count,
+                id,
+                opening,
+            )?
+        };
         if let Some(hash) = expected_hash {
             let iri = match &object {
                 CanonicalObject::Node(bytes) => bytes.as_slice(),
@@ -285,6 +331,12 @@ impl<'a> ChainDictResolver<'a> {
 /// single-atom filter path) and ignored for `NodeValueId` (the value IS the id). The resolution
 /// belt-hash binds each hint to the authenticated result hash, so the hint is not committed and
 /// not part of `commitment_root` (I2a).
+///
+/// `openings`, when supplied (Merkle-dict I2b S3), is the prover-shipped, UNCOMMITTED
+/// [`ResolutionOpenings`] used to resolve ids routed to a TERM-LESS view (whose dropped catalog
+/// cannot rebuild its tree). It is `None` on the ordinary delta path (all `LayerCommitment`
+/// views are term-bearing); every routed view is opened against its own root-bound Merkle root
+/// either way, so `openings` — like `id_hints` — is a proof-side witness, never committed.
 pub(super) fn resolve_result_columns(
     views: &[VerifierCommitmentRef<'_>],
     claimed_columns: &[Vec<ArkFr>],
@@ -293,6 +345,7 @@ pub(super) fn resolve_result_columns(
     domain_log: usize,
     kinds: &[ResolveKind],
     id_hints: Option<&[Vec<u64>]>,
+    openings: Option<&ResolutionOpenings>,
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
     if claimed_columns.len() != com_out.len() || claimed_columns.len() != kinds.len() {
         return Err(invalid("resolve: result column shape mismatch"));
@@ -318,7 +371,7 @@ pub(super) fn resolve_result_columns(
     // (2) Resolve each value against the root-bound chain dictionaries by an id-routed positional
     // Merkle opening — id columns route the value-as-id (I3); hash columns route the prover's
     // (belt-hash-bound) id-hint (I2a). No catalog scan.
-    let mut resolver = ChainDictResolver::new(views);
+    let mut resolver = ChainDictResolver::new(views, openings);
     let mut resolved = Vec::with_capacity(claimed_columns.len());
     for (col_idx, (col, kind)) in claimed_columns.iter().zip(kinds).enumerate() {
         // Per-column id-hints: MANDATORY for the hash kinds (the belt-hash binds them), unused
@@ -351,14 +404,14 @@ pub(super) fn resolve_result_columns(
 // ---------------------------------------------------------------------------
 
 /// Resolve a node/value id directly by chain-routed Merkle opening (optional belt-and-suspenders
-/// hash cross-check). Test-only surface over [`ChainDictResolver`].
+/// hash cross-check). Test-only surface over [`ChainDictResolver`]. Term-bearing views rebuild.
 #[cfg(test)]
 pub(crate) fn resolve_node_value_id_via_chain_merkle(
     views: &[VerifierCommitmentRef<'_>],
     id: u64,
     expected_hash: Option<ArkFr>,
 ) -> io::Result<CanonicalObject> {
-    ChainDictResolver::new(views).resolve_nv_id(id, expected_hash)
+    ChainDictResolver::new(views, None).resolve_nv_id(id, expected_hash)
 }
 
 /// Resolve a predicate id directly by chain-routed Merkle opening (optional hash cross-check).
@@ -368,7 +421,31 @@ pub(crate) fn resolve_predicate_id_via_chain_merkle(
     id: u64,
     expected_hash: Option<ArkFr>,
 ) -> io::Result<CanonicalObject> {
-    ChainDictResolver::new(views).resolve_pred_id(id, expected_hash)
+    ChainDictResolver::new(views, None).resolve_pred_id(id, expected_hash)
+}
+
+/// Merkle-dict I2b S3 differential/negative test surface: resolve a node/value id over the
+/// chain when a routed view is TERM-LESS, consuming prover-shipped `openings`.
+#[cfg(test)]
+pub(crate) fn resolve_node_value_id_via_chain_merkle_with_openings(
+    views: &[VerifierCommitmentRef<'_>],
+    id: u64,
+    expected_hash: Option<ArkFr>,
+    openings: &ResolutionOpenings,
+) -> io::Result<CanonicalObject> {
+    ChainDictResolver::new(views, Some(openings)).resolve_nv_id(id, expected_hash)
+}
+
+/// Merkle-dict I2b S3 differential/negative test surface: resolve a predicate id over the chain
+/// when a routed view is TERM-LESS, consuming prover-shipped `openings`.
+#[cfg(test)]
+pub(crate) fn resolve_predicate_id_via_chain_merkle_with_openings(
+    views: &[VerifierCommitmentRef<'_>],
+    id: u64,
+    expected_hash: Option<ArkFr>,
+    openings: &ResolutionOpenings,
+) -> io::Result<CanonicalObject> {
+    ChainDictResolver::new(views, Some(openings)).resolve_pred_id(id, expected_hash)
 }
 
 /// Pre-I3 node/value id resolution: linear scan of the chain catalogs (differential baseline).
@@ -461,6 +538,8 @@ pub(crate) fn resolve_node_value_id_column(
         log_domain,
         &[ResolveKind::NodeValueId],
         None,
+        // Term-bearing `LayerCommitment` views: no term-less openings.
+        None,
     )?;
     resolved
         .pop()
@@ -508,6 +587,9 @@ pub fn verify_and_resolve_single_atom(
         verified.working_log,
         &kinds,
         Some(id_hints),
+        // Delta path resolves over full term-bearing `LayerCommitment` views (term-less is
+        // base/rollup-only and is fail-closed upstream at `present_bgp.rs` require_terms_present).
+        None,
     )
 }
 
@@ -529,6 +611,6 @@ pub fn verify_and_resolve_two_atom_join(
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     // Join output [id_x, id_y, id_z] are all node/value combined-dict ids (no id-hints needed).
     let kinds = [ResolveKind::NodeValueId, ResolveKind::NodeValueId, ResolveKind::NodeValueId];
-    resolve_result_columns(&views, claimed_columns, &join.com_join_out, out_len, join.join_log, &kinds, None)
+    resolve_result_columns(&views, claimed_columns, &join.com_join_out, out_len, join.join_log, &kinds, None, None)
 }
 

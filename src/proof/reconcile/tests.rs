@@ -1921,3 +1921,110 @@ fn i3_leaf_term_hash_mismatch_is_rejected() {
     assert_ne!(hash_term(&pred1), wrong);
     assert!(resolve_predicate_id_via_chain_merkle(&views, 1, Some(wrong)).is_err());
 }
+
+/// Merkle-dict I2b S3: over the CHAIN resolver, resolving ids on a TERM-LESS base view via
+/// prover-shipped Merkle openings yields terms IDENTICAL to the term-bearing rebuild path (node/
+/// value AND predicate, both reconstruction branches), the belt-hash still binds, and the path
+/// fails CLOSED on a missing carrier / missing per-id opening / belt-hash mismatch. (Term-less is
+/// base/rollup-only, so this exercises a single-view chain — the delta stack stays term-bearing
+/// and is fail-closed upstream at the re-mint choke.)
+#[test]
+fn s3_termless_chain_resolution_matches_term_bearing() {
+    use crate::proof::commitment::VerifierLayer;
+    // A base layer carrying Node + Value objects and a predicate.
+    let store = open_sync_memory_store();
+    let builder = store.create_base_layer().unwrap();
+    for (s, p, o) in [("a", "knows", "b"), ("b", "knows", "c")] {
+        builder
+            .add_value_triple(ValueTriple::new_node(&iri(s), &iri(p), &iri(o)))
+            .unwrap();
+    }
+    builder
+        .add_value_triple(ValueTriple::new_string_value(&iri("a"), &iri("label"), "hello"))
+        .unwrap();
+    let base = builder.commit().unwrap();
+    let base_lc = base.proof_commitment().unwrap();
+
+    let bearing_view = base_lc.verifier_view();
+    let termless = base_lc.verifier_commitment_termless().unwrap();
+    let tl_view = termless.verifier_view();
+    assert!(!tl_view.terms_present);
+
+    let nv_ids: Vec<u64> = (1..=bearing_view.state.node_value_count).collect();
+    let pred_ids: Vec<u64> = (1..=bearing_view.state.predicate_count).collect();
+    assert!(nv_ids.len() >= 3 && !pred_ids.is_empty());
+    // Prover ships openings from the term-bearing view (UNCOMMITTED witness).
+    let openings = build_resolution_openings(&[bearing_view], &nv_ids, &pred_ids).unwrap();
+
+    // Node/value: term-less opening resolution == term-bearing rebuild; belt-hash accepts.
+    let mut saw_node = false;
+    let mut saw_value = false;
+    for &id in &nv_ids {
+        let bearing = resolve_node_value_id_via_chain_merkle(&[bearing_view], id, None).unwrap();
+        let via_openings =
+            resolve_node_value_id_via_chain_merkle_with_openings(&[tl_view], id, None, &openings)
+                .unwrap();
+        assert_eq!(bearing, via_openings, "node/value id {id}: term-less != term-bearing");
+        match &bearing {
+            CanonicalObject::Node(_) => saw_node = true,
+            CanonicalObject::Value { .. } => saw_value = true,
+        }
+        assert!(resolve_node_value_id_via_chain_merkle_with_openings(
+            &[tl_view],
+            id,
+            Some(hash_object(&via_openings)),
+            &openings,
+        )
+        .is_ok());
+    }
+    assert!(saw_node && saw_value, "covers Node + Value reconstruction");
+
+    // Predicate: term-less == term-bearing; belt-hash accepts.
+    for &id in &pred_ids {
+        let bearing = resolve_predicate_id_via_chain_merkle(&[bearing_view], id, None).unwrap();
+        let via_openings =
+            resolve_predicate_id_via_chain_merkle_with_openings(&[tl_view], id, None, &openings)
+                .unwrap();
+        assert_eq!(bearing, via_openings, "predicate id {id}: term-less != term-bearing");
+        let iri_bytes = match &via_openings {
+            CanonicalObject::Node(b) => b.clone(),
+            _ => panic!("predicate resolves to a node IRI"),
+        };
+        assert!(resolve_predicate_id_via_chain_merkle_with_openings(
+            &[tl_view],
+            id,
+            Some(hash_term(&iri_bytes)),
+            &openings,
+        )
+        .is_ok());
+    }
+
+    // NEGATIVES on the term-less chain path.
+    // (a) No openings carrier ⇒ Err (fail-closed, not empty).
+    assert!(resolve_node_value_id_via_chain_merkle(&[tl_view], nv_ids[0], None).is_err());
+    // (b) Missing per-id opening ⇒ Err.
+    let others: Vec<u64> = nv_ids.iter().copied().filter(|&x| x != nv_ids[0]).collect();
+    let missing = build_resolution_openings(&[bearing_view], &others, &[]).unwrap();
+    assert!(resolve_node_value_id_via_chain_merkle_with_openings(
+        &[tl_view],
+        nv_ids[0],
+        None,
+        &missing,
+    )
+    .is_err());
+    // (c) Belt-hash mismatch on the term-less path ⇒ Err.
+    let t0 =
+        resolve_node_value_id_via_chain_merkle_with_openings(&[tl_view], nv_ids[0], None, &openings)
+            .unwrap();
+    let t1 =
+        resolve_node_value_id_via_chain_merkle_with_openings(&[tl_view], nv_ids[1], None, &openings)
+            .unwrap();
+    assert_ne!(hash_object(&t0), hash_object(&t1));
+    assert!(resolve_node_value_id_via_chain_merkle_with_openings(
+        &[tl_view],
+        nv_ids[0],
+        Some(hash_object(&t1)),
+        &openings,
+    )
+    .is_err());
+}

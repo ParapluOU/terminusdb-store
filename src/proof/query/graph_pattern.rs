@@ -222,6 +222,12 @@ pub fn verify_layer_graph_pattern2_with_source(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
+    // Merkle-dict I2b (interim S4) fail-close: as in `verify_layer_bgp`, a TERM-LESS artifact's
+    // committed predicate-dict HASH column is prover-chosen (validate() skips the catalog re-MSM),
+    // so the `verify_dict_membership` predicate constant-match below is forgeable. This legacy
+    // 2-hop entry is OFF the compact-envelope release path but is a pub verify surface — fence
+    // term-less out of it too. (No-op on a term-bearing sidecar/artifact.)
+    layer.require_terms_present("layer graph-pattern predicate constant-match")?;
     let n = source_count(layer.state, column_source) as usize;
     let padded = padded_len(n)?;
     let a = padded.trailing_zeros() as usize;

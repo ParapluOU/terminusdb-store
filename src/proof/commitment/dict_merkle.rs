@@ -389,6 +389,149 @@ pub(crate) fn verify_opening(
     object_from_leaf_parts(opening.datatype_tag, opening.term_bytes.clone())
 }
 
+/// Prover-side, UNCOMMITTED resolution witness for a TERM-LESS artifact (Merkle-dict I2b S3).
+///
+/// A term-less [`VerifierCommitment`] dropped its two clear catalogs, so the verifier can no
+/// longer REBUILD the id-indexed dictionary tree to open an id. Instead the prover ships one
+/// positional [`DictOpening`] per DISTINCT resolved id — node/value and predicate ids kept in
+/// separate namespaces — and term-less resolution verifies each against the root-bound
+/// `nv_merkle_root`/`pred_merkle_root` (β re-anchor), taking the term from the opening's OWN
+/// authenticated `term_bytes` ([`object_from_leaf_parts`]). This is EXACTLY analogous to the
+/// I2a filter-path `id_hints`: a proof-side witness, NEVER folded into
+/// `commitment_root`/`resolution_root`, bound solely by [`verify_opening`] (which re-forces the
+/// interval `(parent,count]` + the structural position `id-parent-1` against the trusted root,
+/// so a fabricated tree or a wrong-id opening cannot authenticate). A MISSING opening is an
+/// `Err` (fail-closed), never a silent empty result.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ResolutionOpenings {
+    node_value: std::collections::BTreeMap<u64, DictOpening>,
+    predicate: std::collections::BTreeMap<u64, DictOpening>,
+}
+
+impl ResolutionOpenings {
+    /// The shipped opening for a node/value id, or `Err` (fail-closed) if the prover shipped
+    /// none. The caller still runs [`verify_opening`] against the root-bound root, so a present
+    /// but WRONG opening is rejected there; this only turns a MISSING opening into an error
+    /// rather than an empty resolution.
+    pub(crate) fn node_value_opening(&self, id: u64) -> io::Result<&DictOpening> {
+        self.node_value.get(&id).ok_or_else(|| {
+            invalid("term-less resolution: prover shipped no node/value Merkle opening for this id")
+        })
+    }
+
+    /// The shipped opening for a predicate id, or `Err` (fail-closed) if the prover shipped none.
+    pub(crate) fn predicate_opening(&self, id: u64) -> io::Result<&DictOpening> {
+        self.predicate.get(&id).ok_or_else(|| {
+            invalid("term-less resolution: prover shipped no predicate Merkle opening for this id")
+        })
+    }
+
+    /// Insert a node/value opening (keyed by its own id). Prover/test constructor. S3 only
+    /// PRODUCES term-less openings in-crate tests, so this is `#[cfg(test)]` — a shipping path
+    /// cannot mint them until S5 un-gates the prover-side plumbing.
+    #[cfg(test)]
+    pub(crate) fn insert_node_value(&mut self, opening: DictOpening) {
+        self.node_value.insert(opening.id, opening);
+    }
+
+    /// Insert a predicate opening (keyed by its own id). Prover/test constructor (`#[cfg(test)]`).
+    #[cfg(test)]
+    pub(crate) fn insert_predicate(&mut self, opening: DictOpening) {
+        self.predicate.insert(opening.id, opening);
+    }
+}
+
+/// Prover-side builder: assemble the [`ResolutionOpenings`] for the given DISTINCT node/value
+/// and predicate ids from TERM-BEARING layer view(s) (the prover still holds the clear catalogs
+/// and rebuilds each tree). Each id is ROUTED to the unique view whose introduced interval
+/// `(parent_count, count]` contains it — the same public routing the resolver re-forces — and
+/// opened positionally. A single-element slice serves the base path; the N-element slice serves
+/// the chain. Every supplied view MUST be term-bearing (a term-less view has no catalog to open
+/// from); an id outside every interval (or in more than one) is an `Err`. The produced openings
+/// are an UNCOMMITTED witness the prover ships alongside the term-less artifact.
+///
+/// `#[cfg(test)]` in S3: term-less openings are PRODUCED only by in-crate tests until S5 wires
+/// the shipping prover — this compile-time gate keeps the term-less path test-only (the
+/// coupling guard for the I2b object-constant forge, which S4's belt-hash closes).
+#[cfg(test)]
+pub(crate) fn build_resolution_openings(
+    term_bearing_views: &[VerifierCommitmentRef<'_>],
+    node_value_ids: &[u64],
+    predicate_ids: &[u64],
+) -> io::Result<ResolutionOpenings> {
+    let mut nv_trees: Vec<Option<DictMerkleTree>> =
+        (0..term_bearing_views.len()).map(|_| None).collect();
+    let mut pred_trees: Vec<Option<DictMerkleTree>> =
+        (0..term_bearing_views.len()).map(|_| None).collect();
+    let mut out = ResolutionOpenings::default();
+
+    for &id in node_value_ids {
+        if out.node_value.contains_key(&id) {
+            continue;
+        }
+        let i = nv_interval_layer(term_bearing_views, id)?;
+        let view = term_bearing_views[i];
+        view.require_terms_present("building node/value resolution openings")?;
+        if nv_trees[i].is_none() {
+            nv_trees[i] = Some(build_node_value_tree(
+                view.node_value_catalog,
+                view.state.parent_node_value_count,
+                view.state.node_value_count,
+            )?);
+        }
+        out.insert_node_value(nv_trees[i].as_ref().unwrap().open(id)?);
+    }
+
+    for &id in predicate_ids {
+        if out.predicate.contains_key(&id) {
+            continue;
+        }
+        let i = pred_interval_layer(term_bearing_views, id)?;
+        let view = term_bearing_views[i];
+        view.require_terms_present("building predicate resolution openings")?;
+        if pred_trees[i].is_none() {
+            pred_trees[i] = Some(build_predicate_tree(
+                view.predicate_catalog,
+                view.state.parent_predicate_count,
+                view.state.predicate_count,
+            )?);
+        }
+        out.insert_predicate(pred_trees[i].as_ref().unwrap().open(id)?);
+    }
+
+    Ok(out)
+}
+
+/// The unique view index whose node/value interval `(parent, count]` contains `id`.
+#[cfg(test)]
+fn nv_interval_layer(views: &[VerifierCommitmentRef<'_>], id: u64) -> io::Result<usize> {
+    let mut found = None;
+    for (i, view) in views.iter().enumerate() {
+        if id > view.state.parent_node_value_count && id <= view.state.node_value_count {
+            if found.is_some() {
+                return Err(invalid("node/value id lies in more than one layer's interval"));
+            }
+            found = Some(i);
+        }
+    }
+    found.ok_or_else(|| invalid("node/value id lies outside every layer's introduced interval"))
+}
+
+/// The unique view index whose predicate interval `(parent, count]` contains `id`.
+#[cfg(test)]
+fn pred_interval_layer(views: &[VerifierCommitmentRef<'_>], id: u64) -> io::Result<usize> {
+    let mut found = None;
+    for (i, view) in views.iter().enumerate() {
+        if id > view.state.parent_predicate_count && id <= view.state.predicate_count {
+            if found.is_some() {
+                return Err(invalid("predicate id lies in more than one layer's interval"));
+            }
+            found = Some(i);
+        }
+    }
+    found.ok_or_else(|| invalid("predicate id lies outside every layer's introduced interval"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

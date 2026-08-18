@@ -37,7 +37,8 @@ use super::bgp::{
 };
 use super::commitment::{
     build_node_value_tree, build_predicate_tree, reject_nan_catalog, verify_opening, CommitmentState,
-    DictMerkleTree, LayerCommitment, VerifierCommitmentRef, VerifierLayer,
+    DictMerkleTree, DictOpening, LayerCommitment, ResolutionOpenings, VerifierCommitmentRef,
+    VerifierLayer,
 };
 use super::dict::{
     hash_object, hash_term, prove_dict_membership_with_context, verify_dict_membership, DictProof,
@@ -136,6 +137,15 @@ pub use result::{
     result_column_descriptors, result_id_namespaces, verify_node_value_result_objects,
     verify_result_columns,
 };
+// Merkle-dict I2b S3: term-less resolution over prover-shipped Merkle openings. `#[cfg(test)]`
+// + `pub(crate)` so the opening-based term-less path EXISTS only in test builds inside the store
+// crate — it must NOT be an external end-to-end query path until S4's per-constant belt-hash
+// gates term-less BGP verification (else the I2b object-constant forge). Resolution is decoupled
+// from `verify_layer_bgp`, so even crate-internally it does not enable a term-less full query.
+#[cfg(test)]
+pub(crate) use result::{
+    resolve_node_value_result_objects_with_openings, resolve_result_values_with_openings,
+};
 pub use layer_bgp::{
     prove_layer_bgp, prove_layer_bgp_with_result, prove_layer_bgp_with_result_and_context,
     verify_layer_bgp, verify_layer_bgp_result_log_domain,
@@ -151,6 +161,10 @@ pub(crate) use plan::has_ground_result_unit;
 pub(crate) use result::{
     resolve_node_value_result_objects_via_catalog, resolve_result_values_via_catalog,
 };
+// Merkle-dict I2b S3 differential test: the prover-side opening builder, so a test can ship
+// openings for a term-less artifact and assert term-less resolution == the term-bearing path.
+#[cfg(test)]
+pub(crate) use super::commitment::build_resolution_openings;
 
 // ---------------------------------------------------------------------------
 // Internal hoist: re-expose the cross-module `pub(super)` helpers under this

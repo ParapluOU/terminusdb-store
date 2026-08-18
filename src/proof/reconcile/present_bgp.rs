@@ -883,6 +883,6 @@ pub fn verify_and_resolve_bgp(
     )?;
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     let kinds = vec![ResolveKind::NodeValueId; result_coms.len()];
-    resolve_result_columns(&views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None)
+    resolve_result_columns(&views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None, None)
 }
 

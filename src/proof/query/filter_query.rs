@@ -178,6 +178,13 @@ pub fn verify_layer_filter_with_source(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
+    // Merkle-dict I2b (interim S4) fail-close: a TERM-LESS artifact's committed predicate-dict
+    // HASH column is not tied to real terms (validate() skips the catalog re-MSM), so the
+    // `verify_dict_membership` predicate constant-match below would authenticate a prover-chosen
+    // IRI->id mapping. This legacy single-predicate entry is OFF the compact-envelope release
+    // path (the woql2 compiler lowers to `verify_layer_bgp`), but it is a pub verify surface, so
+    // fence term-less out of it too. (No-op on a term-bearing sidecar/artifact.)
+    layer.require_terms_present("layer filter predicate constant-match")?;
     let n = source_count(layer.state, column_source) as usize;
     let padded = padded_len(n)?;
     let expected_k = padded.trailing_zeros() as usize;

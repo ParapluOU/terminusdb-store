@@ -61,6 +61,32 @@ pub fn resolve_node_value_result_objects(
     trusted_resolution_root: ProofHash,
     columns: &[Vec<ArkFr>],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    // No openings: term-bearing resolves via the rebuilt tree; a term-less view fails closed.
+    resolve_node_value_result_objects_impl(source, trusted_resolution_root, columns, None)
+}
+
+/// Merkle-dict I2b S3: resolve node/value result ids over a TERM-LESS artifact via
+/// prover-shipped Merkle `openings` (the dropped catalog can no longer rebuild the tree). The
+/// term-BEARING path is unchanged (it ignores `openings` and rebuilds the tree). `#[cfg(test)]`:
+/// in S3 the term-less resolve ENTRY POINT exists only in test builds — it must NOT be an
+/// external end-to-end query path until S4's per-constant belt-hash gates term-less BGP
+/// verification (else the I2b object-constant forge). S5 un-gates the shipping wiring.
+#[cfg(test)]
+pub(crate) fn resolve_node_value_result_objects_with_openings(
+    source: &impl VerifierLayer,
+    trusted_resolution_root: ProofHash,
+    columns: &[Vec<ArkFr>],
+    openings: &ResolutionOpenings,
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    resolve_node_value_result_objects_impl(source, trusted_resolution_root, columns, Some(openings))
+}
+
+fn resolve_node_value_result_objects_impl(
+    source: &impl VerifierLayer,
+    trusted_resolution_root: ProofHash,
+    columns: &[Vec<ArkFr>],
+    openings: Option<&ResolutionOpenings>,
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
     let layer = source.verifier_view();
     if layer.resolution_root() != trusted_resolution_root {
         return Err(invalid(
@@ -68,14 +94,28 @@ pub fn resolve_node_value_result_objects(
         ));
     }
     layer.validate()?;
-    let nv_tree = node_value_merkle_tree(layer)?;
+    // TERM-LESS (S3): DELIBERATELY route through the prover openings — never the empty-catalog
+    // rebuild path (which would fail-close only incidentally). A missing openings carrier here
+    // is an explicit fail-close; a missing per-id opening fails inside the resolver.
+    if !layer.terms_present && openings.is_none() {
+        return Err(invalid(
+            "term-less node/value resolution requires prover-shipped Merkle openings",
+        ));
+    }
+    // Term-bearing rebuilds+root-checks the tree once; term-less leaves it `None` and opens
+    // the prover-shipped openings instead.
+    let nv_tree = if layer.terms_present {
+        Some(node_value_merkle_tree(layer)?)
+    } else {
+        None
+    };
 
     columns
         .iter()
         .map(|column| {
             column
                 .iter()
-                .map(|id| resolve_node_value_id_via_merkle(id, layer, &nv_tree))
+                .map(|id| resolve_node_value_id_via_merkle(id, layer, nv_tree.as_ref(), openings))
                 .collect()
         })
         .collect()
@@ -125,38 +165,70 @@ fn predicate_merkle_tree(layer: VerifierCommitmentRef<'_>) -> io::Result<DictMer
 }
 
 /// Open one node/value id against the root-bound `nv_merkle_root`, returning the
-/// authenticated term.
+/// authenticated term. TERM-BEARING (`layer.terms_present`): open the rebuilt+root-checked
+/// `tree` (I1). TERM-LESS (Merkle-dict I2b S3): the catalog is dropped, so `tree` is `None`;
+/// consume the prover-shipped `openings` for this id (fail-closed `Err` if absent) and verify
+/// it against the SAME root-bound root. Either way `verify_opening` re-forces the interval +
+/// structural position against `nv_merkle_root`, so a wrong/tampered opening is rejected.
 fn resolve_node_value_id_via_merkle(
     id: &ArkFr,
     layer: VerifierCommitmentRef<'_>,
-    nv_tree: &DictMerkleTree,
+    tree: Option<&DictMerkleTree>,
+    openings: Option<&ResolutionOpenings>,
 ) -> io::Result<CanonicalObject> {
     let raw = canonical_dictionary_id(id)?;
-    let opening = nv_tree.open(raw)?;
+    let rebuilt;
+    let opening: &DictOpening = if layer.terms_present {
+        let tree = tree
+            .ok_or_else(|| invalid("node/value merkle tree unavailable for resolution"))?;
+        rebuilt = tree.open(raw)?;
+        &rebuilt
+    } else {
+        openings
+            .ok_or_else(|| {
+                invalid("term-less node/value resolution requires prover-shipped Merkle openings")
+            })?
+            .node_value_opening(raw)?
+    };
     verify_opening(
         &layer.nv_merkle_root,
         layer.state.parent_node_value_count,
         layer.state.node_value_count,
         raw,
-        &opening,
+        opening,
     )
 }
 
 /// Open one predicate id against the root-bound `pred_merkle_root`, returning the
 /// authenticated predicate IRI as a `Node` (mirroring the legacy predicate resolver).
+/// Term-bearing rebuilds+opens `tree`; term-less (S3) consumes the prover-shipped `openings`
+/// (fail-closed if absent) — both verified against `pred_merkle_root`.
 fn resolve_predicate_id_via_merkle(
     id: &ArkFr,
     layer: VerifierCommitmentRef<'_>,
-    pred_tree: &DictMerkleTree,
+    tree: Option<&DictMerkleTree>,
+    openings: Option<&ResolutionOpenings>,
 ) -> io::Result<CanonicalObject> {
     let raw = canonical_dictionary_id(id)?;
-    let opening = pred_tree.open(raw)?;
+    let rebuilt;
+    let opening: &DictOpening = if layer.terms_present {
+        let tree = tree
+            .ok_or_else(|| invalid("predicate merkle tree unavailable for resolution"))?;
+        rebuilt = tree.open(raw)?;
+        &rebuilt
+    } else {
+        openings
+            .ok_or_else(|| {
+                invalid("term-less predicate resolution requires prover-shipped Merkle openings")
+            })?
+            .predicate_opening(raw)?
+    };
     verify_opening(
         &layer.pred_merkle_root,
         layer.state.parent_predicate_count,
         layer.state.predicate_count,
         raw,
-        &opening,
+        opening,
     )
 }
 
@@ -207,6 +279,33 @@ pub fn resolve_result_values(
     columns: &[Vec<ArkFr>],
     descriptors: &[ResultColumnDescriptor],
 ) -> io::Result<Vec<Vec<CanonicalResultValue>>> {
+    // No openings: term-bearing resolves via the rebuilt trees; a term-less view fails closed.
+    resolve_result_values_impl(source, trusted_resolution_root, columns, descriptors, None)
+}
+
+/// Merkle-dict I2b S3: resolve typed result columns over a TERM-LESS artifact via
+/// prover-shipped Merkle `openings`. The term-BEARING path is unchanged (ignores `openings`,
+/// rebuilds the trees). `#[cfg(test)]`: the term-less resolve ENTRY POINT exists only in test
+/// builds until S4/S5 gate a full term-less query — and resolution is decoupled from
+/// `verify_layer_bgp`, so even so it cannot enable a term-less full-query verify.
+#[cfg(test)]
+pub(crate) fn resolve_result_values_with_openings(
+    source: &impl VerifierLayer,
+    trusted_resolution_root: ProofHash,
+    columns: &[Vec<ArkFr>],
+    descriptors: &[ResultColumnDescriptor],
+    openings: &ResolutionOpenings,
+) -> io::Result<Vec<Vec<CanonicalResultValue>>> {
+    resolve_result_values_impl(source, trusted_resolution_root, columns, descriptors, Some(openings))
+}
+
+fn resolve_result_values_impl(
+    source: &impl VerifierLayer,
+    trusted_resolution_root: ProofHash,
+    columns: &[Vec<ArkFr>],
+    descriptors: &[ResultColumnDescriptor],
+    openings: Option<&ResolutionOpenings>,
+) -> io::Result<Vec<Vec<CanonicalResultValue>>> {
     let layer = source.verifier_view();
     if columns.len() != descriptors.len() {
         return Err(invalid("result column descriptor shape mismatch"));
@@ -239,12 +338,21 @@ pub fn resolve_result_values(
     let needs_predicate = descriptors
         .iter()
         .any(|d| d.namespace == ResultIdNamespace::Predicate);
-    let nv_tree = if needs_node_value {
+    // TERM-LESS (S3): the two clear catalogs are dropped, so the trees cannot be rebuilt —
+    // DELIBERATELY route through the prover openings (a missing carrier is an explicit
+    // fail-close, not an incidental empty-catalog match-nothing). Term-bearing rebuilds +
+    // root-checks each tree exactly as before.
+    if !layer.terms_present && (needs_node_value || needs_predicate) && openings.is_none() {
+        return Err(invalid(
+            "term-less resolution requires prover-shipped Merkle openings",
+        ));
+    }
+    let nv_tree = if needs_node_value && layer.terms_present {
         Some(node_value_merkle_tree(layer)?)
     } else {
         None
     };
-    let pred_tree = if needs_predicate {
+    let pred_tree = if needs_predicate && layer.terms_present {
         Some(predicate_merkle_tree(layer)?)
     } else {
         None
@@ -280,16 +388,10 @@ pub fn resolve_result_values(
                     }
                     let object = match descriptor.namespace {
                         ResultIdNamespace::NodeValue => {
-                            let tree = nv_tree.as_ref().ok_or_else(|| {
-                                invalid("node/value merkle tree unavailable for resolution")
-                            })?;
-                            resolve_node_value_id_via_merkle(id, layer, tree)?
+                            resolve_node_value_id_via_merkle(id, layer, nv_tree.as_ref(), openings)?
                         }
                         ResultIdNamespace::Predicate => {
-                            let tree = pred_tree.as_ref().ok_or_else(|| {
-                                invalid("predicate merkle tree unavailable for resolution")
-                            })?;
-                            resolve_predicate_id_via_merkle(id, layer, tree)?
+                            resolve_predicate_id_via_merkle(id, layer, pred_tree.as_ref(), openings)?
                         }
                         ResultIdNamespace::GeneratedDecimalU64 => unreachable!(),
                         ResultIdNamespace::GeneratedDecimalI64 => unreachable!(),

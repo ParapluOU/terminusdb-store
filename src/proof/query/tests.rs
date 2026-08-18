@@ -2404,6 +2404,88 @@
         assert!(aerr.to_string().contains("terms-bearing"), "absence: {aerr}");
     }
 
+    /// Merkle-dict I2b (interim S4) soundness: a TERM-LESS view of a base layer MUST fail CLOSED
+    /// at the BGP CONSTANT-match. S1 made `VerifierCommitment::decode` accept `terms_present=0`,
+    /// but a term-less artifact's committed node/value + predicate dict HASH columns are no longer
+    /// tied to real terms (validate() skips the catalog re-MSM), so `verify_dict_membership` would
+    /// authenticate a prover-chosen IRI->id mapping. This closes the deferred I2b object-constant
+    /// forge: an internally-inconsistent term-less artifact could otherwise ASK `?s p "C"` while
+    /// the Merkle data holds a different term at that id and still verify. Both plan shapes verify
+    /// fine term-BEARING (the guard is a no-op there). Covers (1) a single-atom OBJECT-constant
+    /// match and (2) an all-ground ASK / ground-result unit (guard fires BEFORE the early `Ok`).
+    #[test]
+    fn layer_bgp_constant_and_ask_fail_closed_on_termless_view() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
+        let termless = lc.verifier_commitment_termless().unwrap();
+
+        // (1) OBJECT-CONSTANT single atom: `?s knows <b>` — the object constant is resolved via
+        // node/value dictionary membership (the exact I2b forge vector).
+        let obj_const = LayerBgpPlan {
+            source: ColumnSource::Materialized,
+            atoms: vec![LayerBgpAtom {
+                subject: AtomTerm::Variable,
+                predicate_term: KNOWS.to_vec(),
+                predicate_variable: false,
+                object: node_const("b"),
+                object_range: None,
+                object_kind: ObjectKindFilter::Any,
+                subject_object_equal: false,
+                source: ColumnSource::Materialized,
+            }],
+            joins: Vec::new(),
+        };
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &obj_const).unwrap();
+        // Term-bearing verifies (the terms_present guard is a no-op).
+        verify_layer_bgp(&lc, lc.resolution_root(), &obj_const, &ids, &coms, m, &proof).unwrap();
+        // Term-less rejects at the top-of-function fail-close, before the atom membership loop.
+        let err =
+            verify_layer_bgp(&termless, lc.resolution_root(), &obj_const, &ids, &coms, m, &proof)
+                .unwrap_err();
+        assert!(err.to_string().contains("terms-bearing"), "object-constant: {err}");
+
+        // (2) ALL-GROUND ASK: `<a> knows <b>` — the ground-result-unit path, whose honest verify
+        // ends in an early `Ok`. The guard must fire BEFORE that Ok on a term-less view.
+        let ask = LayerBgpPlan {
+            source: ColumnSource::Materialized,
+            atoms: vec![LayerBgpAtom {
+                subject: node_const("a"),
+                predicate_term: KNOWS.to_vec(),
+                predicate_variable: false,
+                object: node_const("b"),
+                object_range: None,
+                object_kind: ObjectKindFilter::Any,
+                subject_object_equal: false,
+                source: ColumnSource::Materialized,
+            }],
+            joins: Vec::new(),
+        };
+        let ares = prove_layer_bgp_with_result(&lc, &ask).unwrap();
+        assert_eq!(ares.result_len, 1, "ASK <a> knows <b> is present");
+        // Term-bearing reaches the ground-result-unit Ok (guard is a no-op).
+        verify_layer_bgp(
+            &lc,
+            lc.resolution_root(),
+            &ask,
+            &ares.predicate_ids,
+            &ares.result_commitments,
+            ares.result_len,
+            &ares.proof,
+        )
+        .unwrap();
+        // Term-less rejects BEFORE the ground-result-unit early Ok.
+        let aerr = verify_layer_bgp(
+            &termless,
+            lc.resolution_root(),
+            &ask,
+            &ares.predicate_ids,
+            &ares.result_commitments,
+            ares.result_len,
+            &ares.proof,
+        )
+        .unwrap_err();
+        assert!(aerr.to_string().contains("terms-bearing"), "ask: {aerr}");
+    }
+
     #[test]
     fn layer_bgp_object_range_dict_domain_exceeds_table_end_to_end() {
         // D = 16 (dict) strictly exceeds the table domain 8: the object column relocates
@@ -2727,6 +2809,162 @@
             CanonicalResultValue::Object(CanonicalObject::Node(_))
         ));
         assert_eq!(merkle[2][0], CanonicalResultValue::Null);
+    }
+
+    // Merkle-dict I2b S3 DIFFERENTIAL TEST: resolving a result set over a TERM-LESS artifact
+    // (the two clear catalogs dropped) via prover-shipped Merkle openings must produce
+    // BYTE-IDENTICAL terms to the term-bearing rebuild path — node/value AND predicate.
+    #[test]
+    fn s3_termless_opening_resolution_matches_term_bearing_for_every_id() {
+        let lc = mixed_layer();
+        let root = lc.resolution_root();
+
+        let mut nv_ids: Vec<u64> = lc.node_value_catalog.iter().map(|r| r.object_id).collect();
+        nv_ids.sort_unstable();
+        let mut pred_ids: Vec<u64> = lc.predicate_catalog.iter().map(|r| r.predicate_id).collect();
+        pred_ids.sort_unstable();
+        assert!(nv_ids.len() >= 5 && !pred_ids.is_empty());
+        let nv_col: Vec<ArkFr> = nv_ids.iter().map(|&id| ArkFr::from_u64(id)).collect();
+        let pred_col: Vec<ArkFr> = pred_ids.iter().map(|&id| ArkFr::from_u64(id)).collect();
+
+        // The TERM-LESS artifact: commitment_root byte-identical, catalogs dropped, and its
+        // resolution_root (the external anchor binding the two Merkle roots) is UNCHANGED.
+        let tl = lc.verifier_commitment_termless().unwrap();
+        assert!(!tl.terms_present);
+        assert_eq!(tl.state.commitment_root, lc.state.commitment_root);
+        assert_eq!(tl.resolution_root(), root);
+
+        // Prover ships one opening per DISTINCT resolved id (UNCOMMITTED witness).
+        let openings = build_resolution_openings(&[lc.verifier_view()], &nv_ids, &pred_ids).unwrap();
+
+        // Node/value-only: term-less openings == term-bearing rebuild.
+        let bearing_nv =
+            resolve_node_value_result_objects(&lc, root, std::slice::from_ref(&nv_col)).unwrap();
+        let termless_nv = resolve_node_value_result_objects_with_openings(
+            &tl,
+            root,
+            std::slice::from_ref(&nv_col),
+            &openings,
+        )
+        .unwrap();
+        assert_eq!(bearing_nv, termless_nv);
+        // Both reconstruction branches are exercised (Node + Value).
+        assert!(termless_nv[0]
+            .iter()
+            .any(|o| matches!(o, CanonicalObject::Node(_))));
+        assert!(termless_nv[0]
+            .iter()
+            .any(|o| matches!(o, CanonicalObject::Value { .. })));
+
+        // Typed resolver over node/value + predicate + a nullable-zero column: identical.
+        let columns = vec![nv_col.clone(), pred_col.clone(), vec![f0(), f0()]];
+        let descriptors = vec![
+            ResultColumnDescriptor {
+                namespace: ResultIdNamespace::NodeValue,
+                nullable: false,
+            },
+            ResultColumnDescriptor {
+                namespace: ResultIdNamespace::Predicate,
+                nullable: false,
+            },
+            ResultColumnDescriptor {
+                namespace: ResultIdNamespace::NodeValue,
+                nullable: true,
+            },
+        ];
+        let bearing = resolve_result_values(&lc, root, &columns, &descriptors).unwrap();
+        let termless =
+            resolve_result_values_with_openings(&tl, root, &columns, &descriptors, &openings)
+                .unwrap();
+        assert_eq!(bearing, termless);
+        assert!(matches!(
+            termless[1][0],
+            CanonicalResultValue::Object(CanonicalObject::Node(_))
+        ));
+        // The nullable zero resolves to Null WITHOUT needing an opening.
+        assert_eq!(termless[2][0], CanonicalResultValue::Null);
+    }
+
+    // Merkle-dict I2b S3 NEGATIVES: term-less resolution fails CLOSED on a missing carrier, a
+    // missing per-id opening, a tampered/wrong-id opening, and a fabricated Merkle root.
+    #[test]
+    fn s3_termless_resolution_fails_closed_on_bad_openings() {
+        let lc = mixed_layer();
+        let root = lc.resolution_root();
+        let tl = lc.verifier_commitment_termless().unwrap();
+
+        let mut nv_ids: Vec<u64> = lc.node_value_catalog.iter().map(|r| r.object_id).collect();
+        nv_ids.sort_unstable();
+        let victim = nv_ids[0];
+        let other = nv_ids[1];
+        let col = vec![ArkFr::from_u64(victim)];
+
+        // (a) No openings carrier at all: DELIBERATE fail-close (not an empty/match-nothing).
+        assert!(
+            resolve_node_value_result_objects(&tl, root, std::slice::from_ref(&col)).is_err()
+        );
+
+        // (b) A carrier missing the resolved id's opening ⇒ Err (never a silent empty result).
+        let others: Vec<u64> = nv_ids.iter().copied().filter(|&id| id != victim).collect();
+        let missing = build_resolution_openings(&[lc.verifier_view()], &others, &[]).unwrap();
+        assert!(resolve_node_value_result_objects_with_openings(
+            &tl,
+            root,
+            std::slice::from_ref(&col),
+            &missing
+        )
+        .is_err());
+
+        // Prover-side tree (term-bearing) to mint tamperable openings.
+        let tree = build_node_value_tree(
+            &lc.node_value_catalog,
+            lc.state.parent_node_value_count,
+            lc.state.node_value_count,
+        )
+        .unwrap();
+
+        // (c) Tampered opening (corrupted term_bytes): the re-hashed leaf no longer walks to the
+        // root-bound root ⇒ Err via verify_opening.
+        let mut bad = tree.open(victim).unwrap();
+        bad.term_bytes.push(0xff);
+        let mut tampered = ResolutionOpenings::default();
+        tampered.insert_node_value(bad);
+        assert!(resolve_node_value_result_objects_with_openings(
+            &tl,
+            root,
+            std::slice::from_ref(&col),
+            &tampered
+        )
+        .is_err());
+
+        // (d) Wrong-id opening: a real opening for `other`, re-keyed to `victim` (id claims
+        // victim, position/term are other's) ⇒ Err (position != id-parent-1).
+        let mut wrong = tree.open(other).unwrap();
+        wrong.id = victim;
+        let mut wrong_map = ResolutionOpenings::default();
+        wrong_map.insert_node_value(wrong);
+        assert!(resolve_node_value_result_objects_with_openings(
+            &tl,
+            root,
+            std::slice::from_ref(&col),
+            &wrong_map
+        )
+        .is_err());
+
+        // (e) Fabricated Merkle root (β re-anchor): openings authentic against the REAL tree, but
+        // the artifact's nv_merkle_root is flipped; the anchor still self-consistent, yet a real
+        // opening cannot authenticate against the forged root ⇒ Err.
+        let good = build_resolution_openings(&[lc.verifier_view()], &nv_ids, &[]).unwrap();
+        let mut forged = lc.verifier_commitment_termless().unwrap();
+        forged.nv_merkle_root[0] ^= 0x01;
+        let forged_root = forged.resolution_root();
+        assert!(resolve_node_value_result_objects_with_openings(
+            &forged,
+            forged_root,
+            std::slice::from_ref(&col),
+            &good
+        )
+        .is_err());
     }
 
     // The `resolution_root` wrapper binds `commitment_root` to the two Merkle roots WITHOUT
