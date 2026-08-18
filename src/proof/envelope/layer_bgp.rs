@@ -71,7 +71,7 @@ use crate::proof::order::{
 use crate::proof::permutation::RelationPermutationProof;
 use crate::proof::query::{
     has_ground_result_unit, prove_layer_bgp_with_result_and_context,
-    resolve_typed_result_objects, result_id_namespaces,
+    resolve_typed_result_objects, resolve_typed_result_objects_with_openings, result_id_namespaces,
     resolve_result_values, verify_layer_bgp, verify_layer_bgp_result_log_domain,
     verify_result_columns, generated_decimal_i64_field, generated_decimal_u64_value,
     AtomTerm, CanonicalResultValue, ColumnSource,
@@ -161,11 +161,14 @@ impl LayerBgpEnvelope {
             }
             Vec::new()
         } else {
-            resolve_typed_result_objects(
+            // Merkle-dict I2b S5: consume the proof's term-less openings (`None` on a term-bearing
+            // proof — resolution rebuilds the tree). The proof was just belt-verified above.
+            resolve_typed_result_objects_with_openings(
                 layer,
                 layer.resolution_root(),
                 &result_columns,
                 &result_id_namespaces(plan)?,
+                proof.openings.as_ref(),
             )?
         };
         Ok(Self {
@@ -223,11 +226,13 @@ impl LayerBgpEnvelope {
             }
             Ok(())
         } else {
-            let resolved = resolve_typed_result_objects(
+            // Merkle-dict I2b S5: term-less resolution consumes the proof's shipped openings.
+            let resolved = resolve_typed_result_objects_with_openings(
                 layer,
                 layer.resolution_root(),
                 &self.result_columns,
                 &result_id_namespaces(plan)?,
+                self.proof.openings.as_ref(),
             )?;
             if resolved != self.result_objects {
                 return Err(invalid(

@@ -353,6 +353,14 @@ pub struct LayerBgpProof {
     /// containing a dictionary-absent term cannot exist, so its conjunction cannot have
     /// a solution. The atom index and position make the public claim unambiguous.
     pub dictionary_absence: Option<DictionaryAbsence>,
+    /// Merkle-dict I2b S5: the UNCOMMITTED term-less resolution witness. A base/rollup proof
+    /// destined for a TERM-LESS artifact ships one positional [`DictOpening`] per DISTINCT
+    /// matched-constant id (the S4 belt-hash) and per DISTINCT resolved-result id (S3
+    /// resolution); a TERM-BEARING proof carries `None` (the catalog re-MSM supplies term
+    /// fidelity, and resolution rebuilds the tree). NEVER folded into
+    /// `commitment_root`/`resolution_root` — every consumer re-runs `verify_opening` against the
+    /// trusted root, and a term-less proof reaching `verify_layer_bgp` WITHOUT it fails closed.
+    pub openings: Option<ResolutionOpenings>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

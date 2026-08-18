@@ -73,6 +73,9 @@ pub fn prove_layer_bgp_with_result_and_context(
                 atoms: Vec::new(),
                 chain: None,
                 dictionary_absence: Some(absence),
+                // Term-bearing by default; the S5 term-less producer attaches openings after the
+                // fact. (Dictionary-absence anyway fail-closes term-less — `require_terms_present`.)
+                openings: None,
             },
             result_commitments: vec![zero_commitment; result_arity],
             result_columns: vec![zero_column; result_arity],
@@ -312,6 +315,9 @@ pub fn prove_layer_bgp_with_result_and_context(
             atoms: atom_proofs,
             chain,
             dictionary_absence: None,
+            // Term-bearing by default; `attach_termless_bgp_openings` fills this for the
+            // term-less shipping path (Merkle-dict I2b S5).
+            openings: None,
         },
         result_commitments: result_coms,
         result_columns,
@@ -319,6 +325,84 @@ pub fn prove_layer_bgp_with_result_and_context(
         result_len: result_m,
         predicate_ids,
     })
+}
+
+/// Merkle-dict I2b S5: attach the UNCOMMITTED term-less resolution witness to a freshly proven
+/// base/rollup BGP result, so it can ship alongside a TERM-LESS artifact
+/// ([`VerifierCommitment::verifier_commitment_termless`]). The prover still holds the full
+/// term-bearing catalog, so it rebuilds the id-indexed dictionary trees and opens:
+///   * every DISTINCT matched-constant id (predicate IRI + subject/object constants) — the S4
+///     belt-hash witness tying each authenticated constant to its real `resolution_root`-bound
+///     term; and
+///   * every DISTINCT resolved-result id (per the plan's result namespaces) — the S3 resolution
+///     witness.
+///
+/// The openings are stored on `result.proof.openings`; they are NEVER folded into
+/// `commitment_root`/`resolution_root` and are re-verified per id by `verify_opening` at the
+/// verifier (a forged/absent opening fails closed). BASE/ROLLUP single-layer only.
+///
+/// Over-inclusion is safe (the verifier only looks up the ids it needs, each independently
+/// checked); under-inclusion fails closed. A term-bearing verifier ignores the witness entirely.
+pub fn attach_termless_bgp_openings(
+    layer: &LayerCommitment,
+    plan: &LayerBgpPlan,
+    result: &mut LayerBgpResult,
+) -> io::Result<()> {
+    require_base_layer_for_query(&layer.state)?;
+    let mut nv_ids: Vec<u64> = Vec::new();
+    let mut pred_ids: Vec<u64> = Vec::new();
+
+    // (a) Matched-constant ids (S4 belt-hash). A variable predicate carries the canonical zero
+    // placeholder (skip); subject/object constants come from the per-atom proof.
+    for &pid in &result.predicate_ids {
+        if pid != 0 {
+            pred_ids.push(pid);
+        }
+    }
+    for atom in &result.proof.atoms {
+        if let Some(id) = atom.subject_id {
+            nv_ids.push(id);
+        }
+        if let Some(id) = atom.object_id {
+            nv_ids.push(id);
+        }
+    }
+
+    // (b) Resolved-result ids (S3 resolution). A ground-result UNIT / dictionary-absence carries
+    // no dictionary result ids.
+    if !has_ground_result_unit(plan) && result.proof.dictionary_absence.is_none() {
+        let namespaces = result_id_namespaces(plan)?;
+        if namespaces.len() != result.result_columns.len() {
+            return Err(invalid(
+                "term-less openings: result column count does not match the plan namespaces",
+            ));
+        }
+        for (column, namespace) in result.real_columns().iter().zip(&namespaces) {
+            for id in column {
+                match namespace {
+                    ResultIdNamespace::NodeValue => {
+                        nv_ids.push(super::result::canonical_dictionary_id(id)?)
+                    }
+                    ResultIdNamespace::Predicate => {
+                        pred_ids.push(super::result::canonical_dictionary_id(id)?)
+                    }
+                    // Generated scalars are not dictionary ids — no opening needed.
+                    ResultIdNamespace::GeneratedDecimalU64
+                    | ResultIdNamespace::GeneratedDecimalI64 => {}
+                }
+            }
+        }
+    }
+
+    // The reserved null id 0 is never a real dictionary id (never a constant, never resolved).
+    nv_ids.retain(|&id| id != 0);
+    pred_ids.retain(|&id| id != 0);
+
+    // The builder routes each id to the unique interval that contains it and dedups internally.
+    let view = layer.verifier_view();
+    let openings = build_resolution_openings(&[view], &nv_ids, &pred_ids)?;
+    result.proof.openings = Some(openings);
+    Ok(())
 }
 
 /// Verify a k-atom layer BGP proof. Anchors to `commitment_root` FIRST (exactly like
@@ -335,12 +419,12 @@ pub fn verify_layer_bgp(
     m: usize,
     proof: &LayerBgpProof,
 ) -> io::Result<()> {
-    // Merkle-dict I2b S4: the PUBLIC entry ships NO per-constant belt-hash openings. A
-    // term-bearing artifact verifies unchanged (the belt is a no-op there — the catalog re-MSM
-    // already supplied term fidelity); a TERM-LESS artifact fails closed (its matched constants
-    // have no belt to tie them to real terms until the S5 FFI plumbing ships the openings). This
-    // preserves the residual fail-close: no term-less artifact verifies a constant-match through
-    // the FFI without the belt.
+    // Merkle-dict I2b S5: the per-matched-CONSTANT belt-hash openings now travel INSIDE the proof
+    // (`proof.openings`). A term-bearing proof carries `None` and verifies unchanged (the belt is a
+    // no-op there — the catalog re-MSM already supplied term fidelity). A TERM-LESS proof with its
+    // openings verifies the belt; a term-less proof reaching here WITHOUT openings fails closed
+    // (the residual guard in `verify_layer_bgp_impl`). No separate FFI plumbing is needed: the wire
+    // carries the witness.
     verify_layer_bgp_impl(
         source,
         trusted_resolution_root,
@@ -349,17 +433,14 @@ pub fn verify_layer_bgp(
         result_coms,
         m,
         proof,
-        None,
+        proof.openings.as_ref(),
     )
 }
 
-/// Merkle-dict I2b S4: verify a term-less layer BGP given the prover-shipped per-matched-CONSTANT
-/// Merkle openings (the belt-hash witness that ties each authenticated constant id to its real
-/// `resolution_root`-bound term). A term-bearing artifact ignores `openings` (the catalog re-MSM
-/// already supplied that fidelity). `#[cfg(test)]`: the openings-consuming entry is test-only until
-/// S5 wires the shipping prover/FFI — so a term-less artifact reaching the PUBLIC
-/// [`verify_layer_bgp`] (openings `None`) still fails closed and no shipping path verifies a
-/// constant-match without the belt.
+/// Merkle-dict I2b S5 test shim: openings now live INSIDE the proof (`proof.openings`), so this
+/// injects the separately-supplied `openings` into a proof clone and routes through the PUBLIC
+/// [`verify_layer_bgp`] — keeping the S3/S4 belt-hash tests (which pass a bare proof + openings)
+/// exercising the exact production path.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_layer_bgp_with_constant_openings(
@@ -372,15 +453,16 @@ pub(crate) fn verify_layer_bgp_with_constant_openings(
     proof: &LayerBgpProof,
     openings: &ResolutionOpenings,
 ) -> io::Result<()> {
-    verify_layer_bgp_impl(
+    let mut proof = proof.clone();
+    proof.openings = Some(openings.clone());
+    verify_layer_bgp(
         source,
         trusted_resolution_root,
         plan,
         predicate_ids,
         result_coms,
         m,
-        proof,
-        Some(openings),
+        &proof,
     )
 }
 

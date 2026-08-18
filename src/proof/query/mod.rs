@@ -133,22 +133,20 @@ pub use plan::{
     ResultIdNamespace, SecondRangeSubproof,
 };
 pub use result::{
-    resolve_node_value_result_objects, resolve_result_values, resolve_typed_result_objects,
+    resolve_node_value_result_objects, resolve_result_values, resolve_result_values_with_openings,
+    resolve_typed_result_objects, resolve_typed_result_objects_with_openings,
     result_column_descriptors, result_id_namespaces, verify_node_value_result_objects,
     verify_result_columns,
 };
-// Merkle-dict I2b S3: term-less resolution over prover-shipped Merkle openings. `#[cfg(test)]`
-// + `pub(crate)` so the opening-based term-less path EXISTS only in test builds inside the store
-// crate — it must NOT be an external end-to-end query path until S4's per-constant belt-hash
-// gates term-less BGP verification (else the I2b object-constant forge). Resolution is decoupled
-// from `verify_layer_bgp`, so even crate-internally it does not enable a term-less full query.
+// Merkle-dict I2b S5: term-less resolution over prover-shipped Merkle openings is now PRODUCTION
+// (`resolve_result_values_with_openings` / `resolve_typed_result_objects_with_openings` above) —
+// the term-less BGP path is gated end-to-end by S4's mandatory per-constant belt-hash in
+// `verify_layer_bgp`. This single-column node/value variant stays test-only (differential probes).
 #[cfg(test)]
-pub(crate) use result::{
-    resolve_node_value_result_objects_with_openings, resolve_result_values_with_openings,
-};
+pub(crate) use result::resolve_node_value_result_objects_with_openings;
 pub use layer_bgp::{
-    prove_layer_bgp, prove_layer_bgp_with_result, prove_layer_bgp_with_result_and_context,
-    verify_layer_bgp, verify_layer_bgp_result_log_domain,
+    attach_termless_bgp_openings, prove_layer_bgp, prove_layer_bgp_with_result,
+    prove_layer_bgp_with_result_and_context, verify_layer_bgp, verify_layer_bgp_result_log_domain,
 };
 // Merkle-dict I2b S4: the per-matched-constant belt-hash entry that consumes the prover-shipped
 // constant openings for a TERM-LESS artifact. `#[cfg(test)]` + `pub(crate)` — the openings-
@@ -167,9 +165,8 @@ pub(crate) use plan::has_ground_result_unit;
 pub(crate) use result::{
     resolve_node_value_result_objects_via_catalog, resolve_result_values_via_catalog,
 };
-// Merkle-dict I2b S3 differential test: the prover-side opening builder, so a test can ship
-// openings for a term-less artifact and assert term-less resolution == the term-bearing path.
-#[cfg(test)]
+// Merkle-dict I2b S5: the prover-side opening builder is now PRODUCTION — the term-less BGP
+// producer (`attach_termless_bgp_openings`) mints the shipped opening witness with it.
 pub(crate) use super::commitment::build_resolution_openings;
 
 // ---------------------------------------------------------------------------

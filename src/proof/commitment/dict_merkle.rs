@@ -332,8 +332,13 @@ pub(super) fn predicate_merkle_root(
 
 /// A positional Merkle opening of one dictionary id: the leaf preimage plus the sibling
 /// path up to the root.
+///
+/// Merkle-dict I2b S5: this is now a PUBLIC (but UNCOMMITTED) proof-wire witness — a term-less
+/// [`LayerBgpProof`](crate::proof::query::LayerBgpProof) ships one per distinct matched-constant /
+/// resolved-result id. It is never folded into `commitment_root`/`resolution_root`; every consumer
+/// re-runs [`verify_opening`] against the trusted root, so a forged/absent opening fails closed.
 #[derive(Clone, Debug)]
-pub(crate) struct DictOpening {
+pub struct DictOpening {
     pub id: u64,
     pub datatype_tag: u8,
     pub term_bytes: Vec<u8>,
@@ -403,7 +408,7 @@ pub(crate) fn verify_opening(
 /// so a fabricated tree or a wrong-id opening cannot authenticate). A MISSING opening is an
 /// `Err` (fail-closed), never a silent empty result.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ResolutionOpenings {
+pub struct ResolutionOpenings {
     node_value: std::collections::BTreeMap<u64, DictOpening>,
     predicate: std::collections::BTreeMap<u64, DictOpening>,
 }
@@ -426,18 +431,49 @@ impl ResolutionOpenings {
         })
     }
 
-    /// Insert a node/value opening (keyed by its own id). Prover/test constructor. S3 only
-    /// PRODUCES term-less openings in-crate tests, so this is `#[cfg(test)]` — a shipping path
-    /// cannot mint them until S5 un-gates the prover-side plumbing.
-    #[cfg(test)]
+    /// Insert a node/value opening (keyed by its own id). Prover/wire constructor. Merkle-dict
+    /// I2b S5: un-gated — the shipping term-less producer now mints openings (bound at verify by
+    /// [`verify_opening`], never committed).
     pub(crate) fn insert_node_value(&mut self, opening: DictOpening) {
         self.node_value.insert(opening.id, opening);
     }
 
-    /// Insert a predicate opening (keyed by its own id). Prover/test constructor (`#[cfg(test)]`).
-    #[cfg(test)]
+    /// Insert a predicate opening (keyed by its own id). Prover/wire constructor.
     pub(crate) fn insert_predicate(&mut self, opening: DictOpening) {
         self.predicate.insert(opening.id, opening);
+    }
+
+    /// Merkle-dict I2b S5 (wire): the node/value openings in deterministic id order (BTreeMap
+    /// iteration) — the encoder's view. Uncommitted; re-verified per id at consume time.
+    pub(crate) fn node_value_openings(&self) -> impl Iterator<Item = &DictOpening> {
+        self.node_value.values()
+    }
+
+    /// Merkle-dict I2b S5 (wire): the predicate openings in deterministic id order.
+    pub(crate) fn predicate_openings(&self) -> impl Iterator<Item = &DictOpening> {
+        self.predicate.values()
+    }
+
+    /// Merkle-dict I2b S5 (wire): reconstruct from decoded opening lists, each keyed by its own
+    /// `id`. A duplicate id in either list is malformed (rejected). This is pure PARSING — it
+    /// confers NO trust; every opening is re-checked against the trusted root by [`verify_opening`]
+    /// at consume time, and a MISSING opening fails closed there.
+    pub(crate) fn from_wire(
+        node_value: Vec<DictOpening>,
+        predicate: Vec<DictOpening>,
+    ) -> io::Result<Self> {
+        let mut out = Self::default();
+        for opening in node_value {
+            if out.node_value.insert(opening.id, opening).is_some() {
+                return Err(invalid("duplicate node/value id in resolution openings"));
+            }
+        }
+        for opening in predicate {
+            if out.predicate.insert(opening.id, opening).is_some() {
+                return Err(invalid("duplicate predicate id in resolution openings"));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -450,10 +486,10 @@ impl ResolutionOpenings {
 /// from); an id outside every interval (or in more than one) is an `Err`. The produced openings
 /// are an UNCOMMITTED witness the prover ships alongside the term-less artifact.
 ///
-/// `#[cfg(test)]` in S3: term-less openings are PRODUCED only by in-crate tests until S5 wires
-/// the shipping prover — this compile-time gate keeps the term-less path test-only (the
-/// coupling guard for the I2b object-constant forge, which S4's belt-hash closes).
-#[cfg(test)]
+/// Merkle-dict I2b S5: un-gated (production). The shipping term-less BGP/ReadDocument producer
+/// calls this to mint the uncommitted opening witness it ships alongside the term-less artifact;
+/// the coupling guard against the I2b object-constant forge is now S4's mandatory per-constant
+/// belt-hash (not this compile-time gate).
 pub(crate) fn build_resolution_openings(
     term_bearing_views: &[VerifierCommitmentRef<'_>],
     node_value_ids: &[u64],
@@ -503,7 +539,6 @@ pub(crate) fn build_resolution_openings(
 }
 
 /// The unique view index whose node/value interval `(parent, count]` contains `id`.
-#[cfg(test)]
 fn nv_interval_layer(views: &[VerifierCommitmentRef<'_>], id: u64) -> io::Result<usize> {
     let mut found = None;
     for (i, view) in views.iter().enumerate() {
@@ -518,7 +553,6 @@ fn nv_interval_layer(views: &[VerifierCommitmentRef<'_>], id: u64) -> io::Result
 }
 
 /// The unique view index whose predicate interval `(parent, count]` contains `id`.
-#[cfg(test)]
 fn pred_interval_layer(views: &[VerifierCommitmentRef<'_>], id: u64) -> io::Result<usize> {
     let mut found = None;
     for (i, view) in views.iter().enumerate() {

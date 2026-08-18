@@ -45,7 +45,7 @@ use crate::proof::anti::{
 };
 use crate::proof::argument::{commit_column, ColumnOpening, StoreProverContext, SumcheckProof, Transcript254};
 use crate::proof::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit, RelationWitness};
-use crate::proof::commitment::{LayerCommitment, VerifierLayer};
+use crate::proof::commitment::{DictOpening, LayerCommitment, ResolutionOpenings, VerifierLayer};
 use crate::proof::count::CountProof;
 use crate::proof::dict::DictProof;
 use crate::proof::logup_gkr::{GkrFractionProof, GkrLayerProof};
@@ -164,7 +164,11 @@ pub(super) fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
 // `SortedProof`/`membership`/`count` are unchanged (already migrated). Every multi-atom BGP join
 // has different proof bytes; the UNION/ANTI/OUTER envelopes embed the same BGP chain / semi-join,
 // so all four bump in lockstep.
-pub(super) const VERSION: u32 = 11;
+// v12: Merkle-dict I2b S5 — `LayerBgpProof` gained the optional term-less resolution witness
+// `openings` (`Option<ResolutionOpenings>`). Term-bearing proofs carry `None` (one added option
+// tag byte); a term-less proof ships the matched-constant + resolved-result openings. Every
+// query-BGP envelope's proof bytes shift by the added tag.
+pub(super) const VERSION: u32 = 12;
 // v10: LogUp-GKR bag-union (`Or`) migration (Inc 4) — `BagUnionProof` dropped its `N+1`
 // committed reciprocal GT commitments (`reciprocal_commitments`) and the masked multiset-link
 // sumcheck for ONE multi-block GKR fraction tree (`gkr`: `N+1` blocks tiled into a
@@ -175,9 +179,15 @@ pub(super) const VERSION: u32 = 11;
 // it). The `LeftOuterJoinProof` (OUTER) embeds a `BagUnionProof` directly and the recursive
 // transitive-closure union nodes embed it too, so OUTER/RECURSIVE bump in lockstep; ANTI does
 // NOT embed a union (unchanged).
-pub(super) const UNION_VERSION: u32 = 10;
-pub(super) const ANTI_VERSION: u32 = 11;
-pub(super) const OUTER_VERSION: u32 = 9;
+// v11: Merkle-dict I2b S5 — the union branches are `LayerBgpEnvelope`s embedding a `LayerBgpProof`,
+// which gained the optional `openings` field, so every branch's proof bytes shift (lockstep).
+pub(super) const UNION_VERSION: u32 = 11;
+// v12: Merkle-dict I2b S5 — the anti sides are `LayerBgpEnvelope`s embedding a `LayerBgpProof`
+// (added `openings`); lockstep bump.
+pub(super) const ANTI_VERSION: u32 = 12;
+// v10: Merkle-dict I2b S5 — the outer sides are `LayerBgpEnvelope`s embedding a `LayerBgpProof`
+// (added `openings`); lockstep bump.
+pub(super) const OUTER_VERSION: u32 = 10;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
 // v23 adds the ordered `sys:Array` walk composite node (tag 24).
@@ -224,7 +234,10 @@ pub(super) const OUTER_VERSION: u32 = 9;
 // migrated `SortedProof`) + the three link data-column leaf evaluations + one batched opening, so
 // those recursive envelopes' proof bytes changed. (No `VERSION`/UNION/ANTI/OUTER bump: the list
 // walk is a recursive-only composite; the top-level BGP/join/semi-join envelopes never embed it.)
-pub(super) const RECURSIVE_VERSION: u32 = 33;
+// v34: Merkle-dict I2b S5 — recursive envelopes embed a `RecursiveRelationProof::Bgp` leaf
+// (`LayerBgpEnvelope` -> `LayerBgpProof`), which gained the optional `openings` field, so every
+// recursive envelope carrying a BGP leaf shifts by the added option tag.
+pub(super) const RECURSIVE_VERSION: u32 = 34;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -884,10 +897,52 @@ wire_struct!(LayerBgpAtomProof {
     subject_id,
     object_id
 });
+// Merkle-dict I2b S5: one positional Merkle opening (leaf preimage + sibling path). The
+// UNCOMMITTED term-less resolution witness — never in `commitment_root`/`resolution_root`,
+// re-verified per id by `verify_opening` at consume time.
+wire_struct!(DictOpening {
+    id,
+    datatype_tag,
+    term_bytes,
+    position,
+    siblings
+});
+// Merkle-dict I2b S5: the two-namespace opening witness. Encoded as node/value then predicate
+// opening lists (deterministic id order); decoded through `from_wire`, which keys each by its own
+// id and rejects duplicates. Pure parsing — verification re-checks each opening against the
+// trusted root.
+impl Wire for ResolutionOpenings {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        let nv: Vec<&DictOpening> = self.node_value_openings().collect();
+        let pred: Vec<&DictOpening> = self.predicate_openings().collect();
+        if nv.len() > MAX_ITEMS || pred.len() > MAX_ITEMS {
+            return Err(invalid("too many resolution openings"));
+        }
+        nv.len().put(out)?;
+        for opening in nv {
+            opening.put(out)?;
+        }
+        pred.len().put(out)?;
+        for opening in pred {
+            opening.put(out)?;
+        }
+        Ok(())
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        let node_value: Vec<DictOpening> = Wire::get(reader)?;
+        let predicate: Vec<DictOpening> = Wire::get(reader)?;
+        ResolutionOpenings::from_wire(node_value, predicate)
+    }
+}
+// Merkle-dict I2b S5: `openings` carries the term-less resolution witness (`None` on term-bearing
+// proofs — a single option tag). This is a WIRE-FORMAT change: every envelope embedding a
+// `LayerBgpProof` (the query BGP leaf, the bag-union branches, the anti/outer sides, and the
+// recursive Bgp leaf) shifts, so `VERSION`/`UNION`/`ANTI`/`OUTER`/`RECURSIVE` all bump below.
 wire_struct!(LayerBgpProof {
     atoms,
     chain,
-    dictionary_absence
+    dictionary_absence,
+    openings
 });
 wire_struct!(JoinStep {
     acc_key,

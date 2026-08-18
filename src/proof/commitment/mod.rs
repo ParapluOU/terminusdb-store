@@ -142,12 +142,15 @@ pub use op_value::{node_value_op_value, NODE_DATATYPE_TAG};
 // proof as `pub(crate)` — internal only, never part of the external `pub` surface.
 pub(crate) use columns::reject_nan_catalog;
 pub(crate) use dict_merkle::{
-    build_node_value_tree, build_predicate_tree, verify_opening, DictMerkleTree, DictOpening,
-    ResolutionOpenings,
+    build_node_value_tree, build_predicate_tree, verify_opening, DictMerkleTree,
 };
-// Merkle-dict I2b S3: the prover-side term-less-opening BUILDER is test-only (openings are minted
-// only by in-crate tests until S5 wires the shipping prover — the coupling gate).
-#[cfg(test)]
+// Merkle-dict I2b S5: the term-less opening witness (`DictOpening`/`ResolutionOpenings`) is a
+// PUBLIC (uncommitted) proof-wire type — a term-less `LayerBgpProof` carries it. Re-exported `pub`
+// so the proof module can surface it and woql2 can name it.
+pub use dict_merkle::{DictOpening, ResolutionOpenings};
+// Merkle-dict I2b S5: the prover-side term-less-opening BUILDER is now PRODUCTION (the shipping
+// term-less producer mints openings; the anti-forge coupling is S4's mandatory belt-hash, not a
+// compile-time gate).
 pub(crate) use dict_merkle::build_resolution_openings;
 pub(crate) use legacy::decode_legacy_v3;
 pub(crate) use setup::{

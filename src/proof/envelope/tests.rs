@@ -31,7 +31,10 @@ use crate::proof::anti::{
 };
 use crate::proof::argument::{commit_column, ColumnOpening, StoreProverContext, SumcheckProof, Transcript254};
 use crate::proof::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit, RelationWitness};
-use crate::proof::commitment::{LayerCommitment, VerifierLayer};
+use crate::proof::commitment::{
+    build_node_value_tree, build_predicate_tree, build_resolution_openings, DictOpening,
+    LayerCommitment, ResolutionOpenings, VerifierCommitment, VerifierLayer,
+};
 use crate::proof::count::CountProof;
 use crate::proof::dict::DictProof;
 use crate::proof::dicthash::{
@@ -67,7 +70,7 @@ use crate::proof::order::{
 };
 use crate::proof::permutation::RelationPermutationProof;
 use crate::proof::query::{
-    has_ground_result_unit, prove_layer_bgp_with_result_and_context,
+    attach_termless_bgp_openings, has_ground_result_unit, prove_layer_bgp_with_result_and_context,
     resolve_typed_result_objects, result_id_namespaces,
     resolve_result_values, verify_layer_bgp, verify_layer_bgp_result_log_domain,
     verify_result_columns, generated_decimal_i64_field, generated_decimal_u64_value,
@@ -496,22 +499,224 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         use sha2::Digest as _;
         let hash = sha2::Sha256::digest(&bytes);
         let hash_hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        assert_eq!(bytes.len(), 177241, "materialized proof byte length changed");
-        // Hash + length regenerated for the LogUp-GKR migration of the KEYED-JOIN LINKS (Inc 3):
-        // the two-atom join's `join2` proof (`BinaryPairsProof`) dropped its FOUR committed
-        // reciprocal GT commitments (`rec_src_l`/`rec_cand_l`/`rec_src_r`/`rec_cand_r`) and the
-        // batched membership sumcheck for two block-disjoint GKR fraction-tree links (each a
-        // `JoinLinkProof`: GKR tree + committed-column leaf evaluations + one batched opening + a
-        // co-running `(1 − χ_{n_R|n_S})·mult = 0` GAP-1 Identity sumcheck and its `mult` opening).
-        // The embedded `SortedProof`/`membership`/`count` are unchanged (already migrated). The
-        // proof bytes (structure AND transcript-derived challenges) shifted while prover↔verifier
-        // still agree; the byte length rose (165762 -> 177241: the two GKR trees' rounds + the two
-        // link openings/evals + two Identity sumchecks outweigh the four dropped GT commitments).
-        // Intended, verified new stable image.
+        assert_eq!(bytes.len(), 177242, "materialized proof byte length changed");
+        // Length + hash REGENERATED for Merkle-dict I2b S5: `LayerBgpProof` gained the optional
+        // term-less resolution witness `openings` (`Option<ResolutionOpenings>`). This is a
+        // TERM-BEARING proof, so `openings == None` — exactly ONE added option tag byte (177241 ->
+        // 177242); the trailing `0u8` also perturbs the whole-proof SHA-256. Nothing about the
+        // committed proof/transcript changed; `commitment_root` is byte-identical (the witness is
+        // never committed). Prior image was the LogUp-GKR keyed-join-links (Inc 3) migration.
         assert_eq!(
             hash_hex,
-            "cda5dc8e1141bfb1423e808d5c574308850ef4650ba89da4f4ab93bafb908afa",
+            "5c42a8dab253a6dc8fd8ed32324ab852981f4287e81b28ce9b91e410d8b646de",
             "materialized multi-atom proof transcript/commitments changed (byte-identity regression)"
+        );
+    }
+
+    // =========================================================================================
+    // Merkle-dict I2b S5: term-less BGP/join verify + resolve END-TO-END through the proof WIRE.
+    // The prover ships the artifact TERM-LESS (no clear catalogs — the 256 MiB / O(1)-artifact
+    // win) and carries the matched-constant + resolved-result Merkle openings INSIDE the proof;
+    // the verifier consumes them for the S4 belt-hash and S3 resolution.
+    // =========================================================================================
+
+    /// Prove `plan`, attach the term-less openings (`attach_termless_bgp_openings`), build + encode
+    /// + decode the envelope, and assert it verifies AND resolves to the SAME result objects
+    /// against BOTH the term-bearing and the TERM-LESS artifact — the S5 differential realized
+    /// through the real prove -> encode -> decode -> verify pipeline.
+    fn differential_termless_query(
+        lc: &LayerCommitment,
+        bearing: &VerifierCommitment,
+        termless: &VerifierCommitment,
+        root: ProofHash,
+        plan: &LayerBgpPlan,
+    ) {
+        let mut result = prove_layer_bgp_with_result(lc, plan).unwrap();
+        attach_termless_bgp_openings(lc, plan, &mut result).unwrap();
+        assert!(
+            result.proof.openings.is_some(),
+            "S5 producer must attach the term-less opening witness"
+        );
+        let qd = plan_digest(plan).unwrap();
+        let columns = result.real_columns();
+        let envelope = LayerBgpEnvelope::new_verified(
+            lc,
+            root,
+            plan,
+            qd,
+            result.proof,
+            result.result_commitments,
+            columns,
+            result.result_log_domain,
+            result.result_len,
+            result.predicate_ids,
+        )
+        .unwrap();
+        let reference = envelope.result_objects.clone();
+        assert!(!reference.is_empty(), "the query must return at least one row");
+
+        let encoded = envelope.encode().unwrap();
+        let decoded = LayerBgpEnvelope::decode(&encoded).unwrap();
+        // (i) THE WIN: verifies + resolves against the TERM-LESS artifact using ONLY the shipped
+        // openings (no clear catalog present).
+        decoded.verify(termless, root, plan, qd).unwrap();
+        assert_eq!(
+            decoded.result_objects, reference,
+            "term-less resolution must equal the term-bearing resolution (differential)"
+        );
+        // (ii) the SAME proof still verifies against the term-bearing artifact (belt no-op there;
+        // resolution rebuilds the tree and ignores the openings).
+        decoded.verify(bearing, root, plan, qd).unwrap();
+    }
+
+    #[test]
+    fn s5_termless_bgp_and_join_verify_and_resolve_through_wire() {
+        let lc = node_layer(&[
+            ("a", "knows", "b"),
+            ("b", "knows", "c"),
+            ("a", "likes", "c"),
+        ]);
+        let root = lc.state.commitment_root;
+        let bearing = lc.verifier_commitment().unwrap();
+        let termless = lc.verifier_commitment_termless().unwrap();
+        // `commitment_root` byte-identical (openings never touch it); `resolution_root` identical
+        // (same dictionary Merkle roots). The artifact framing is the ONLY difference.
+        assert_eq!(bearing.state.commitment_root, termless.state.commitment_root);
+        assert_eq!(bearing.resolution_root(), termless.resolution_root());
+        assert!(bearing.terms_present && !termless.terms_present);
+
+        // (1) single-atom OBJECT-constant lookup `?s knows <b>` (matched constant + resolved ?s).
+        let plan1 = LayerBgpPlan {
+            source: ColumnSource::Materialized,
+            atoms: vec![LayerBgpAtom {
+                subject: AtomTerm::Variable,
+                predicate_term: iri("knows").into_bytes(),
+                predicate_variable: false,
+                object: AtomTerm::NodeConstant(iri("b").into_bytes()),
+                object_range: None,
+                object_kind: ObjectKindFilter::Any,
+                subject_object_equal: false,
+                source: ColumnSource::Materialized,
+            }],
+            joins: Vec::new(),
+        };
+        differential_termless_query(&lc, &bearing, &termless, root, &plan1);
+
+        // (2) 2-atom predicate-constant JOIN `?x knows ?y . ?x likes ?z` (join on ?x; three
+        // resolved node/value result columns).
+        let atom = |p: &str| LayerBgpAtom {
+            subject: AtomTerm::Variable,
+            predicate_term: iri(p).into_bytes(),
+            predicate_variable: false,
+            object: AtomTerm::Variable,
+            object_range: None,
+            object_kind: ObjectKindFilter::Any,
+            subject_object_equal: false,
+            source: ColumnSource::Materialized,
+        };
+        let plan2 = LayerBgpPlan {
+            source: ColumnSource::Materialized,
+            atoms: vec![atom("knows"), atom("likes")],
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+                additional_keys: Vec::new(),
+            }],
+        };
+        differential_termless_query(&lc, &bearing, &termless, root, &plan2);
+    }
+
+    /// S5 fail-close: a TERM-LESS proof that reaches the verifier WITHOUT its openings, and one
+    /// whose constant opening was SUBSTITUTED, are both rejected — while the term-bearing artifact
+    /// still verifies. Preserves the S3/S4 discipline through the wire.
+    #[test]
+    fn s5_termless_missing_and_forged_openings_rejected() {
+        let lc = node_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
+        let root = lc.state.commitment_root;
+        let bearing = lc.verifier_commitment().unwrap();
+        let termless = lc.verifier_commitment_termless().unwrap();
+        let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
+            atoms: vec![LayerBgpAtom {
+                subject: AtomTerm::Variable,
+                predicate_term: iri("knows").into_bytes(),
+                predicate_variable: false,
+                object: AtomTerm::NodeConstant(iri("b").into_bytes()),
+                object_range: None,
+                object_kind: ObjectKindFilter::Any,
+                subject_object_equal: false,
+                source: ColumnSource::Materialized,
+            }],
+            joins: Vec::new(),
+        };
+        let qd = plan_digest(&plan).unwrap();
+
+        // (a) MISSING openings: prove, LEAVE `openings = None`, ship. The term-bearing envelope
+        // build succeeds (belt no-op), but verifying against the TERM-LESS artifact fails closed.
+        let r0 = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+        assert!(r0.proof.openings.is_none());
+        let cols0 = r0.real_columns();
+        let env0 = LayerBgpEnvelope::new_verified(
+            &lc,
+            root,
+            &plan,
+            qd,
+            r0.proof,
+            r0.result_commitments,
+            cols0,
+            r0.result_log_domain,
+            r0.result_len,
+            r0.predicate_ids,
+        )
+        .unwrap();
+        let dec0 = LayerBgpEnvelope::decode(&env0.encode().unwrap()).unwrap();
+        assert!(
+            dec0.verify(&termless, root, &plan, qd).is_err(),
+            "term-less proof with MISSING openings must fail closed"
+        );
+        dec0.verify(&bearing, root, &plan, qd).unwrap();
+
+        // (b) FORGED constant opening: substitute a WRONG term at the object-constant id. The
+        // opening no longer re-hashes to the root-bound leaf, so the belt rejects it.
+        let mut r1 = prove_layer_bgp_with_result(&lc, &plan).unwrap();
+        let obj_id = r1.proof.atoms[0].object_id.unwrap();
+        let knows_id = r1.predicate_ids[0];
+        let nv_tree = build_node_value_tree(
+            &lc.node_value_catalog,
+            lc.state.parent_node_value_count,
+            lc.state.node_value_count,
+        )
+        .unwrap();
+        let pred_tree = build_predicate_tree(
+            &lc.predicate_catalog,
+            lc.state.parent_predicate_count,
+            lc.state.predicate_count,
+        )
+        .unwrap();
+        let mut forged = ResolutionOpenings::default();
+        let mut tampered: DictOpening = nv_tree.open(obj_id).unwrap();
+        tampered.term_bytes = iri("c").into_bytes(); // claim id(<b>) actually holds <c>
+        forged.insert_node_value(tampered);
+        forged.insert_predicate(pred_tree.open(knows_id).unwrap());
+        r1.proof.openings = Some(forged);
+        let cols1 = r1.real_columns();
+        let env1 = LayerBgpEnvelope::new_verified(
+            &lc,
+            root,
+            &plan,
+            qd,
+            r1.proof,
+            r1.result_commitments,
+            cols1,
+            r1.result_log_domain,
+            r1.result_len,
+            r1.predicate_ids,
+        )
+        .unwrap();
+        let dec1 = LayerBgpEnvelope::decode(&env1.encode().unwrap()).unwrap();
+        assert!(
+            dec1.verify(&termless, root, &plan, qd).is_err(),
+            "term-less proof with a SUBSTITUTED constant opening must fail closed"
         );
     }
 

@@ -124,7 +124,7 @@ fn resolve_node_value_result_objects_impl(
 /// The canonical u64 an id field element must equal to index a dictionary. Rejects a
 /// field element that is not a small (`< 2^64`) integer, exactly as the generated-decimal
 /// path does before trusting a scalar.
-fn canonical_dictionary_id(id: &ArkFr) -> io::Result<u64> {
+pub(super) fn canonical_dictionary_id(id: &ArkFr) -> io::Result<u64> {
     let raw = id.0.into_bigint().as_ref()[0];
     if ArkFr::from_u64(raw) != *id {
         return Err(invalid("dictionary result id is outside canonical u64 range"));
@@ -241,6 +241,33 @@ pub fn resolve_typed_result_objects(
     columns: &[Vec<ArkFr>],
     namespaces: &[ResultIdNamespace],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    // No openings: term-bearing resolves via the rebuilt trees; a term-less view fails closed.
+    resolve_typed_result_objects_impl(layer, trusted_resolution_root, columns, namespaces, None)
+}
+
+/// Merkle-dict I2b S5: resolve typed result columns over a TERM-LESS artifact via the
+/// prover-shipped Merkle `openings` (carried in [`LayerBgpProof::openings`]). The term-BEARING
+/// path is unchanged (`openings = None`, rebuilds the trees). PRODUCTION (drops the S3
+/// `#[cfg(test)]` gate): term-less BGP verification is now gated by S4's MANDATORY per-constant
+/// belt-hash, so a term-less proof that reaches this resolver already passed the belt; a missing
+/// opening still fails closed here.
+pub fn resolve_typed_result_objects_with_openings(
+    layer: &impl VerifierLayer,
+    trusted_resolution_root: ProofHash,
+    columns: &[Vec<ArkFr>],
+    namespaces: &[ResultIdNamespace],
+    openings: Option<&ResolutionOpenings>,
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    resolve_typed_result_objects_impl(layer, trusted_resolution_root, columns, namespaces, openings)
+}
+
+fn resolve_typed_result_objects_impl(
+    layer: &impl VerifierLayer,
+    trusted_resolution_root: ProofHash,
+    columns: &[Vec<ArkFr>],
+    namespaces: &[ResultIdNamespace],
+    openings: Option<&ResolutionOpenings>,
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
     let descriptors: Vec<_> = namespaces
         .iter()
         .map(|namespace| ResultColumnDescriptor {
@@ -248,7 +275,7 @@ pub fn resolve_typed_result_objects(
             nullable: false,
         })
         .collect();
-    resolve_result_values(layer, trusted_resolution_root, columns, &descriptors)?
+    resolve_result_values_impl(layer, trusted_resolution_root, columns, &descriptors, openings)?
         .into_iter()
         .map(|column| {
             column
@@ -283,13 +310,12 @@ pub fn resolve_result_values(
     resolve_result_values_impl(source, trusted_resolution_root, columns, descriptors, None)
 }
 
-/// Merkle-dict I2b S3: resolve typed result columns over a TERM-LESS artifact via
-/// prover-shipped Merkle `openings`. The term-BEARING path is unchanged (ignores `openings`,
-/// rebuilds the trees). `#[cfg(test)]`: the term-less resolve ENTRY POINT exists only in test
-/// builds until S4/S5 gate a full term-less query — and resolution is decoupled from
-/// `verify_layer_bgp`, so even so it cannot enable a term-less full-query verify.
-#[cfg(test)]
-pub(crate) fn resolve_result_values_with_openings(
+/// Merkle-dict I2b S5: resolve typed result columns over a TERM-LESS artifact via prover-shipped
+/// Merkle `openings` (carried in [`LayerBgpProof::openings`]). The term-BEARING path is unchanged
+/// (ignores `openings`, rebuilds the trees). PRODUCTION (drops the S3 `#[cfg(test)]` gate): the
+/// term-less resolve path is now gated end-to-end by S4's mandatory per-constant belt-hash in
+/// `verify_layer_bgp`; a missing opening fails closed here.
+pub fn resolve_result_values_with_openings(
     source: &impl VerifierLayer,
     trusted_resolution_root: ProofHash,
     columns: &[Vec<ArkFr>],
