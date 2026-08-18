@@ -326,7 +326,6 @@ pub fn prove_layer_bgp_with_result_and_context(
 /// re-checks every atom's dictionary binding + complete filter, and the left-deep join
 /// chain over the filtered relations (which enforces the two continuity conditions).
 /// Concludes `result_coms[0..m]` is EXACTLY the complete BGP result, without rerunning it.
-#[allow(clippy::too_many_arguments)]
 pub fn verify_layer_bgp(
     source: &impl VerifierLayer,
     trusted_resolution_root: ProofHash,
@@ -335,6 +334,66 @@ pub fn verify_layer_bgp(
     result_coms: &[ArkGT],
     m: usize,
     proof: &LayerBgpProof,
+) -> io::Result<()> {
+    // Merkle-dict I2b S4: the PUBLIC entry ships NO per-constant belt-hash openings. A
+    // term-bearing artifact verifies unchanged (the belt is a no-op there — the catalog re-MSM
+    // already supplied term fidelity); a TERM-LESS artifact fails closed (its matched constants
+    // have no belt to tie them to real terms until the S5 FFI plumbing ships the openings). This
+    // preserves the residual fail-close: no term-less artifact verifies a constant-match through
+    // the FFI without the belt.
+    verify_layer_bgp_impl(
+        source,
+        trusted_resolution_root,
+        plan,
+        predicate_ids,
+        result_coms,
+        m,
+        proof,
+        None,
+    )
+}
+
+/// Merkle-dict I2b S4: verify a term-less layer BGP given the prover-shipped per-matched-CONSTANT
+/// Merkle openings (the belt-hash witness that ties each authenticated constant id to its real
+/// `resolution_root`-bound term). A term-bearing artifact ignores `openings` (the catalog re-MSM
+/// already supplied that fidelity). `#[cfg(test)]`: the openings-consuming entry is test-only until
+/// S5 wires the shipping prover/FFI — so a term-less artifact reaching the PUBLIC
+/// [`verify_layer_bgp`] (openings `None`) still fails closed and no shipping path verifies a
+/// constant-match without the belt.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_layer_bgp_with_constant_openings(
+    source: &impl VerifierLayer,
+    trusted_resolution_root: ProofHash,
+    plan: &LayerBgpPlan,
+    predicate_ids: &[u64],
+    result_coms: &[ArkGT],
+    m: usize,
+    proof: &LayerBgpProof,
+    openings: &ResolutionOpenings,
+) -> io::Result<()> {
+    verify_layer_bgp_impl(
+        source,
+        trusted_resolution_root,
+        plan,
+        predicate_ids,
+        result_coms,
+        m,
+        proof,
+        Some(openings),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_layer_bgp_impl(
+    source: &impl VerifierLayer,
+    trusted_resolution_root: ProofHash,
+    plan: &LayerBgpPlan,
+    predicate_ids: &[u64],
+    result_coms: &[ArkGT],
+    m: usize,
+    proof: &LayerBgpProof,
+    openings: Option<&ResolutionOpenings>,
 ) -> io::Result<()> {
     let layer = source.verifier_view();
     require_base_layer_for_query(layer.state)?;
@@ -350,16 +409,12 @@ pub fn verify_layer_bgp(
             "layer commitment_root does not bind its committed columns/dictionary",
         ));
     }
-    // Merkle-dict I2b (interim S4) fail-close: reject a TERM-LESS artifact before ANY constant
-    // work. S1 made `VerifierCommitment::decode` accept `terms_present=0`; such an artifact
-    // dropped its clear catalogs, so `validate()` skips the catalog re-MSM that ties the
-    // committed node/value + predicate dict HASH columns to the real terms. Its `com_nv_hash`/
-    // `com_pred_hash` are then prover-chosen, so the `verify_dict_membership` constant-match in
-    // the atom loop below — AND the all-ground / ground-result-unit (ASK) early `Ok` — would
-    // authenticate a fabricated IRI->id mapping (the deferred I2b object-constant forge). Gate it
-    // HERE, before the `dictionary_absence` branch, the atom loop, and the ASK Ok. The base BGP
-    // path is NOT term-less-queryable until S4's per-constant belt-hash. (No-op term-bearing.)
-    layer.require_terms_present("layer BGP constant-match / ground-result unit")?;
+    // Merkle-dict I2b S4: the blanket interim term-less fail-close is RELAXED here. Constant
+    // matches are now tied to real terms by a per-matched-CONSTANT belt-hash (below), so a
+    // term-less artifact is verifiable GIVEN the prover-shipped constant `openings`. The
+    // `dictionary_absence` branch keeps its OWN blanket guard (absence cannot be proven from a
+    // dropped catalog), and the residual fail-close (term-less WITHOUT openings ⇒ Err) is enforced
+    // just after it, before the atom loop.
     let k = validate_bgp_plan(plan)?;
     if let Some(claimed_absence) = proof.dictionary_absence {
         // Merkle-dict I2b S2 fail-close: `dictionary_absence` proves a constant is ABSENT by
@@ -395,6 +450,18 @@ pub fn verify_layer_bgp(
             ));
         }
         return Ok(());
+    }
+    // Merkle-dict I2b S4 residual fail-close: past the `dictionary_absence` branch we are on the
+    // atom / all-ground (ASK) constant-match path. A TERM-LESS artifact here has prover-chosen dict
+    // HASH columns (no catalog re-MSM), so every matched constant MUST be belt-hashed against its
+    // real `resolution_root`-bound Merkle term — which needs the prover-shipped `openings`. Without
+    // them (the PUBLIC `verify_layer_bgp` entry, i.e. every FFI caller until S5) fail closed, even
+    // for an all-variable BGP: no term-less constant-match verifies without the belt. (Term-bearing
+    // is unaffected; the belt below is a no-op there.)
+    if !layer.terms_present && openings.is_none() {
+        return Err(invalid(
+            "term-less layer BGP constant-match requires prover-shipped constant Merkle openings",
+        ));
     }
     if proof.atoms.len() != k || predicate_ids.len() != k {
         return Err(invalid("layer BGP proof/atom/id count mismatch"));
@@ -482,6 +549,10 @@ pub fn verify_layer_bgp(
                     .ok_or_else(|| invalid("constant predicate membership is absent"))?,
                 &mut transcript,
             )?;
+            // Merkle-dict I2b S4 belt-hash: on a TERM-LESS artifact `com_pred_hash` is prover-chosen,
+            // so the membership alone could authenticate a fabricated IRI->id mapping. Tie this
+            // authenticated id to its real `pred_merkle_root`-bound IRI. (No-op term-bearing.)
+            belt_hash_predicate_constant(layer, openings, predicate_id, &atom.predicate_term)?;
         }
         // (2) Subject / object constant memberships, in the SAME order as the prover. The
         // authenticated id is reused verbatim in the filter spec below (the security tie).
@@ -500,6 +571,9 @@ pub fn verify_layer_bgp(
                 membership,
                 &mut transcript,
             )?;
+            // Merkle-dict I2b S4 belt-hash: tie this authenticated subject id to its real
+            // `nv_merkle_root`-bound term (no-op term-bearing).
+            belt_hash_node_value_constant(layer, openings, subject_id, &object)?;
         }
         if let Some(object_id) = ids.object_id {
             let object = atom_term_object(&atom.object)
@@ -516,6 +590,9 @@ pub fn verify_layer_bgp(
                 membership,
                 &mut transcript,
             )?;
+            // Merkle-dict I2b S4 belt-hash: tie this authenticated object id to its real
+            // `nv_merkle_root`-bound term — THE deferred I2b object-constant forge closer.
+            belt_hash_node_value_constant(layer, openings, object_id, &object)?;
         }
         // (3) Selection: `kept_commitments[0..m]` is the complete per-atom result. Which
         // path runs is decided by the PLAN atom's `object_range` (public), NOT by the
@@ -645,6 +722,88 @@ pub fn verify_layer_bgp(
     if chain_m != m || chain_coms.as_slice() != result_coms {
         return Err(invalid(
             "layer BGP result does not match the proof's chain output",
+        ));
+    }
+    Ok(())
+}
+
+/// Merkle-dict I2b S4 per-matched-CONSTANT belt-hash (node/value position). TERM-BEARING: no-op —
+/// `validate()`'s catalog re-MSM already tied `com_nv_hash` to the real terms. TERM-LESS:
+/// `com_nv_hash` is prover-chosen, so `verify_dict_membership` alone could authenticate a
+/// fabricated term->id mapping; open the authenticated constant `id` against the
+/// `resolution_root`-bound `nv_merkle_root` (via the prover-shipped `openings`, fail-closed if
+/// absent) and require the opened term to hash to the SAME value the membership matched
+/// (`hash_object`, the Blake2b used by `verify_dict_membership` + the I2a belt). A wrong id or a
+/// substituted term ⇒ hash mismatch ⇒ Err. `verify_opening` independently re-forces the interval +
+/// structural position against the trusted root, so no id/term substitution survives.
+fn belt_hash_node_value_constant(
+    layer: VerifierCommitmentRef<'_>,
+    openings: Option<&ResolutionOpenings>,
+    id: u64,
+    constant: &CanonicalObject,
+) -> io::Result<()> {
+    if layer.terms_present {
+        return Ok(());
+    }
+    let opening = openings
+        .ok_or_else(|| {
+            invalid(
+                "term-less layer BGP constant-match requires prover-shipped constant Merkle openings",
+            )
+        })?
+        .node_value_opening(id)?;
+    let opened = verify_opening(
+        &layer.nv_merkle_root,
+        layer.state.parent_node_value_count,
+        layer.state.node_value_count,
+        id,
+        opening,
+    )?;
+    if hash_object(&opened) != hash_object(constant) {
+        return Err(invalid(
+            "term-less BGP belt-hash: opened node/value term does not match the matched constant",
+        ));
+    }
+    Ok(())
+}
+
+/// Merkle-dict I2b S4 per-matched-CONSTANT belt-hash (predicate position). As
+/// [`belt_hash_node_value_constant`], but opens `pred_merkle_root` and compares `hash_term` of the
+/// reconstructed IRI (predicate leaves are node IRIs) against the matched predicate constant.
+fn belt_hash_predicate_constant(
+    layer: VerifierCommitmentRef<'_>,
+    openings: Option<&ResolutionOpenings>,
+    id: u64,
+    predicate_term: &[u8],
+) -> io::Result<()> {
+    if layer.terms_present {
+        return Ok(());
+    }
+    let opening = openings
+        .ok_or_else(|| {
+            invalid(
+                "term-less layer BGP constant-match requires prover-shipped constant Merkle openings",
+            )
+        })?
+        .predicate_opening(id)?;
+    let opened = verify_opening(
+        &layer.pred_merkle_root,
+        layer.state.parent_predicate_count,
+        layer.state.predicate_count,
+        id,
+        opening,
+    )?;
+    let iri = match &opened {
+        CanonicalObject::Node(bytes) => bytes.as_slice(),
+        _ => {
+            return Err(invalid(
+                "term-less BGP belt-hash: predicate leaf did not reconstruct as a node IRI",
+            ))
+        }
+    };
+    if hash_term(iri) != hash_term(predicate_term) {
+        return Err(invalid(
+            "term-less BGP belt-hash: opened predicate IRI does not match the matched constant",
         ));
     }
     Ok(())

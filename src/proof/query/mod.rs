@@ -150,6 +150,12 @@ pub use layer_bgp::{
     prove_layer_bgp, prove_layer_bgp_with_result, prove_layer_bgp_with_result_and_context,
     verify_layer_bgp, verify_layer_bgp_result_log_domain,
 };
+// Merkle-dict I2b S4: the per-matched-constant belt-hash entry that consumes the prover-shipped
+// constant openings for a TERM-LESS artifact. `#[cfg(test)]` + `pub(crate)` — the openings-
+// consuming verify path exists only in test builds until S5 wires the shipping FFI, so a term-less
+// artifact through the PUBLIC `verify_layer_bgp` still fails closed (no belt-less constant-match).
+#[cfg(test)]
+pub(crate) use layer_bgp::verify_layer_bgp_with_constant_openings;
 
 // Crate-internal API (consumed by sibling proof modules such as `envelope`).
 pub(crate) use column_source::require_base_layer_for_query;

@@ -2362,10 +2362,17 @@
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
         verify_layer_bgp(&lc, lc.resolution_root(), &plan, &ids, &coms, m, &proof).unwrap();
         let termless = lc.verifier_commitment_termless().unwrap();
+        // Via the PUBLIC entry (no openings) S4's residual fail-close rejects any term-less BGP
+        // before the atom loop, so a range plan never reaches `verify_ranged_atom` here — it fails
+        // closed at the missing-openings guard. (The range's OWN value/datatype fail-close, which
+        // holds even WITH openings, is asserted by `s4_termless_range_still_rejects_with_openings`.)
         let err =
             verify_layer_bgp(&termless, lc.resolution_root(), &plan, &ids, &coms, m, &proof)
                 .unwrap_err();
-        assert!(err.to_string().contains("terms-bearing"), "range: {err}");
+        assert!(
+            err.to_string().contains("constant Merkle openings"),
+            "range: {err}"
+        );
 
         // (2) ABSENCE.
         let alc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
@@ -2404,15 +2411,18 @@
         assert!(aerr.to_string().contains("terms-bearing"), "absence: {aerr}");
     }
 
-    /// Merkle-dict I2b (interim S4) soundness: a TERM-LESS view of a base layer MUST fail CLOSED
-    /// at the BGP CONSTANT-match. S1 made `VerifierCommitment::decode` accept `terms_present=0`,
-    /// but a term-less artifact's committed node/value + predicate dict HASH columns are no longer
-    /// tied to real terms (validate() skips the catalog re-MSM), so `verify_dict_membership` would
-    /// authenticate a prover-chosen IRI->id mapping. This closes the deferred I2b object-constant
-    /// forge: an internally-inconsistent term-less artifact could otherwise ASK `?s p "C"` while
-    /// the Merkle data holds a different term at that id and still verify. Both plan shapes verify
-    /// fine term-BEARING (the guard is a no-op there). Covers (1) a single-atom OBJECT-constant
-    /// match and (2) an all-ground ASK / ground-result unit (guard fires BEFORE the early `Ok`).
+    /// Merkle-dict I2b S4 residual fail-close: a TERM-LESS artifact reaching the PUBLIC
+    /// `verify_layer_bgp` (which ships NO per-constant belt-hash openings — every FFI caller until
+    /// S5) MUST fail CLOSED at the BGP CONSTANT-match, before the atom membership loop. Without the
+    /// belt, a term-less artifact's prover-chosen dict HASH columns would let `verify_dict_membership`
+    /// authenticate a fabricated IRI->id mapping (ASK `?s p "C"` while the Merkle data holds a
+    /// different term at that id). S4 relaxes the interim blanket guard, but the openings-consuming
+    /// entry is `#[cfg(test)]` only, so the public/FFI path still rejects. Both plan shapes verify
+    /// fine term-BEARING (the belt is a no-op). Covers (1) a single-atom OBJECT-constant match and
+    /// (2) an all-ground ASK / ground-result unit (residual guard fires BEFORE the early `Ok`). The
+    /// positive belt-hash path (term-less verifying WITH correct openings) is
+    /// `s4_termless_bgp_verifies_and_resolves_with_belt_openings`; the forges are
+    /// `s4_termless_constant_belt_forges_reject`.
     #[test]
     fn layer_bgp_constant_and_ask_fail_closed_on_termless_view() {
         let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
@@ -2435,16 +2445,20 @@
             joins: Vec::new(),
         };
         let (proof, coms, m, ids) = prove_layer_bgp(&lc, &obj_const).unwrap();
-        // Term-bearing verifies (the terms_present guard is a no-op).
+        // Term-bearing verifies (the belt is a no-op).
         verify_layer_bgp(&lc, lc.resolution_root(), &obj_const, &ids, &coms, m, &proof).unwrap();
-        // Term-less rejects at the top-of-function fail-close, before the atom membership loop.
+        // Term-less via the PUBLIC entry (no openings) rejects at the residual fail-close, before
+        // the atom membership loop — no belt-less constant-match verifies through the FFI.
         let err =
             verify_layer_bgp(&termless, lc.resolution_root(), &obj_const, &ids, &coms, m, &proof)
                 .unwrap_err();
-        assert!(err.to_string().contains("terms-bearing"), "object-constant: {err}");
+        assert!(
+            err.to_string().contains("constant Merkle openings"),
+            "object-constant: {err}"
+        );
 
         // (2) ALL-GROUND ASK: `<a> knows <b>` — the ground-result-unit path, whose honest verify
-        // ends in an early `Ok`. The guard must fire BEFORE that Ok on a term-less view.
+        // ends in an early `Ok`. The residual guard must fire BEFORE that Ok on a term-less view.
         let ask = LayerBgpPlan {
             source: ColumnSource::Materialized,
             atoms: vec![LayerBgpAtom {
@@ -2461,7 +2475,7 @@
         };
         let ares = prove_layer_bgp_with_result(&lc, &ask).unwrap();
         assert_eq!(ares.result_len, 1, "ASK <a> knows <b> is present");
-        // Term-bearing reaches the ground-result-unit Ok (guard is a no-op).
+        // Term-bearing reaches the ground-result-unit Ok (belt is a no-op).
         verify_layer_bgp(
             &lc,
             lc.resolution_root(),
@@ -2472,7 +2486,7 @@
             &ares.proof,
         )
         .unwrap();
-        // Term-less rejects BEFORE the ground-result-unit early Ok.
+        // Term-less via the public entry (no openings) rejects BEFORE the ground-result-unit Ok.
         let aerr = verify_layer_bgp(
             &termless,
             lc.resolution_root(),
@@ -2483,7 +2497,411 @@
             &ares.proof,
         )
         .unwrap_err();
-        assert!(aerr.to_string().contains("terms-bearing"), "ask: {aerr}");
+        assert!(
+            aerr.to_string().contains("constant Merkle openings"),
+            "ask: {aerr}"
+        );
+    }
+
+    // A one-atom BGP plan over the materialized head with a constant predicate.
+    fn single_atom_plan(subject: AtomTerm, predicate: &[u8], object: AtomTerm) -> LayerBgpPlan {
+        LayerBgpPlan {
+            source: ColumnSource::Materialized,
+            atoms: vec![LayerBgpAtom {
+                subject,
+                predicate_term: predicate.to_vec(),
+                predicate_variable: false,
+                object,
+                object_range: None,
+                object_kind: ObjectKindFilter::Any,
+                subject_object_equal: false,
+                source: ColumnSource::Materialized,
+            }],
+            joins: Vec::new(),
+        }
+    }
+
+    // Merkle-dict I2b S4 forge helpers: a REAL id-indexed dictionary tree over the SAME catalog with
+    // exactly ONE record's term replaced. Its root is self-consistent (a positional opening of the
+    // replaced id AUTHENTICATES against it), but the opened term now hashes DIFFERENTLY from the
+    // matched constant — precisely the self-inconsistent term-less artifact the per-constant
+    // belt-hash must reject (com_*_hash still authenticates the constant at that id, while the Merkle
+    // root says a different term; the dropped catalog re-MSM would have caught the disagreement).
+    // `commitment_root` is untouched; only `nv/pred_merkle_root` (hence `resolution_root`) moves.
+    fn forged_nv_tree(lc: &LayerCommitment, id: u64, new_term: &[u8]) -> DictMerkleTree {
+        let mut cat = lc.node_value_catalog.clone();
+        let rec = cat
+            .iter_mut()
+            .find(|r| r.object_id == id)
+            .expect("node/value id present in catalog");
+        rec.triple.object = CanonicalObject::Node(new_term.to_vec());
+        build_node_value_tree(
+            &cat,
+            lc.state.parent_node_value_count,
+            lc.state.node_value_count,
+        )
+        .unwrap()
+    }
+
+    fn forged_pred_tree(lc: &LayerCommitment, id: u64, new_iri: &[u8]) -> DictMerkleTree {
+        let mut cat = lc.predicate_catalog.clone();
+        let rec = cat
+            .iter_mut()
+            .find(|r| r.predicate_id == id)
+            .expect("predicate id present in catalog");
+        rec.triple.predicate = new_iri.to_vec();
+        build_predicate_tree(
+            &cat,
+            lc.state.parent_predicate_count,
+            lc.state.predicate_count,
+        )
+        .unwrap()
+    }
+
+    /// Merkle-dict I2b S4 (N2) — the SOUNDNESS increment. On a TERM-LESS artifact the per-matched-
+    /// CONSTANT belt-hash is the ONLY thing tying a matched constant's authenticated id to a real
+    /// term (com_*_hash is prover-chosen once the catalog re-MSM is gone). Every forge below PASSES
+    /// `verify_dict_membership` (the id IS authenticated against the committed hash column) yet MUST
+    /// reject at the belt:
+    ///   (a) OBJECT-constant term substitution — nv_merkle_root maps the id to a DIFFERENT term;
+    ///   (b) PREDICATE-constant term substitution — pred_merkle_root maps the id to a different IRI;
+    ///   (c) SUBJECT-constant term substitution — nv_merkle_root at the subject id;
+    ///   (d) a MISSING per-constant opening (fail-closed, never a silent accept);
+    ///   (e) a TAMPERED opening (corrupt term bytes ⇒ verify_opening);
+    ///   (f) a WRONG-ID opening (re-keyed ⇒ verify_opening interval/position).
+    /// (a)/(b)/(c) exercise the hash-mismatch belt ITSELF (verify_opening PASSES against the
+    /// self-consistent forged root — the term merely differs); (d)/(e)/(f) exercise the opening
+    /// carrier + verify_opening. All go through the `#[cfg(test)]` openings entry — the only
+    /// term-less verify path (the public entry fails closed, tested above).
+    #[test]
+    fn s4_termless_constant_belt_forges_reject() {
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
+        let honest_nv = build_node_value_tree(
+            &lc.node_value_catalog,
+            lc.state.parent_node_value_count,
+            lc.state.node_value_count,
+        )
+        .unwrap();
+        let honest_pred = build_predicate_tree(
+            &lc.predicate_catalog,
+            lc.state.parent_predicate_count,
+            lc.state.predicate_count,
+        )
+        .unwrap();
+
+        // (a) OBJECT-constant `?s knows <b>`: nv_merkle_root maps b's id to a different term.
+        let obj_const = single_atom_plan(AtomTerm::Variable, KNOWS, node_const("b"));
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &obj_const).unwrap();
+        let knows_id = ids[0];
+        let xb = proof.atoms[0].object_id.unwrap();
+        let forged = forged_nv_tree(&lc, xb, b"http://ex/NOT-b");
+        let mut tl = lc.verifier_commitment_termless().unwrap();
+        tl.nv_merkle_root = forged.root();
+        let mut op = ResolutionOpenings::default();
+        op.insert_predicate(honest_pred.open(knows_id).unwrap());
+        op.insert_node_value(forged.open(xb).unwrap()); // authenticates vs forged root, term != "b"
+        let err = verify_layer_bgp_with_constant_openings(
+            &tl,
+            tl.resolution_root(),
+            &obj_const,
+            &ids,
+            &coms,
+            m,
+            &proof,
+            &op,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("belt-hash") && err.to_string().contains("node/value"),
+            "(a) object: {err}"
+        );
+
+        // (b) PREDICATE-constant `?s knows ?o`: pred_merkle_root maps knows' id to a different IRI.
+        let pred_const = single_atom_plan(AtomTerm::Variable, KNOWS, AtomTerm::Variable);
+        let (pproof, pcoms, pm, pids) = prove_layer_bgp(&lc, &pred_const).unwrap();
+        let pknows = pids[0];
+        let forged_p = forged_pred_tree(&lc, pknows, b"http://ex/NOT-knows");
+        let mut tlp = lc.verifier_commitment_termless().unwrap();
+        tlp.pred_merkle_root = forged_p.root();
+        let mut opp = ResolutionOpenings::default();
+        opp.insert_predicate(forged_p.open(pknows).unwrap());
+        let perr = verify_layer_bgp_with_constant_openings(
+            &tlp,
+            tlp.resolution_root(),
+            &pred_const,
+            &pids,
+            &pcoms,
+            pm,
+            &pproof,
+            &opp,
+        )
+        .unwrap_err();
+        assert!(
+            perr.to_string().contains("belt-hash") && perr.to_string().contains("predicate"),
+            "(b) predicate: {perr}"
+        );
+
+        // (c) SUBJECT-constant `<a> knows ?o`: nv_merkle_root maps a's id to a different term.
+        let subj_const = single_atom_plan(node_const("a"), KNOWS, AtomTerm::Variable);
+        let (sproof, scoms, sm, sids) = prove_layer_bgp(&lc, &subj_const).unwrap();
+        let sknows = sids[0];
+        let xa = sproof.atoms[0].subject_id.unwrap();
+        let forged_s = forged_nv_tree(&lc, xa, b"http://ex/NOT-a");
+        let mut tls = lc.verifier_commitment_termless().unwrap();
+        tls.nv_merkle_root = forged_s.root();
+        let mut ops = ResolutionOpenings::default();
+        ops.insert_predicate(honest_pred.open(sknows).unwrap());
+        ops.insert_node_value(forged_s.open(xa).unwrap());
+        let serr = verify_layer_bgp_with_constant_openings(
+            &tls,
+            tls.resolution_root(),
+            &subj_const,
+            &sids,
+            &scoms,
+            sm,
+            &sproof,
+            &ops,
+        )
+        .unwrap_err();
+        assert!(
+            serr.to_string().contains("belt-hash") && serr.to_string().contains("node/value"),
+            "(c) subject: {serr}"
+        );
+
+        // (d)(e)(f): HONEST term-less artifact (real roots), bad OBJECT opening carrier.
+        let tl_ok = lc.verifier_commitment_termless().unwrap();
+        // (d) missing object opening (predicate opening present) ⇒ fail-closed.
+        let mut miss = ResolutionOpenings::default();
+        miss.insert_predicate(honest_pred.open(knows_id).unwrap());
+        let derr = verify_layer_bgp_with_constant_openings(
+            &tl_ok,
+            tl_ok.resolution_root(),
+            &obj_const,
+            &ids,
+            &coms,
+            m,
+            &proof,
+            &miss,
+        )
+        .unwrap_err();
+        assert!(
+            derr.to_string().contains("no node/value Merkle opening"),
+            "(d) missing: {derr}"
+        );
+        // (e) tampered object opening (corrupt term bytes) ⇒ verify_opening rejects.
+        let mut tamper_op = honest_nv.open(xb).unwrap();
+        tamper_op.term_bytes.push(0xff);
+        let mut tamper = ResolutionOpenings::default();
+        tamper.insert_predicate(honest_pred.open(knows_id).unwrap());
+        tamper.insert_node_value(tamper_op);
+        let terr = verify_layer_bgp_with_constant_openings(
+            &tl_ok,
+            tl_ok.resolution_root(),
+            &obj_const,
+            &ids,
+            &coms,
+            m,
+            &proof,
+            &tamper,
+        )
+        .unwrap_err();
+        assert!(
+            terr.to_string().contains("does not authenticate"),
+            "(e) tampered: {terr}"
+        );
+        // (f) wrong-id object opening: a real opening for another id, re-keyed to xb ⇒ position.
+        let other = lc
+            .node_value_catalog
+            .iter()
+            .map(|r| r.object_id)
+            .find(|&i| i != xb)
+            .unwrap();
+        let mut wrong = honest_nv.open(other).unwrap();
+        wrong.id = xb;
+        let mut wrong_map = ResolutionOpenings::default();
+        wrong_map.insert_predicate(honest_pred.open(knows_id).unwrap());
+        wrong_map.insert_node_value(wrong);
+        let ferr = verify_layer_bgp_with_constant_openings(
+            &tl_ok,
+            tl_ok.resolution_root(),
+            &obj_const,
+            &ids,
+            &coms,
+            m,
+            &proof,
+            &wrong_map,
+        )
+        .unwrap_err();
+        assert!(ferr.to_string().contains("position"), "(f) wrong-id: {ferr}");
+    }
+
+    /// Merkle-dict I2b S4 (N3) — liveness / differential: a VALID term-less BGP (constants + joins)
+    /// WITH correct per-constant belt-hash openings VERIFIES, and its result resolves (via the S3
+    /// opening path) to the SAME terms as the term-BEARING artifact. Proves the belt is a no-op on
+    /// honest inputs and that S4 did not break the point-lookup / join core.
+    #[test]
+    fn s4_termless_bgp_verifies_and_resolves_with_belt_openings() {
+        // (1) single-atom OBJECT-constant `?s knows <b>`.
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
+        let root = lc.resolution_root();
+        let honest_nv = build_node_value_tree(
+            &lc.node_value_catalog,
+            lc.state.parent_node_value_count,
+            lc.state.node_value_count,
+        )
+        .unwrap();
+        let honest_pred = build_predicate_tree(
+            &lc.predicate_catalog,
+            lc.state.parent_predicate_count,
+            lc.state.predicate_count,
+        )
+        .unwrap();
+        let obj_const = single_atom_plan(AtomTerm::Variable, KNOWS, node_const("b"));
+        let res = prove_layer_bgp_with_result(&lc, &obj_const).unwrap();
+        let knows_id = res.predicate_ids[0];
+        let xb = res.proof.atoms[0].object_id.unwrap();
+        let tl = lc.verifier_commitment_termless().unwrap();
+        let mut op = ResolutionOpenings::default();
+        op.insert_predicate(honest_pred.open(knows_id).unwrap());
+        op.insert_node_value(honest_nv.open(xb).unwrap());
+        // term-bearing verifies (belt no-op); term-less verifies WITH the belt openings.
+        verify_layer_bgp(
+            &lc,
+            root,
+            &obj_const,
+            &res.predicate_ids,
+            &res.result_commitments,
+            res.result_len,
+            &res.proof,
+        )
+        .unwrap();
+        verify_layer_bgp_with_constant_openings(
+            &tl,
+            tl.resolution_root(),
+            &obj_const,
+            &res.predicate_ids,
+            &res.result_commitments,
+            res.result_len,
+            &res.proof,
+            &op,
+        )
+        .unwrap();
+        // resolve the ?s result column both ways: identical terms.
+        assert_eq!(res.result_len, 1);
+        let col: Vec<ArkFr> = res.result_columns[0][..res.result_len].to_vec();
+        let all_nv: Vec<u64> = lc.node_value_catalog.iter().map(|r| r.object_id).collect();
+        let res_op = build_resolution_openings(&[lc.verifier_view()], &all_nv, &[]).unwrap();
+        let bearing =
+            resolve_node_value_result_objects(&lc, root, std::slice::from_ref(&col)).unwrap();
+        let termless = resolve_node_value_result_objects_with_openings(
+            &tl,
+            root,
+            std::slice::from_ref(&col),
+            &res_op,
+        )
+        .unwrap();
+        assert_eq!(bearing, termless);
+        assert_eq!(bearing[0][0], CanonicalObject::Node(iri("a").into_bytes()));
+
+        // (2) 2-atom PREDICATE-constant JOIN over mixed_layer: `?x knows ?y . ?x likes ?z` on ?x.
+        let mlc = mixed_layer();
+        let mroot = mlc.resolution_root();
+        let likes = b"http://ex/likes";
+        let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
+            atoms: vec![
+                LayerBgpAtom {
+                    subject: AtomTerm::Variable,
+                    predicate_term: KNOWS.to_vec(),
+                    predicate_variable: false,
+                    object: AtomTerm::Variable,
+                    object_range: None,
+                    object_kind: ObjectKindFilter::Any,
+                    subject_object_equal: false,
+                    source: ColumnSource::Materialized,
+                },
+                LayerBgpAtom {
+                    subject: AtomTerm::Variable,
+                    predicate_term: likes.to_vec(),
+                    predicate_variable: false,
+                    object: AtomTerm::Variable,
+                    object_range: None,
+                    object_kind: ObjectKindFilter::Any,
+                    subject_object_equal: false,
+                    source: ColumnSource::Materialized,
+                },
+            ],
+            joins: vec![JoinStep {
+                acc_key: 0,
+                rel_key: 0,
+                additional_keys: Vec::new(),
+            }],
+        };
+        let mres = prove_layer_bgp_with_result(&mlc, &plan).unwrap();
+        let mtl = mlc.verifier_commitment_termless().unwrap();
+        // openings for BOTH predicate constants (knows, likes); no nv constants in this plan.
+        let mop = build_resolution_openings(&[mlc.verifier_view()], &[], &mres.predicate_ids).unwrap();
+        verify_layer_bgp(
+            &mlc,
+            mroot,
+            &plan,
+            &mres.predicate_ids,
+            &mres.result_commitments,
+            mres.result_len,
+            &mres.proof,
+        )
+        .unwrap();
+        verify_layer_bgp_with_constant_openings(
+            &mtl,
+            mtl.resolution_root(),
+            &plan,
+            &mres.predicate_ids,
+            &mres.result_commitments,
+            mres.result_len,
+            &mres.proof,
+            &mop,
+        )
+        .unwrap();
+        assert_eq!(mres.result_len, 1, "x=a joins a-knows-b with a-likes-c");
+        // resolve every result column (x,y,z node/value ids) both ways: identical.
+        let all_mnv: Vec<u64> = mlc.node_value_catalog.iter().map(|r| r.object_id).collect();
+        let mres_op = build_resolution_openings(&[mlc.verifier_view()], &all_mnv, &[]).unwrap();
+        let cols: Vec<Vec<ArkFr>> = mres
+            .result_columns
+            .iter()
+            .map(|c| c[..mres.result_len].to_vec())
+            .collect();
+        let mbearing = resolve_node_value_result_objects(&mlc, mroot, &cols).unwrap();
+        let mtermless =
+            resolve_node_value_result_objects_with_openings(&mtl, mroot, &cols, &mres_op).unwrap();
+        assert_eq!(mbearing, mtermless);
+    }
+
+    /// Merkle-dict I2b S4: a term-less RANGE BGP still fails closed EVEN WITH constant openings —
+    /// S4 relaxed only the constant-match guard; the range's OWN value/datatype fail-close
+    /// (`verify_ranged_atom` → `require_terms_present`, out of term-less scope) is untouched. The
+    /// predicate-constant belts pass; verification then rejects at the ranged atom. Proves S4 did
+    /// not open the `FILTER(?o > c)` value forge.
+    #[test]
+    fn s4_termless_range_still_rejects_with_openings() {
+        let lc = build_age_name_layer();
+        let plan = age_range_plan(RangeOp::Gt, 18);
+        let (proof, coms, m, ids) = prove_layer_bgp(&lc, &plan).unwrap();
+        let tl = lc.verifier_commitment_termless().unwrap();
+        // openings for BOTH predicate constants; the ranged atom still needs value/datatype.
+        let op = build_resolution_openings(&[lc.verifier_view()], &[], &ids).unwrap();
+        let err = verify_layer_bgp_with_constant_openings(
+            &tl,
+            tl.resolution_root(),
+            &plan,
+            &ids,
+            &coms,
+            m,
+            &proof,
+            &op,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("terms-bearing"), "range w/ openings: {err}");
     }
 
     #[test]
