@@ -72,26 +72,6 @@ fn base_plus_one_reconciles_and_counts() {
     assert!(bag_eq(present.rows.clone(), ground));
 }
 
-/// Merkle-dict I2b S2 (N1): the hoisted no-re-mint choke point (`assert_combined_catalog_hash_
-/// unique`, run by BOTH reconcile cores before any reconciled filter/join/range/resolution)
-/// fails CLOSED on a TERM-LESS view — its empty catalog would silently drop out of the
-/// hash-uniqueness multiset (fail-OPEN re-mint) and omit its rows from the combined range dict.
-/// This single guard fail-closes the entire delta/reconciled family. Term-bearing is a no-op.
-#[test]
-fn reconcile_remint_guard_fails_closed_on_termless_view() {
-    use crate::proof::commitment::VerifierLayer;
-    let base_lc = &base_plus_one()[0];
-
-    // Term-BEARING single-layer view: no duplicate hashes, the check passes.
-    let bearing = base_lc.verifier_commitment().unwrap();
-    assert_combined_catalog_hash_unique(&[bearing.verifier_view()]).unwrap();
-
-    // TERM-LESS base view: the re-mint choke rejects up front.
-    let termless = base_lc.verifier_commitment_termless().unwrap();
-    let err = assert_combined_catalog_hash_unique(&[termless.verifier_view()]).unwrap_err();
-    assert!(err.to_string().contains("terms-bearing"), "{err}");
-}
-
 // --- Base + 3 deltas: adds AND removes across layers, add-then-remove,
 //     remove-of-inherited, and a delta with a BRAND-NEW predicate. ---
 fn base_plus_three() -> Vec<Arc<LayerCommitment>> {
@@ -1452,76 +1432,6 @@ fn range_plan_mismatch_rejects() {
 // ============================================================
 // Wave 7 — trust-boundary hardening (present set-ness + combined-dict id uniqueness).
 // ============================================================
-
-#[test]
-fn honest_stack_asserts_present_set_and_dict_hash_unique() {
-    // A normal delta stack: present is asserted duplicate-free (over the id key) AND the
-    // combined dictionaries are asserted hash-unique (no re-mint) — both HOLD (verify passes).
-    let layers = bgp_stack();
-    let lref = refs(&layers);
-    let atoms = [atom(var(), "http://ex/p1", var())];
-    let (rec, bgp, _) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
-    let head_root = lref.last().unwrap().resolution_root();
-    assert!(bgp.present_distinct.is_some(), "present duplicate-freeness must be asserted");
-    // The combined catalog hash-uniqueness assertion holds on an honest stack.
-    let views: Vec<VerifierCommitmentRef<'_>> = lref.iter().map(|l| l.verifier_view()).collect();
-    assert_combined_catalog_hash_unique(&views).unwrap();
-    verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap();
-}
-
-#[test]
-fn hash_uniqueness_checker_rejects_a_re_minted_dictionary() {
-    // An honest store cannot re-mint a term (per-layer validate enforces a term↔id bijection
-    // over a disjoint id range), so drive the no-re-mint checker DIRECTLY on a crafted hash
-    // column: a distinct set passes; a duplicate hash (the same term at two ids) is rejected.
-    let distinct = vec![hash_node("http://ex/a"), hash_node("http://ex/b"), hash_node("http://ex/c")];
-    assert_hashes_unique(distinct, "node/value").unwrap();
-    let re_minted = vec![
-        hash_node("http://ex/a"),
-        hash_node("http://ex/b"),
-        hash_node("http://ex/a"), // 'a' registered twice -> a re-minted term
-    ];
-    assert!(assert_hashes_unique(re_minted, "node/value").is_err());
-}
-
-#[test]
-fn hoisted_uniqueness_rejects_re_minted_views_on_the_join_path() {
-    // The no-re-mint guard `assert_combined_catalog_hash_unique` was HOISTED into
-    // `verify_reconcile_core` (and `verify_delta_read_core`), so EVERY reconciled id-space read
-    // entry — `verify_present_join` included — now asserts it, even though the join path (unlike
-    // the BGP path) carries no uniqueness call of its own. Drive that exact assertion over the
-    // SAME input it consumes on the join path: the reconciliation's `VerifierCommitmentRef` views
-    // built from a real join stack. A full end-to-end forged-proof reject is not constructible
-    // from here (the per-layer dict/root recompute helpers are `pub(super)` to the commitment
-    // module), so — mirroring the sibling checker tests above — the re-mint is injected at the
-    // views the hoisted check runs over.
-    let layers = join_stack();
-    // Honest stack: the combined dictionaries are hash-unique, so the guard PASSES — the hoist
-    // does not disturb honest join proofs (see `two_atom_join_over_present`).
-    let honest: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
-    assert_combined_catalog_hash_unique(&honest).unwrap();
-
-    // Adversarial re-mint: the head's incremental node/value catalog re-registers a BASE term at a
-    // FRESH id above the parent watermark (same canonical object, two distinct ids across layers).
-    // Each layer's own `validate()` still passes (per-layer catalogs stay bijective over disjoint
-    // id ranges); only the cross-layer combined-hash check catches it — which is why it MUST run on
-    // the join path. The guard now REJECTS it.
-    let base_view = layers[0].verifier_view();
-    let head_view = layers[1].verifier_view();
-    let mut re_minted_head_catalog = head_view.node_value_catalog.to_vec();
-    let mut re_mint = base_view.node_value_catalog[0].clone();
-    re_mint.object_id = head_view.state.node_value_count + 1; // a fresh id, above the watermark
-    re_minted_head_catalog.push(re_mint);
-    let re_minted_head = VerifierCommitmentRef {
-        node_value_catalog: &re_minted_head_catalog,
-        ..head_view
-    };
-    let re_minted_views = vec![base_view, re_minted_head];
-    assert!(
-        assert_combined_catalog_hash_unique(&re_minted_views).is_err(),
-        "the hoisted guard must reject a term re-minted across the chain on the join path's input"
-    );
-}
 
 #[test]
 fn distinct_checker_rejects_a_duplicate_column() {

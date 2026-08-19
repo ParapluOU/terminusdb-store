@@ -258,14 +258,17 @@ pub(super) fn bgp_needs_range_dict(atoms: &[PresentBgpAtom]) -> bool {
 // The key columns are the reconciliation-authenticated id commitments (bound to the trusted
 // head root); the whole argument runs on the shared reconcile/BGP transcript.
 //
-// RESIDUAL (documented follow-up): full dictionary HASH-uniqueness (no term re-minted with two
-// DIFFERENT ids — a duplicate HASH sitting at two ids) is NOT closed here. Detecting a
-// duplicate among 254-bit canonical hashes needs a full-field distinctness primitive (limb-wise
-// lexicographic strict sort) the store does not yet have — the magnitude strict-sort caps keys
-// at 253 bits and `hash_object`/`hash_term` values sit near the ~254-bit field modulus, so
-// their sorted adjacent gaps overflow the range check on honest stacks. Assertion (2) closes
-// duplicate/malformed IDS; hash collision-resistance (Blake2b-512) closes distinct-terms-same-
-// hash; the remaining same-hash-two-distinct-ids case is the scoped follow-up.
+// NO-RE-MINT (I4): full dictionary HASH-uniqueness (no term re-minted with two DIFFERENT ids —
+// a duplicate HASH sitting at two ids) is now PROVED over COMMITTED data by `prove_remint` /
+// `verify_remint` (below), run by both reconcile cores. Detecting a duplicate among 254-bit
+// canonical hashes needs a full-field distinctness primitive (limb-wise lexicographic strict
+// sort) — I4-a's `prove_column_distinct_fullfield` — because the magnitude strict-sort caps keys
+// at 253 bits and `hash_object`/`hash_term` values sit near the ~254-bit field modulus, so their
+// sorted adjacent gaps overflow the range check on honest stacks. `prove_remint` runs that
+// full-field distinctness over each combined `Com(dict_hash)` column (the bag union of every
+// layer's root-bound dict-hash rows), so the old clear-catalog recompute guard is retired.
+// Assertion (2) closes duplicate/malformed IDS; hash collision-resistance (Blake2b-512) closes
+// distinct-terms-same-hash; the same-hash-two-distinct-ids case is now closed by `verify_remint`.
 // ===========================================================================
 
 /// `2^w` as a field element (`w` is small — a dictionary-id bit-width, `<= 84`).
@@ -359,7 +362,7 @@ pub(super) fn verify_column_distinct(
 /// Sorts the prefix, proves the sort is a permutation of the committed column, and proves the
 /// sorted candidate strictly increases LEXICOGRAPHICALLY over 2×127-bit limbs (I4-a).
 #[derive(Clone, Debug)]
-pub(super) struct ColumnDistinctFullFieldProof {
+pub(crate) struct ColumnDistinctFullFieldProof {
     pub perm: RelationPermutationProof,
     pub com_sorted: ArkGT,
     pub lex: LexDistinctProof,
@@ -415,6 +418,51 @@ pub(super) fn verify_column_distinct_fullfield(
     verify_lex_strictly_sorted(&proof.com_sorted, n, &proof.lex, transcript)
 }
 
+/// The no-re-mint carrier: full-field distinctness proofs for the COMBINED node/value and
+/// predicate dictionary hash columns (each the bag union of every chain layer's root-bound
+/// `Com(dict_hash)`, relocated to the working domain). Distinctness of these committed columns
+/// ⇔ no canonical term is re-minted at two ids across the chain — the committed-data replacement
+/// for the old clear-catalog `assert_combined_catalog_hash_unique` (works term-less: a term-less
+/// view drops its clear catalog but RETAINS its dict commitments, so it still contributes to the
+/// combined column and is covered).
+#[derive(Clone, Debug)]
+pub(crate) struct RemintProof {
+    pub nv: ColumnDistinctFullFieldProof,
+    pub pred: ColumnDistinctFullFieldProof,
+}
+
+/// Prove the combined node/value + predicate dictionary hash columns are each all-distinct
+/// (no re-mint). Runs right after `prove_combined_dict` for both dicts, before any group-hash /
+/// BGP step trusts the term↔id bijection.
+pub(super) fn prove_remint(
+    context: &StoreProverContext<'_>,
+    combined_nv: &CombinedDictBuilt,
+    combined_pred: &CombinedDictBuilt,
+    working_log: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<RemintProof> {
+    let nv = prove_column_distinct_fullfield(
+        context, &combined_nv.hash_at_k, combined_nv.com_hash_at_k, combined_nv.n, working_log, transcript,
+    )?;
+    let pred = prove_column_distinct_fullfield(
+        context, &combined_pred.hash_at_k, combined_pred.com_hash_at_k, combined_pred.n, working_log, transcript,
+    )?;
+    Ok(RemintProof { nv, pred })
+}
+
+/// Verify both combined-dict hash columns are all-distinct (no re-mint). Runs right after
+/// `verify_combined_dict` for both dicts, mirroring `prove_remint`'s transcript position.
+pub(super) fn verify_remint(
+    combined_nv: &CombinedDictProof,
+    combined_pred: &CombinedDictProof,
+    working_log: usize,
+    proof: &RemintProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    verify_column_distinct_fullfield(combined_nv.com_hash_at_k, combined_nv.n, working_log, &proof.nv, transcript)?;
+    verify_column_distinct_fullfield(combined_pred.com_hash_at_k, combined_pred.n, working_log, &proof.pred, transcript)
+}
+
 /// The bounded canonical-triple key column `id_s + 2^w*id_p + 2^(2w)*id_o` for present (an
 /// injective pack of the three authenticated dict ids, so distinct keys ⇔ distinct triples).
 /// Returns the packed column and the pack bit-width `w`; the caller derives its commitment
@@ -447,54 +495,6 @@ pub(super) fn present_triple_key_commitment(auth_s: &PresentIdAuth, auth_p: &Pre
     let wshift = pow2_fr(w);
     let w2shift = wshift * wshift;
     auth_s.com_id + wshift * auth_p.com_id + w2shift * auth_o.com_id
-}
-
-/// Assert a hash column has NO duplicate (a term appears at most once), by sorting the field
-/// values as integers and checking adjacent distinctness. This is a VERIFIER-side check over
-/// values RECOMPUTED from root-authenticated data — the field-native no-re-mint guard for
-/// ~254-bit hashes (which the magnitude strict-sort's 253-bit gap bound cannot handle).
-pub(super) fn assert_hashes_unique(mut hashes: Vec<ArkFr>, what: &str) -> io::Result<()> {
-    use ark_ff::PrimeField;
-    hashes.sort_by(|a, b| a.0.into_bigint().cmp(&b.0.into_bigint()));
-    for pair in hashes.windows(2) {
-        if pair[0] == pair[1] {
-            return Err(invalid(format!(
-                "combined {what} dictionary contains a duplicate hash (a term re-minted with two ids across layers)"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Assert the COMBINED node/value + predicate dictionaries have NO duplicate hash across the
-/// chain — the real no-re-mint guard (id-distinctness is already guaranteed by the per-layer
-/// term↔id bijection + disjoint watermark ranges). The canonical hashes are recomputed from the
-/// chain catalogs, which are authenticated to the trusted head root by the reconciliation's
-/// per-layer `validate()`; so a re-minted (duplicate-hash) dictionary is soundly rejected.
-pub(super) fn assert_combined_catalog_hash_unique(views: &[VerifierCommitmentRef<'_>]) -> io::Result<()> {
-    // Merkle-dict I2b S2 fail-close (delta / whole-reconcile). This is the hoisted no-re-mint
-    // choke point for BOTH reconcile cores (`verify_reconcile_core`, `verify_delta_read`), run
-    // right after each view's `validate()` and before ANY reconciled id-space filter/join/range/
-    // resolution trusts the term↔id bijection. A TERM-LESS view carries an EMPTY catalog, so its
-    // canonical hashes silently drop out of the uniqueness multiset (a re-minted term would be
-    // MISSED — fail-open) AND the combined range dict would omit its rows. Term-less is
-    // base/rollup-only (a term-less delta already fails `validate()`), so this rejects the only
-    // residual case: a term-less BASE at the bottom of a reconciled chain. One guard here
-    // fail-closes the entire delta/reconciled family (re-mint, present range/filter/join, chain
-    // resolution, the reconciled list/array walks).
-    for view in views {
-        view.require_terms_present("reconciled / delta query (re-mint over chain catalogs)")?;
-    }
-    let node_value: Vec<ArkFr> = views
-        .iter()
-        .flat_map(|view| view.node_value_catalog.iter().map(|rec| hash_object(&rec.triple.object)))
-        .collect();
-    assert_hashes_unique(node_value, "node/value")?;
-    let predicate: Vec<ArkFr> = views
-        .iter()
-        .flat_map(|view| view.predicate_catalog.iter().map(|rec| hash_term(&rec.triple.predicate)))
-        .collect();
-    assert_hashes_unique(predicate, "predicate")
 }
 
 /// Prove one RANGED atom over `present`: the authenticated object-value range selection
@@ -616,8 +616,9 @@ pub(crate) fn prove_present_bgp(
 
     // (1h) TRUST-BOUNDARY HARDENING (Wave 7): present is a SET — no duplicate canonical triple —
     // proved over the bounded combined-dict-id key `(id_s, id_p, id_o)` on the shared transcript.
-    // (Its soundness in TERM space rests on the combined-dict hash-uniqueness the VERIFIER asserts
-    // from the root-authenticated catalogs — see `assert_combined_catalog_hash_unique`.)
+    // (Its soundness in TERM space rests on the combined-dict hash-uniqueness the VERIFIER checks
+    // via `verify_remint` over the root-bound combined `Com(dict_hash)` columns — see `prove_remint`,
+    // run in both reconcile cores right after the combined dicts and before this BGP.)
     let present_distinct = if m >= 2 {
         let (key, w) = present_triple_key(artifacts, head_nv, head_pred)?;
         let com_key = present_triple_key_commitment(&auth_s, &auth_p, &auth_o, w);
@@ -790,9 +791,10 @@ pub(crate) fn verify_present_bgp(
     // (1h) TRUST-BOUNDARY HARDENING (Wave 7): assert the store invariant `present`'s SET proof rests
     // on. The sibling HASH-UNIQUENESS invariant (the no-re-mint guard: the combined node/value +
     // predicate dictionaries assign a UNIQUE id per TERM, no hash at two ids across the chain) is
-    // asserted once per reconciled entry by `verify_reconcile_core` over the same root-authenticated
-    // catalogs (and by `verify_delta_read_core` on the delta-read path, which reuses this BGP core
-    // without going through `verify_reconcile_core`), so it already holds here — no second recompute.
+    // PROVED once per reconciled entry by `verify_remint` (I4), run by `verify_reconcile_core` over the
+    // root-bound combined `Com(dict_hash)` columns (and by `verify_delta_read_core` on the delta-read
+    // path, which reuses this BGP core without going through `verify_reconcile_core`), so it already
+    // holds here — no second check.
     //   present is a SET (no duplicate canonical triple) over the bounded id key; the key commitment
     //   is DERIVED from the authenticated id commitments, so a fabricated key is rejected. Given
     //   hash-uniqueness (term ↔ id bijective), id-triple distinctness ⇒ TERM-triple distinctness.

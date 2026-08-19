@@ -77,6 +77,10 @@ impl DeltaSource {
 pub struct DeltaReadProof {
     pub combined_nv: CombinedDictProof,
     pub combined_pred: CombinedDictProof,
+    /// I4 no-re-mint: full-field distinctness of the two combined dict-hash columns (no canonical
+    /// term re-minted at two ids across the chain), proved over the root-bound `Com(dict_hash)`
+    /// columns — the committed-data replacement for the old clear-catalog guard.
+    pub(crate) remint: RemintProof,
     pub working_log: usize,
     /// The head group's S/O/P id→hash authentications (S,O vs the combined node/value dict, P vs
     /// the combined predicate dict), each relocated from the root-committed group column.
@@ -197,6 +201,11 @@ pub(super) fn prove_delta_read_core(
     let combined_nv_proof = combined_nv.proof.clone();
     let combined_pred_proof = combined_pred.proof.clone();
 
+    // (1u) NO-RE-MINT (I4): prove each combined dict-hash column is all-distinct over COMMITTED,
+    // root-bound data, mirroring `prove_reconcile_core`. Read `combined_nv`/`combined_pred` by
+    // reference — they are moved into `ReconcileArtifacts` below. Runs before the head group hashes.
+    let remint = prove_remint(context, &combined_nv, &combined_pred, working_log, transcript)?;
+
     // Authenticate the head group's S/O/P hash columns against the combined dicts, each tied to
     // its ROOT-committed `column_commitments` column (S,O vs node/value; P vs predicate).
     let cc = &head.column_commitments;
@@ -249,6 +258,7 @@ pub(super) fn prove_delta_read_core(
         DeltaReadProof {
             combined_nv: combined_nv_proof,
             combined_pred: combined_pred_proof,
+            remint,
             working_log,
             group: CommittedGroupProof { s: s.0, o: o.0, p: p.0 },
             group_len,
@@ -288,12 +298,6 @@ pub(super) fn verify_delta_read_core(
     for view in &views {
         view.validate()?;
     }
-    // (1u) NO-RE-MINT GUARD: over the now root-authenticated catalogs, assert the combined
-    // node/value + predicate dictionaries assign a UNIQUE id per term (no canonical hash at two ids
-    // across the chain). Delta-read reuses `verify_present_bgp`'s id-space filter/join logic but does
-    // NOT route through `verify_reconcile_core`, so it asserts hash-uniqueness here — mirroring that
-    // core's guard on exactly the same authenticated catalog data.
-    assert_combined_catalog_hash_unique(&views)?;
     // (2) Whole parent chain + trusted head anchor (splice/reorder/drop/foreign-proof).
     let states: Vec<&crate::proof::commitment::CommitmentState> = views.iter().map(|v| v.state).collect();
     validate_chain_states(&states)?;
@@ -335,6 +339,13 @@ pub(super) fn verify_delta_read_core(
     let (nv_branches, pred_branches) = nv_pred_branch_commits(&views)?;
     verify_combined_dict(&nv_branches, head_nv, working_log, &proof.combined_nv, transcript)?;
     verify_combined_dict(&pred_branches, head_pred, working_log, &proof.combined_pred, transcript)?;
+
+    // (1u) NO-RE-MINT (I4): verify each combined dict-hash column is all-distinct over the COMMITTED,
+    // root-bound `Com(dict_hash)` columns just authenticated above — no canonical term re-minted at two
+    // ids across the chain. Delta-read reuses `verify_present_bgp`'s id-space filter/join logic but does
+    // NOT route through `verify_reconcile_core`, so it runs the no-re-mint proof here, mirroring that
+    // core. Committed-data replacement for the old clear-catalog `assert_combined_catalog_hash_unique`.
+    verify_remint(&proof.combined_nv, &proof.combined_pred, working_log, &proof.remint, transcript)?;
 
     // Authenticate the head group's S/O/P hash columns against the ROOT-committed group columns.
     let cc = head.column_commitments;

@@ -50,6 +50,10 @@ pub struct CombinedDictProof {
 pub struct ReconcileProof {
     pub combined_nv: CombinedDictProof,
     pub combined_pred: CombinedDictProof,
+    /// I4 no-re-mint: full-field distinctness of the two combined dict-hash columns (no canonical
+    /// term re-minted at two ids across the chain), proved over the root-bound `Com(dict_hash)`
+    /// columns — the committed-data replacement for the old clear-catalog guard.
+    pub(crate) remint: RemintProof,
     pub working_log: usize,
     /// Committed groups (each layer's additions then removals, in chain order).
     pub groups: Vec<CommittedGroupProof>,
@@ -297,6 +301,12 @@ pub(crate) fn prove_reconcile_core(
     let combined_nv = prove_combined_dict(context, &nv_branches, working_log, transcript)?;
     let combined_pred = prove_combined_dict(context, &pred_branches, working_log, transcript)?;
 
+    // (1u) NO-RE-MINT (I4): prove each combined dict-hash column is all-distinct over COMMITTED,
+    // root-bound data (the bag union of every layer's `Com(dict_hash)`), replacing the old
+    // clear-catalog recompute guard. Read `combined_nv`/`combined_pred` by reference here — they are
+    // moved into `ReconcileArtifacts` below. Runs before any group-hash step trusts term↔id.
+    let remint = prove_remint(context, &combined_nv, &combined_pred, working_log, transcript)?;
+
     // Committed group descriptors (canonical order).
     let column_commitments: Vec<&[ArkGT; 6]> = layers.iter().map(|l| &l.column_commitments).collect();
     let addition_counts: Vec<usize> = layers.iter().map(|l| l.additions.len()).collect();
@@ -421,6 +431,7 @@ pub(crate) fn prove_reconcile_core(
         ReconcileProof {
             combined_nv: combined_nv.proof.clone(),
             combined_pred: combined_pred.proof.clone(),
+            remint,
             working_log,
             groups,
             com_present_s,
@@ -593,17 +604,6 @@ pub(crate) fn verify_reconcile_core(
     for view in &views {
         view.validate()?;
     }
-    // (1u) NO-RE-MINT GUARD (one of the two store invariants the reconcile verifier's soundness
-    // relies on): the combined node/value + predicate dictionaries assign a UNIQUE id per TERM — no
-    // canonical hash appears at two ids across the chain. Each layer's own dict is a term↔id
-    // bijection over a disjoint id range (per-layer `validate` + watermark), so combined IDS are
-    // already globally distinct; the remaining risk is a term RE-MINTED in two layers (same hash,
-    // two ids). The catalogs are now root-authenticated (the `view.validate()` loop above), so
-    // recomputing their canonical hashes and asserting uniqueness directly rejects a re-minted
-    // (duplicate-hash / bag) dictionary. Hoisted here so EVERY reconciled id-space read entry that
-    // goes through this core (present BGP / filter / join / result, the reconciled list/array walks)
-    // asserts it exactly once, before any id-space filter or join trusts the term↔id bijection.
-    assert_combined_catalog_hash_unique(&views)?;
     // (2) Whole parent chain + trusted head anchor.
     let states: Vec<&crate::proof::commitment::CommitmentState> = views.iter().map(|v| v.state).collect();
     validate_chain_states(&states)?;
@@ -669,6 +669,14 @@ pub(crate) fn verify_reconcile_core(
     }
     verify_combined_dict(&nv_branches, head_nv, working_log, &proof.combined_nv, transcript)?;
     verify_combined_dict(&pred_branches, head_pred, working_log, &proof.combined_pred, transcript)?;
+
+    // (1u) NO-RE-MINT (I4): verify each combined dict-hash column is all-distinct over the COMMITTED,
+    // root-bound `Com(dict_hash)` columns just authenticated above (the bag union of every layer's
+    // dict-hash rows) — no canonical term re-minted at two ids across the chain. This is the
+    // committed-data replacement for the old clear-catalog `assert_combined_catalog_hash_unique`, and
+    // fail-closes the entire delta/reconciled family (present BGP/filter/join/result, list/array walks)
+    // before any id-space step trusts the term↔id bijection. Transcript position mirrors `prove_remint`.
+    verify_remint(&proof.combined_nv, &proof.combined_pred, working_log, &proof.remint, transcript)?;
 
     // Committed group descriptors (same canonical order the prover used).
     let column_commitments: Vec<&[ArkGT; 6]> = views.iter().map(|v| v.column_commitments).collect();
