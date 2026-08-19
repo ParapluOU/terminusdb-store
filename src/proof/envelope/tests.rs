@@ -4125,6 +4125,291 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     }
 
     // -----------------------------------------------------------------------
+    // C3a: the reconciled ordered rdf:List walk over a TERM-LESS delta head.
+    // -----------------------------------------------------------------------
+
+    /// A base + 1 delta stack whose reconciled `present` is `doc -tracks-> [a, c, d]` where c and d
+    /// are nodes introduced ONLY by the HEAD layer. Base stored `[a, x, y]` (cell0/cell1/cell2); the
+    /// delta REMOVES cell1/cell2's old `first` edges (2 removals) and ADDS `cell1 -first-> c`,
+    /// `cell2 -first-> d` with c/d BRAND-NEW (2 additions) — both committed groups >= 2, satisfying
+    /// the reconcile floor. So the two delivered elements c, d are HEAD-minted combined-dict ids
+    /// whose canonical bytes live ONLY in the head catalog: the term-less element-render path MUST
+    /// open them from the shipped Merkle openings (a term-bearing base render cannot reach them). `a`
+    /// and `rdf:nil` are base-minted (nil still resolves through the term-less belt-hash).
+    fn list_delta_stack_head_elements() -> Vec<std::sync::Arc<LayerCommitment>> {
+        let rest = rdf_rest();
+        let first = rdf_first();
+        let nil = rdf_nil();
+        let doc = iri("doc");
+        let tracks = iri("tracks");
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (s, p, o) in [
+            (doc.clone(), tracks.clone(), cell(0)),
+            (cell(0), first.clone(), iri("a")),
+            (cell(0), rest.clone(), cell(1)),
+            (cell(1), first.clone(), iri("x")),
+            (cell(1), rest.clone(), cell(2)),
+            (cell(2), first.clone(), iri("y")),
+            (cell(2), rest.clone(), nil.clone()),
+        ] {
+            builder.add_value_triple(ValueTriple::new_node(&s, &p, &o)).unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let base_lc = base.proof_commitment().unwrap();
+
+        let child = base.open_write().unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&cell(1), &first, &iri("x"))).unwrap();
+        child.remove_value_triple(ValueTriple::new_node(&cell(2), &first, &iri("y"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&cell(1), &first, &iri("c"))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&cell(2), &first, &iri("d"))).unwrap();
+        let head = child.commit().unwrap();
+        vec![base_lc, head.proof_commitment().unwrap()]
+    }
+
+    /// C3a THE-WIN differential: a reconciled list walk whose HEAD view is TERM-LESS delivers the
+    /// SAME ordered element list as the term-bearing path — the two HEAD-minted elements (c, d) are
+    /// rendered purely from the prover-shipped Merkle openings (no clear head catalog).
+    fn assert_reconciled_list_walk_termless_parity() {
+        let stack = list_delta_stack_head_elements();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let subj = CanonicalObject::Node(iri("doc").into_bytes());
+        let pred = iri("tracks");
+        let pbytes = pred.as_bytes();
+
+        let (mut proof, prover_elements) =
+            super::list_walk::prove_ordered_list_walk_reconciled(&lref, &subj, pbytes).unwrap();
+        assert_eq!(object_iris(&prover_elements), vec![iri("a"), iri("c"), iri("d")]);
+
+        // Mint the term-less openings (element render + rdf:nil belt-hash) from term-bearing catalogs.
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let nil_id = super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
+        let element_ids = proof.element_ids.clone();
+        super::list_walk::attach_termless_list_walk_openings(&mut proof, &lref, &element_ids, nil_id)
+            .unwrap();
+
+        // Term-bearing baseline (the `layers` wrapper: catalog scan + catalog render).
+        let bearing_elements = super::list_walk::verify_ordered_list_walk_reconciled(
+            &lref, head_root, &subj, pbytes, &proof,
+        )
+        .unwrap();
+
+        // Term-less head view: verify + render through `_from_views` using ONLY the shipped openings.
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        assert!(!head_termless.verifier_view().terms_present);
+        let termless_views = termless_head_views(&lref, &head_termless);
+        let termless_elements = super::list_walk::verify_ordered_list_walk_reconciled_from_views(
+            &termless_views, head_root, &subj, pbytes, &proof,
+        )
+        .unwrap();
+
+        assert_eq!(object_iris(&bearing_elements), object_iris(&termless_elements));
+        assert_eq!(
+            object_iris(&termless_elements),
+            vec![iri("a"), iri("c"), iri("d")],
+            "term-less list walk must deliver the exact ordered [a, c, d] (c, d head-minted)"
+        );
+    }
+
+    /// C3a fail-closed / soundness on the ELEMENT render: a term-less list walk MUST ship a Merkle
+    /// opening for every HEAD-minted element id; a MISSING opening (dropped) fails closed and a
+    /// FORGED opening (tampered term bytes) is rejected by `verify_opening` against the root-bound tree.
+    fn assert_reconciled_list_walk_termless_element_openings() {
+        let stack = list_delta_stack_head_elements();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let subj = CanonicalObject::Node(iri("doc").into_bytes());
+        let pred = iri("tracks");
+        let pbytes = pred.as_bytes();
+
+        let (mut proof, _) =
+            super::list_walk::prove_ordered_list_walk_reconciled(&lref, &subj, pbytes).unwrap();
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let nil_id = super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
+        let c_id = super::reconciled::resolve_combined_node_id(&bearing_views, iri("c").as_bytes());
+        let element_ids = proof.element_ids.clone();
+        super::list_walk::attach_termless_list_walk_openings(&mut proof, &lref, &element_ids, nil_id)
+            .unwrap();
+
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+
+        // Sanity: the honest term-less proof verifies.
+        super::list_walk::verify_ordered_list_walk_reconciled_from_views(
+            &termless_views, head_root, &subj, pbytes, &proof,
+        )
+        .unwrap();
+
+        let honest = proof.element_openings.clone().unwrap();
+
+        // (i) MISSING: drop the HEAD-minted element `c`'s opening -> fail-closed (no silent render).
+        let mut missing = crate::proof::commitment::ResolutionOpenings::default();
+        for op in honest.node_value_openings() {
+            if op.id == c_id {
+                continue;
+            }
+            missing.insert_node_value(op.clone());
+        }
+        let mut missing_proof = proof.clone();
+        missing_proof.element_openings = Some(missing);
+        assert!(
+            super::list_walk::verify_ordered_list_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, pbytes, &missing_proof,
+            )
+            .is_err(),
+            "a term-less list walk missing a head-minted element opening must fail closed"
+        );
+
+        // (ii) FORGED: tamper the head-minted element `c`'s opening term bytes -> verify_opening rejects.
+        let mut forged = crate::proof::commitment::ResolutionOpenings::default();
+        for op in honest.node_value_openings() {
+            let mut op = op.clone();
+            if op.id == c_id {
+                op.term_bytes[0] ^= 0xff;
+            }
+            forged.insert_node_value(op);
+        }
+        let mut forged_proof = proof.clone();
+        forged_proof.element_openings = Some(forged);
+        assert!(
+            super::list_walk::verify_ordered_list_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, pbytes, &forged_proof,
+            )
+            .is_err(),
+            "a forged head-minted element opening must be rejected by verify_opening"
+        );
+    }
+
+    /// C3a fail-closed / soundness on the rdf:nil TERMINATOR: a term-less list walk MUST ship the nil
+    /// opening (it keys the terminator equality / LeftAnti strip / cons-cell count pin); a MISSING
+    /// opening fails closed and a nil opening minted for a NON-nil real id is rejected by the
+    /// belt-hash (opened term does not hash to `hash_object(Node(rdf:nil))`).
+    fn assert_reconciled_list_walk_termless_nil_opening() {
+        let stack = list_delta_stack_head_elements();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let subj = CanonicalObject::Node(iri("doc").into_bytes());
+        let pred = iri("tracks");
+        let pbytes = pred.as_bytes();
+
+        let (mut proof, _) =
+            super::list_walk::prove_ordered_list_walk_reconciled(&lref, &subj, pbytes).unwrap();
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let nil_id = super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
+        let a_id = super::reconciled::resolve_combined_node_id(&bearing_views, iri("a").as_bytes());
+        let element_ids = proof.element_ids.clone();
+        super::list_walk::attach_termless_list_walk_openings(&mut proof, &lref, &element_ids, nil_id)
+            .unwrap();
+
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+
+        // Sanity: honest verifies.
+        super::list_walk::verify_ordered_list_walk_reconciled_from_views(
+            &termless_views, head_root, &subj, pbytes, &proof,
+        )
+        .unwrap();
+
+        // (i) MISSING nil opening -> fail-closed (never a silent scan of the dropped head catalog).
+        let mut no_nil = proof.clone();
+        no_nil.nil_opening = None;
+        assert!(
+            super::list_walk::verify_ordered_list_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, pbytes, &no_nil,
+            )
+            .is_err(),
+            "a term-less list walk without a nil opening must fail closed"
+        );
+
+        // (ii) FORGED nil opening for a NON-nil real id (`a`) -> the belt-hash rejects the terminator.
+        let forged = crate::proof::commitment::build_resolution_openings(&bearing_views, &[a_id], &[])
+            .unwrap();
+        let forged_nil = forged.node_value_opening(a_id).unwrap().clone();
+        let mut forged_proof = proof.clone();
+        forged_proof.nil_opening = Some(forged_nil);
+        assert!(
+            super::list_walk::verify_ordered_list_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, pbytes, &forged_proof,
+            )
+            .is_err(),
+            "a nil opening for a non-nil real id must fail the belt-hash (terminator guard)"
+        );
+    }
+
+    /// C3a: the existing forged-ORDER / structure negatives still reject with a TERM-LESS head. Each
+    /// forgery rejects in ID-SPACE (successor / permutation / the C[0]==head opening), BEFORE the
+    /// element render, so the term-less refactor does not weaken them; the openings are attached only
+    /// so the honest prelude (nil resolution) passes and the forgery reaches its intended gadget.
+    fn assert_reconciled_list_walk_termless_forged_order() {
+        let stack = list_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let subj = CanonicalObject::Node(iri("doc").into_bytes());
+        let pred = iri("tracks");
+        let pbytes = pred.as_bytes();
+
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let nil_id = super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
+        let c0 = super::reconciled::resolve_combined_node_id(&bearing_views, cell(0).as_bytes());
+        let c1 = super::reconciled::resolve_combined_node_id(&bearing_views, cell(1).as_bytes());
+        let c2 = super::reconciled::resolve_combined_node_id(&bearing_views, cell(2).as_bytes());
+        let a_id = super::reconciled::resolve_combined_node_id(&bearing_views, iri("a").as_bytes());
+
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+
+        let forge = |order: Vec<u64>| {
+            super::list_walk::prove_ordered_list_walk_reconciled_forged(&lref, &subj, pbytes, order)
+                .and_then(|(mut proof, _)| {
+                    let element_ids = proof.element_ids.clone();
+                    super::list_walk::attach_termless_list_walk_openings(
+                        &mut proof, &lref, &element_ids, nil_id,
+                    )?;
+                    super::list_walk::verify_ordered_list_walk_reconciled_from_views(
+                        &termless_views, head_root, &subj, pbytes, &proof,
+                    )
+                })
+        };
+
+        // Honest order verifies over the term-less head (openings render [a, b, a]).
+        forge(vec![c0, c1, c2]).unwrap();
+        // Reorder -> successor; wrong head -> C[0] opening; dropped/injected/gap -> permutation.
+        assert!(forge(vec![c0, c2, c1]).is_err(), "reordered chain must reject over a term-less head");
+        assert!(forge(vec![c2, c1, c0]).is_err(), "non-head first cons cell must reject over a term-less head");
+        assert!(forge(vec![c0, c2]).is_err(), "dropped cell must reject over a term-less head");
+        assert!(
+            forge(vec![c0, c1, a_id, c2]).is_err(),
+            "injected non-cons node must reject over a term-less head"
+        );
+        assert!(forge(vec![c0, c1, c2, c0]).is_err(), "appended/gap cell must reject over a term-less head");
+    }
+
+    #[test]
+    fn reconciled_list_walk_termless_parity() {
+        big_stack(assert_reconciled_list_walk_termless_parity);
+    }
+
+    #[test]
+    fn reconciled_list_walk_termless_element_openings() {
+        big_stack(assert_reconciled_list_walk_termless_element_openings);
+    }
+
+    #[test]
+    fn reconciled_list_walk_termless_nil_opening() {
+        big_stack(assert_reconciled_list_walk_termless_nil_opening);
+    }
+
+    #[test]
+    fn reconciled_list_walk_termless_forged_order() {
+        big_stack(assert_reconciled_list_walk_termless_forged_order);
+    }
+
+    // -----------------------------------------------------------------------
     // Reconciled ordered sys:Array walk over a delta head's `present` (ReadDocument 6d).
     // -----------------------------------------------------------------------
 

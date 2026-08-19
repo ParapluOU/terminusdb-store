@@ -63,7 +63,8 @@ use super::recursive::{
 };
 use super::reconciled::{
     bound_subject_leaf_atom, predicate_edge_leaf_atom, prove_reconciled_leaf,
-    resolve_combined_node_id, verify_reconciled_leaf, RECONCILE_TRANSCRIPT,
+    resolve_combined_node_id, resolve_combined_node_id_termless, verify_reconciled_leaf_from_views,
+    RECONCILE_TRANSCRIPT,
 };
 use super::wire::{invalid, Reader, Wire};
 
@@ -78,7 +79,9 @@ use crate::proof::anti::{
 };
 use crate::proof::argument::{verify_column_openings, ColumnOpening, StoreProverContext, Transcript254};
 use crate::proof::bgp::{RelationCommit, RelationWitness};
-use crate::proof::commitment::{LayerCommitment, VerifierLayer};
+use crate::proof::commitment::{
+    build_resolution_openings, DictOpening, LayerCommitment, ResolutionOpenings, VerifierLayer,
+};
 use crate::proof::equality::{
     prove_relation_equality_with_context, verify_relation_equality, RelationEqualityConstraint,
 };
@@ -1139,6 +1142,22 @@ pub struct OrderedListWalkReconciledProof {
     /// The ordered element combined-dict ids (PUBLIC): bound to `com_elements` by re-commit at verify,
     /// then resolved to `CanonicalObject`s over the chain catalogs.
     pub element_ids: Vec<u64>,
+
+    /// C3a: the prover-shipped, UNCOMMITTED Merkle openings for the delivered [`Self::element_ids`],
+    /// used to render them to IRIs over a TERM-LESS head (`resolve_node_value_id_column`). `None` on
+    /// the ordinary term-bearing path (the resolver rebuilds each id-indexed tree from the clear
+    /// catalog and ignores them); minted by [`attach_termless_list_walk_openings`]. IN-MEMORY ONLY —
+    /// like [`super::reconciled::ReconciledClosureProof::reachable_openings`] /
+    /// [`PresentBgpProof::openings`], NEVER folded into `commitment_root`/`resolution_root` and
+    /// carrying NO wire/golden/version change (reconciled walk proofs are not in `wire.rs`).
+    pub element_openings: Option<ResolutionOpenings>,
+    /// C3a: the prover-shipped, UNCOMMITTED Merkle opening for the `rdf:nil` terminator constant,
+    /// used to resolve+belt-hash the nil id over a TERM-LESS head
+    /// (`resolve_combined_node_id_termless`) — the nil id keys the terminator equality, the
+    /// LeftAnti strip and the cons-cell count pin, so a wrong nil would certify a wrong walk. `None`
+    /// on the term-bearing path (nil is resolved by the audited catalog scan). Same in-memory-only
+    /// discipline as `element_openings`.
+    pub nil_opening: Option<DictOpening>,
 }
 
 /// The `[subject, object]` id columns of a proven 2-column edge relation delivered as a
@@ -1381,6 +1400,11 @@ fn prove_ordered_list_walk_reconciled_impl(
         nested_join: nested.proof,
         nested_join_out: nested.commitments,
         element_ids,
+        // Term-bearing default: elements are rendered by the catalog resolver and rdf:nil by the
+        // catalog scan. The term-less producer attaches these via
+        // `attach_termless_list_walk_openings`; a term-bearing verifier ignores them.
+        element_openings: None,
+        nil_opening: None,
     };
     Ok((proof, elements))
 }
@@ -1398,33 +1422,50 @@ pub fn verify_ordered_list_walk_reconciled(
     predicate: &[u8],
     proof: &OrderedListWalkReconciledProof,
 ) -> io::Result<Vec<CanonicalObject>> {
+    let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+        layers.iter().map(|l| l.verifier_view()).collect();
+    verify_ordered_list_walk_reconciled_from_views(&views, trusted_head_root, subject, predicate, proof)
+}
+
+/// Verify a reconciled ordered `rdf:List` walk FROM verifier VIEWS (C3a) — the term-less-capable
+/// core. Views-based analogue of [`verify_ordered_list_walk_reconciled`] (split exactly like
+/// [`verify_reconciled_transitive_closure_from_views`](super::reconciled::verify_reconciled_transitive_closure_from_views)):
+/// a TERM-LESS head view (`LayerCommitment::verifier_commitment_termless`, term-bearing elsewhere)
+/// can be passed for the term-less remote verifier. The whole walk STRUCTURE is id-space (the
+/// anchor/rest/first leaves deliver combined-dict id columns; the closure rounds / LeftAnti /
+/// permutation / InnerJoin / successor / terminator all consume committed id columns), so it is
+/// term-less-safe unchanged; the three term-sensitive reads go term-less:
+/// [`verify_reconciled_leaf_from_views`] for the three `present` leaves (plain conjunctive atoms, no
+/// range ⇒ C1/E3-sound), the `rdf:nil` resolution via [`resolve_combined_node_id_termless`]
+/// (belt-hashed against `proof.nil_opening`, fail-closed on a missing/forged opening — the nil id
+/// keys the terminator equality, the strip and the cons-cell count pin), and the delivered-element
+/// render via [`resolve_node_value_id_column`] threading `proof.element_openings`.
+pub fn verify_ordered_list_walk_reconciled_from_views(
+    views: &[crate::proof::VerifierCommitmentRef<'_>],
+    trusted_head_root: ProofHash,
+    subject: &CanonicalObject,
+    predicate: &[u8],
+    proof: &OrderedListWalkReconciledProof,
+) -> io::Result<Vec<CanonicalObject>> {
     // β re-anchor: the transcript/gadget-binding `root` is the head's COMMITMENT root (matching
     // `prove_ordered_list_walk_reconciled`); `trusted_head_root` is now a `resolution_root` used
     // ONLY for the head-pin equality inside `verify_reconcile_core` below.
-    let root = layers
+    let head = *views
         .last()
-        .ok_or_else(|| invalid("reconciled ordered-list-walk needs a head layer"))?
-        .state
-        .commitment_root;
+        .ok_or_else(|| invalid("reconciled ordered-list-walk needs a head layer"))?;
+    let root = head.state.commitment_root;
     let digest = reconciled_list_walk_digest(subject, predicate)?;
     let closure_digest = child_digest(&digest, b"closure");
 
     // Reconcile + the three leaves, replayed on the SHARED transcript in the SAME order as prove.
     let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
-    let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
-        layers.iter().map(|l| l.verifier_view()).collect();
-    let verified = verify_reconcile_core(&views, trusted_head_root, &proof.reconcile, &mut transcript)?;
-    let head_nv = layers
-        .last()
-        .ok_or_else(|| invalid("reconciled ordered-list-walk needs a head layer"))?
-        .verifier_view()
-        .state
-        .node_value_count as usize;
+    let verified = verify_reconcile_core(views, trusted_head_root, &proof.reconcile, &mut transcript)?;
+    let head_nv = head.state.node_value_count as usize;
 
     // (1) ANCHOR leaf + head-id binding.
     let anchor_atom = bound_subject_leaf_atom(subject, predicate);
-    let anchor_commit = verify_reconciled_leaf(
-        layers, &proof.reconcile, &verified, head_nv, anchor_atom, &proof.anchor_leaf, &mut transcript,
+    let anchor_commit = verify_reconciled_leaf_from_views(
+        views, &proof.reconcile, &verified, head_nv, anchor_atom, &proof.anchor_leaf, &mut transcript,
     )?;
     if anchor_commit.n != 1 || anchor_commit.commitments.len() != 1 {
         return Err(invalid("reconciled ordered-list-walk anchor must be exactly one head triple"));
@@ -1433,12 +1474,12 @@ pub fn verify_ordered_list_walk_reconciled(
 
     // (2) EDGE leaves (same shared-transcript order as prove).
     let rest_atom = predicate_edge_leaf_atom(RDF_REST);
-    let rest_commit = verify_reconciled_leaf(
-        layers, &proof.reconcile, &verified, head_nv, rest_atom, &proof.rest_edge_leaf, &mut transcript,
+    let rest_commit = verify_reconciled_leaf_from_views(
+        views, &proof.reconcile, &verified, head_nv, rest_atom, &proof.rest_edge_leaf, &mut transcript,
     )?;
     let first_atom = predicate_edge_leaf_atom(RDF_FIRST);
-    let first_commit = verify_reconciled_leaf(
-        layers, &proof.reconcile, &verified, head_nv, first_atom, &proof.first_edge_leaf, &mut transcript,
+    let first_commit = verify_reconciled_leaf_from_views(
+        views, &proof.reconcile, &verified, head_nv, first_atom, &proof.first_edge_leaf, &mut transcript,
     )?;
 
     // Bind the public head id to the anchor commitment (position-0 opening; fresh transcript).
@@ -1465,8 +1506,12 @@ pub fn verify_ordered_list_walk_reconciled(
     )?;
     let closure_commit = closure_set_commit(&reachable)?;
 
-    // (4) strip nil.
-    let nil_id = resolve_combined_node_id(&views, RDF_NIL);
+    // (4) strip nil. C3a: term-less-safe nil resolution — belt-hashed against the prover-shipped
+    // opening on a term-less chain, the audited catalog scan on a fully term-bearing one. The nil id
+    // keys the terminator equality, the LeftAnti strip and the cons-cell count pin, so a wrong nil
+    // (an unguarded scan on a term-less head returns the impossible-id sentinel) would certify a
+    // wrong walk.
+    let nil_id = resolve_combined_node_id_termless(views, RDF_NIL, proof.nil_opening.as_ref())?;
     let nil_commit = singleton_commit(nil_id)?;
     let cons_commit = RelationCommit {
         commitments: proof.cons_commitments.clone(),
@@ -1564,8 +1609,48 @@ pub fn verify_ordered_list_walk_reconciled(
     )?;
 
     // (9) Resolve the delivered element column over the chain (binds element_ids to com_elements).
+    // C3a: a TERM-LESS head opens each element id from the prover-shipped `element_openings`
+    // (fail-closed on a missing/forged one); a term-bearing chain passes `None` and rebuilds from
+    // catalogs.
     if proof.element_ids.len() != proof.cons_len {
         return Err(invalid("reconciled ordered-list-walk element id count mismatch"));
     }
-    resolve_node_value_id_column(&views, &proof.element_ids, proof.com_elements, proof.cons_log_domain, None)
+    resolve_node_value_id_column(
+        views,
+        &proof.element_ids,
+        proof.com_elements,
+        proof.cons_log_domain,
+        proof.element_openings.as_ref(),
+    )
+}
+
+/// C3a (producer): attach the UNCOMMITTED term-less opening witnesses to a proven
+/// [`OrderedListWalkReconciledProof`], so it can ship alongside a TERM-LESS reconciled artifact.
+/// Mints the delivered-element [`ResolutionOpenings`] (for the ordered element render) plus the
+/// `rdf:nil` [`DictOpening`] (routed to its introducing layer via [`build_resolution_openings`] for
+/// the single resolved nil id). `element_ids` are the walk's delivered element column
+/// ([`OrderedListWalkReconciledProof::element_ids`], the second return of
+/// [`prove_ordered_list_walk_reconciled`] resolved to ids); `nil_id` is the resolved combined-dict
+/// id of `rdf:nil` (`resolve_combined_node_id(&views, RDF_NIL)` on the term-bearing chain). Mirrors
+/// [`attach_termless_closure_openings`](super::reconciled::attach_termless_closure_openings) /
+/// [`attach_termless_reconcile_openings`](crate::proof::reconcile::attach_termless_reconcile_openings).
+/// The prover still holds the term-bearing catalogs, so it rebuilds each id-indexed tree; the
+/// witnesses are re-verified per id at the verifier by `verify_opening` against the root-bound
+/// `nv_merkle_root` (forged ⇒ rejected, missing ⇒ fail-closed) and are NEVER folded into
+/// `commitment_root`/`resolution_root`. Over-inclusion is safe; the nil constant must be present in
+/// the dict (a positive opening cannot be minted for an absent term).
+pub fn attach_termless_list_walk_openings(
+    proof: &mut OrderedListWalkReconciledProof,
+    layers: &[&LayerCommitment],
+    element_ids: &[u64],
+    nil_id: u64,
+) -> io::Result<()> {
+    let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+        layers.iter().map(|l| l.verifier_view()).collect();
+    // The prover holds term-bearing catalogs: rebuild each element's id-indexed tree, then open it.
+    proof.element_openings = Some(build_resolution_openings(&views, element_ids, &[])?);
+    // The single rdf:nil opening (routed to its introducing layer, opened positionally).
+    let nil_openings = build_resolution_openings(&views, &[nil_id], &[])?;
+    proof.nil_opening = Some(nil_openings.node_value_opening(nil_id)?.clone());
+    Ok(())
 }

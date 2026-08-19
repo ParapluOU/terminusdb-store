@@ -128,7 +128,8 @@ pub use reconciled::{
 // standalone prove/verify pair the compiler lift (6c-iii) routes a delta-path `List` to. Built on the
 // 6c-i foundation; the materialized `OrderedListWalk` composite stays byte-identical (a PARALLEL entry).
 pub use list_walk::{
-    prove_ordered_list_walk_reconciled, verify_ordered_list_walk_reconciled,
+    attach_termless_list_walk_openings, prove_ordered_list_walk_reconciled,
+    verify_ordered_list_walk_reconciled, verify_ordered_list_walk_reconciled_from_views,
     OrderedListWalkReconciledProof,
 };
 
