@@ -2663,3 +2663,154 @@ fn s3_termless_chain_resolution_matches_term_bearing() {
     )
     .is_err());
 }
+
+// ============================================================
+// C4 — WIRE SERIALIZATION of the delta-read plain-BGP proof + the byte-in remote verifier.
+//
+// A `DeltaReadProof` gets an independent framed wire format (`DELTA_READ_*`); a remote party
+// holding only bytes + the term-less `VerifierCommitment` chain + a trusted head root re-verifies
+// through the SAME audited `verify_delta_read_from_views`. Serialization changes NO verification
+// logic. These gate the plain-BGP slice (every atom Plain, `range_dict: None`).
+// ============================================================
+
+/// Round-trip re-verify: prove a plain-BGP delta-read, `encode` → `decode`, and assert the decoded
+/// proof STILL passes the term-bearing `verify_delta_read` AND `verify_delta_read_from_views` with
+/// a term-less head. Serialization is transparent to verification.
+#[test]
+fn c4_delta_read_wire_roundtrip_reverifies() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = delta_read_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (proof, _result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+
+    let encoded = proof.encode().unwrap();
+    let decoded = DeltaReadProof::decode(&encoded).unwrap();
+
+    // Decoded proof still passes the term-bearing sidecar verify.
+    let n =
+        verify_delta_read(&lref, head_root, DeltaSource::Additions, &atoms, &[], &decoded).unwrap();
+    assert_eq!(n, 2);
+
+    // ...and the views entry with a TERM-LESS head + term-bearing ancestors.
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    let n_views =
+        verify_delta_read_from_views(&views, head_root, DeltaSource::Additions, &atoms, &[], &decoded)
+            .unwrap();
+    assert_eq!(n, n_views, "decoded proof must re-verify identically through the views entry");
+}
+
+/// The UNCOMMITTED term-less resolution openings survive the wire: attach them, round-trip the
+/// proof, and assert `verify_and_resolve_delta_read_from_views` still RESOLVES over a term-less
+/// head (which needs the openings — a missing one fails closed).
+#[test]
+fn c4_delta_read_wire_roundtrip_preserves_openings() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = delta_read_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (mut proof, result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+    attach_termless_delta_openings(&mut proof, &lref, &result.columns).unwrap();
+
+    let decoded = DeltaReadProof::decode(&proof.encode().unwrap()).unwrap();
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    let resolved = verify_and_resolve_delta_read_from_views(
+        &views, head_root, DeltaSource::Additions, &atoms, &[], &decoded, &result.columns,
+    )
+    .unwrap();
+    assert!(!rows_of(&resolved).is_empty(), "openings must survive the wire and resolve term-less");
+}
+
+/// Byte-identity golden + tamper-reject: the canonical encoding is a stable fixed point across
+/// decode/encode (deterministic given the fixed SRS + Fiat-Shamir transcript), and flipping one
+/// body byte breaks the trailing checksum so `decode` fails closed.
+#[test]
+fn c4_delta_read_wire_golden_and_tamper() {
+    let layers = delta_read_stack();
+    let lref = refs(&layers);
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (proof, _result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+
+    // Golden: encode is a byte-identity fixed point (decode then re-encode reproduces the bytes).
+    let encoded = proof.encode().unwrap();
+    let reencoded = DeltaReadProof::decode(&encoded).unwrap().encode().unwrap();
+    assert_eq!(
+        encoded, reencoded,
+        "delta-read wire encoding must be a stable byte-identity fixed point"
+    );
+
+    // Tamper: byte 20 is inside the framed body (past the 12-byte magic + 4-byte version); flipping
+    // it invalidates the SHA-256 checksum.
+    let mut corrupt = encoded.clone();
+    corrupt[20] ^= 1;
+    assert!(
+        DeltaReadProof::decode(&corrupt).is_err(),
+        "a flipped body byte must fail the checksum"
+    );
+}
+
+/// E2E BYTE-IN (the payoff): prove a plain-BGP delta-read, then verify it holding ONLY bytes — the
+/// encoded `DeltaReadProof` + one encoded TERM-LESS `VerifierCommitment` per layer — through
+/// `decode_and_verify_delta_read`. The count must equal the in-memory `verify_delta_read`. Includes
+/// anti-substitution negatives: the WRONG atoms or WRONG source must Err.
+#[test]
+fn c4_delta_read_byte_in_matches_in_memory_and_rejects_substitution() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = delta_read_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (proof, _result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+
+    let n_mem =
+        verify_delta_read(&lref, head_root, DeltaSource::Additions, &atoms, &[], &proof).unwrap();
+
+    // Cross the byte boundary: encode the proof + a TERM-LESS commitment per layer (all-term-less
+    // chain). Only `&[u8]` crosses to the remote verifier.
+    let proof_bytes = proof.encode().unwrap();
+    let commit_bytes: Vec<Vec<u8>> = lref
+        .iter()
+        .map(|l| l.verifier_commitment_termless().unwrap().encode().unwrap())
+        .collect();
+    let commit_refs: Vec<&[u8]> = commit_bytes.iter().map(|b| b.as_slice()).collect();
+
+    let n_bytes = decode_and_verify_delta_read(
+        &proof_bytes, &commit_refs, head_root, DeltaSource::Additions, &atoms, &[],
+    )
+    .unwrap();
+    assert_eq!(n_mem, 2);
+    assert_eq!(n_mem, n_bytes, "byte-in delta verify must match the in-memory count");
+
+    // (6) Surface the wire sizes the user asked about.
+    println!("C4 delta-read encoded proof bytes = {}", proof_bytes.len());
+    for (i, b) in commit_bytes.iter().enumerate() {
+        println!("C4 term-less VerifierCommitment[{i}] encoded bytes = {}", b.len());
+    }
+
+    // Anti-substitution: the verifier's OWN atoms/source are load-bearing. A different predicate...
+    let wrong_atoms = [atom(var(), "http://ex/p2", var())];
+    assert!(
+        decode_and_verify_delta_read(
+            &proof_bytes, &commit_refs, head_root, DeltaSource::Additions, &wrong_atoms, &[],
+        )
+        .is_err(),
+        "byte-in verify with the WRONG atoms must fail (anti-substitution)"
+    );
+    // ...or a different source must both fail closed.
+    assert!(
+        decode_and_verify_delta_read(
+            &proof_bytes, &commit_refs, head_root, DeltaSource::Removals, &atoms, &[],
+        )
+        .is_err(),
+        "byte-in verify with the WRONG source must fail (anti-substitution)"
+    );
+}

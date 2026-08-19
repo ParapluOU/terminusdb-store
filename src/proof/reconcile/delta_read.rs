@@ -94,8 +94,10 @@ pub struct DeltaReadProof {
     /// on the prover default and on term-bearing artifacts (whose resolver rebuilds from the clear
     /// catalogs); the term-less producer attaches it via [`attach_termless_delta_openings`]. NEVER
     /// folded into `commitment_root`/`resolution_root` — bound solely by [`verify_opening`], so a
-    /// forged opening is rejected and a missing one fails closed. No wire serialization
-    /// (`DeltaReadProof` is in-memory only), so this adds no wire/golden/version change.
+    /// forged opening is rejected and a missing one fails closed. C4: this witness IS now wire-
+    /// serialized (it rides the `Option<ResolutionOpenings>` `Wire` impl in `DeltaReadProof::encode`),
+    /// so it survives the byte boundary; it stays an UNCOMMITTED witness, re-verified per id at
+    /// resolve time.
     pub openings: Option<ResolutionOpenings>,
 }
 
@@ -489,6 +491,31 @@ pub fn verify_delta_read(
 ) -> io::Result<usize> {
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     verify_delta_read_from_views(&views, trusted_head_root, source, atoms, joins, proof)
+}
+
+/// C4 byte-in remote-verifier entry: verify a delta-read plain-BGP proof shipped as BYTES against
+/// a trusted head root, holding ONLY the encoded proof + the encoded term-less
+/// `VerifierCommitment` chain (no `LayerCommitment` sidecars, no DB). Decodes each layer
+/// commitment and the proof, then re-verifies through the audited
+/// [`verify_delta_read_from_views`] — serialization does NOT change verification. `atoms`/`joins`/
+/// `source` are the VERIFIER's OWN compiled query (anti-substitution): they are NEVER parsed from
+/// the proof bytes.
+pub fn decode_and_verify_delta_read(
+    delta_proof_bytes: &[u8],
+    verifier_commitment_bytes: &[&[u8]],
+    trusted_head_root: ProofHash,
+    source: DeltaSource,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+) -> io::Result<usize> {
+    // Own the decoded commitments FIRST, so the borrowed views below cannot dangle.
+    let owned: Vec<crate::proof::commitment::VerifierCommitment> = verifier_commitment_bytes
+        .iter()
+        .map(|b| crate::proof::commitment::VerifierCommitment::decode(b))
+        .collect::<io::Result<_>>()?;
+    let views: Vec<VerifierCommitmentRef<'_>> = owned.iter().map(|c| c.verifier_view()).collect();
+    let proof = DeltaReadProof::decode(delta_proof_bytes)?;
+    verify_delta_read_from_views(&views, trusted_head_root, source, atoms, joins, &proof)
 }
 
 /// Verify a delta-read BGP AND resolve its result bindings to `CanonicalObject`s (real IRIs /

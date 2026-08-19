@@ -102,11 +102,23 @@ use crate::proof::relocate::{prove_column_relocation_with_context, verify_column
 use crate::proof::sort::SortedProof;
 use crate::proof::union::{verify_bag_union, BagUnionProof};
 use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
+// C4: the delta-read plain-BGP proof family (all leaves already `Wire`; the container structs
+// below get `wire_struct!`/hand-written enum impls in this file — see the block near the bottom).
+use crate::proof::lexdistinct::LexDistinctProof;
+use crate::proof::reconcile::{
+    ColumnDistinctFullFieldProof, ColumnDistinctProof, CombinedDictProof, CombinedRangeDictProof,
+    CommittedGroupProof, DeltaReadProof, GroupHashProof, PresentAtomFilter, PresentBgpAtomProof,
+    PresentBgpProof, PresentIdAuth, PresentRangeSubproof, PresentSecondRange, RemintProof,
+};
 pub(super) const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
 pub(super) const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
 pub(super) const ANTI_MAGIC: &[u8; 12] = b"TDBWQANTI\0\0\0";
 pub(super) const OUTER_MAGIC: &[u8; 12] = b"TDBWQOUTER\0\0";
 pub(super) const RECURSIVE_MAGIC: &[u8; 12] = b"TDBWQTREE\0\0\0";
+// C4: the delta-read plain-BGP proof family gets its OWN independent wire format (its bytes are
+// `DeltaReadProof`, NOT a `LayerBgpEnvelope`), so it carries a fresh MAGIC/VERSION and never
+// touches the envelope `VERSION`/`UNION`/`ANTI`/`OUTER`/`RECURSIVE` constants above.
+pub(super) const DELTA_READ_MAGIC: &[u8; 12] = b"TDBWQDLTA\0\0\0";
 
 /// Canonical hidden column for a zero-column relation: one on every real row and zero
 /// on commitment padding. This is the same representation used by all-ground BGPs.
@@ -259,6 +271,8 @@ pub(super) const OUTER_VERSION: u32 = 11;
 // order/group node shifts. Order/group appear ONLY under `RecursiveRelationProof` (the standalone
 // UNION/ANTI/OUTER envelopes embed only `LayerBgpEnvelope` branches), so ONLY this version bumps.
 pub(super) const RECURSIVE_VERSION: u32 = 36;
+// C4: initial version of the independent delta-read plain-BGP wire format (see `DELTA_READ_MAGIC`).
+pub(super) const DELTA_READ_VERSION: u32 = 1;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1210,6 +1224,203 @@ impl Wire for CanonicalResultValue {
             3 => Ok(Self::GeneratedDecimalI64(i64::get(reader)?)),
             _ => Err(invalid("invalid canonical result value tag")),
         }
+    }
+}
+
+// ===========================================================================
+// C4: the delta-read plain-BGP proof family. Every cryptographic LEAF already implements
+// `Wire` above (shared with the base `LayerBgpProof` family); the container structs below just
+// forward to those leaves in field order via `wire_struct!` (plus one hand-written enum tag for
+// `PresentAtomFilter`). Bottom-up so each impl reads against already-`Wire` fields.
+// ===========================================================================
+// 1. The limb-lexicographic strict-distinctness proof (I4-a no-re-mint carrier).
+wire_struct!(LexDistinctProof {
+    com_hi,
+    com_lo,
+    com_lo_shift,
+    hi_nondec,
+    lo_succ,
+    aux_commitments,
+    bit_commitments,
+    sumcheck,
+    opening
+});
+// 2. `present`'s per-position id-column authentication.
+wire_struct!(PresentIdAuth { com_id, lookup });
+// 3. One committed group's `id -> hash` inner lookup + the binding relocation.
+wire_struct!(GroupHashProof {
+    obj_reloc,
+    com_obj_at_k,
+    lookup
+});
+// 4. Bounded-key distinctness of one committed column (present-is-a-set guard).
+wire_struct!(ColumnDistinctProof { perm, com_sorted, sorted });
+// 5. An atom's SECOND range bound (half-open interval) authenticated selection + intersection.
+wire_struct!(PresentSecondRange {
+    object_range,
+    com_range_sel,
+    intersect,
+    com_intersection_sel
+});
+// 6. The combined `(id, value, datatype)` range dictionary relocated to the working domain.
+wire_struct!(CombinedRangeDictProof {
+    union,
+    com_id,
+    com_value,
+    com_datatype,
+    log,
+    n,
+    reloc_id,
+    reloc_value,
+    reloc_datatype,
+    com_id_at_k,
+    com_value_at_k,
+    com_datatype_at_k
+});
+// 7. The combined `(hash, id)` node/value | predicate dictionary relocated to the working domain.
+wire_struct!(CombinedDictProof {
+    union,
+    com_hash,
+    com_id,
+    log,
+    n,
+    reloc_hash,
+    reloc_id,
+    com_hash_at_k,
+    com_id_at_k
+});
+// 8. Full-field (whole-`Fr`) distinctness of one committed column (I4-a via `LexDistinctProof`).
+wire_struct!(ColumnDistinctFullFieldProof { perm, com_sorted, lex });
+// 9. The no-re-mint carrier: full-field distinctness of the combined nv + predicate hash columns.
+wire_struct!(RemintProof { nv, pred });
+// 10. A committed group's three authenticated canonical hash columns (S/O vs nv, P vs predicate).
+wire_struct!(CommittedGroupProof { s, o, p });
+// 11. A ranged atom's sub-proofs over `present`.
+wire_struct!(PresentRangeSubproof {
+    object_range,
+    com_range_sel,
+    second,
+    equality,
+    com_equality_sel,
+    combine,
+    com_combined_sel,
+    compaction
+});
+// 12. The per-atom filter: a PLAIN equality atom or a RANGED object atom (hand-written enum tag,
+// mirroring `AtomFilterProof` above). Which arm is used is fixed by the PUBLIC atom, not the proof.
+impl Wire for PresentAtomFilter {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Plain {
+                selection,
+                com_sel,
+                compaction,
+            } => {
+                0u8.put(out)?;
+                selection.put(out)?;
+                com_sel.put(out)?;
+                compaction.put(out)
+            }
+            Self::Range(proof) => {
+                1u8.put(out)?;
+                proof.put(out)
+            }
+        }
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        match u8::get(reader)? {
+            0 => Ok(Self::Plain {
+                selection: Wire::get(reader)?,
+                com_sel: Wire::get(reader)?,
+                compaction: Wire::get(reader)?,
+            }),
+            1 => Ok(Self::Range(Wire::get(reader)?)),
+            _ => Err(invalid("invalid present atom-filter tag")),
+        }
+    }
+}
+// 13. The per-atom half of a `present` BGP proof: the atom filter + compacted kept-column commits.
+wire_struct!(PresentBgpAtomProof { filter, com_kept, m });
+// 14. A general n-atom BGP proof over `present`. `openings`/`range_object_oid`/`range_value_openings`
+// are the UNCOMMITTED term-less resolution witnesses — now serialized (they ride the existing
+// Option/Vec/ResolutionOpenings `Wire` impls), still re-verified per id at resolve time.
+wire_struct!(PresentBgpProof {
+    auth_s,
+    auth_o,
+    auth_p,
+    present_distinct,
+    range_dict,
+    atoms,
+    chain,
+    result_len,
+    result_log_domain,
+    result_arity,
+    openings,
+    range_object_oid,
+    range_value_openings
+});
+// 15. The top-level delta-read proof. `remint` is `pub(crate)` — accessible here (same crate).
+wire_struct!(DeltaReadProof {
+    combined_nv,
+    combined_pred,
+    remint,
+    working_log,
+    group,
+    group_len,
+    bgp,
+    openings
+});
+
+impl DeltaReadProof {
+    /// Frame this delta-read proof for shipping as BYTES: MAGIC ‖ VERSION ‖ body ‖ SHA-256
+    /// checksum, exactly like the base `LayerBgpProof::encode` but with the independent
+    /// `DELTA_READ_*` constants. Serialization does NOT change verification: the decoded proof is
+    /// re-verified by the SAME `verify_delta_read{,_from_views}` function.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(DELTA_READ_MAGIC);
+        out.extend_from_slice(&DELTA_READ_VERSION.to_le_bytes());
+        self.put(&mut out)?;
+        if out
+            .len()
+            .checked_add(CHECKSUM_BYTES)
+            .map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES)
+        {
+            return Err(invalid("delta-read proof too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    /// Decode a framed delta-read proof. This is ONLY parsing under the strict size/item budgets —
+    /// it performs NO trust checks; the decoded proof is handed back to `verify_delta_read*`.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < DELTA_READ_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid delta-read proof size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("delta-read proof checksum mismatch"));
+        }
+        let mut reader = Reader {
+            bytes: body,
+            pos: 0,
+            decoded_items: 0,
+        };
+        if reader.take(DELTA_READ_MAGIC.len())? != DELTA_READ_MAGIC {
+            return Err(invalid("unknown delta-read proof magic"));
+        }
+        let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if version != DELTA_READ_VERSION {
+            return Err(invalid("unsupported delta-read proof version"));
+        }
+        let proof = Self::get(&mut reader)?;
+        reader.finish()?;
+        Ok(proof)
     }
 }
 

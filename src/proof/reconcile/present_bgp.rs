@@ -158,16 +158,18 @@ pub struct PresentBgpProof {
     /// prover default and on term-bearing artifacts (whose resolver rebuilds from the clear
     /// catalogs); the term-less producer attaches it via [`attach_termless_reconcile_openings`].
     /// NEVER folded into `commitment_root`/`resolution_root` — bound solely by [`verify_opening`],
-    /// so a forged opening is rejected and a missing one fails closed. No wire serialization
-    /// (`PresentBgpProof` is Clone/Debug in-memory only), so this adds no wire/golden/version
-    /// change. Mirrors [`DeltaReadProof::openings`].
+    /// so a forged opening is rejected and a missing one fails closed. C4: this witness IS now
+    /// wire-serialized as part of `DeltaReadProof::encode` (it rides the `Option<ResolutionOpenings>`
+    /// `Wire` impl), so it survives the byte boundary; it stays an UNCOMMITTED witness, re-verified
+    /// per id at resolve time. Mirrors [`DeltaReadProof::openings`].
     pub openings: Option<ResolutionOpenings>,
     /// C2a: UNCOMMITTED prover-shipped REAL present object-id column (the same `present_id_o`
     /// prefix `auth_o.com_id` commits), used by [`verify_dict_value_terms_chain`] to recommit the
     /// touched object column and pin it to `auth_o.com_id` when a numeric object-value RANGE is
     /// verified over a TERM-LESS delta / reconciled view. Empty on the prover default and on
     /// term-bearing artifacts; the term-less producer attaches it via
-    /// [`attach_termless_present_range_openings`]. In-memory only (no wire), like `openings`.
+    /// [`attach_termless_present_range_openings`]. C4: wire-serialized (rides the `Vec<u64>` `Wire`
+    /// impl in `DeltaReadProof::encode`), like `openings`; still an uncommitted, resolve-time witness.
     pub range_object_oid: Vec<u64>,
     /// C2a: UNCOMMITTED prover-shipped Merkle value↔term openings for a TERM-LESS object-value
     /// RANGE — one [`crate::proof::commitment::DictOpening`] per DISTINCT present object id,
@@ -175,7 +177,8 @@ pub struct PresentBgpProof {
     /// time. `None` on the prover default and on term-bearing artifacts (whose committed
     /// value/datatype columns are tied by `validate()`'s catalog re-MSM); a term-less range with
     /// this `None` fails closed (the D2 default). NEVER folded into `commitment_root` /
-    /// `resolution_root`; in-memory only (no wire/golden/version change). Mirrors `openings`.
+    /// `resolution_root`. C4: wire-serialized (rides the `Option<ResolutionOpenings>` `Wire` impl in
+    /// `DeltaReadProof::encode`); still an uncommitted, resolve-time witness. Mirrors `openings`.
     pub range_value_openings: Option<ResolutionOpenings>,
 }
 
