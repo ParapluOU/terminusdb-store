@@ -201,8 +201,9 @@ pub use present_bgp::{
     PresentSecondRange, PresentTerm,
 };
 pub use delta_read::{
-    prove_delta_read, verify_and_resolve_delta_read, verify_and_resolve_delta_read_from_views,
-    verify_delta_read, verify_delta_read_from_views, DeltaReadProof, DeltaSource,
+    attach_termless_delta_openings, build_termless_delta_openings, prove_delta_read,
+    verify_and_resolve_delta_read, verify_and_resolve_delta_read_from_views, verify_delta_read,
+    verify_delta_read_from_views, DeltaReadProof, DeltaSource,
 };
 
 // ---------------------------------------------------------------------------

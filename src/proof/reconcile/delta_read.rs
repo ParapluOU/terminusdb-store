@@ -8,6 +8,7 @@
 //! from the reconciliation envelope, so the read is bound to the trusted head root.
 
 use super::*;
+use crate::proof::commitment::build_resolution_openings;
 
 // ===========================================================================
 // DELTA-READS — `AddedTriple` / `DeletedTriple` over the HEAD delta layer.
@@ -87,6 +88,15 @@ pub struct DeltaReadProof {
     pub group: CommittedGroupProof,
     pub group_len: usize,
     pub bgp: PresentBgpProof,
+    /// E2b: UNCOMMITTED prover-shipped Merkle resolution witness for a TERM-LESS delta artifact.
+    /// One [`DictOpening`] per DISTINCT resolved result id, re-verified per id against the
+    /// root-bound `nv_merkle_root` at resolve time ([`ChainDictResolver::resolve_nv_id`]). `None`
+    /// on the prover default and on term-bearing artifacts (whose resolver rebuilds from the clear
+    /// catalogs); the term-less producer attaches it via [`attach_termless_delta_openings`]. NEVER
+    /// folded into `commitment_root`/`resolution_root` — bound solely by [`verify_opening`], so a
+    /// forged opening is rejected and a missing one fails closed. No wire serialization
+    /// (`DeltaReadProof` is in-memory only), so this adds no wire/golden/version change.
+    pub openings: Option<ResolutionOpenings>,
 }
 
 /// The working power-of-two domain a delta-read runs at: large enough for the combined
@@ -263,6 +273,9 @@ pub(super) fn prove_delta_read_core(
             group: CommittedGroupProof { s: s.0, o: o.0, p: p.0 },
             group_len,
             bgp,
+            // Prover default: the term-less producer attaches the openings witness separately via
+            // `attach_termless_delta_openings`; a term-bearing artifact leaves this `None`.
+            openings: None,
         },
         result,
     ))
@@ -282,6 +295,52 @@ pub fn prove_delta_read(
     let context = StoreProverContext::cpu();
     let mut transcript = Transcript254::new(DELTA_READ_TRANSCRIPT);
     prove_delta_read_core(&context, layers, source, atoms, joins, &mut transcript)
+}
+
+/// E2b (producer): build the UNCOMMITTED term-less resolution witness for a proven delta-read, so
+/// its results can be RESOLVED to real IRIs/typed literals over a TERM-LESS head view. Every
+/// delta-read kept result column is a combined-dict node/value id (predicates are constants,
+/// matched in committed hash space — there is NO catalog dict-membership step to open, unlike the
+/// base path's constant openings), so this opens ONLY node/value ids: it maps each column value via
+/// [`canonical_dictionary_id`], drops the reserved null id 0, and routes each distinct id to its
+/// introducing layer via [`build_resolution_openings`] over the term-bearing prover views (the
+/// prover still holds the full catalogs). Mirrors [`build_termless_bgp_openings`]. The witness is
+/// re-verified per id at the verifier by [`verify_opening`] against the root-bound `nv_merkle_root`
+/// (a forged opening is rejected, a missing one fails closed) and is NEVER folded into
+/// `commitment_root`/`resolution_root`.
+pub fn build_termless_delta_openings(
+    layers: &[&LayerCommitment],
+    result_columns: &[Vec<ArkFr>],
+) -> io::Result<ResolutionOpenings> {
+    let mut nv_ids: Vec<u64> = Vec::new();
+    for column in result_columns {
+        for value in column {
+            let raw = canonical_dictionary_id(value)?;
+            // The reserved null id 0 never indexes a dict row (never opened; masked out).
+            if raw != 0 {
+                nv_ids.push(raw);
+            }
+        }
+    }
+    // Term-bearing prover views: the prover holds the clear catalogs and rebuilds each id-indexed
+    // tree. Empty predicate id list — delta-read constants carry no dict-membership opening.
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    build_resolution_openings(&views, &nv_ids, &[])
+}
+
+/// E2b (producer): attach the term-less resolution witness to a proven [`DeltaReadProof`], so it
+/// can ship alongside a TERM-LESS delta artifact. `result_columns` are the prover's
+/// [`PresentReadResult::columns`] returned by [`prove_delta_read`]. Mirrors
+/// [`attach_termless_bgp_openings`]. Over-inclusion is safe (the verifier only looks up the ids it
+/// needs, each independently checked); under-inclusion fails closed. A term-bearing verifier
+/// ignores the witness entirely (it rebuilds from the clear catalogs).
+pub fn attach_termless_delta_openings(
+    proof: &mut DeltaReadProof,
+    layers: &[&LayerCommitment],
+    result_columns: &[Vec<ArkFr>],
+) -> io::Result<()> {
+    proof.openings = Some(build_termless_delta_openings(layers, result_columns)?);
+    Ok(())
 }
 
 pub(super) fn verify_delta_read_core(
@@ -388,10 +447,12 @@ pub fn verify_delta_read_from_views(
     Ok(result_m)
 }
 
-/// Verify a delta-read BGP AND resolve its result bindings FROM verifier VIEWS (E2a). Views-based
-/// analogue of [`verify_and_resolve_delta_read`]. For E2a, resolution over a TERM-LESS view
-/// fail-closes: the resolver Errs when a term-less view has no prover-shipped Merkle `openings`
-/// carrier, and this pass still passes `None` for openings (E2b adds the openings field).
+/// Verify a delta-read BGP AND resolve its result bindings FROM verifier VIEWS (E2a/E2b).
+/// Views-based analogue of [`verify_and_resolve_delta_read`]. Resolution over a TERM-LESS view
+/// consumes the prover-shipped Merkle `proof.openings` (E2b, minted by
+/// [`attach_termless_delta_openings`]): each id is re-verified against the root-bound
+/// `nv_merkle_root`, so a forged opening is rejected and a MISSING/absent one fails closed. A
+/// term-bearing artifact leaves `proof.openings` `None` and the resolver rebuilds from catalogs.
 pub fn verify_and_resolve_delta_read_from_views(
     views: &[VerifierCommitmentRef<'_>],
     trusted_head_root: ProofHash,
@@ -405,7 +466,13 @@ pub fn verify_and_resolve_delta_read_from_views(
     let (result_coms, result_m, result_log_domain) =
         verify_delta_read_core(views, trusted_head_root, source, atoms, joins, proof, &mut transcript)?;
     let kinds = vec![ResolveKind::NodeValueId; result_coms.len()];
-    resolve_result_columns(views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None, None)
+    // E2b: pass the prover-shipped term-less resolution openings (delta results have no hash
+    // kinds, so `id_hints` stays `None`). `None` on a term-bearing artifact, whose resolver
+    // rebuilds from the clear catalogs instead.
+    resolve_result_columns(
+        views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None,
+        proof.openings.as_ref(),
+    )
 }
 
 /// Verify a delta-read BGP against the trusted head root. On success returns the authenticated

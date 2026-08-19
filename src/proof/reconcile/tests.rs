@@ -1864,6 +1864,117 @@ fn resolve_delta_read_from_views_termless_head_fail_closes() {
     );
 }
 
+// --- E2b: term-less delta-read RESOLUTION openings (prover-shipped Merkle witness) ---
+
+/// E2b PAYOFF (verify-AND-resolve differential): a plain `AddedTriple(?s, p1, ?o)` over a delta
+/// stack RESOLVES to the SAME rows through the term-bearing path (rebuilds from catalogs) and the
+/// TERM-LESS views path (consumes the prover-shipped Merkle openings minted by
+/// `attach_termless_delta_openings`). ONE proof serves both: the term-bearing resolver ignores
+/// `proof.openings`; the term-less resolver requires + re-verifies them against the root-bound
+/// `nv_merkle_root`. Proves term-less delta results resolve IDENTICALLY.
+#[test]
+fn e2b_delta_read_termless_resolve_matches_term_bearing() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = delta_read_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+
+    let (mut proof, result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+    attach_termless_delta_openings(&mut proof, &lref, &result.columns).unwrap();
+
+    // Term-bearing resolution (rebuilds from catalogs; ignores proof.openings).
+    let bearing = verify_and_resolve_delta_read(
+        &lref, head_root, DeltaSource::Additions, &atoms, &[], &proof, &result.columns,
+    )
+    .unwrap();
+
+    // Term-less resolution: TERM-LESS head view + term-bearing ancestors, consuming the openings.
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    let termless = verify_and_resolve_delta_read_from_views(
+        &views, head_root, DeltaSource::Additions, &atoms, &[], &proof, &result.columns,
+    )
+    .unwrap();
+
+    assert!(!rows_of(&bearing).is_empty(), "the differential must not be vacuous");
+    assert!(
+        bag_eq_rows(rows_of(&bearing), rows_of(&termless)),
+        "term-less delta results must resolve to the same rows as term-bearing"
+    );
+}
+
+/// E2b NEGATIVE (missing opening): a term-less resolve whose `proof.openings` OMITS a needed
+/// result id fails closed (`Err`) — a missing opening is never a silent empty resolution.
+#[test]
+fn e2b_delta_read_termless_resolve_missing_opening_fails_closed() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = delta_read_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+
+    let (mut proof, result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+    attach_termless_delta_openings(&mut proof, &lref, &result.columns).unwrap();
+
+    // Reconstruct the openings MISSING one needed node/value id (all here are result ids).
+    let full = proof.openings.as_ref().unwrap();
+    let mut nv: Vec<_> = full.node_value_openings().cloned().collect();
+    let pred: Vec<_> = full.predicate_openings().cloned().collect();
+    assert!(!nv.is_empty(), "delta result ids must be opened");
+    nv.pop(); // drop one resolved id's opening
+    proof.openings = Some(ResolutionOpenings::from_wire(nv, pred).unwrap());
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    assert!(
+        verify_and_resolve_delta_read_from_views(
+            &views, head_root, DeltaSource::Additions, &atoms, &[], &proof, &result.columns,
+        )
+        .is_err(),
+        "a missing resolution opening must fail closed"
+    );
+}
+
+/// E2b NEGATIVE (forged opening): tampering a shipped opening (a wrong Merkle sibling) is rejected
+/// by `verify_opening` at resolve time — the opening no longer authenticates against the
+/// root-bound `nv_merkle_root`.
+#[test]
+fn e2b_delta_read_termless_resolve_forged_opening_rejected() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = delta_read_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+
+    let (mut proof, result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+    attach_termless_delta_openings(&mut proof, &lref, &result.columns).unwrap();
+
+    // Tamper one node/value opening's first Merkle sibling (mirrors dict_merkle's sibling-tamper).
+    let full = proof.openings.as_ref().unwrap();
+    let mut nv: Vec<_> = full.node_value_openings().cloned().collect();
+    let pred: Vec<_> = full.predicate_openings().cloned().collect();
+    assert!(!nv.is_empty() && !nv[0].siblings.is_empty(), "opening must have a sibling to tamper");
+    nv[0].siblings[0][0] ^= 0x01;
+    proof.openings = Some(ResolutionOpenings::from_wire(nv, pred).unwrap());
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    assert!(
+        verify_and_resolve_delta_read_from_views(
+            &views, head_root, DeltaSource::Additions, &atoms, &[], &proof, &result.columns,
+        )
+        .is_err(),
+        "a forged resolution opening must be rejected by verify_opening"
+    );
+}
+
 // ============================================================
 // Increment I3 — delta-stack (reconciled-present) id->term resolution via per-layer,
 // id-routed Merkle openings. The differential gate + the routing/root/hash negatives.
