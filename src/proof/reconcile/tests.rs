@@ -1557,6 +1557,86 @@ fn distinct_checker_rejects_a_duplicate_column() {
 }
 
 #[test]
+fn full_field_column_distinct_accepts_distinct_hashes() {
+    // Full-field (~254-bit) analogue of `distinct_checker_rejects_a_duplicate_column`: a column
+    // of DISTINCT canonical field elements — a mix of lower-⅓ values (`hi = 0`) and near-`p`
+    // values (`hi = p_hi`, differing only in the low limb), exactly the shape a combined hash
+    // catalog takes — proves + verifies via the permutation + I4-a lex-distinct composition, for
+    // which the bounded strict-sort's 253-bit gap cannot cover.
+    let ctx = StoreProverContext::cpu();
+    let log = 3usize; // domain 8
+    let column = pad_to(
+        &[
+            ark(3),
+            ark(100_000),
+            ark(u64::MAX),
+            ark(1) - ark(9),  // p - 8: near p, hi = p_hi
+            ark(1) - ark(2),  // p - 1: the max canonical value (equal hi, larger lo)
+            ark(1) - ark(50), // p - 49: another near-p value, equal hi
+        ],
+        log,
+    );
+    let com = commit_col(&column);
+    let mut pt = Transcript254::new(b"i4b-fullfield-distinct");
+    let proof = prove_column_distinct_fullfield(&ctx, &column, com, 6, log, &mut pt).unwrap();
+    let mut vt = Transcript254::new(b"i4b-fullfield-distinct");
+    verify_column_distinct_fullfield(com, 6, log, &proof, &mut vt).unwrap();
+}
+
+#[test]
+fn full_field_column_distinct_rejects_duplicate() {
+    // A repeated full-field value: after the permutation sorts the duplicate adjacent, I4-a's
+    // strict-lex increase sees an equal pair (`lo_shift - lo - 1 = -1`) and range-fails — so
+    // either the prover cannot build a proof or the verifier rejects it. No valid distinctness
+    // proof passes (the prover cannot lie).
+    let ctx = StoreProverContext::cpu();
+    let log = 3usize;
+    let dup = ark(1) - ark(9); // p - 8
+    let column = pad_to(&[ark(3), dup, ark(100_000), dup], log);
+    let com = commit_col(&column);
+    let mut dt = Transcript254::new(b"i4b-fullfield-dup");
+    match prove_column_distinct_fullfield(&ctx, &column, com, 4, log, &mut dt) {
+        Err(_) => {}
+        Ok(dup_proof) => {
+            let mut dvt = Transcript254::new(b"i4b-fullfield-dup");
+            assert!(
+                verify_column_distinct_fullfield(com, 4, log, &dup_proof, &mut dvt).is_err(),
+                "the lex-distinct gadget must reject a duplicated full-field column"
+            );
+        }
+    }
+}
+
+#[test]
+fn full_field_column_distinct_rejects_tampered_com() {
+    // Prove a valid full-field column, then verify against a commitment to a DIFFERENT column:
+    // the permutation binding to the wrong `com` fails.
+    let ctx = StoreProverContext::cpu();
+    let log = 3usize;
+    let column = pad_to(&[ark(3), ark(100_000), ark(1) - ark(9), ark(1) - ark(2)], log);
+    let com = commit_col(&column);
+    let mut pt = Transcript254::new(b"i4b-fullfield-tamper");
+    let proof = prove_column_distinct_fullfield(&ctx, &column, com, 4, log, &mut pt).unwrap();
+    let wrong = commit_col(&pad_to(&[ark(11), ark(22), ark(33), ark(44)], log));
+    let mut vt = Transcript254::new(b"i4b-fullfield-tamper");
+    assert!(verify_column_distinct_fullfield(wrong, 4, log, &proof, &mut vt).is_err());
+}
+
+#[test]
+fn full_field_column_distinct_single_row_trivial() {
+    // A single-row column is a trivially-distinct set: `n == 1` proves + verifies (the bounded
+    // helper requires `n >= 2`; the full-field helper's floor is `n >= 1`).
+    let ctx = StoreProverContext::cpu();
+    let log = 2usize; // domain 4 (the permutation needs a relocatable domain, `working_log >= 1`)
+    let column = pad_to(&[ark(1) - ark(2)], log); // a single near-p value
+    let com = commit_col(&column);
+    let mut pt = Transcript254::new(b"i4b-fullfield-single");
+    let proof = prove_column_distinct_fullfield(&ctx, &column, com, 1, log, &mut pt).unwrap();
+    let mut vt = Transcript254::new(b"i4b-fullfield-single");
+    verify_column_distinct_fullfield(com, 1, log, &proof, &mut vt).unwrap();
+}
+
+#[test]
 fn tampered_present_distinct_rejects() {
     let layers = bgp_stack();
     let lref = refs(&layers);

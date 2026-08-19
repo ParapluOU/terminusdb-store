@@ -9,6 +9,9 @@
 //! hash uniqueness) that make `present` a genuine set.
 
 use super::*;
+use crate::proof::lexdistinct::{
+    prove_lex_strictly_sorted_with_context, verify_lex_strictly_sorted, LexDistinctProof,
+};
 
 // ===========================================================================
 // Wave 6 — GENERAL n-atom conjunctive BGP over the reconciled `present` relation.
@@ -348,6 +351,68 @@ pub(super) fn verify_column_distinct(
         &input, std::slice::from_ref(&proof.com_sorted), n, working_log, &proof.perm, transcript,
     )?;
     verify_strictly_sorted_bits(&proof.com_sorted, n, bits, &proof.sorted, transcript)
+}
+
+/// Full-field variant of [`ColumnDistinctProof`]: proves the real prefix `[0, n)` of the
+/// column committed by `com` is ALL-DISTINCT over the ENTIRE field (each entry a canonical
+/// `Fr < p`) — for ~254-bit hash columns the bounded strict-sort's 253-bit gap cannot cover.
+/// Sorts the prefix, proves the sort is a permutation of the committed column, and proves the
+/// sorted candidate strictly increases LEXICOGRAPHICALLY over 2×127-bit limbs (I4-a).
+#[derive(Clone, Debug)]
+pub(super) struct ColumnDistinctFullFieldProof {
+    pub perm: RelationPermutationProof,
+    pub com_sorted: ArkGT,
+    pub lex: LexDistinctProof,
+}
+
+/// Prove the real prefix `[0, n)` of the column committed by `com` (values `column`, padded
+/// to `2^working_log`) is ALL-DISTINCT over the ENTIRE field — every real entry is a canonical
+/// `Fr < p` by construction, so there is NO bit-width bound (unlike [`prove_column_distinct`]).
+/// Sorts the prefix, proves the sort is a permutation of the committed column, and proves the
+/// sorted candidate strictly increases LEXICOGRAPHICALLY (I4-a). Requires `n >= 1` (a single-row
+/// column is a trivially-distinct set).
+pub(super) fn prove_column_distinct_fullfield(
+    context: &StoreProverContext<'_>,
+    column: &[ArkFr],
+    com: ArkGT,
+    n: usize,
+    working_log: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<ColumnDistinctFullFieldProof> {
+    use ark_ff::PrimeField;
+    if n < 1 {
+        return Err(invalid("full-field column-distinct requires at least one row"));
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| column[a].0.into_bigint().cmp(&column[b].0.into_bigint()));
+    let input = RelationWitness {
+        columns: vec![column.to_vec()],
+        commitments: vec![com],
+        log_domain: working_log,
+        n,
+    };
+    let perm = prove_relation_permutation_with_context(context, &input, &order, transcript)?;
+    let com_sorted = perm.commitments[0];
+    let lex =
+        prove_lex_strictly_sorted_with_context(context, &perm.columns[0], n, &com_sorted, transcript)?;
+    Ok(ColumnDistinctFullFieldProof { perm: perm.proof, com_sorted, lex })
+}
+
+pub(super) fn verify_column_distinct_fullfield(
+    com: ArkGT,
+    n: usize,
+    working_log: usize,
+    proof: &ColumnDistinctFullFieldProof,
+    transcript: &mut Transcript254,
+) -> io::Result<()> {
+    if n < 1 {
+        return Err(invalid("full-field column-distinct requires at least one row"));
+    }
+    let input = RelationCommit { commitments: vec![com], log_domain: working_log, n };
+    verify_relation_permutation(
+        &input, std::slice::from_ref(&proof.com_sorted), n, working_log, &proof.perm, transcript,
+    )?;
+    verify_lex_strictly_sorted(&proof.com_sorted, n, &proof.lex, transcript)
 }
 
 /// The bounded canonical-triple key column `id_s + 2^w*id_p + 2^(2w)*id_o` for present (an
