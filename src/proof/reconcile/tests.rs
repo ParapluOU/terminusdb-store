@@ -1767,6 +1767,103 @@ fn delta_read_forged_result_binding_rejects() {
     .is_err());
 }
 
+// --- E2a: term-less delta-read VERIFY path (views-based entries) ---
+
+/// POSITIVE differential (COUNT): a plain conjunctive `AddedTriple(?s, <const p>, ?o)` counts
+/// IDENTICALLY through the term-bearing `verify_delta_read(&layers, ..)` and the views entry
+/// `verify_delta_read_from_views(&views, ..)` built with a TERM-LESS head view (term-bearing
+/// ancestors). Plain BGP (no value/datatype read) is sound term-less, so the count must agree.
+#[test]
+fn delta_read_from_views_termless_head_matches_term_bearing_count() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = delta_read_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (proof, _result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+
+    // Term-bearing sidecar entry.
+    let n_bearing =
+        verify_delta_read(&lref, head_root, DeltaSource::Additions, &atoms, &[], &proof).unwrap();
+
+    // Views entry: TERM-LESS head + term-bearing ancestors. The owned term-less commitment must
+    // outlive the ref, so bind it in a `let` before building the views vec.
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    assert!(!head_termless.verifier_view().terms_present);
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    let n_views =
+        verify_delta_read_from_views(&views, head_root, DeltaSource::Additions, &atoms, &[], &proof)
+            .unwrap();
+
+    assert_eq!(n_bearing, 2);
+    assert_eq!(n_bearing, n_views, "term-less views must give the SAME count as term-bearing");
+}
+
+/// D2 NEGATIVE: a delta-read with an object-value RANGE atom must FAIL CLOSED when verified over a
+/// TERM-LESS view (the order-preserving value/datatype is not authenticated term-less). The SAME
+/// range query over all-term-bearing views still verifies (regression).
+#[test]
+fn delta_read_from_views_range_termless_rejects() {
+    use crate::proof::commitment::VerifierLayer;
+    // age_stack head additions == {grace age 25, grace name grace_n} (group_len 2).
+    let layers = age_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    // AddedTriple(?x, age, ?v)[?v >= 18] over the additions -> exactly {grace 25}.
+    let atoms = [range_atom(RangeOp::Ge, 18, None)];
+    let (proof, _result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+
+    // Regression: all-term-bearing views verify the range delta-read (D2 guard is a no-op).
+    let bearing_views: Vec<VerifierCommitmentRef<'_>> =
+        lref.iter().map(|l| l.verifier_view()).collect();
+    let n = verify_delta_read_from_views(
+        &bearing_views, head_root, DeltaSource::Additions, &atoms, &[], &proof,
+    )
+    .unwrap();
+    assert_eq!(n, 1, "grace age 25 >= 18");
+
+    // D2: a TERM-LESS head view must fail closed on the object-value range.
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut termless_views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    termless_views.push(head_termless.verifier_view());
+    assert!(
+        verify_delta_read_from_views(
+            &termless_views, head_root, DeltaSource::Additions, &atoms, &[], &proof,
+        )
+        .is_err(),
+        "object-value range over a term-less view must fail closed (D2)"
+    );
+}
+
+/// RESOLUTION fail-close: `verify_and_resolve_delta_read_from_views` on a TERM-LESS head view
+/// Errs — term-less id->term resolution needs prover-shipped Merkle openings, and E2a still passes
+/// `None` (E2b adds the openings carrier). The added terms (a5/a6/b5/b6) are minted by the head, so
+/// they route to the term-less head view and fail closed.
+#[test]
+fn resolve_delta_read_from_views_termless_head_fail_closes() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = delta_read_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (proof, result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    assert!(
+        verify_and_resolve_delta_read_from_views(
+            &views, head_root, DeltaSource::Additions, &atoms, &[], &proof, &result.columns,
+        )
+        .is_err(),
+        "term-less resolve without openings must Err (E2a)"
+    );
+}
+
 // ============================================================
 // Increment I3 — delta-stack (reconciled-present) id->term resolution via per-layer,
 // id-routed Merkle openings. The differential gate + the routing/root/hash negatives.

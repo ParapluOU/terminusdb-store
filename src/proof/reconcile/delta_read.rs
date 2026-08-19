@@ -285,7 +285,7 @@ pub fn prove_delta_read(
 }
 
 pub(super) fn verify_delta_read_core(
-    layers: &[&LayerCommitment],
+    views: &[VerifierCommitmentRef<'_>],
     trusted_head_root: ProofHash,
     source: DeltaSource,
     atoms: &[PresentBgpAtom],
@@ -293,9 +293,8 @@ pub(super) fn verify_delta_read_core(
     proof: &DeltaReadProof,
     transcript: &mut Transcript254,
 ) -> io::Result<(Vec<ArkGT>, usize, usize)> {
-    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     // (1) Each layer authenticated against ITS OWN commitment root.
-    for view in &views {
+    for view in views {
         view.validate()?;
     }
     // (2) Whole parent chain + trusted head anchor (splice/reorder/drop/foreign-proof).
@@ -331,12 +330,12 @@ pub(super) fn verify_delta_read_core(
 
     transcript.append_bytes(b"pow/delta-read/domain", DELTA_READ_DOMAIN);
     transcript.append_bytes(b"pow/delta-read/source", source.transcript_tag());
-    for view in &views {
+    for view in views {
         transcript.append_bytes(b"pow/delta-read/layer-root", &view.state.commitment_root);
     }
 
     // Combined dictionaries (verifier side).
-    let (nv_branches, pred_branches) = nv_pred_branch_commits(&views)?;
+    let (nv_branches, pred_branches) = nv_pred_branch_commits(views)?;
     verify_combined_dict(&nv_branches, head_nv, working_log, &proof.combined_nv, transcript)?;
     verify_combined_dict(&pred_branches, head_pred, working_log, &proof.combined_pred, transcript)?;
 
@@ -363,16 +362,20 @@ pub(super) fn verify_delta_read_core(
     };
 
     verify_present_bgp(
-        layers, &proof.combined_nv, &proof.combined_pred, &verified, head_nv, atoms, joins,
+        views, &proof.combined_nv, &proof.combined_pred, &verified, head_nv, atoms, joins,
         &proof.bgp, transcript,
     )
 }
 
-/// Verify a delta-read BGP against the trusted head root. On success returns the authenticated
-/// result row count. `atoms`/`joins` MUST be the VERIFIER's own compiled query (anti-substitution
-/// is enforced one level up in the compiler routing).
-pub fn verify_delta_read(
-    layers: &[&LayerCommitment],
+/// Verify a delta-read BGP against the trusted head root FROM verifier VIEWS. On success returns
+/// the authenticated result row count. This is the views-based core entry (E2a): it accepts the
+/// borrowed [`VerifierCommitmentRef`] slice directly, so a TERM-LESS delta view (built via
+/// [`LayerCommitment::verifier_commitment_termless`] on the head, term-bearing elsewhere) can be
+/// passed for the term-less remote verifier. Plain conjunctive BGP is sound term-less; an
+/// object-value RANGE atom fails closed inside `verify_present_bgp` (D2). Transcript init is
+/// identical to [`verify_delta_read`].
+pub fn verify_delta_read_from_views(
+    views: &[VerifierCommitmentRef<'_>],
     trusted_head_root: ProofHash,
     source: DeltaSource,
     atoms: &[PresentBgpAtom],
@@ -381,15 +384,16 @@ pub fn verify_delta_read(
 ) -> io::Result<usize> {
     let mut transcript = Transcript254::new(DELTA_READ_TRANSCRIPT);
     let (_coms, result_m, _log) =
-        verify_delta_read_core(layers, trusted_head_root, source, atoms, joins, proof, &mut transcript)?;
+        verify_delta_read_core(views, trusted_head_root, source, atoms, joins, proof, &mut transcript)?;
     Ok(result_m)
 }
 
-/// Verify a delta-read BGP AND resolve its result bindings to `CanonicalObject`s (real IRIs /
-/// typed literals) against the chain catalogs — the readable answer, no re-run. Every result
-/// column is a combined-dict node/value id (predicates are constants).
-pub fn verify_and_resolve_delta_read(
-    layers: &[&LayerCommitment],
+/// Verify a delta-read BGP AND resolve its result bindings FROM verifier VIEWS (E2a). Views-based
+/// analogue of [`verify_and_resolve_delta_read`]. For E2a, resolution over a TERM-LESS view
+/// fail-closes: the resolver Errs when a term-less view has no prover-shipped Merkle `openings`
+/// carrier, and this pass still passes `None` for openings (E2b adds the openings field).
+pub fn verify_and_resolve_delta_read_from_views(
+    views: &[VerifierCommitmentRef<'_>],
     trusted_head_root: ProofHash,
     source: DeltaSource,
     atoms: &[PresentBgpAtom],
@@ -399,9 +403,43 @@ pub fn verify_and_resolve_delta_read(
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
     let mut transcript = Transcript254::new(DELTA_READ_TRANSCRIPT);
     let (result_coms, result_m, result_log_domain) =
-        verify_delta_read_core(layers, trusted_head_root, source, atoms, joins, proof, &mut transcript)?;
-    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+        verify_delta_read_core(views, trusted_head_root, source, atoms, joins, proof, &mut transcript)?;
     let kinds = vec![ResolveKind::NodeValueId; result_coms.len()];
-    resolve_result_columns(&views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None, None)
+    resolve_result_columns(views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None, None)
+}
+
+/// Verify a delta-read BGP against the trusted head root. On success returns the authenticated
+/// result row count. `atoms`/`joins` MUST be the VERIFIER's own compiled query (anti-substitution
+/// is enforced one level up in the compiler routing). Thin wrapper over
+/// [`verify_delta_read_from_views`] that builds term-bearing views from the full sidecars.
+pub fn verify_delta_read(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    source: DeltaSource,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    proof: &DeltaReadProof,
+) -> io::Result<usize> {
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    verify_delta_read_from_views(&views, trusted_head_root, source, atoms, joins, proof)
+}
+
+/// Verify a delta-read BGP AND resolve its result bindings to `CanonicalObject`s (real IRIs /
+/// typed literals) against the chain catalogs — the readable answer, no re-run. Every result
+/// column is a combined-dict node/value id (predicates are constants). Thin wrapper over
+/// [`verify_and_resolve_delta_read_from_views`] that builds term-bearing views.
+pub fn verify_and_resolve_delta_read(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    source: DeltaSource,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    proof: &DeltaReadProof,
+    claimed_columns: &[Vec<ArkFr>],
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    verify_and_resolve_delta_read_from_views(
+        &views, trusted_head_root, source, atoms, joins, proof, claimed_columns,
+    )
 }
 

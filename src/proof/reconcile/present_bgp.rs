@@ -764,7 +764,7 @@ pub(super) fn verify_present_range_atom(
 }
 
 pub(crate) fn verify_present_bgp(
-    layers: &[&LayerCommitment],
+    views: &[VerifierCommitmentRef<'_>],
     combined_nv: &CombinedDictProof,
     combined_pred: &CombinedDictProof,
     verified: &ReconcileVerified,
@@ -781,7 +781,7 @@ pub(crate) fn verify_present_bgp(
         return Err(invalid("present BGP atom count mismatch"));
     }
     let m = verified.present_len;
-    let head_pred = layers.last().unwrap().verifier_view().state.predicate_count as usize;
+    let head_pred = views.last().unwrap().state.predicate_count as usize;
     // (1) present id authentication (subject/object vs combined node/value dict, predicate vs
     //     combined predicate dict) against the reconciled hashes.
     verify_id_auth(combined_nv, m, head_nv, verified.com_present_s, &proof.auth_s, transcript)?;
@@ -816,12 +816,24 @@ pub(crate) fn verify_present_bgp(
 
     // (1r) The combined range dictionary — required iff (and only iff) some atom ranges.
     let needs_range = bgp_needs_range_dict(atoms);
+    // (1r-tl) Merkle-dict I2b / E2a-D2: a numeric object-value RANGE authenticates each object
+    // id's ORDER-PRESERVING VALUE + DATATYPE against the committed `node_value_dict_range_commitments`
+    // columns, whose tie to the REAL terms rests on the catalog re-MSM a TERM-LESS artifact drops.
+    // Fail closed on ANY term-less view BEFORE the range-dict branches / value+datatype columns are
+    // trusted below. No-op on the term-bearing materialized/reconciled-walk callers (their views are
+    // always `terms_present`).
+    if needs_range {
+        for view in views {
+            view.require_terms_present(
+                "delta/present BGP object-value range (order-preserving value/datatype not authenticated term-less)",
+            )?;
+        }
+    }
     if needs_range != proof.range_dict.is_some() {
         return Err(invalid("present BGP: range-dict presence disagrees with the plan"));
     }
     if let Some(range_dict) = &proof.range_dict {
-        let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
-        let branches = range_dict_branch_commits(&views)?;
+        let branches = range_dict_branch_commits(views)?;
         verify_combined_range_dict(&branches, head_nv, verified.working_log, range_dict, transcript)?;
     }
 
@@ -921,9 +933,10 @@ pub fn verify_read_bgp(
 ) -> io::Result<usize> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
     let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
-    let head_nv = layers.last().unwrap().verifier_view().state.node_value_count as usize;
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let head_nv = views.last().unwrap().state.node_value_count as usize;
     let (_coms, result_m, _log) = verify_present_bgp(
-        layers, &reconcile.combined_nv, &reconcile.combined_pred, &verified, head_nv, atoms, joins, proof,
+        &views, &reconcile.combined_nv, &reconcile.combined_pred, &verified, head_nv, atoms, joins, proof,
         &mut transcript,
     )?;
     Ok(result_m)
@@ -943,12 +956,12 @@ pub fn verify_and_resolve_bgp(
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
     let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
-    let head_nv = layers.last().unwrap().verifier_view().state.node_value_count as usize;
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let head_nv = views.last().unwrap().state.node_value_count as usize;
     let (result_coms, result_m, result_log_domain) = verify_present_bgp(
-        layers, &reconcile.combined_nv, &reconcile.combined_pred, &verified, head_nv, atoms, joins, proof,
+        &views, &reconcile.combined_nv, &reconcile.combined_pred, &verified, head_nv, atoms, joins, proof,
         &mut transcript,
     )?;
-    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     let kinds = vec![ResolveKind::NodeValueId; result_coms.len()];
     resolve_result_columns(&views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None, None)
 }

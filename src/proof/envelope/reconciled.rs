@@ -180,8 +180,9 @@ pub(crate) fn verify_reconciled_leaf(
     proof: &PresentBgpProof,
     transcript: &mut Transcript254,
 ) -> io::Result<RelationCommit> {
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     let (commitments, n, log_domain) = verify_present_bgp(
-        layers,
+        &views,
         &reconcile.combined_nv,
         &reconcile.combined_pred,
         verified,
