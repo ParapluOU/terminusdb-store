@@ -826,6 +826,7 @@ pub mod logup;
 pub mod logup_gkr;
 pub mod membership;
 pub mod order;
+pub mod lexdistinct;
 pub mod lexsort;
 pub mod multiorder;
 pub mod pairs;
