@@ -14,7 +14,11 @@ use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{commit_column, StoreProverContext, Transcript254};
 use super::bgp::{RelationCommit, RelationWitness};
-use super::commitment::{LayerCommitment, VerifierLayer};
+use super::commitment::{reject_nan_objects, LayerCommitment, ResolutionOpenings, VerifierLayer};
+use super::query::{
+    build_resolution_openings, canonical_dictionary_id, require_base_layer_for_query,
+    verify_dict_value_terms,
+};
 use super::filter::{
     prove_filter_indicator_with_context, verify_filter_indicator, FilterProof,
 };
@@ -66,6 +70,18 @@ pub struct ExactScalarOrderProof {
     pub datatype_selection_commitment: ArkGT,
     pub datatype_inverse_commitment: ArkGT,
     pub sorted: SortedProof,
+    /// Merkle-dict I2b step 3 (value↔term consistency, TERM-LESS order). The real object
+    /// ids of the SORTED output rows (`oid[i]` = the id at sorted row `i`, length = the
+    /// output row count), and one positional Merkle opening per DISTINCT id (node/value
+    /// namespace). EMPTY / `None` on a TERM-BEARING artifact (the catalog re-MSM ties the
+    /// sort-key value/datatype to real terms; the verifier ignores these). On a TERM-LESS
+    /// artifact the verifier recommits `oid` to `com_output_id_at_d` (binding the sort key's
+    /// object-id column) and rederives `lookup.com_v_val`/`lookup.com_v_dt` from the Merkle-
+    /// authenticated opened terms ([`verify_dict_value_terms`]). UNCOMMITTED — never folded
+    /// into `commitment_root`/`resolution_root`; a missing opening (or recommit mismatch)
+    /// fails closed.
+    pub oid: Vec<u64>,
+    pub value_openings: Option<ResolutionOpenings>,
 }
 
 /// Prover result: the proof plus the ordered output relation (the single id column, its
@@ -321,6 +337,11 @@ pub fn prove_exact_scalar_order_with_context(
             datatype_selection_commitment,
             datatype_inverse_commitment,
             sorted,
+            // Merkle-dict I2b step 3: term-bearing by default (the catalog re-MSM ties the
+            // sort-key value/datatype to terms). `build_termless_order_openings` fills these
+            // when a TERM-LESS artifact is shipped for a base/rollup layer.
+            oid: Vec::new(),
+            value_openings: None,
         },
         commitments: permutation.commitments,
         columns: permutation.columns,
@@ -369,20 +390,36 @@ pub fn verify_exact_scalar_order(
         return Err(invalid("exact scalar order requires one supported numeric column"));
     }
     let layer = source.verifier_view();
-    // Merkle-dict I2b S2 fail-close: the ordering key is each id's order-preserving dict VALUE,
-    // tied to real terms only by the catalog re-MSM a TERM-LESS artifact drops. Reject up front.
-    layer.require_terms_present("exact scalar OrderBy (dictionary-value sort key)")?;
     layer.validate()?;
-    super::commitment::reject_nan_catalog(
-        layer.node_value_catalog,
-        ArkFr::from_u64(datatype as u64),
-    )?;
-    let n_dict = layer.node_value_catalog.len();
-    let (_, dict_id) = layer.node_value_dictionary_columns()?;
-    if dict_id.is_empty() || !dict_id.len().is_power_of_two() {
-        return Err(invalid("exact scalar order requires a nonempty authenticated dictionary"));
-    }
-    let dict_log_domain = dict_id.len().trailing_zeros() as usize;
+    // Merkle-dict I2b step 3 (value↔term consistency). The ordering key is each output id's
+    // order-preserving dict VALUE (`lookup.com_v_val`) plus its datatype (`lookup.com_v_dt`).
+    //   * TERM-BEARING: `validate()`'s catalog re-MSM ties value/datatype to the clear terms and
+    //     the NaN guard scans the catalog; read `n_dict` / the dict domain from the catalog.
+    //     Unchanged.
+    //   * TERM-LESS: the re-MSM is dropped ⇒ the committed value/datatype are prover-chosen. Read
+    //     `n_dict` / the dict domain from the root-bound counts, and (once the lookup pins the
+    //     per-row value/datatype below) tie them to the Merkle-authenticated terms via the prover-
+    //     shipped `oid` + value openings. Missing openings ⇒ Err (fail-closed). DELTA order stays
+    //     fail-closed (`validate()` already rejects a term-less delta; re-asserted here).
+    let (n_dict, dict_log_domain) = if layer.terms_present {
+        super::commitment::reject_nan_catalog(
+            layer.node_value_catalog,
+            ArkFr::from_u64(datatype as u64),
+        )?;
+        let n_dict = layer.node_value_catalog.len();
+        let (_, dict_id) = layer.node_value_dictionary_columns()?;
+        if dict_id.is_empty() || !dict_id.len().is_power_of_two() {
+            return Err(invalid("exact scalar order requires a nonempty authenticated dictionary"));
+        }
+        (n_dict, dict_id.len().trailing_zeros() as usize)
+    } else {
+        require_base_layer_for_query(layer.state)?;
+        let n_dict = layer.state.node_value_count as usize;
+        if n_dict == 0 {
+            return Err(invalid("exact scalar order requires a nonempty authenticated dictionary"));
+        }
+        (n_dict, n_dict.next_power_of_two().max(2).trailing_zeros() as usize)
+    };
     let common_log_domain = input.log_domain.max(dict_log_domain);
     bind_statement(transcript, datatype, direction, input.n, common_log_domain);
     verify_relation_permutation(
@@ -427,6 +464,34 @@ pub fn verify_exact_scalar_order(
             transcript,
         )?;
     }
+    // Merkle-dict I2b step 3 (TERM-LESS value↔term tie). The lookup below binds
+    // `lookup.com_v_val`/`lookup.com_v_dt` as the dict value/datatype gathered at each SORTED
+    // output id (`com_output_id_at_d`); on a term-less artifact those committed dict columns are
+    // prover-chosen. Recommit the shipped `oid` to `com_output_id_at_d` (binding the exact sort-
+    // key object column) and rederive the value/datatype from the Merkle-authenticated opened
+    // terms, forcing `lookup.com_v_val`/`lookup.com_v_dt` == OP-encode(real term) at every row —
+    // the SAME columns the sort key (`sort_commitment`) and datatype mask below consume. Runs
+    // BEFORE the (transcript-consuming) lookup; it is itself transcript-free.
+    if !layer.terms_present {
+        let value_openings = proof.value_openings.as_ref().ok_or_else(|| {
+            invalid(
+                "term-less exact scalar OrderBy requires the prover-shipped value↔term Merkle openings",
+            )
+        })?;
+        let domain = 1usize << common_log_domain;
+        let touched = verify_dict_value_terms(
+            &proof.com_output_id_at_d,
+            &proof.lookup.com_v_val,
+            &proof.lookup.com_v_dt,
+            output_len,
+            domain,
+            &proof.oid,
+            value_openings,
+            layer,
+            layer.resolution_root(),
+        )?;
+        reject_nan_objects(&touched, ArkFr::from_u64(datatype as u64))?;
+    }
     verify_dict_value_lookup(
         &proof.com_output_id_at_d,
         &proof.com_dict_id_at_d,
@@ -465,6 +530,39 @@ pub fn verify_exact_scalar_order(
         &proof.sorted,
         transcript,
     )
+}
+
+/// Merkle-dict I2b step 3 (producer): mint the TERM-LESS value↔term witness for a proven
+/// base/rollup exact-scalar-order proof. `output_ids` are the SORTED output id column's real
+/// rows (`result.columns[0][..result.n]` — the exact ids `com_output_id_at_d` commits and the
+/// lookup gathered `(v_val, v_dt)` from). Records them as `proof.oid` and opens each DISTINCT id
+/// against the node/value tree, populating `proof.value_openings` IN PLACE.
+///
+/// UNCOMMITTED witness (never folded into `commitment_root`/`resolution_root`): at verify,
+/// [`verify_dict_value_terms`] recommits `oid` to `com_output_id_at_d` (binding the sort-key
+/// object column) and rederives the sort key value/datatype from the opened terms, failing closed
+/// on any mismatch or missing opening. BASE/ROLLUP single-layer ONLY (delta order stays
+/// fail-closed).
+pub fn build_termless_order_openings(
+    layer: &LayerCommitment,
+    proof: &mut ExactScalarOrderProof,
+    output_ids: &[ArkFr],
+) -> io::Result<()> {
+    require_base_layer_for_query(layer.verifier_view().state)?;
+    let mut oid: Vec<u64> = Vec::with_capacity(output_ids.len());
+    let mut nv_ids: Vec<u64> = Vec::new();
+    for value in output_ids {
+        let raw = canonical_dictionary_id(value)?;
+        oid.push(raw);
+        // The reserved null id 0 never indexes a dict row (never opened; masked out).
+        if raw != 0 {
+            nv_ids.push(raw);
+        }
+    }
+    let openings = build_resolution_openings(&[layer.verifier_view()], &nv_ids, &[])?;
+    proof.oid = oid;
+    proof.value_openings = Some(openings);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -623,7 +721,9 @@ mod tests {
             &mut tv,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("terms-bearing"), "{err}");
+        // Merkle-dict I2b step 3: a term-less scalar-order proof WITHOUT the value openings still
+        // fails closed, now with the step-3 "value↔term Merkle openings" message.
+        assert!(err.to_string().contains("Merkle openings"), "{err}");
     }
 
     #[test]
@@ -695,5 +795,94 @@ mod tests {
             &layer, &input.view(), CanonicalDatatype::UInt32, OrderDirection::Ascending,
             &result.commitments, result.n, result.log_domain, &result.proof, &mut transcript(),
         ).is_err());
+    }
+
+    // =====================================================================================
+    // Merkle-dict I2b step 3 (value↔term consistency, ORDER). A TERM-LESS base/rollup order
+    // proof ties the committed sort-key value/datatype to the Merkle-authenticated terms via the
+    // prover-shipped `oid` + per-distinct value openings. Term-bearing verify is unchanged.
+    // =====================================================================================
+    fn prove_attach_order(
+        layer: &LayerCommitment,
+        dir: OrderDirection,
+    ) -> (RelationWitness, ExactScalarOrderResult) {
+        let ids = [id_for(layer, 30), id_for(layer, 10), id_for(layer, 20)];
+        let input =
+            RelationWitness::commit(vec![ids.iter().map(|id| ArkFr::from_u64(*id)).collect()], 3)
+                .unwrap();
+        let mut result = prove_exact_scalar_order_with_context(
+            &StoreProverContext::cpu(), layer, &input, CanonicalDatatype::UInt32, dir,
+            &mut transcript(),
+        )
+        .unwrap();
+        let n = result.n;
+        build_termless_order_openings(layer, &mut result.proof, &result.columns[0][..n]).unwrap();
+        assert!(result.proof.value_openings.is_some(), "order value openings attached");
+        assert!(!result.proof.oid.is_empty(), "order oid vector minted");
+        (input, result)
+    }
+
+    /// Differential positive: a TERM-LESS scalar-order proof verifies EXACTLY like the
+    /// TERM-BEARING one — same accept (honest), same reject (wrong datatype), ascending + descending.
+    #[test]
+    fn i2b_step3_order_termless_differential() {
+        let layer = layer();
+        for dir in [OrderDirection::Ascending, OrderDirection::Descending] {
+            let (input, result) = prove_attach_order(&layer, dir);
+            let termless = layer.verifier_commitment_termless().unwrap();
+            verify_exact_scalar_order(&layer, &input.view(), CanonicalDatatype::UInt32, dir,
+                &result.commitments, result.n, result.log_domain, &result.proof, &mut transcript()).unwrap();
+            verify_exact_scalar_order(&termless, &input.view(), CanonicalDatatype::UInt32, dir,
+                &result.commitments, result.n, result.log_domain, &result.proof, &mut transcript()).unwrap();
+            // Same reject: a wrong queried datatype rejects on BOTH artifacts.
+            assert!(verify_exact_scalar_order(&layer, &input.view(), CanonicalDatatype::Int32, dir,
+                &result.commitments, result.n, result.log_domain, &result.proof, &mut transcript()).is_err());
+            assert!(verify_exact_scalar_order(&termless, &input.view(), CanonicalDatatype::Int32, dir,
+                &result.commitments, result.n, result.log_domain, &result.proof, &mut transcript()).is_err());
+        }
+    }
+
+    /// Forged committed VALUE column (`lookup.com_v_val`) ⇒ the Merkle-rederived value disagrees ⇒
+    /// `Com(ov) != com_v_val` ⇒ REJECT (term-less). Term-bearing is unaffected (its own lookup ties it).
+    #[test]
+    fn i2b_step3_order_termless_rejects_forged_value_column() {
+        let layer = layer();
+        let (input, mut result) = prove_attach_order(&layer, OrderDirection::Ascending);
+        result.proof.lookup.com_v_val = result.proof.lookup.com_v_dt;
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let err = verify_exact_scalar_order(&termless, &input.view(), CanonicalDatatype::UInt32,
+            OrderDirection::Ascending, &result.commitments, result.n, result.log_domain, &result.proof,
+            &mut transcript()).unwrap_err();
+        assert!(err.to_string().contains("com_v_val"), "{err}");
+    }
+
+    /// A substituted `oid` vector no longer recommits to `com_output_id_at_d` ⇒ REJECT (only the
+    /// tie checks `oid`).
+    #[test]
+    fn i2b_step3_order_termless_rejects_forged_oid() {
+        let layer = layer();
+        let (input, mut result) = prove_attach_order(&layer, OrderDirection::Ascending);
+        result.proof.oid[0] = result.proof.oid[0].wrapping_add(1);
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let err = verify_exact_scalar_order(&termless, &input.view(), CanonicalDatatype::UInt32,
+            OrderDirection::Ascending, &result.commitments, result.n, result.log_domain, &result.proof,
+            &mut transcript()).unwrap_err();
+        assert!(err.to_string().contains("oid column"), "{err}");
+    }
+
+    /// A term-less order proof WITHOUT the value openings fails closed; term-bearing still verifies.
+    #[test]
+    fn i2b_step3_order_termless_rejects_missing_openings() {
+        let layer = layer();
+        let (input, mut result) = prove_attach_order(&layer, OrderDirection::Ascending);
+        result.proof.value_openings = None;
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let err = verify_exact_scalar_order(&termless, &input.view(), CanonicalDatatype::UInt32,
+            OrderDirection::Ascending, &result.commitments, result.n, result.log_domain, &result.proof,
+            &mut transcript()).unwrap_err();
+        assert!(err.to_string().contains("Merkle openings"), "{err}");
+        verify_exact_scalar_order(&layer, &input.view(), CanonicalDatatype::UInt32,
+            OrderDirection::Ascending, &result.commitments, result.n, result.log_domain, &result.proof,
+            &mut transcript()).unwrap();
     }
 }

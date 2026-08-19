@@ -251,7 +251,14 @@ pub(super) const OUTER_VERSION: u32 = 11;
 // v35: Merkle-dict I2b step 3 — recursive envelopes embed a `RecursiveRelationProof::Bgp` leaf
 // (`LayerBgpProof`) whose `RangeAtomSubproof` gained the term-less value↔term witness (`oid` +
 // `value_openings`), so every recursive envelope carrying a BGP leaf with a ranged atom shifts.
-pub(super) const RECURSIVE_VERSION: u32 = 35;
+// v36: Merkle-dict I2b step 3 (ORDER + GROUP) — the recursive `ExactScalarOrder`/`ExactMultiOrder`/
+// `GroupExtrema` variants gained the term-less value↔term witness: `ExactScalarOrderProof` +
+// `{oid, value_openings}`, `ExactMultiOrderProof` + `value_openings`, `GroupExtremaEntryProof` +
+// `oid`, `GroupExtremaProof` + `value_openings`. A term-bearing order/group proof carries empty
+// vectors + `None` (length prefixes + one option tag), so every recursive envelope with an
+// order/group node shifts. Order/group appear ONLY under `RecursiveRelationProof` (the standalone
+// UNION/ANTI/OUTER envelopes embed only `LayerBgpEnvelope` branches), so ONLY this version bumps.
+pub(super) const RECURSIVE_VERSION: u32 = 36;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -597,10 +604,16 @@ wire_struct!(ExactScalarOrderProof {
     datatype_filter,
     datatype_selection_commitment,
     datatype_inverse_commitment,
-    sorted
+    sorted,
+    // Merkle-dict I2b step 3: the term-less value↔term witness (empty vec + `None` on a
+    // term-bearing artifact). Uncommitted — re-checked by `verify_dict_value_terms`.
+    oid,
+    value_openings
 });
 wire_struct!(LexicographicSortedProof { sorted });
-wire_struct!(ExactMultiOrderProof { permutation, lexicographic });
+// Merkle-dict I2b step 3: `value_openings` carries the term-less value↔term witness; the per-key
+// `oid` is the shipped `result_columns[k]`, so no `oid` field here. `None` on a term-bearing artifact.
+wire_struct!(ExactMultiOrderProof { permutation, lexicographic, value_openings });
 
 impl Wire for OrderDirection {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
@@ -630,9 +643,12 @@ wire_struct!(GroupExtremaEntryProof {
     com_dict_value_at_d,
     com_dict_datatype_at_d,
     range,
-    com_range_selection
+    com_range_selection,
+    // Merkle-dict I2b step 3: the term-less per-group value-column object ids (empty on a
+    // term-bearing artifact). Uncommitted — recommitted to `com_value_at_d` at verify.
+    oid
 });
-wire_struct!(GroupExtremaProof { entries });
+wire_struct!(GroupExtremaProof { entries, value_openings });
 
 impl Wire for GroupExtremaKind {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {

@@ -20,6 +20,7 @@
 //! order-preserving datatypes (the integer/float/boolean family) are accepted, because the
 //! order proof compares the committed value encodings as magnitudes.
 
+use std::collections::BTreeMap;
 use std::{cmp::Ordering, io};
 use ark_ff::PrimeField;
 use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
@@ -27,7 +28,14 @@ use dory_pcs::primitives::arithmetic::Field;
 use dory_pcs::primitives::transcript::Transcript;
 use super::argument::{commit_column, StoreProverContext, Transcript254};
 use super::bgp::{RelationCommit, RelationWitness};
-use super::commitment::{node_value_op_value, LayerCommitment, VerifierLayer};
+use super::commitment::{
+    node_value_op_value, reject_nan_objects, LayerCommitment, ResolutionOpenings,
+    VerifierCommitmentRef, VerifierLayer,
+};
+use super::query::{
+    build_resolution_openings, canonical_dictionary_id, require_base_layer_for_query,
+    resolve_node_value_id_via_merkle, verify_dict_value_terms,
+};
 use super::lexsort::{prove_lexicographically_nondecreasing_with_context, verify_lexicographically_nondecreasing, LexicographicSortedProof};
 use super::order::OrderDirection;
 use super::permutation::{prove_relation_permutation_with_context, verify_relation_permutation, RelationPermutationProof};
@@ -39,6 +47,15 @@ use super::{invalid, CanonicalDatatype, CanonicalObject};
 pub struct ExactMultiOrderProof {
     pub permutation: RelationPermutationProof,
     pub lexicographic: LexicographicSortedProof,
+    /// Merkle-dict I2b step 3 (value↔term consistency, TERM-LESS multi-key order). One
+    /// positional Merkle opening per DISTINCT id touched across ALL key columns (node/value
+    /// namespace). `None` on a TERM-BEARING artifact (the catalog re-MSM ties each key's
+    /// value/datatype to real terms). On a TERM-LESS artifact the verifier rederives each key
+    /// column's sort values from these openings and ties them to the root-bound output-id
+    /// commitments per column ([`verify_dict_value_terms`]); the per-column `oid` vector is the
+    /// shipped `result_columns[k]` (already bound to `result_commitments[k]`), so no separate
+    /// `oid` field is needed. UNCOMMITTED — a missing opening (or recommit mismatch) fails closed.
+    pub value_openings: Option<ResolutionOpenings>,
 }
 
 /// Prover result: the proof plus the sorted output relation (its id columns, their
@@ -87,6 +104,72 @@ fn resolve_values(source: &impl VerifierLayer, columns: &[Vec<ArkFr>], n: usize,
     }).collect()
 }
 
+/// Merkle-dict I2b step 3 (TERM-LESS value↔term resolve). For each key column, decode its sort
+/// values from the Merkle-authenticated terms at the shipped output ids (`output_columns[k]`) and
+/// tie them to the root-bound `output_commitments[k]` via the audited [`verify_dict_value_terms`].
+///
+/// The per-column `oid` is the shipped `output_columns[k]` itself (already bound to
+/// `output_commitments[k]` by the enclosing envelope's `verify_result_columns`); the tie re-forces
+/// `Com(oid) == output_commitments[k]` HERE too, so a forged `output_columns[k]` recommits
+/// differently and rejects. The locally-built `values`/`dt_col` are consistency-checked by the tie
+/// (`Com(values) == com_v_val` etc.), so the returned per-row value columns are exactly
+/// OP-encode(real term) — the columns `lexsort` consumes. Missing openings / non-value ids / a
+/// datatype mismatch all fail closed.
+fn resolve_values_termless(
+    view: VerifierCommitmentRef<'_>,
+    output_columns: &[Vec<ArkFr>],
+    output_commitments: &[ArkGT],
+    n: usize,
+    datatypes: &[CanonicalDatatype],
+    domain: usize,
+    proof: &ExactMultiOrderProof,
+) -> io::Result<Vec<Vec<ArkFr>>> {
+    view.validate()?;
+    require_base_layer_for_query(view.state)?;
+    let value_openings = proof.value_openings.as_ref().ok_or_else(|| {
+        invalid("term-less exact multi-column OrderBy requires the prover-shipped value↔term Merkle openings")
+    })?;
+    if output_commitments.len() != output_columns.len() {
+        return Err(invalid("multi-order term-less output/commitment shape mismatch"));
+    }
+    let trusted_root = view.resolution_root();
+    output_columns.iter().zip(datatypes).zip(output_commitments).map(|((column, datatype), com)| {
+        if column.len() < n { return Err(invalid("multi-order output column too short")); }
+        let mut oid: Vec<u64> = Vec::with_capacity(n);
+        let mut values = vec![ArkFr::zero(); domain];
+        let mut dt_col = vec![ArkFr::zero(); domain];
+        let mut cache: BTreeMap<u64, (ArkFr, ArkFr)> = BTreeMap::new();
+        for (i, id) in column[..n].iter().enumerate() {
+            let raw = canonical_dictionary_id(id)?;
+            if raw == 0 { return Err(invalid("multi-order key id must be a nonzero dictionary id")); }
+            oid.push(raw);
+            let (val, dt) = if let Some(entry) = cache.get(&raw) {
+                *entry
+            } else {
+                let opened = resolve_node_value_id_via_merkle(id, view, None, Some(value_openings))?;
+                let actual = match &opened {
+                    CanonicalObject::Value { datatype, .. } => *datatype,
+                    _ => return Err(invalid("multi-order key is not a value")),
+                };
+                if actual != *datatype { return Err(invalid("multi-order datatype mask is not complete")); }
+                let val = node_value_op_value(&opened)?;
+                let dt = ArkFr::from_u64(actual as u8 as u64);
+                cache.insert(raw, (val, dt));
+                (val, dt)
+            };
+            values[i] = val;
+            dt_col[i] = dt;
+        }
+        // Audited tie: binds this column's ids to the root-bound output_commitments[k] and
+        // re-verifies value/datatype == the Merkle terms (consistency-checking the resolve above).
+        let com_v_val = commit_column(&values)?;
+        let com_v_dt = commit_column(&dt_col)?;
+        let touched = verify_dict_value_terms(com, &com_v_val, &com_v_dt, n, domain, &oid, value_openings, view, trusted_root)?;
+        reject_nan_objects(&touched, ArkFr::from_u64(*datatype as u64))?;
+        Ok(values)
+    }).collect()
+}
+
 fn bind(transcript: &mut Transcript254, datatypes: &[CanonicalDatatype], key_indices: &[usize], directions: &[OrderDirection], n: usize) {
     transcript.append_bytes(b"pow/multi-order/domain", b"parture/exact-multi-order/v0");
     transcript.append_bytes(b"pow/multi-order/rows", &(n as u64).to_le_bytes());
@@ -121,7 +204,9 @@ pub fn prove_exact_multi_order_with_context(context: &StoreProverContext<'_>, la
     let ordered_key_values = key_indices.iter().map(|i| ordered_values[*i].clone()).collect::<Vec<_>>();
     let ordered_key_commitments = key_indices.iter().map(|i| value_commitments[*i]).collect::<Vec<_>>();
     let lexicographic = prove_lexicographically_nondecreasing_with_context(context, &ordered_key_values, &ordered_key_commitments, directions, &chi_commitment, input.n, transcript)?;
-    Ok(ExactMultiOrderResult { proof: ExactMultiOrderProof { permutation: permutation.proof, lexicographic }, commitments: permutation.commitments, columns: permutation.columns, log_domain: permutation.log_domain, n: permutation.n })
+    // Merkle-dict I2b step 3: term-bearing by default (the catalog re-MSM ties value/datatype to
+    // terms). `build_termless_multi_order_openings` fills `value_openings` for a TERM-LESS artifact.
+    Ok(ExactMultiOrderResult { proof: ExactMultiOrderProof { permutation: permutation.proof, lexicographic, value_openings: None }, commitments: permutation.commitments, columns: permutation.columns, log_domain: permutation.log_domain, n: permutation.n })
 }
 
 /// Verify an exact multi-key order proof: the claimed output relation (its `output_columns`
@@ -133,11 +218,47 @@ pub fn verify_exact_multi_order(source: &impl VerifierLayer, input: &RelationCom
     verify_relation_permutation(input, output_commitments, output_len, output_log_domain, &proof.permutation, transcript)?;
     if output_len != input.n || output_log_domain != input.log_domain || output_columns.len() != datatypes.len() { return Err(invalid("multi-order output shape mismatch")); }
     let domain = 1usize << output_log_domain;
-    let values = resolve_values(source, output_columns, output_len, datatypes, domain)?;
+    let view = source.verifier_view();
+    // Merkle-dict I2b step 3 (value↔term consistency). Each key column's sort values are its ids'
+    // order-preserving dict VALUEs. TERM-BEARING: `resolve_values` decodes them from the root-bound
+    // catalog (re-MSM tie). TERM-LESS: the catalog is dropped ⇒ decode from the Merkle-authenticated
+    // terms via the prover-shipped openings and tie each column to its root-bound output-id
+    // commitment. Missing openings ⇒ Err (fail-closed). DELTA order stays fail-closed.
+    let values = if view.terms_present {
+        resolve_values(source, output_columns, output_len, datatypes, domain)?
+    } else {
+        resolve_values_termless(view, output_columns, output_commitments, output_len, datatypes, domain, proof)?
+    };
     let commitments = values.iter().map(|column| commit_column(column)).collect::<io::Result<Vec<_>>>()?;
     let mut chi = vec![ArkFr::zero(); domain]; chi[..output_len].fill(ArkFr::one());
     let key_commitments = key_indices.iter().map(|i| commitments[*i]).collect::<Vec<_>>();
     verify_lexicographically_nondecreasing(&key_commitments, directions, &commit_column(&chi)?, output_len, &proof.lexicographic, transcript)
+}
+
+/// Merkle-dict I2b step 3 (producer): mint the TERM-LESS value↔term witness for a proven
+/// base/rollup exact-multi-order proof. `output_columns` are the SORTED output id columns
+/// (`result.columns`); `n` is the real row count. Opens each DISTINCT id touched across ALL key
+/// columns against the node/value tree, populating `proof.value_openings` IN PLACE. The per-column
+/// `oid` is the shipped `output_columns[k]` itself, so no `oid` field is minted. UNCOMMITTED
+/// witness; BASE/ROLLUP single-layer ONLY (delta multi-order stays fail-closed).
+pub fn build_termless_multi_order_openings(
+    layer: &LayerCommitment,
+    proof: &mut ExactMultiOrderProof,
+    output_columns: &[Vec<ArkFr>],
+    n: usize,
+) -> io::Result<()> {
+    require_base_layer_for_query(layer.verifier_view().state)?;
+    let mut nv_ids: Vec<u64> = Vec::new();
+    for column in output_columns {
+        for value in column.iter().take(n) {
+            let raw = canonical_dictionary_id(value)?;
+            if raw != 0 { nv_ids.push(raw); }
+        }
+    }
+    // `build_resolution_openings` dedups + routes each id to the layer's interval.
+    let openings = build_resolution_openings(&[layer.verifier_view()], &nv_ids, &[])?;
+    proof.value_openings = Some(openings);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -168,7 +289,9 @@ mod tests {
         verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &[1,0], &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-test")).unwrap();
         let termless = layer.verifier_commitment_termless().unwrap();
         let err = verify_exact_multi_order(&termless, &input.view(), &result.columns, &types, &[1,0], &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"multiorder-test")).unwrap_err();
-        assert!(err.to_string().contains("terms-bearing"), "{err}");
+        // Merkle-dict I2b step 3: a term-less multi-order proof WITHOUT the value openings still
+        // fails closed, now with the step-3 "value↔term Merkle openings" message.
+        assert!(err.to_string().contains("Merkle openings"), "{err}");
     }
 
     #[test]
@@ -271,5 +394,69 @@ mod tests {
         // TRUNCATION: claiming one fewer row is not a full-row permutation of the three input rows.
         let truncated = result.columns.iter().map(|c| { let mut c = c.clone(); c[2] = ArkFr::zero(); c }).collect::<Vec<_>>();
         assert!(reject(truncated, result.n - 1));
+    }
+
+    // =====================================================================================
+    // Merkle-dict I2b step 3 (value↔term consistency, MULTI-KEY ORDER). A TERM-LESS base/rollup
+    // multi-order proof rederives each key column's sort values from the Merkle-authenticated terms
+    // and ties them (per column) to the root-bound output-id commitments. Term-bearing unchanged.
+    // =====================================================================================
+    fn prove_attach_multi(layer: &LayerCommitment) -> (RelationWitness, ExactMultiOrderResult, [CanonicalDatatype; 2], [usize; 2], [OrderDirection; 2]) {
+        let input = RelationWitness::commit(vec![
+            vec![id(layer,2),id(layer,1),id(layer,1)],
+            vec![id(layer,8),id(layer,3),id(layer,9)],
+        ], 3).unwrap();
+        let types = [CanonicalDatatype::UInt32, CanonicalDatatype::UInt32];
+        let keys = [1usize, 0];
+        let dirs = [OrderDirection::Descending, OrderDirection::Ascending];
+        let mut result = prove_exact_multi_order_with_context(&StoreProverContext::cpu(), layer, &input, &types, &keys, &dirs, &mut Transcript254::new(b"mo-step3")).unwrap();
+        let n = result.n;
+        build_termless_multi_order_openings(layer, &mut result.proof, &result.columns, n).unwrap();
+        assert!(result.proof.value_openings.is_some(), "multi-order value openings attached");
+        (input, result, types, keys, dirs)
+    }
+
+    /// Differential positive: a TERM-LESS multi-key order proof verifies EXACTLY like the
+    /// TERM-BEARING one — same accept (honest) and same reject (wrong key priority).
+    #[test]
+    fn i2b_step3_multi_order_termless_differential() {
+        let layer = fixture();
+        let (input, result, types, keys, dirs) = prove_attach_multi(&layer);
+        let termless = layer.verifier_commitment_termless().unwrap();
+        verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &keys, &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"mo-step3")).unwrap();
+        verify_exact_multi_order(&termless, &input.view(), &result.columns, &types, &keys, &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"mo-step3")).unwrap();
+        // Same reject: a different key priority rejects on BOTH artifacts.
+        assert!(verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &[0,1], &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"mo-step3")).is_err());
+        assert!(verify_exact_multi_order(&termless, &input.view(), &result.columns, &types, &[0,1], &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"mo-step3")).is_err());
+    }
+
+    /// A forged output-id column (`output_columns[k]`) no longer recommits to `output_commitments[k]`
+    /// ⇒ REJECT (the per-column tie binds it; the gadget is self-contained, not relying on the
+    /// enclosing `verify_result_columns`).
+    #[test]
+    fn i2b_step3_multi_order_termless_rejects_forged_output_ids() {
+        let layer = fixture();
+        let (input, result, types, keys, dirs) = prove_attach_multi(&layer);
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let mut forged = result.columns.clone();
+        // Forge column 0 row 0 to a DIFFERENT real dict id that IS present in the shipped openings
+        // (id(8) appears in column 1), so the resolve opens it fine and the TIE's `oid` recommit is
+        // the load-bearing check: Com(oid) != output_commitments[0] ⇒ REJECT.
+        forged[0][0] = id(&layer, 8);
+        let err = verify_exact_multi_order(&termless, &input.view(), &forged, &types, &keys, &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"mo-step3")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("oid column"), "GOT: {}", msg);
+    }
+
+    /// A term-less multi-order proof WITHOUT the value openings fails closed; term-bearing verifies.
+    #[test]
+    fn i2b_step3_multi_order_termless_rejects_missing_openings() {
+        let layer = fixture();
+        let (input, mut result, types, keys, dirs) = prove_attach_multi(&layer);
+        result.proof.value_openings = None;
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let err = verify_exact_multi_order(&termless, &input.view(), &result.columns, &types, &keys, &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"mo-step3")).unwrap_err();
+        assert!(err.to_string().contains("Merkle openings"), "{err}");
+        verify_exact_multi_order(&layer, &input.view(), &result.columns, &types, &keys, &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"mo-step3")).unwrap();
     }
 }

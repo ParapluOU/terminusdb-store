@@ -159,6 +159,13 @@ pub(crate) use layer_bgp::verify_layer_bgp_with_constant_openings;
 // Crate-internal API (consumed by sibling proof modules such as `envelope`).
 pub(crate) use column_source::require_base_layer_for_query;
 pub(crate) use plan::has_ground_result_unit;
+// Merkle-dict I2b step 3 (value↔term consistency): the shared audited helper + its Merkle
+// resolver / id decoder, re-exposed at `pub(crate)` so the sibling `order`/`multiorder`/`group`
+// gadgets (in `crate::proof`, one level up) can tie their term-less value/datatype columns to the
+// Merkle-authenticated terms exactly as the range gadget does.
+pub(crate) use result::{
+    canonical_dictionary_id, resolve_node_value_id_via_merkle, verify_dict_value_terms,
+};
 
 // I1 differential-test baseline: the pre-Merkle catalog-scan resolvers, reachable from the
 // query test module to assert the Merkle path resolves every id identically.

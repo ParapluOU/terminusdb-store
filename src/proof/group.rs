@@ -17,7 +17,13 @@ use dory_pcs::primitives::transcript::Transcript;
 
 use super::argument::{commit_column, StoreProverContext, Transcript254};
 use super::bgp::{RelationCommit, RelationWitness};
-use super::commitment::{LayerCommitment, VerifierLayer};
+use super::commitment::{
+    node_value_op_value, reject_nan_objects, LayerCommitment, ResolutionOpenings, VerifierLayer,
+};
+use super::query::{
+    build_resolution_openings, canonical_dictionary_id, require_base_layer_for_query,
+    resolve_node_value_id_via_merkle, verify_dict_value_terms,
+};
 use super::equality::{
     prove_relation_equality_with_context, verify_relation_equality, RelationEqualityConstraint,
     RelationEqualityProof,
@@ -75,12 +81,25 @@ pub struct GroupExtremaEntryProof {
     pub com_dict_datatype_at_d: ArkGT,
     pub range: ObjectRangeProof,
     pub com_range_selection: ArkGT,
+    /// Merkle-dict I2b step 3 (value↔term consistency, TERM-LESS group). The real object ids of
+    /// this group's VALUE column (`oid[i]` = the id at compacted row `i`, length = `group_len`,
+    /// in input/compaction order), which `com_value_at_d` commits and `range.lookup` gathers
+    /// `(v_val, v_dt)` from. EMPTY on a TERM-BEARING artifact. On a TERM-LESS artifact the verifier
+    /// recommits `oid` to `com_value_at_d` and rederives `range.lookup.com_v_val`/`com_v_dt` from
+    /// the Merkle-authenticated opened terms ([`verify_dict_value_terms`]) — the SAME columns the
+    /// Min/Max range selection consumes. UNCOMMITTED; a missing opening / recommit mismatch fails
+    /// closed.
+    pub oid: Vec<u64>,
 }
 
 /// A group-extrema proof: one entry per public output group row.
 #[derive(Clone, Debug)]
 pub struct GroupExtremaProof {
     pub entries: Vec<GroupExtremaEntryProof>,
+    /// Merkle-dict I2b step 3: one positional Merkle opening per DISTINCT id touched across ALL
+    /// groups' value columns AND the extremum ids (node/value namespace). `None` on a TERM-BEARING
+    /// artifact (the catalog re-MSM ties value/datatype to real terms). UNCOMMITTED.
+    pub value_openings: Option<ResolutionOpenings>,
 }
 
 /// Prover result: the proof plus the output relation `(key, extremum-id)` — its columns,
@@ -150,18 +169,36 @@ fn validate_statement(input: &RelationCommit, key: usize, value: usize, datatype
     Ok(())
 }
 
-fn extremum_encoding(source: &impl VerifierLayer, id: u64, datatype: CanonicalDatatype) -> io::Result<ArkFr> {
+fn extremum_encoding(
+    source: &impl VerifierLayer,
+    id: u64,
+    datatype: CanonicalDatatype,
+    openings: Option<&ResolutionOpenings>,
+) -> io::Result<ArkFr> {
     let layer = source.verifier_view();
-    // Merkle-dict I2b S2 fail-close: encodes the chosen extremum id's dict VALUE — untied to
-    // terms on a TERM-LESS artifact. (Belt; `verify_group_extrema` also guards at entry.)
-    layer.require_terms_present("group extremum value encoding")?;
-    let record = layer.node_value_catalog.iter().find(|r| r.object_id == id)
-        .ok_or_else(|| invalid("group-extrema result id absent from node/value dictionary"))?;
-    match &record.triple.object {
+    // Merkle-dict I2b step 3: encode the chosen extremum id's order-preserving dict VALUE (the
+    // range-select constant `c`). TERM-BEARING reads the root-bound catalog; TERM-LESS opens the id
+    // against the `resolution_root`-bound Merkle tree (the extremum is a member of its group's value
+    // column, so its opening is present in `value_openings`). Either way the datatype must match.
+    let object = if layer.terms_present {
+        layer
+            .node_value_catalog
+            .iter()
+            .find(|r| r.object_id == id)
+            .ok_or_else(|| invalid("group-extrema result id absent from node/value dictionary"))?
+            .triple
+            .object
+            .clone()
+    } else {
+        let openings = openings
+            .ok_or_else(|| invalid("term-less group extremum requires the value↔term Merkle openings"))?;
+        resolve_node_value_id_via_merkle(&ArkFr::from_u64(id), layer, None, Some(openings))?
+    };
+    match &object {
         CanonicalObject::Value { datatype: actual, .. } if *actual == datatype => {}
         _ => return Err(invalid("group-extrema result does not have the exact planned datatype")),
     }
-    super::commitment::node_value_op_value(&record.triple.object)
+    node_value_op_value(&object)
 }
 
 /// Prove a scalar-key `GroupBy(key_column)` followed by `RangeMin`/`RangeMax(value_column)`
@@ -208,7 +245,7 @@ pub fn prove_group_extrema_with_context(
         let log_domain = 1;
         let columns = vec![vec![ArkFr::zero(); 2], vec![ArkFr::zero(); 2]];
         let commitments = columns.iter().map(|c| context.commit_column(c)).collect::<io::Result<Vec<_>>>()?;
-        return Ok(GroupExtremaResult { proof: GroupExtremaProof { entries: Vec::new() }, columns, commitments, log_domain, n: 0 });
+        return Ok(GroupExtremaResult { proof: GroupExtremaProof { entries: Vec::new(), value_openings: None }, columns, commitments, log_domain, n: 0 });
     }
     let (dict_id, dict_value, dict_datatype) = {
         let (_, id) = layer.node_value_dictionary_columns()?;
@@ -247,7 +284,7 @@ pub fn prove_group_extrema_with_context(
         let relocate_dict_id = prove_column_relocation_with_context(context, &dict_id, &layer.node_value_dict_commitments.1, &dict_id_at_d, &com_dict_id_at_d, transcript)?;
         let relocate_dict_value = prove_column_relocation_with_context(context, &dict_value, &layer.node_value_dict_range_commitments.0, &dict_value_at_d, &com_dict_value_at_d, transcript)?;
         let relocate_dict_datatype = prove_column_relocation_with_context(context, &dict_datatype, &layer.node_value_dict_range_commitments.1, &dict_datatype_at_d, &com_dict_datatype_at_d, transcript)?;
-        let c = extremum_encoding(layer, extremum, datatype)?;
+        let c = extremum_encoding(layer, extremum, datatype, None)?;
         let (range, com_range_selection) = prove_object_range_select_with_context(
             context, &value_at_d, &com_value_at_d, &dict_id_at_d, &dict_value_at_d, &dict_datatype_at_d,
             &com_dict_id_at_d, &com_dict_value_at_d, &com_dict_datatype_at_d, n_dict,
@@ -268,6 +305,9 @@ pub fn prove_group_extrema_with_context(
             relocate_value, relocate_dict_id, relocate_dict_value, relocate_dict_datatype,
             com_value_at_d, com_dict_id_at_d, com_dict_value_at_d, com_dict_datatype_at_d,
             range, com_range_selection,
+            // Merkle-dict I2b step 3: term-bearing by default; `build_termless_group_openings`
+            // fills the per-group value oid vector for a TERM-LESS artifact.
+            oid: Vec::new(),
         });
     }
     if entries.iter().try_fold(0usize, |n, e| n.checked_add(e.group_len)).ok_or_else(|| invalid("group-extrema cardinality overflow"))? != input.n {
@@ -276,7 +316,7 @@ pub fn prove_group_extrema_with_context(
     let out_log = result_rows.len().max(1).next_power_of_two().max(2).trailing_zeros() as usize;
     let columns = vec![padded(&result_rows.iter().map(|r| ArkFr::from_u64(r.0)).collect::<Vec<_>>(), out_log), padded(&result_rows.iter().map(|r| ArkFr::from_u64(r.1)).collect::<Vec<_>>(), out_log)];
     let commitments = columns.iter().map(|c| context.commit_column(c)).collect::<io::Result<Vec<_>>>()?;
-    Ok(GroupExtremaResult { proof: GroupExtremaProof { entries }, columns, commitments, log_domain: out_log, n: result_rows.len() })
+    Ok(GroupExtremaResult { proof: GroupExtremaProof { entries, value_openings: None }, columns, commitments, log_domain: out_log, n: result_rows.len() })
 }
 
 /// Verify a group-extrema proof: the public `result_rows` are exactly one `(key, min/max)`
@@ -292,16 +332,27 @@ pub fn verify_group_extrema(
     if proof.entries.len() != result_rows.len() { return Err(invalid("group-extrema proof/result count mismatch")); }
     bind(transcript, input, key_column, value_column, datatype, kind, result_rows);
     let view = layer.verifier_view();
-    // Merkle-dict I2b S2 fail-close: GroupBy + Min/Max ranges over the order-preserving dict
-    // VALUE column, tied to real terms only by the catalog re-MSM a TERM-LESS artifact drops.
-    view.require_terms_present("group extrema (GroupBy + Min/Max over dictionary values)")?;
     view.validate()?;
-    super::commitment::reject_nan_catalog(
-        &view.node_value_catalog,
-        ArkFr::from_u64(datatype as u64),
-    )?;
+    // Merkle-dict I2b step 3 (value↔term consistency). GroupBy + Min/Max ranges over each group's
+    // order-preserving dict VALUE column. TERM-BEARING: `validate()`'s catalog re-MSM ties
+    // value/datatype to the clear terms, the NaN guard scans the catalog, and the shipped count is
+    // cross-checked. TERM-LESS: the re-MSM is dropped ⇒ require the openings (fail-closed) and,
+    // per entry, tie the gathered `(v_val, v_dt)` to the Merkle terms (below). Reject a delta layer
+    // (base/rollup only). `n_dict` is root-bound (`state.node_value_count`) either way.
+    let value_openings: Option<&ResolutionOpenings> = if view.terms_present {
+        super::commitment::reject_nan_catalog(
+            &view.node_value_catalog,
+            ArkFr::from_u64(datatype as u64),
+        )?;
+        None
+    } else {
+        require_base_layer_for_query(view.state)?;
+        Some(proof.value_openings.as_ref().ok_or_else(|| {
+            invalid("term-less group extrema requires the prover-shipped value↔term Merkle openings")
+        })?)
+    };
     let n_dict = view.state.node_value_count as usize;
-    if n_dict != view.node_value_catalog.len() || (!result_rows.is_empty() && n_dict == 0) { return Err(invalid("group-extrema dictionary count mismatch or empty")); }
+    if (view.terms_present && n_dict != view.node_value_catalog.len()) || (!result_rows.is_empty() && n_dict == 0) { return Err(invalid("group-extrema dictionary count mismatch or empty")); }
     if result_rows.is_empty() { return Ok(()); }
     let dict_len = n_dict.next_power_of_two().max(2);
     let dict_log = dict_len.trailing_zeros() as usize;
@@ -321,7 +372,27 @@ pub fn verify_group_extrema(
         verify_column_relocation(&view.node_value_dict_commitments.1, dict_log, &entry.com_dict_id_at_d, d_log, &entry.relocate_dict_id, transcript)?;
         verify_column_relocation(&view.node_value_dict_range_commitments.0, dict_log, &entry.com_dict_value_at_d, d_log, &entry.relocate_dict_value, transcript)?;
         verify_column_relocation(&view.node_value_dict_range_commitments.1, dict_log, &entry.com_dict_datatype_at_d, d_log, &entry.relocate_dict_datatype, transcript)?;
-        let c = extremum_encoding(layer, extremum, datatype)?;
+        let c = extremum_encoding(layer, extremum, datatype, value_openings)?;
+        // Merkle-dict I2b step 3 (TERM-LESS value↔term tie). The range-select below gathers
+        // `range.lookup.com_v_val`/`com_v_dt` at each group VALUE id (from `com_value_at_d`); on a
+        // term-less artifact those committed dict columns are prover-chosen. Recommit the shipped
+        // `oid` to `com_value_at_d` (binding the group value column) and rederive the value/datatype
+        // from the Merkle terms, forcing the Min/Max comparison onto real values. Runs BEFORE the
+        // (transcript-consuming) range-select; it is itself transcript-free.
+        if let Some(openings) = value_openings {
+            let touched = verify_dict_value_terms(
+                &entry.com_value_at_d,
+                &entry.range.lookup.com_v_val,
+                &entry.range.lookup.com_v_dt,
+                entry.group_len,
+                1usize << d_log,
+                &entry.oid,
+                openings,
+                view,
+                view.resolution_root(),
+            )?;
+            reject_nan_objects(&touched, ArkFr::from_u64(datatype as u64))?;
+        }
         verify_object_range_select(&entry.com_value_at_d, &entry.com_dict_id_at_d, &entry.com_dict_value_at_d, &entry.com_dict_datatype_at_d,
             n_dict, ArkFr::from_u64(datatype as u64), kind.op(), c, OBJECT_RANGE_B_BITS, entry.group_len,
             &entry.com_range_selection, &entry.range, transcript)?;
@@ -337,6 +408,55 @@ pub fn verify_group_extrema(
         if entry.com_range_selection != expected_whole { return Err(invalid("group-extrema candidate does not dominate its group")); }
     }
     if total != input.n { return Err(invalid("group-extrema groups do not exactly cover input")); }
+    Ok(())
+}
+
+/// Merkle-dict I2b step 3 (producer): mint the TERM-LESS value↔term witness for a proven
+/// base/rollup group-extrema proof. Re-derives each group's VALUE column ids by filtering the
+/// (prover-held) `input_columns` where `key_column == key` in input/compaction order — the SAME
+/// dense compaction `com_value_at_d` commits — records them as `entry.oid`, and opens each DISTINCT
+/// touched id (group values + extremum ids) against the node/value tree into `proof.value_openings`.
+/// UNCOMMITTED witness; BASE/ROLLUP single-layer ONLY (delta group stays fail-closed).
+pub fn build_termless_group_openings(
+    layer: &LayerCommitment,
+    proof: &mut GroupExtremaProof,
+    input_columns: &[Vec<ArkFr>],
+    input_n: usize,
+    key_column: usize,
+    value_column: usize,
+    result_rows: &[(u64, u64)],
+) -> io::Result<()> {
+    require_base_layer_for_query(layer.verifier_view().state)?;
+    if proof.entries.len() != result_rows.len() {
+        return Err(invalid("group openings: proof/result count mismatch"));
+    }
+    if key_column >= input_columns.len() || value_column >= input_columns.len() {
+        return Err(invalid("group openings: column out of range"));
+    }
+    if input_columns[key_column].len() < input_n || input_columns[value_column].len() < input_n {
+        return Err(invalid("group openings: input column too short"));
+    }
+    let mut nv_ids: Vec<u64> = Vec::new();
+    for (entry, &(key, extremum)) in proof.entries.iter_mut().zip(result_rows) {
+        let mut oid: Vec<u64> = Vec::new();
+        for i in 0..input_n {
+            if canonical_dictionary_id(&input_columns[key_column][i])? == key {
+                let raw = canonical_dictionary_id(&input_columns[value_column][i])?;
+                oid.push(raw);
+                if raw != 0 {
+                    nv_ids.push(raw);
+                }
+            }
+        }
+        entry.oid = oid;
+        // The extremum id (range-select constant `c`) is a member of the group's value column, so
+        // it is already gathered above; push it explicitly as belt-and-suspenders (dedup is free).
+        if extremum != 0 {
+            nv_ids.push(extremum);
+        }
+    }
+    let openings = build_resolution_openings(&[layer.verifier_view()], &nv_ids, &[])?;
+    proof.value_openings = Some(openings);
     Ok(())
 }
 
@@ -411,7 +531,9 @@ mod tests {
         let termless = layer.verifier_commitment_termless().unwrap();
         let mut tv = Transcript254::new(b"group-min-test");
         let err = verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &termless, &result.proof, &mut tv).unwrap_err();
-        assert!(err.to_string().contains("terms-bearing"), "{err}");
+        // Merkle-dict I2b step 3: a term-less group-extrema proof WITHOUT the value openings still
+        // fails closed, now with the step-3 "value↔term Merkle openings" message.
+        assert!(err.to_string().contains("Merkle openings"), "{err}");
     }
 
     #[test]
@@ -419,5 +541,92 @@ mod tests {
         let input = RelationWitness::commit(vec![vec![ArkFr::from_u64(1)], vec![ArkFr::from_u64(2)]], 1).unwrap();
         assert!(validate_statement(&input.view(), 0, 1, CanonicalDatatype::UInt32, &[(1,2),(1,2)]).is_err());
         assert!(validate_statement(&input.view(), 0, 1, CanonicalDatatype::Decimal, &[(1,2)]).is_err());
+    }
+
+    // =====================================================================================
+    // Merkle-dict I2b step 3 (value↔term consistency, GROUP). A TERM-LESS base/rollup group-extrema
+    // proof ties each group's VALUE column (and the extremum constant) to the Merkle-authenticated
+    // terms via the prover-shipped per-group `oid` + value openings. Term-bearing verify unchanged.
+    // =====================================================================================
+    fn prove_attach_group() -> (std::sync::Arc<LayerCommitment>, RelationWitness, Vec<(u64,u64)>, GroupExtremaResult) {
+        let (layer, values, nodes) = fixture();
+        let id = |v| values.iter().find(|x| x.0 == v).unwrap().1;
+        let keys = [nodes[0], nodes[0], nodes[1], nodes[1]];
+        let vals = [id(30), id(10), id(5), id(20)];
+        let input = RelationWitness::commit(vec![
+            keys.iter().map(|x| ArkFr::from_u64(*x)).collect(),
+            vals.iter().map(|x| ArkFr::from_u64(*x)).collect(),
+        ], 4).unwrap();
+        let rows = vec![(nodes[0], id(10)), (nodes[1], id(5))];
+        let mut result = prove_group_extrema(&input, 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &layer, &mut Transcript254::new(b"g-step3")).unwrap();
+        build_termless_group_openings(&layer, &mut result.proof, &input.columns, input.n, 0, 1, &rows).unwrap();
+        assert!(result.proof.value_openings.is_some(), "group value openings attached");
+        assert!(result.proof.entries.iter().all(|e| !e.oid.is_empty()), "group oid vectors minted");
+        (layer, input, rows, result)
+    }
+
+    /// Differential positive: a TERM-LESS group-extrema proof verifies EXACTLY like the
+    /// TERM-BEARING one — same accept (honest Min), same reject (verifying as Max).
+    #[test]
+    fn i2b_step3_group_termless_differential() {
+        let (layer, input, rows, result) = prove_attach_group();
+        let termless = layer.verifier_commitment_termless().unwrap();
+        verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &*layer, &result.proof, &mut Transcript254::new(b"g-step3")).unwrap();
+        verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &termless, &result.proof, &mut Transcript254::new(b"g-step3")).unwrap();
+        // Same reject: verifying a Min proof as Max rejects on BOTH artifacts.
+        assert!(verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Max, &rows, &*layer, &result.proof, &mut Transcript254::new(b"g-step3")).is_err());
+        assert!(verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Max, &rows, &termless, &result.proof, &mut Transcript254::new(b"g-step3")).is_err());
+    }
+
+    /// Forged committed VALUE column (`entry.range.lookup.com_v_val`) ⇒ Merkle-rederived value
+    /// disagrees ⇒ REJECT (term-less).
+    #[test]
+    fn i2b_step3_group_termless_rejects_forged_value_column() {
+        let (layer, input, rows, mut result) = prove_attach_group();
+        result.proof.entries[0].range.lookup.com_v_val = result.proof.entries[0].range.lookup.com_v_dt;
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let err = verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &termless, &result.proof, &mut Transcript254::new(b"g-step3")).unwrap_err();
+        assert!(err.to_string().contains("com_v_val"), "{err}");
+    }
+
+    /// A substituted per-group `oid` no longer recommits to `com_value_at_d` ⇒ REJECT (only the tie
+    /// checks `oid`).
+    #[test]
+    fn i2b_step3_group_termless_rejects_forged_oid() {
+        let (layer, input, rows, mut result) = prove_attach_group();
+        result.proof.entries[0].oid[0] = result.proof.entries[0].oid[0].wrapping_add(1);
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let err = verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &termless, &result.proof, &mut Transcript254::new(b"g-step3")).unwrap_err();
+        assert!(err.to_string().contains("oid column"), "{err}");
+    }
+
+    /// A term-less group proof WITHOUT the value openings fails closed; term-bearing still verifies.
+    #[test]
+    fn i2b_step3_group_termless_rejects_missing_openings() {
+        let (layer, input, rows, mut result) = prove_attach_group();
+        result.proof.value_openings = None;
+        let termless = layer.verifier_commitment_termless().unwrap();
+        let err = verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &termless, &result.proof, &mut Transcript254::new(b"g-step3")).unwrap_err();
+        assert!(err.to_string().contains("Merkle openings"), "{err}");
+        verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &*layer, &result.proof, &mut Transcript254::new(b"g-step3")).unwrap();
+    }
+
+    /// DELTA fail-closed (order + group + multi-order share this root guard): a term-less artifact
+    /// CANNOT be built for a delta layer, so term-less order/group verification over a delta is
+    /// unreachable. (`require_base_layer_for_query` in every term-less verify branch and `validate()`
+    /// re-assert it defense-in-depth.)
+    #[test]
+    fn i2b_step3_delta_termless_artifact_rejected() {
+        let iri = |s: &str| format!("http://group.test/{s}");
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        builder.add_value_triple(ValueTriple::new_value(&iri("a"), &iri("age"), u32::make_entry(&10u32))).unwrap();
+        let base = builder.commit().unwrap();
+        let child = base.open_write().unwrap();
+        child.add_value_triple(ValueTriple::new_value(&iri("b"), &iri("age"), u32::make_entry(&20u32))).unwrap();
+        let delta = child.commit().unwrap().proof_commitment().unwrap();
+        assert!(delta.state.parent_state_root.is_some(), "constructed a delta layer");
+        let err = delta.verifier_commitment_termless().unwrap_err();
+        assert!(err.to_string().contains("base/rollup"), "{err}");
     }
 }

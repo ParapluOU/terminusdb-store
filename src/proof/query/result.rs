@@ -124,7 +124,7 @@ fn resolve_node_value_result_objects_impl(
 /// The canonical u64 an id field element must equal to index a dictionary. Rejects a
 /// field element that is not a small (`< 2^64`) integer, exactly as the generated-decimal
 /// path does before trusting a scalar.
-pub(super) fn canonical_dictionary_id(id: &ArkFr) -> io::Result<u64> {
+pub(crate) fn canonical_dictionary_id(id: &ArkFr) -> io::Result<u64> {
     let raw = id.0.into_bigint().as_ref()[0];
     if ArkFr::from_u64(raw) != *id {
         return Err(invalid("dictionary result id is outside canonical u64 range"));
@@ -170,7 +170,7 @@ fn predicate_merkle_tree(layer: VerifierCommitmentRef<'_>) -> io::Result<DictMer
 /// consume the prover-shipped `openings` for this id (fail-closed `Err` if absent) and verify
 /// it against the SAME root-bound root. Either way `verify_opening` re-forces the interval +
 /// structural position against `nv_merkle_root`, so a wrong/tampered opening is rejected.
-fn resolve_node_value_id_via_merkle(
+pub(crate) fn resolve_node_value_id_via_merkle(
     id: &ArkFr,
     layer: VerifierCommitmentRef<'_>,
     tree: Option<&DictMerkleTree>,
@@ -226,7 +226,7 @@ fn resolve_node_value_id_via_merkle(
 /// ([`verify_opening`] Err), a substituted `oid` (`Com(oid) ≠ com_obj_id`), or a forged
 /// `dict_value`/`dict_datatype` (recommit mismatch) all reject.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn verify_dict_value_terms(
+pub(crate) fn verify_dict_value_terms(
     com_obj_id: &ArkGT,
     com_v_val: &ArkGT,
     com_v_dt: &ArkGT,
