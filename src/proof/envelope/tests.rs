@@ -3528,8 +3528,8 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
             crate::proof::reconcile::verify_reconcile_core(&views, head_root, &reconcile, &mut vt)
                 .unwrap();
         let head_nv = lref.last().unwrap().verifier_view().state.node_value_count as usize;
-        let edge_commit = super::reconciled::verify_reconciled_leaf(
-            &lref,
+        let edge_commit = super::reconciled::verify_reconciled_leaf_from_views(
+            &views,
             &reconcile,
             &verified,
             head_nv,
@@ -3567,8 +3567,8 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
             &mut pt,
         )
         .unwrap();
-        let anchor_commit = super::reconciled::verify_reconciled_leaf(
-            &lref,
+        let anchor_commit = super::reconciled::verify_reconciled_leaf_from_views(
+            &views,
             &reconcile,
             &verified,
             head_nv,
@@ -4687,4 +4687,413 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     #[test]
     fn reconciled_array_walk_soundness_negatives() {
         big_stack(assert_reconciled_array_walk_soundness);
+    }
+
+    // -----------------------------------------------------------------------
+    // C3b: term-less reconciled ordered sys:Array walk (value re-pin + belt-hashed constant).
+    // -----------------------------------------------------------------------
+
+    /// The base triples of a dense array `subject -predicate-> cells` where EVERY cell's
+    /// `sys:index`/`sys:value` is deliberately WRONG, so the delta corrects them ALL — making every
+    /// index literal and value HEAD-minted (needed to swap two head-minted index openings in the
+    /// value-forge headline test).
+    fn array_all_wrong_base(subject: &str, predicate: &str, cells: &[(u64, &str)]) -> Vec<ArrTriple> {
+        let mut base = Vec::new();
+        for (k, _) in cells.iter().enumerate() {
+            let c = cell(k);
+            base.push(ArrTriple::Node(subject.to_string(), predicate.to_string(), c.clone()));
+            base.push(ArrTriple::Node(c.clone(), rdf_type(), sys_array()));
+            base.push(ArrTriple::Index(c.clone(), 900 + k as u64));
+            base.push(ArrTriple::Node(c.clone(), sys_value(), iri(&format!("__wrong{k}__"))));
+        }
+        base
+    }
+
+    /// The delta that corrects EVERY cell of [`array_all_wrong_base`] to its real index/value.
+    fn array_all_cell_delta(cells: &[(u64, &str)]) -> (Vec<ArrTriple>, Vec<ArrTriple>) {
+        let mut removals = Vec::new();
+        let mut additions = Vec::new();
+        for (k, (index, value)) in cells.iter().enumerate() {
+            let c = cell(k);
+            removals.push(ArrTriple::Index(c.clone(), 900 + k as u64));
+            removals.push(ArrTriple::Node(c.clone(), sys_value(), iri(&format!("__wrong{k}__"))));
+            additions.push(ArrTriple::Index(c.clone(), *index));
+            additions.push(ArrTriple::Node(c.clone(), sys_value(), iri(value)));
+        }
+        (removals, additions)
+    }
+
+    /// A base + 1 delta stack whose reconciled `present` is the dense array `subject -predicate-> cells`
+    /// with EVERY cell's index/value HEAD-minted (the whole cell corrected in the delta layer).
+    fn array_all_headminted_stack(
+        subject: &str,
+        predicate: &str,
+        cells: &[(u64, &str)],
+    ) -> Vec<std::sync::Arc<LayerCommitment>> {
+        let base = array_all_wrong_base(subject, predicate, cells);
+        let (removals, additions) = array_all_cell_delta(cells);
+        build_delta_stack(base, removals, additions)
+    }
+
+    /// C3b THE-WIN differential: a reconciled array walk whose HEAD view is TERM-LESS delivers the SAME
+    /// ordered value sequence as the term-bearing path — the HEAD-minted last value (z) and its
+    /// HEAD-minted `sys:index` (2) are rendered / density-re-pinned purely from the prover-shipped
+    /// Merkle openings (no clear head catalog).
+    fn assert_reconciled_array_walk_termless_parity() {
+        let p = iri("items");
+        let s = iri("atldoc");
+        let subj = CanonicalObject::Node(s.clone().into_bytes());
+        let cells = vec![(0u64, "x"), (1, "y"), (2, "z")];
+        let stack = array_delta_stack(&s, &p, &cells);
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+
+        let (mut proof, prover_elements) =
+            super::array_walk::prove_ordered_array_walk_reconciled(&lref, &subj, p.as_bytes()).unwrap();
+        assert_eq!(object_iris(&prover_elements), vec![iri("x"), iri("y"), iri("z")]);
+
+        // Mint the term-less openings (value render + sys:Array belt-hash + index value re-pin) from
+        // the term-bearing catalogs.
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let sys_array_id =
+            super::reconciled::resolve_combined_node_id(&bearing_views, sys_array().as_bytes());
+        let value_ids = proof.value_ids.clone();
+        let index_ids = proof.index_oid.clone();
+        super::array_walk::attach_termless_array_walk_openings(
+            &mut proof, &lref, &value_ids, sys_array_id, &index_ids,
+        )
+        .unwrap();
+
+        // Term-bearing baseline (the `layers` wrapper: catalog scan + catalog render + re-MSM tie).
+        let bearing_elements = super::array_walk::verify_ordered_array_walk_reconciled(
+            &lref, head_root, &subj, p.as_bytes(), &proof,
+        )
+        .unwrap();
+
+        // Term-less head view: verify + render through `_from_views` using ONLY the shipped openings.
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        assert!(!head_termless.verifier_view().terms_present);
+        let termless_views = termless_head_views(&lref, &head_termless);
+        let termless_elements = super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+            &termless_views, head_root, &subj, p.as_bytes(), &proof,
+        )
+        .unwrap();
+
+        assert_eq!(object_iris(&bearing_elements), object_iris(&termless_elements));
+        assert_eq!(
+            object_iris(&termless_elements),
+            vec![iri("x"), iri("y"), iri("z")],
+            "term-less array walk must deliver the exact sys:index-ordered [x, y, z] (z + its index head-minted)"
+        );
+    }
+
+    /// C3b THE HEADLINE — forged range-dict VALUE column ⇒ Err. Over a stack where every cell's
+    /// `sys:index` is head-minted, SWAP the Merkle data of two head-minted index openings: id-of-index-0
+    /// now opens to the term of index-1 (and vice-versa). This is the array-REORDER value forge — a real
+    /// `sys:index` id decodes to a DIFFERENT position. The C2a value re-pin
+    /// (`verify_dict_value_terms_chain`) recomputes each id's true order-preserving value from the
+    /// chain-opened term and finds it no longer matches the density lookup's committed `com_v_val`
+    /// (`Com(ov) != com_v_val`), so the reorder is rejected CLOSED.
+    fn assert_reconciled_array_walk_termless_forged_index_value() {
+        let p = iri("items");
+        let s = iri("afiv");
+        let subj = CanonicalObject::Node(s.clone().into_bytes());
+        let cells = vec![(0u64, "a"), (1, "b"), (2, "c")];
+        let stack = array_all_headminted_stack(&s, &p, &cells);
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+
+        let (mut proof, _) =
+            super::array_walk::prove_ordered_array_walk_reconciled(&lref, &subj, p.as_bytes()).unwrap();
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let sys_array_id =
+            super::reconciled::resolve_combined_node_id(&bearing_views, sys_array().as_bytes());
+        let value_ids = proof.value_ids.clone();
+        let index_ids = proof.index_oid.clone();
+        super::array_walk::attach_termless_array_walk_openings(
+            &mut proof, &lref, &value_ids, sys_array_id, &index_ids,
+        )
+        .unwrap();
+
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+
+        // Sanity: the honest term-less array walk verifies.
+        super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+            &termless_views, head_root, &subj, p.as_bytes(), &proof,
+        )
+        .unwrap();
+
+        // Forge: swap the Merkle data (term/datatype/position/siblings) of the two smallest index
+        // literal ids, keeping their ids — each now opens to the OTHER position's index value.
+        let honest = proof.index_value_openings.clone().unwrap();
+        let mut nv: Vec<_> = honest.node_value_openings().cloned().collect();
+        let pred: Vec<_> = honest.predicate_openings().cloned().collect();
+        nv.sort_by_key(|o| o.id);
+        assert!(nv.len() >= 2, "need >=2 head-minted index openings to swap");
+        let (lo, hi) = (nv[0].clone(), nv[1].clone());
+        nv[0].term_bytes = hi.term_bytes;
+        nv[0].datatype_tag = hi.datatype_tag;
+        nv[0].position = hi.position;
+        nv[0].siblings = hi.siblings;
+        nv[1].term_bytes = lo.term_bytes;
+        nv[1].datatype_tag = lo.datatype_tag;
+        nv[1].position = lo.position;
+        nv[1].siblings = lo.siblings;
+        let mut forged = proof.clone();
+        forged.index_value_openings = Some(
+            crate::proof::commitment::ResolutionOpenings::from_wire(nv, pred).unwrap(),
+        );
+        assert!(
+            super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, p.as_bytes(), &forged,
+            )
+            .is_err(),
+            "a forged index range-dict value column (array reorder) must be rejected by the value re-pin"
+        );
+    }
+
+    /// C3b fail-closed on the index value re-pin: a term-less array walk MUST ship the index value
+    /// openings (they tie the density order key to the real terms). A wholly MISSING carrier fails
+    /// closed at the re-pin's `ok_or_else`; DROPPING a single head-minted index opening fails closed in
+    /// the chain resolver (the dropped id cannot be opened).
+    fn assert_reconciled_array_walk_termless_missing_index_opening() {
+        let p = iri("items");
+        let s = iri("amii");
+        let subj = CanonicalObject::Node(s.clone().into_bytes());
+        let cells = vec![(0u64, "a"), (1, "b"), (2, "c")];
+        let stack = array_all_headminted_stack(&s, &p, &cells);
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+
+        let (mut proof, _) =
+            super::array_walk::prove_ordered_array_walk_reconciled(&lref, &subj, p.as_bytes()).unwrap();
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let sys_array_id =
+            super::reconciled::resolve_combined_node_id(&bearing_views, sys_array().as_bytes());
+        let value_ids = proof.value_ids.clone();
+        let index_ids = proof.index_oid.clone();
+        super::array_walk::attach_termless_array_walk_openings(
+            &mut proof, &lref, &value_ids, sys_array_id, &index_ids,
+        )
+        .unwrap();
+
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+
+        // Sanity: honest verifies.
+        super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+            &termless_views, head_root, &subj, p.as_bytes(), &proof,
+        )
+        .unwrap();
+
+        // (i) WHOLLY MISSING carrier -> fail-closed at the re-pin's `ok_or_else`.
+        let mut none_proof = proof.clone();
+        none_proof.index_value_openings = None;
+        assert!(
+            super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, p.as_bytes(), &none_proof,
+            )
+            .is_err(),
+            "a term-less array density without index value openings must fail closed"
+        );
+
+        // (ii) DROP one head-minted index opening -> the chain resolver cannot open that id.
+        let honest = proof.index_value_openings.clone().unwrap();
+        let dropped_id = honest.node_value_openings().map(|o| o.id).min().unwrap();
+        let mut kept = crate::proof::commitment::ResolutionOpenings::default();
+        for op in honest.node_value_openings() {
+            if op.id == dropped_id {
+                continue;
+            }
+            kept.insert_node_value(op.clone());
+        }
+        let mut missing_proof = proof.clone();
+        missing_proof.index_value_openings = Some(kept);
+        assert!(
+            super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, p.as_bytes(), &missing_proof,
+            )
+            .is_err(),
+            "a missing head-minted index value opening must fail closed"
+        );
+    }
+
+    /// C3b fail-closed on the `sys:Array` class constant + the delivered value render: a forged
+    /// `sys:Array` opening (minted for a NON-array real id) is rejected by the belt-hash (type-check
+    /// bypass blocked); a MISSING / FORGED value opening for a head-minted value fails closed / is
+    /// rejected by `verify_opening`.
+    fn assert_reconciled_array_walk_termless_constant_and_value_openings() {
+        let p = iri("items");
+        let s = iri("acav");
+        let subj = CanonicalObject::Node(s.clone().into_bytes());
+        let cells = vec![(0u64, "x"), (1, "y"), (2, "z")];
+        let stack = array_delta_stack(&s, &p, &cells);
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+
+        let (mut proof, _) =
+            super::array_walk::prove_ordered_array_walk_reconciled(&lref, &subj, p.as_bytes()).unwrap();
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let sys_array_id =
+            super::reconciled::resolve_combined_node_id(&bearing_views, sys_array().as_bytes());
+        // A real but NON-sys:Array node id (a cell node) to forge the class opening with.
+        let cell_id = super::reconciled::resolve_combined_node_id(&bearing_views, cell(0).as_bytes());
+        // A head-minted value id (`z`) whose value opening must bite over a term-less head.
+        let z_id = super::reconciled::resolve_combined_node_id(&bearing_views, iri("z").as_bytes());
+        let value_ids = proof.value_ids.clone();
+        let index_ids = proof.index_oid.clone();
+        super::array_walk::attach_termless_array_walk_openings(
+            &mut proof, &lref, &value_ids, sys_array_id, &index_ids,
+        )
+        .unwrap();
+
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+
+        // Sanity: honest verifies.
+        super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+            &termless_views, head_root, &subj, p.as_bytes(), &proof,
+        )
+        .unwrap();
+
+        // (i) MISSING sys:Array opening -> fail-closed (never a silent scan of the dropped head catalog).
+        let mut no_sa = proof.clone();
+        no_sa.sys_array_opening = None;
+        assert!(
+            super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, p.as_bytes(), &no_sa,
+            )
+            .is_err(),
+            "a term-less array walk without a sys:Array opening must fail closed"
+        );
+
+        // (ii) FORGED sys:Array opening minted for a NON-array real id -> belt-hash rejects (the opened
+        // term does not hash to hash_object(Node(sys:Array)) -> type-check bypass blocked).
+        let forged = crate::proof::commitment::build_resolution_openings(&bearing_views, &[cell_id], &[])
+            .unwrap();
+        let forged_sa = forged.node_value_opening(cell_id).unwrap().clone();
+        let mut forged_proof = proof.clone();
+        forged_proof.sys_array_opening = Some(forged_sa);
+        assert!(
+            super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, p.as_bytes(), &forged_proof,
+            )
+            .is_err(),
+            "a sys:Array opening for a non-array real id must fail the belt-hash (type-check guard)"
+        );
+
+        // (iii) MISSING head-minted value opening (`z`) -> the delivered value render fails closed.
+        let honest_values = proof.value_openings.clone().unwrap();
+        let mut missing_v = crate::proof::commitment::ResolutionOpenings::default();
+        for op in honest_values.node_value_openings() {
+            if op.id == z_id {
+                continue;
+            }
+            missing_v.insert_node_value(op.clone());
+        }
+        let mut missing_v_proof = proof.clone();
+        missing_v_proof.value_openings = Some(missing_v);
+        assert!(
+            super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, p.as_bytes(), &missing_v_proof,
+            )
+            .is_err(),
+            "a missing head-minted value opening must fail closed"
+        );
+
+        // (iv) FORGED head-minted value opening (`z`) term bytes -> verify_opening rejects.
+        let mut forged_v = crate::proof::commitment::ResolutionOpenings::default();
+        for op in honest_values.node_value_openings() {
+            let mut op = op.clone();
+            if op.id == z_id {
+                op.term_bytes[0] ^= 0xff;
+            }
+            forged_v.insert_node_value(op);
+        }
+        let mut forged_v_proof = proof.clone();
+        forged_v_proof.value_openings = Some(forged_v);
+        assert!(
+            super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                &termless_views, head_root, &subj, p.as_bytes(), &forged_v_proof,
+            )
+            .is_err(),
+            "a forged head-minted value opening must be rejected by verify_opening"
+        );
+    }
+
+    /// C3b: the existing density/order forgeries still reject with a TERM-LESS head. The REORDER forge
+    /// rejects in ID-SPACE at the density permutation-to-identity, independent of the value re-pin; the
+    /// openings are attached only so the honest prelude passes and the forgery reaches its gadget.
+    fn assert_reconciled_array_walk_termless_forged_order() {
+        let p = iri("items");
+        let s = iri("afo");
+        let subj = CanonicalObject::Node(s.clone().into_bytes());
+        let cells = vec![(0u64, "m"), (1, "n")];
+        let stack = array_delta_stack(&s, &p, &cells);
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let sys_array_id =
+            super::reconciled::resolve_combined_node_id(&bearing_views, sys_array().as_bytes());
+
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+
+        let verifies = |order: Vec<usize>| {
+            super::array_walk::prove_ordered_array_walk_reconciled_forged(
+                &lref, &subj, p.as_bytes(), order,
+            )
+            .and_then(|(mut proof, _)| {
+                let value_ids = proof.value_ids.clone();
+                let index_ids = proof.index_oid.clone();
+                super::array_walk::attach_termless_array_walk_openings(
+                    &mut proof, &lref, &value_ids, sys_array_id, &index_ids,
+                )?;
+                super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                    &termless_views, head_root, &subj, p.as_bytes(), &proof,
+                )
+            })
+            .is_ok()
+        };
+        // Exactly one density order verifies over the term-less head; the reorder rejects.
+        let ok_count = [vec![0usize, 1], vec![1usize, 0]]
+            .into_iter()
+            .filter(|o| verifies(o.to_vec()))
+            .count();
+        assert_eq!(
+            ok_count, 1,
+            "exactly one density order verifies over a term-less head; a reorder must be rejected"
+        );
+    }
+
+    #[test]
+    fn reconciled_array_walk_termless_parity() {
+        big_stack(assert_reconciled_array_walk_termless_parity);
+    }
+
+    #[test]
+    fn reconciled_array_walk_termless_forged_index_value() {
+        big_stack(assert_reconciled_array_walk_termless_forged_index_value);
+    }
+
+    #[test]
+    fn reconciled_array_walk_termless_missing_index_opening() {
+        big_stack(assert_reconciled_array_walk_termless_missing_index_opening);
+    }
+
+    #[test]
+    fn reconciled_array_walk_termless_constant_and_value_openings() {
+        big_stack(assert_reconciled_array_walk_termless_constant_and_value_openings);
+    }
+
+    #[test]
+    fn reconciled_array_walk_termless_forged_order() {
+        big_stack(assert_reconciled_array_walk_termless_forged_order);
     }

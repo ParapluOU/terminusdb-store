@@ -343,7 +343,7 @@ impl<'a> ChainDictResolver<'a> {
 /// `verify_reconcile_core` / `verify_delta_read_core` (every view `validate()`d + chained to the
 /// trusted head root before this runs), exactly as the sibling chain result-resolver relies on.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn verify_dict_value_terms_chain(
+pub(crate) fn verify_dict_value_terms_chain(
     views: &[VerifierCommitmentRef<'_>],
     com_obj_id: &ArkGT,
     com_v_val: &ArkGT,

@@ -170,26 +170,11 @@ fn leaf_witness(proof: &PresentBgpProof, result: &PresentReadResult) -> io::Resu
     })
 }
 
-/// Verify ONE walk-leaf read (FOUNDATION-A) on the shared `transcript`, returning the authenticated
+/// Verify ONE walk-leaf read (FOUNDATION-A) FROM verifier VIEWS (C3), returning the authenticated
 /// combined-dict-id `RelationCommit` the gluing gadgets consume. Mirror of [`prove_reconciled_leaf`]
 /// — the `verify_present_bgp` call re-derives the kept commitments from the atom's own sub-proofs
-/// (never trusting a fresh relation commitment), so a tampered leaf relation is rejected here.
-pub(crate) fn verify_reconciled_leaf(
-    layers: &[&LayerCommitment],
-    reconcile: &ReconcileProof,
-    verified: &ReconcileVerified,
-    head_nv: usize,
-    atom: PresentBgpAtom,
-    proof: &PresentBgpProof,
-    transcript: &mut Transcript254,
-) -> io::Result<RelationCommit> {
-    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
-    verify_reconciled_leaf_from_views(&views, reconcile, verified, head_nv, atom, proof, transcript)
-}
-
-/// Verify ONE walk-leaf read (FOUNDATION-A) FROM verifier VIEWS (C3), returning the authenticated
-/// combined-dict-id `RelationCommit`. Views-based analogue of [`verify_reconciled_leaf`] (split
-/// exactly like [`verify_read_bgp_from_views`](crate::proof::reconcile::verify_read_bgp_from_views)):
+/// (never trusting a fresh relation commitment), so a tampered leaf relation is rejected here. Split
+/// exactly like [`verify_read_bgp_from_views`](crate::proof::reconcile::verify_read_bgp_from_views):
 /// it accepts the borrowed [`VerifierCommitmentRef`] slice directly, so a TERM-LESS reconcile view
 /// (built via [`LayerCommitment::verifier_commitment_termless`] on the head, term-bearing elsewhere)
 /// can be passed for the term-less remote verifier. The leaf atom carries no range

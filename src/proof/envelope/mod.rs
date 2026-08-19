@@ -114,7 +114,7 @@ pub use recursive::{
 
 // FOUNDATION for reading walk/closure composites over the reconciled `present` (ReadDocument
 // increment 6c-i) — the reconciled `TransitiveClosure` entry (FOUNDATION-B). The FOUNDATION-A leaf
-// provider (`prove/verify_reconciled_leaf`, `resolve_combined_node_id`, the leaf-atom builders)
+// provider (`prove_reconciled_leaf`/`verify_reconciled_leaf_from_views`, `resolve_combined_node_id`, the leaf-atom builders)
 // stays `pub(crate)` in the submodule — it is the shared enabler consumed by the reconciled list
 // walk (6c-ii) and schema closure (6e), not a standalone public entry.
 pub use reconciled::{
@@ -139,7 +139,8 @@ pub use list_walk::{
 // combined `(id, value, datatype)` range-dict authentication; the materialized `OrderedArrayWalk`
 // composite stays byte-identical (a PARALLEL entry).
 pub use array_walk::{
-    prove_ordered_array_walk_reconciled, verify_ordered_array_walk_reconciled,
+    attach_termless_array_walk_openings, prove_ordered_array_walk_reconciled,
+    verify_ordered_array_walk_reconciled, verify_ordered_array_walk_reconciled_from_views,
     OrderedArrayWalkReconciledProof,
 };
 
