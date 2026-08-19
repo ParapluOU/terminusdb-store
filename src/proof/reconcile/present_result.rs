@@ -622,11 +622,19 @@ pub(crate) fn resolve_predicate_hash_via_catalog_scan(
 /// the root-bound combined node/value catalogs (fail-closed on an absent id). This is exactly the
 /// `resolve_result_columns` discipline for one `NodeValueId` column — the walk's `com_elements` is
 /// authenticated by the walk's own gluing gadgets, so this ties the readable answer to it.
+///
+/// `openings`, when supplied (C3), is the prover-shipped, UNCOMMITTED [`ResolutionOpenings`] used to
+/// resolve ids routed to a TERM-LESS view (whose dropped catalog cannot rebuild its tree) — the
+/// term-less reconciled walk/closure output-resolution path. `None` on the ordinary term-bearing
+/// path (the resolver rebuilds each routed tree from the clear catalog and ignores it); either way
+/// each routed view is opened against its own root-bound Merkle root, so `openings` is a proof-side
+/// witness, never committed.
 pub(crate) fn resolve_node_value_id_column(
     views: &[VerifierCommitmentRef<'_>],
     ids: &[u64],
     com: ArkGT,
     log_domain: usize,
+    openings: Option<&ResolutionOpenings>,
 ) -> io::Result<Vec<CanonicalObject>> {
     let column: Vec<ArkFr> = ids.iter().map(|id| ark(*id)).collect();
     let mut resolved = resolve_result_columns(
@@ -637,12 +645,43 @@ pub(crate) fn resolve_node_value_id_column(
         log_domain,
         &[ResolveKind::NodeValueId],
         None,
-        // Term-bearing `LayerCommitment` views: no term-less openings.
-        None,
+        // Term-less routed views open from the prover-shipped `openings`; a term-bearing chain
+        // passes `None` and the resolver rebuilds from the clear catalogs.
+        openings,
     )?;
     resolved
         .pop()
         .ok_or_else(|| invalid("resolve: empty node/value-id column"))
+}
+
+/// C3 (term-less reconciled CONSTANT resolution): route+open a prover-CLAIMED node/value `id`
+/// against its introducing view's root-bound `nv_merkle_root` (via the single prover-shipped
+/// `opening`) and BELT-HASH the opened term against `expected` (`hash_object` of the constant). The
+/// reconciled analogue of the S4 `belt_hash_node_value_constant` (`query::layer_bgp`): on a
+/// term-less view the combined-dict hash columns are prover-chosen, so a catalog SCAN reads empty
+/// and would fail-OPEN to a garbage id a prover could steer (the closure seed → a wrong-but-real
+/// id). Instead this drives the audited [`ChainDictResolver`], which routes `id` to its layer and
+/// re-forces the interval + structural position under [`verify_opening`], then requires
+/// `hash_object(opened) == hash_object(expected)`. A wrong id, a substituted term, or a missing
+/// opening fails closed. If a routed view is itself term-bearing the resolver rebuilds+opens its
+/// tree and the shipped opening is redundant (still belt-checked). Returns unit on success.
+pub(crate) fn resolve_termless_node_constant(
+    views: &[VerifierCommitmentRef<'_>],
+    id: u64,
+    expected: &CanonicalObject,
+    opening: &DictOpening,
+) -> io::Result<()> {
+    if opening.id != id {
+        return Err(invalid(
+            "term-less reconciled constant: opening id does not match the claimed id",
+        ));
+    }
+    let mut openings = ResolutionOpenings::default();
+    openings.insert_node_value(opening.clone());
+    // `resolve_nv_id` with `Some(expected_hash)` performs the mandatory belt-hash (opened term must
+    // hash to `hash_object(expected)`), rejecting a wrong id / substituted term.
+    ChainDictResolver::new(views, Some(&openings)).resolve_nv_id(id, Some(hash_object(expected)))?;
+    Ok(())
 }
 
 /// The output-column resolution kinds for a single-atom filter (the two non-constant columns).

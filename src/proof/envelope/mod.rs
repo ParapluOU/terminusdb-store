@@ -118,8 +118,10 @@ pub use recursive::{
 // stays `pub(crate)` in the submodule — it is the shared enabler consumed by the reconciled list
 // walk (6c-ii) and schema closure (6e), not a standalone public entry.
 pub use reconciled::{
-    prove_reconciled_transitive_closure, resolve_reconciled_node_ids,
-    verify_reconciled_transitive_closure, ReconciledClosureProof,
+    attach_termless_closure_openings, prove_reconciled_transitive_closure,
+    resolve_reconciled_node_ids, resolve_reconciled_node_ids_from_views,
+    verify_reconciled_transitive_closure, verify_reconciled_transitive_closure_from_views,
+    ReconciledClosureProof,
 };
 
 // The reconciled ordered `rdf:List` walk over a delta head's `present` (ReadDocument 6c-ii) — the

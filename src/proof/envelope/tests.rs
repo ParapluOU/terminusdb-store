@@ -3695,6 +3695,230 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         .is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // C3c: TERM-LESS reconciled transitive closure (head view term-less; seed belt-hashed).
+    // -----------------------------------------------------------------------
+
+    /// Build a mixed verifier-view slice for a stack whose HEAD is TERM-LESS (its catalogs dropped),
+    /// every earlier layer term-bearing — the term-less remote-verifier framing. `head_termless`
+    /// owns the data the returned refs borrow, so the caller must bind it first.
+    fn termless_head_views<'a>(
+        lref: &'a [&'a LayerCommitment],
+        head_termless: &'a crate::proof::commitment::VerifierCommitment,
+    ) -> Vec<crate::proof::VerifierCommitmentRef<'a>> {
+        let mut views: Vec<crate::proof::VerifierCommitmentRef<'a>> =
+            lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+        views.push(head_termless.verifier_view());
+        views
+    }
+
+    /// C3c THE-WIN differential: a reconciled closure whose HEAD view is term-less verifies (through
+    /// the belt-hashed seed opening) to the SAME reachable set as the term-bearing path, and the
+    /// reachable-id render agrees too — using ONLY the prover-shipped openings (no clear head catalog).
+    fn assert_reconciled_closure_termless_parity() {
+        let stack = closure_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let rest = rdf_rest_iri();
+        let seed = iri("cell0");
+
+        let (mut proof, prover_ids) = super::reconciled::prove_reconciled_transitive_closure(
+            &lref,
+            rest.as_bytes(),
+            seed.as_bytes(),
+            true,
+        )
+        .unwrap();
+        super::reconciled::attach_termless_closure_openings(
+            &mut proof,
+            &lref,
+            seed.as_bytes(),
+            &prover_ids,
+        )
+        .unwrap();
+
+        // Term-bearing baseline (the `layers` wrapper, seed by the audited catalog scan).
+        let bearing_ids = super::reconciled::verify_reconciled_transitive_closure(
+            &lref, head_root, rest.as_bytes(), seed.as_bytes(), true, &proof,
+        )
+        .unwrap();
+
+        // Term-less head view: verify through `_from_views` with the belt-hashed seed opening.
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        assert!(!head_termless.verifier_view().terms_present);
+        let termless_views = termless_head_views(&lref, &head_termless);
+        let termless_ids = super::reconciled::verify_reconciled_transitive_closure_from_views(
+            &termless_views, head_root, rest.as_bytes(), seed.as_bytes(), true, &proof,
+        )
+        .unwrap();
+
+        assert_eq!(
+            bearing_ids.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            termless_ids.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            "term-less closure reachable set must equal the term-bearing set"
+        );
+
+        // Reachable-id RENDER parity: term-bearing catalog render vs term-less Merkle-opening render.
+        let bearing_objs = super::reconciled::resolve_reconciled_node_ids(&lref, &bearing_ids).unwrap();
+        let termless_objs = super::reconciled::resolve_reconciled_node_ids_from_views(
+            &termless_views,
+            &termless_ids,
+            proof.reachable_openings.as_ref(),
+        )
+        .unwrap();
+        let as_iris = |objs: &[CanonicalObject]| -> std::collections::BTreeSet<Vec<u8>> {
+            objs.iter()
+                .map(|o| match o {
+                    CanonicalObject::Node(b) => b.clone(),
+                    other => panic!("closure output must be a node IRI, got {:?}", other),
+                })
+                .collect()
+        };
+        assert_eq!(
+            as_iris(&bearing_objs),
+            as_iris(&termless_objs),
+            "term-less reachable-id render must equal the term-bearing render"
+        );
+    }
+
+    /// C3c HEADLINE soundness: a seed opening for a DIFFERENT (real) node id certifies the WRONG
+    /// closure — the belt-hash (`hash_object(opened) != hash_object(Node(seed))`) rejects it.
+    fn assert_reconciled_closure_termless_forged_seed() {
+        let stack = closure_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let rest = rdf_rest_iri();
+        let seed = iri("cell0");
+
+        let (mut proof, prover_ids) = super::reconciled::prove_reconciled_transitive_closure(
+            &lref, rest.as_bytes(), seed.as_bytes(), true,
+        )
+        .unwrap();
+        super::reconciled::attach_termless_closure_openings(
+            &mut proof, &lref, seed.as_bytes(), &prover_ids,
+        )
+        .unwrap();
+
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+
+        // Sanity: the honest term-less proof verifies.
+        super::reconciled::verify_reconciled_transitive_closure_from_views(
+            &termless_views, head_root, rest.as_bytes(), seed.as_bytes(), true, &proof,
+        )
+        .unwrap();
+
+        // Forge: swap the seed opening for one authenticating a DIFFERENT real node id (cell1).
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let other_id = super::reconciled::resolve_combined_node_id(&bearing_views, iri("cell1").as_bytes());
+        let forged = crate::proof::commitment::build_resolution_openings(&bearing_views, &[other_id], &[]).unwrap();
+        let forged_opening = forged.node_value_opening(other_id).unwrap().clone();
+        let mut forged_proof = proof.clone();
+        forged_proof.seed_opening = Some(forged_opening);
+        assert!(
+            super::reconciled::verify_reconciled_transitive_closure_from_views(
+                &termless_views, head_root, rest.as_bytes(), seed.as_bytes(), true, &forged_proof,
+            )
+            .is_err(),
+            "a seed opening for the wrong (but real) node id must fail the belt-hash"
+        );
+    }
+
+    /// C3c fail-closed: a term-less closure with NO seed opening is rejected (never a silent scan of
+    /// the dropped head catalog).
+    fn assert_reconciled_closure_termless_missing_seed() {
+        let stack = closure_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let rest = rdf_rest_iri();
+        let seed = iri("cell0");
+
+        let (mut proof, prover_ids) = super::reconciled::prove_reconciled_transitive_closure(
+            &lref, rest.as_bytes(), seed.as_bytes(), true,
+        )
+        .unwrap();
+        super::reconciled::attach_termless_closure_openings(
+            &mut proof, &lref, seed.as_bytes(), &prover_ids,
+        )
+        .unwrap();
+
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+
+        let mut no_seed = proof.clone();
+        no_seed.seed_opening = None;
+        assert!(
+            super::reconciled::verify_reconciled_transitive_closure_from_views(
+                &termless_views, head_root, rest.as_bytes(), seed.as_bytes(), true, &no_seed,
+            )
+            .is_err(),
+            "a term-less closure without a seed opening must fail closed"
+        );
+    }
+
+    /// C3c: the FOUNDATION-B soundness negatives (tampered edge, forged round, truncated closure,
+    /// wrong head root) still reject with a TERM-LESS head (seed opening attached so the honest
+    /// path would otherwise pass).
+    fn assert_reconciled_closure_termless_soundness() {
+        let stack = closure_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let rest = rdf_rest_iri();
+        let seed = iri("cell0");
+
+        let (mut proof, prover_ids) = super::reconciled::prove_reconciled_transitive_closure(
+            &lref, rest.as_bytes(), seed.as_bytes(), true,
+        )
+        .unwrap();
+        super::reconciled::attach_termless_closure_openings(
+            &mut proof, &lref, seed.as_bytes(), &prover_ids,
+        )
+        .unwrap();
+
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+
+        // Honest term-less proof verifies.
+        super::reconciled::verify_reconciled_transitive_closure_from_views(
+            &termless_views, head_root, rest.as_bytes(), seed.as_bytes(), true, &proof,
+        )
+        .unwrap();
+
+        // (i) Wrong head root.
+        let mut bogus = head_root;
+        bogus[0] ^= 0xff;
+        assert!(super::reconciled::verify_reconciled_transitive_closure_from_views(
+            &termless_views, bogus, rest.as_bytes(), seed.as_bytes(), true, &proof,
+        )
+        .is_err());
+
+        // (ii) Tampered `present` edge column (swap kept commitments).
+        let mut tampered_edge = proof.clone();
+        tampered_edge.edge_leaf.atoms[0].com_kept.swap(0, 1);
+        assert!(super::reconciled::verify_reconciled_transitive_closure_from_views(
+            &termless_views, head_root, rest.as_bytes(), seed.as_bytes(), true, &tampered_edge,
+        )
+        .is_err());
+
+        // (iii) A spurious node forged into the final closure round.
+        let mut forged_round = proof.clone();
+        assert!(!forged_round.rounds.is_empty());
+        forged_round.rounds.last_mut().unwrap().next_rows.push(999_999);
+        assert!(super::reconciled::verify_reconciled_transitive_closure_from_views(
+            &termless_views, head_root, rest.as_bytes(), seed.as_bytes(), true, &forged_round,
+        )
+        .is_err());
+
+        // (iv) A truncated (non-converged) closure.
+        let mut truncated = proof.clone();
+        truncated.rounds.pop();
+        assert!(super::reconciled::verify_reconciled_transitive_closure_from_views(
+            &termless_views, head_root, rest.as_bytes(), seed.as_bytes(), true, &truncated,
+        )
+        .is_err());
+    }
+
     #[test]
     fn reconciled_edge_relation_parity() {
         big_stack(assert_reconciled_edge_parity);
@@ -3708,6 +3932,26 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     #[test]
     fn reconciled_transitive_closure_soundness() {
         big_stack(assert_reconciled_closure_soundness);
+    }
+
+    #[test]
+    fn reconciled_transitive_closure_termless_parity() {
+        big_stack(assert_reconciled_closure_termless_parity);
+    }
+
+    #[test]
+    fn reconciled_transitive_closure_termless_forged_seed() {
+        big_stack(assert_reconciled_closure_termless_forged_seed);
+    }
+
+    #[test]
+    fn reconciled_transitive_closure_termless_missing_seed() {
+        big_stack(assert_reconciled_closure_termless_missing_seed);
+    }
+
+    #[test]
+    fn reconciled_transitive_closure_termless_soundness() {
+        big_stack(assert_reconciled_closure_termless_soundness);
     }
 
     // -----------------------------------------------------------------------

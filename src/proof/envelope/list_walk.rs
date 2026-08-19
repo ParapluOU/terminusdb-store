@@ -1346,7 +1346,7 @@ fn prove_ordered_list_walk_reconciled_impl(
         .iter()
         .map(|f| field_id(*f))
         .collect::<io::Result<Vec<_>>>()?;
-    let elements = resolve_node_value_id_column(&views, &element_ids, com_elements, cons_log_domain)?;
+    let elements = resolve_node_value_id_column(&views, &element_ids, com_elements, cons_log_domain, None)?;
 
     let proof = OrderedListWalkReconciledProof {
         reconcile,
@@ -1567,5 +1567,5 @@ pub fn verify_ordered_list_walk_reconciled(
     if proof.element_ids.len() != proof.cons_len {
         return Err(invalid("reconciled ordered-list-walk element id count mismatch"));
     }
-    resolve_node_value_id_column(&views, &proof.element_ids, proof.com_elements, proof.cons_log_domain)
+    resolve_node_value_id_column(&views, &proof.element_ids, proof.com_elements, proof.cons_log_domain, None)
 }

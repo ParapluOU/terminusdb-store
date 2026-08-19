@@ -1227,7 +1227,7 @@ fn prove_ordered_array_walk_reconciled_impl(
         .map(|f| field_id(*f))
         .collect::<io::Result<Vec<_>>>()?;
     let elements =
-        resolve_node_value_id_column(&views, &value_ids, density.com_out, density.common_log_domain)?;
+        resolve_node_value_id_column(&views, &value_ids, density.com_out, density.common_log_domain, None)?;
 
     let proof = OrderedArrayWalkReconciledProof {
         reconcile,
@@ -1567,7 +1567,7 @@ pub fn verify_ordered_array_walk_reconciled(
     if proof.value_ids.len() != n {
         return Err(invalid("reconciled ordered-array-walk value id count mismatch"));
     }
-    resolve_node_value_id_column(&views, &proof.value_ids, proof.com_out, proof.common_log_domain)
+    resolve_node_value_id_column(&views, &proof.value_ids, proof.com_out, proof.common_log_domain, None)
 }
 
 /// Verify the reconciled density+order certificate. Re-verifies the combined range dict against the

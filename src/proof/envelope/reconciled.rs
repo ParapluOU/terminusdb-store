@@ -63,12 +63,15 @@ use sha2::{Digest, Sha256};
 
 use crate::proof::argument::{StoreProverContext, Transcript254};
 use crate::proof::bgp::{RelationCommit, RelationWitness};
-use crate::proof::commitment::{LayerCommitment, VerifierLayer};
+use crate::proof::commitment::{
+    build_resolution_openings, DictOpening, LayerCommitment, ResolutionOpenings, VerifierLayer,
+};
 use crate::proof::dict::{hash_object, hash_term};
 use crate::proof::reconcile::{
-    prove_present_bgp, prove_reconcile_core, verify_present_bgp, verify_reconcile_core,
-    PresentBgpAtom, PresentBgpProof, PresentReadResult, PresentTerm, ReconcileArtifacts,
-    ReconcileProof, ReconcileVerified,
+    prove_present_bgp, prove_reconcile_core, resolve_node_value_id_column,
+    resolve_termless_node_constant, verify_present_bgp, verify_reconcile_core, PresentBgpAtom,
+    PresentBgpProof, PresentReadResult, PresentTerm, ReconcileArtifacts, ReconcileProof,
+    ReconcileVerified,
 };
 use crate::proof::{invalid, CanonicalObject, ProofHash, VerifierCommitmentRef};
 
@@ -181,8 +184,29 @@ pub(crate) fn verify_reconciled_leaf(
     transcript: &mut Transcript254,
 ) -> io::Result<RelationCommit> {
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    verify_reconciled_leaf_from_views(&views, reconcile, verified, head_nv, atom, proof, transcript)
+}
+
+/// Verify ONE walk-leaf read (FOUNDATION-A) FROM verifier VIEWS (C3), returning the authenticated
+/// combined-dict-id `RelationCommit`. Views-based analogue of [`verify_reconciled_leaf`] (split
+/// exactly like [`verify_read_bgp_from_views`](crate::proof::reconcile::verify_read_bgp_from_views)):
+/// it accepts the borrowed [`VerifierCommitmentRef`] slice directly, so a TERM-LESS reconcile view
+/// (built via [`LayerCommitment::verifier_commitment_termless`] on the head, term-bearing elsewhere)
+/// can be passed for the term-less remote verifier. The leaf atom carries no range
+/// (`object_range: None`), so the plain conjunctive `present_bgp` path is term-less-sound (C1/E3);
+/// a tampered leaf relation is rejected by the atom's own re-derived kept commitments.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_reconciled_leaf_from_views(
+    views: &[VerifierCommitmentRef<'_>],
+    reconcile: &ReconcileProof,
+    verified: &ReconcileVerified,
+    head_nv: usize,
+    atom: PresentBgpAtom,
+    proof: &PresentBgpProof,
+    transcript: &mut Transcript254,
+) -> io::Result<RelationCommit> {
     let (commitments, n, log_domain) = verify_present_bgp(
-        &views,
+        views,
         &reconcile.combined_nv,
         &reconcile.combined_pred,
         verified,
@@ -221,6 +245,45 @@ pub(crate) fn resolve_combined_node_id(views: &[VerifierCommitmentRef<'_>], iri:
         .saturating_add(1)
 }
 
+/// Resolve a node IRI to its COMBINED-dict id (C3), safe over a TERM-LESS reconcile view.
+///
+/// THE SOUNDNESS RISK term-less: [`resolve_combined_node_id`] SCANS the clear catalog, which a
+/// term-less view drops — the scan reads EMPTY and fail-OPENS to the impossible-id sentinel a
+/// prover could steer (a wrong-but-real closure SEED certifies the WRONG closure). So this NEVER
+/// scans a term-less chain; it demands a prover-shipped [`DictOpening`] carrying the claimed id and
+/// BELT-HASHES it (`resolve_termless_node_constant`, the reconciled analogue of the S4
+/// `belt_hash_node_value_constant`): the id is routed to its introducing view and opened against
+/// that view's root-bound `nv_merkle_root`, then the opened term MUST hash to
+/// `hash_object(Node(iri))`. A wrong id / substituted term / MISSING opening fails closed.
+///
+/// * ALL views term-bearing → delegate to the audited [`resolve_combined_node_id`] scan (each
+///   catalog is root-bound by the reconciliation's per-layer `validate()`) — backward compatible.
+/// * ANY view term-less → require `opening` (fail-closed on `None`), belt-hash it, return its
+///   claimed id. A constant genuinely ABSENT from the dict cannot produce an authenticating opening
+///   (no such term exists), so the term-less path fails closed on an absent constant — a stricter
+///   (sound) restriction than the scan's impossible-id sentinel; term-less absence is out of scope
+///   (it would need `dictionary_absence`, not a positive opening).
+pub(crate) fn resolve_combined_node_id_termless(
+    views: &[VerifierCommitmentRef<'_>],
+    iri: &[u8],
+    opening: Option<&DictOpening>,
+) -> io::Result<u64> {
+    if views.iter().all(|view| view.terms_present) {
+        return Ok(resolve_combined_node_id(views, iri));
+    }
+    let opening = opening.ok_or_else(|| {
+        invalid("term-less reconciled constant resolution requires a prover-shipped Merkle opening")
+    })?;
+    let claimed_id = opening.id;
+    resolve_termless_node_constant(
+        views,
+        claimed_id,
+        &CanonicalObject::Node(iri.to_vec()),
+        opening,
+    )?;
+    Ok(claimed_id)
+}
+
 /// Resolve reconciled transitive-closure output node-ids back to their IRIs
 /// ([`CanonicalObject`]s) over the whole chain's root-authenticated catalogs — the exact INVERSE of
 /// [`resolve_combined_node_id`], used by ReadDocument 6e (a reconciled `sys:inherits` ancestor
@@ -253,6 +316,24 @@ pub fn resolve_reconciled_node_ids(
         .collect()
 }
 
+/// Resolve reconciled closure output node-ids to their `CanonicalObject`s FROM verifier VIEWS (C3),
+/// safe over a TERM-LESS head. Views-based, term-less-capable analogue of
+/// [`resolve_reconciled_node_ids`] (whose catalog scan fail-closes on a term-less head). The
+/// reachable `ids` are ALREADY authenticated by the closure verify, so this is a pure id→term
+/// render: it binds them to their own accumulator-shaped commitment (`closure_set_commit`, exactly
+/// the padding the closure threaded) and routes each id through the audited chain Merkle resolver
+/// ([`resolve_node_value_id_column`]). A TERM-LESS routed view opens from the prover-shipped
+/// `openings` (fail-closed on a missing/forged one, each re-verified by `verify_opening` against the
+/// root-bound `nv_merkle_root`); a term-bearing chain passes `None` and rebuilds from catalogs.
+pub fn resolve_reconciled_node_ids_from_views(
+    views: &[VerifierCommitmentRef<'_>],
+    ids: &[u64],
+    openings: Option<&ResolutionOpenings>,
+) -> io::Result<Vec<CanonicalObject>> {
+    let commit = super::recursive::closure_set_commit(ids)?;
+    resolve_node_value_id_column(views, ids, commit.commitments[0], commit.log_domain, openings)
+}
+
 // ===========================================================================
 // FOUNDATION-B — the reconciled `TransitiveClosure`.
 // ===========================================================================
@@ -273,6 +354,17 @@ pub struct ReconciledClosureProof {
     pub rounds: Vec<TransitiveClosureRound>,
     /// The empty-delta fixpoint certificate (`A_K` is closed under the reconciled edge step).
     pub fixpoint: TransitiveClosureFixpoint,
+    /// C3c: the prover-shipped, UNCOMMITTED Merkle opening for the closure SEED constant, used to
+    /// resolve+belt-hash the seed id over a TERM-LESS head (`resolve_combined_node_id_termless`).
+    /// `None` on the ordinary term-bearing path (the seed is resolved by the audited catalog scan);
+    /// minted by [`attach_termless_closure_openings`]. IN-MEMORY ONLY — like
+    /// [`PresentBgpProof::openings`], it is NEVER folded into `commitment_root`/`resolution_root`
+    /// and carries NO wire/golden/version change (reconciled walk proofs are not in `wire.rs`).
+    pub seed_opening: Option<DictOpening>,
+    /// C3c: the prover-shipped, UNCOMMITTED Merkle openings for the REACHABLE ids, used to render
+    /// them to IRIs over a TERM-LESS head (`resolve_reconciled_node_ids_from_views`). `None` on the
+    /// term-bearing path. Same in-memory-only discipline as `seed_opening`.
+    pub reachable_openings: Option<ResolutionOpenings>,
 }
 
 /// The domain-separation digest for a reconciled closure's round/fixpoint operator transcripts.
@@ -339,9 +431,48 @@ pub fn prove_reconciled_transitive_closure(
     )?;
 
     Ok((
-        ReconciledClosureProof { reconcile, edge_leaf, seed, rounds, fixpoint },
+        ReconciledClosureProof {
+            reconcile,
+            edge_leaf,
+            seed,
+            rounds,
+            fixpoint,
+            // Term-bearing default: the seed is resolved by the catalog scan and reachable ids by a
+            // catalog render. The term-less producer attaches these via
+            // `attach_termless_closure_openings`; a term-bearing verifier ignores them.
+            seed_opening: None,
+            reachable_openings: None,
+        },
         reachable_ids,
     ))
+}
+
+/// C3c (producer): attach the UNCOMMITTED term-less opening witnesses to a proven
+/// [`ReconciledClosureProof`], so it can ship alongside a TERM-LESS reconciled artifact. Mints the
+/// SEED [`DictOpening`] (routed to its introducing layer via [`build_resolution_openings`] for the
+/// single resolved seed id) plus the REACHABLE-id [`ResolutionOpenings`] (for the output render).
+/// `reachable_ids` are the closure's proven reachable set (the second return of
+/// [`prove_reconciled_transitive_closure`]). Mirrors
+/// [`attach_termless_reconcile_openings`](crate::proof::reconcile::attach_termless_reconcile_openings)
+/// / [`build_termless_delta_openings`](crate::proof::reconcile::build_termless_delta_openings). The
+/// prover still holds the term-bearing catalogs, so it resolves the seed by the scan and rebuilds
+/// each id-indexed tree; the witnesses are re-verified per id at the verifier by `verify_opening`
+/// against the root-bound `nv_merkle_root` (forged ⇒ rejected, missing ⇒ fail-closed) and are NEVER
+/// folded into `commitment_root`/`resolution_root`. Over-inclusion is safe; the seed constant must
+/// be present in the dict (term-less absence is out of scope — a positive opening cannot be minted).
+pub fn attach_termless_closure_openings(
+    proof: &mut ReconciledClosureProof,
+    layers: &[&LayerCommitment],
+    seed_iri: &[u8],
+    reachable_ids: &[u64],
+) -> io::Result<()> {
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    // The prover holds term-bearing catalogs: resolve the seed by the scan, then open it.
+    let seed_id = resolve_combined_node_id(&views, seed_iri);
+    let seed_openings = build_resolution_openings(&views, &[seed_id], &[])?;
+    proof.seed_opening = Some(seed_openings.node_value_opening(seed_id)?.clone());
+    proof.reachable_openings = Some(build_resolution_openings(&views, reachable_ids, &[])?);
+    Ok(())
 }
 
 /// Verify a reconciled transitive closure and return the reachable combined-dict node-id set. Binds
@@ -357,20 +488,47 @@ pub fn verify_reconciled_transitive_closure(
     reflexive: bool,
     proof: &ReconciledClosureProof,
 ) -> io::Result<Vec<u64>> {
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    verify_reconciled_transitive_closure_from_views(
+        &views,
+        trusted_head_root,
+        edge_predicate,
+        seed_iri,
+        reflexive,
+        proof,
+    )
+}
+
+/// Verify a reconciled transitive closure FROM verifier VIEWS (C3c) — the term-less-capable core.
+/// Views-based analogue of [`verify_reconciled_transitive_closure`] (split like
+/// [`verify_read_bgp_from_views`](crate::proof::reconcile::verify_read_bgp_from_views)): a TERM-LESS
+/// head view (`LayerCommitment::verifier_commitment_termless`, term-bearing elsewhere) can be
+/// passed. The round/fixpoint machinery ([`verify_closure_rounds`]) is commitment-only, so it is
+/// term-less-safe unchanged; the two term-sensitive reads go term-less:
+/// [`verify_reconciled_leaf_from_views`] (plain conjunctive edge atom, no range ⇒ C1/E3-sound) and
+/// the SEED resolution via [`resolve_combined_node_id_termless`] (belt-hashed against
+/// `proof.seed_opening`, fail-closed on a missing/forged opening — the seed constant must be present
+/// and CORRECT, or the wrong closure would be certified).
+pub fn verify_reconciled_transitive_closure_from_views(
+    views: &[VerifierCommitmentRef<'_>],
+    trusted_head_root: ProofHash,
+    edge_predicate: &[u8],
+    seed_iri: &[u8],
+    reflexive: bool,
+    proof: &ReconciledClosureProof,
+) -> io::Result<Vec<u64>> {
     let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
 
-    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
-    let verified = verify_reconcile_core(&views, trusted_head_root, &proof.reconcile, &mut transcript)?;
-    let head_nv = layers
+    let verified =
+        verify_reconcile_core(views, trusted_head_root, &proof.reconcile, &mut transcript)?;
+    let head = *views
         .last()
-        .ok_or_else(|| invalid("reconciled closure needs a head layer"))?
-        .verifier_view()
-        .state
-        .node_value_count as usize;
+        .ok_or_else(|| invalid("reconciled closure needs a head layer"))?;
+    let head_nv = head.state.node_value_count as usize;
 
     let atom = predicate_edge_leaf_atom(edge_predicate);
-    let edge_commit = verify_reconciled_leaf(
-        layers,
+    let edge_commit = verify_reconciled_leaf_from_views(
+        views,
         &proof.reconcile,
         &verified,
         head_nv,
@@ -379,17 +537,15 @@ pub fn verify_reconciled_transitive_closure(
         &mut transcript,
     )?;
 
-    let seed_id = resolve_combined_node_id(&views, seed_iri);
+    // C3c: term-less-safe seed resolution — belt-hashed against the prover-shipped opening on a
+    // term-less chain, the audited catalog scan on a fully term-bearing one.
+    let seed_id = resolve_combined_node_id_termless(views, seed_iri, proof.seed_opening.as_ref())?;
     let digest = reconciled_closure_digest(edge_predicate, seed_id, reflexive);
     let mut nodes = 0usize;
     // β re-anchor: the closure gadget binds the head's COMMITMENT root (matching
     // `prove_reconciled_transitive_closure`); `trusted_head_root` is now a `resolution_root`
     // used ONLY for the head-pin equality inside `verify_reconcile_core` above.
-    let head_commitment_root = layers
-        .last()
-        .ok_or_else(|| invalid("reconciled closure needs a head layer"))?
-        .state
-        .commitment_root;
+    let head_commitment_root = head.state.commitment_root;
     verify_closure_rounds(
         &edge_commit,
         seed_id,
