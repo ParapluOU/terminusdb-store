@@ -168,7 +168,12 @@ pub(super) fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
 // `openings` (`Option<ResolutionOpenings>`). Term-bearing proofs carry `None` (one added option
 // tag byte); a term-less proof ships the matched-constant + resolved-result openings. Every
 // query-BGP envelope's proof bytes shift by the added tag.
-pub(super) const VERSION: u32 = 12;
+// v13: Merkle-dict I2b step 3 — `RangeAtomSubproof` gained the term-less value↔term witness
+// (`oid: Vec<u64>` + `value_openings: Option<ResolutionOpenings>`). A term-bearing range atom
+// carries an empty vector + `None` (a length prefix + one option tag); a term-less range atom
+// ships the object-id vector + per-distinct value openings. Any BGP proof containing a ranged
+// atom shifts, so the format version bumps.
+pub(super) const VERSION: u32 = 13;
 // v10: LogUp-GKR bag-union (`Or`) migration (Inc 4) — `BagUnionProof` dropped its `N+1`
 // committed reciprocal GT commitments (`reciprocal_commitments`) and the masked multiset-link
 // sumcheck for ONE multi-block GKR fraction tree (`gkr`: `N+1` blocks tiled into a
@@ -181,13 +186,19 @@ pub(super) const VERSION: u32 = 12;
 // NOT embed a union (unchanged).
 // v11: Merkle-dict I2b S5 — the union branches are `LayerBgpEnvelope`s embedding a `LayerBgpProof`,
 // which gained the optional `openings` field, so every branch's proof bytes shift (lockstep).
-pub(super) const UNION_VERSION: u32 = 11;
+// v12: Merkle-dict I2b step 3 — the union branches embed a `LayerBgpProof` whose `RangeAtomSubproof`
+// gained the term-less value↔term witness; lockstep bump.
+pub(super) const UNION_VERSION: u32 = 12;
 // v12: Merkle-dict I2b S5 — the anti sides are `LayerBgpEnvelope`s embedding a `LayerBgpProof`
 // (added `openings`); lockstep bump.
-pub(super) const ANTI_VERSION: u32 = 12;
+// v13: Merkle-dict I2b step 3 — the anti sides embed a `LayerBgpProof` whose `RangeAtomSubproof`
+// gained the term-less value↔term witness; lockstep bump.
+pub(super) const ANTI_VERSION: u32 = 13;
 // v10: Merkle-dict I2b S5 — the outer sides are `LayerBgpEnvelope`s embedding a `LayerBgpProof`
 // (added `openings`); lockstep bump.
-pub(super) const OUTER_VERSION: u32 = 10;
+// v11: Merkle-dict I2b step 3 — the outer sides embed a `LayerBgpProof` whose `RangeAtomSubproof`
+// gained the term-less value↔term witness; lockstep bump.
+pub(super) const OUTER_VERSION: u32 = 11;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
 // v23 adds the ordered `sys:Array` walk composite node (tag 24).
@@ -237,7 +248,10 @@ pub(super) const OUTER_VERSION: u32 = 10;
 // v34: Merkle-dict I2b S5 — recursive envelopes embed a `RecursiveRelationProof::Bgp` leaf
 // (`LayerBgpEnvelope` -> `LayerBgpProof`), which gained the optional `openings` field, so every
 // recursive envelope carrying a BGP leaf shifts by the added option tag.
-pub(super) const RECURSIVE_VERSION: u32 = 34;
+// v35: Merkle-dict I2b step 3 — recursive envelopes embed a `RecursiveRelationProof::Bgp` leaf
+// (`LayerBgpProof`) whose `RangeAtomSubproof` gained the term-less value↔term witness (`oid` +
+// `value_openings`), so every recursive envelope carrying a BGP leaf with a ranged atom shifts.
+pub(super) const RECURSIVE_VERSION: u32 = 35;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -884,7 +898,11 @@ wire_struct!(RangeAtomSubproof {
     com_equality_sel,
     combine,
     com_combined_sel,
-    compaction
+    compaction,
+    // Merkle-dict I2b step 3: the term-less value↔term witness (empty vec + `None` on a
+    // term-bearing artifact). Uncommitted — re-checked per id by `verify_dict_value_terms`.
+    oid,
+    value_openings
 });
 wire_struct!(LayerBgpAtomProof {
     predicate_membership,

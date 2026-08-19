@@ -62,7 +62,11 @@ fn range_common_domain(a: usize, n_dict: usize) -> io::Result<(usize, usize)> {
 fn root_bound_n_dict(source: &impl VerifierLayer) -> io::Result<usize> {
     let layer = source.verifier_view();
     let n_dict = layer.state.node_value_count as usize;
-    if n_dict != layer.node_value_catalog.len() {
+    // TERM-BEARING: cross-check the shipped catalog length against the root-bound count.
+    // TERM-LESS (Merkle-dict I2b): the catalog is dropped; the count is bound directly by the
+    // head root and the dict commitments / `nv_merkle_root` authenticate the entries, so there
+    // is no catalog to cross-check (the range path then ties value/datatype via Merkle openings).
+    if layer.terms_present && n_dict != layer.node_value_catalog.len() {
         return Err(invalid(
             "root-bound node/value dictionary count does not match the committed catalog length",
         ));
@@ -340,6 +344,11 @@ pub(super) fn prove_ranged_atom(
             combine,
             com_combined_sel,
             compaction,
+            // Merkle-dict I2b step 3: term-bearing by default (the catalog re-MSM ties
+            // value/datatype to terms). `build_termless_range_openings` fills these when a
+            // TERM-LESS artifact is shipped for a base/rollup layer.
+            oid: Vec::new(),
+            value_openings: None,
         },
         kept_commitments,
         kept_columns,
@@ -364,19 +373,62 @@ pub(super) fn verify_ranged_atom(
     com_p: &ArkGT,
     com_o: &ArkGT,
     layer: VerifierCommitmentRef<'_>,
+    trusted_resolution_root: ProofHash,
     sub: &RangeAtomSubproof,
     kept_commitments: &[ArkGT],
     m: usize,
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
-    // Merkle-dict I2b S2 fail-close: a numeric range filter reads the order-preserving
-    // VALUE/DATATYPE dict columns (via the root-bound commitments) whose tie to real terms is
-    // the catalog re-MSM that a TERM-LESS artifact drops. Reject before any range work — the
-    // committed value/datatype columns would otherwise be prover-chosen and select the wrong rows.
-    layer.require_terms_present("numeric range filter (verify_ranged_atom)")?;
     let n_dict = root_bound_n_dict(&layer)?;
-    reject_nan_catalog(layer.node_value_catalog, range.datatype)?;
     let (d_log, dict_log) = range_common_domain(a, n_dict)?;
+
+    // Merkle-dict I2b step 3 (value↔term consistency). A numeric range reads the order-
+    // preserving VALUE/DATATYPE dict columns (via the root-bound relocations). What ties those
+    // committed columns to the REAL terms differs by artifact:
+    //   * TERM-BEARING: `validate()`'s catalog re-MSM recomputes value/datatype from the clear
+    //     terms and the NaN guard scans the catalog. Unchanged.
+    //   * TERM-LESS: the re-MSM is dropped ⇒ the committed value/datatype are prover-chosen. Tie
+    //     them to the Merkle-authenticated terms via the prover-shipped `oid` vector + per-distinct
+    //     value openings (`verify_dict_value_terms`), then run the NaN guard over the OPENED
+    //     touched terms. Missing openings ⇒ Err (fail-closed). DELTA range stays fail-closed (a
+    //     delta layer is rejected by `require_base_layer_for_query`, upstream and re-asserted here).
+    if layer.terms_present {
+        reject_nan_catalog(layer.node_value_catalog, range.datatype)?;
+    } else {
+        require_base_layer_for_query(layer.state)?;
+        let value_openings = sub.value_openings.as_ref().ok_or_else(|| {
+            invalid("term-less numeric range requires the prover-shipped value↔term Merkle openings")
+        })?;
+        let domain = 1usize << d_log;
+        // Primary object-range lookup: tie its `com_v_val`/`com_v_dt` to the Merkle terms.
+        let touched = super::result::verify_dict_value_terms(
+            &sub.com_object_at_d,
+            &sub.object_range.lookup.com_v_val,
+            &sub.object_range.lookup.com_v_dt,
+            n,
+            domain,
+            &sub.oid,
+            value_openings,
+            layer,
+            trusted_resolution_root,
+        )?;
+        reject_nan_objects(&touched, range.datatype)?;
+        // A second bound ranges over the SAME object column ⇒ the same `oid`/openings; its own
+        // (separately committed) lookup columns must be tied too.
+        if let Some(second) = &sub.second {
+            super::result::verify_dict_value_terms(
+                &sub.com_object_at_d,
+                &second.object_range.lookup.com_v_val,
+                &second.object_range.lookup.com_v_dt,
+                n,
+                domain,
+                &sub.oid,
+                value_openings,
+                layer,
+                trusted_resolution_root,
+            )?;
+        }
+    }
     let com_dict_id = layer.node_value_dict_commitments.1;
     let com_dict_value = layer.node_value_dict_range_commitments.0;
     let com_dict_datatype = layer.node_value_dict_range_commitments.1;

@@ -199,6 +199,119 @@ fn resolve_node_value_id_via_merkle(
     )
 }
 
+/// Merkle-dict I2b step 3 (value↔term consistency, Option B). Tie the committed
+/// order-preserving VALUE (`com_v_val`) and DATATYPE (`com_v_dt`) columns — which a
+/// TERM-LESS artifact leaves prover-chosen (the catalog re-MSM that recomputes them from the
+/// clear terms is dropped) — to the Merkle-authenticated terms, via prover-shipped openings.
+/// Returns the DISTINCT opened touched terms (id-sorted) so the caller can run the residual
+/// datatype/NaN gate. SHARED: the numeric range gadget calls it now; the order/group term-less
+/// paths will reuse it (they gather the SAME `(v_val, v_dt)` per-row from the object column).
+///
+/// Steps (design Option B):
+///   2. Recommit `oid` (real ids for `i < real_n`, `0`-pad to `domain`) and require
+///      `Com(oid) == com_obj_id` — binds the prover's `oid` vector to the SAME object-id
+///      column the lookup gathered `(v_val, v_dt)` from, so the touched set is complete by
+///      construction (every real row's id is pinned; a substituted id shifts the commitment).
+///   3. For each DISTINCT `oid[i]`, [`resolve_node_value_id_via_merkle`] re-forces the
+///      introduced interval `(parent,count]` + the structural position against the
+///      `resolution_root`-bound `nv_merkle_root` and returns the authenticated term.
+///   4. `ov[i] = node_value_op_value(opened)` — the SAME single-source encoder
+///      `commit_node_value_dict_range` builds the committed value column with (byte-identical);
+///      `dt[i]` is the datatype discriminant / `NODE_DATATYPE_TAG`, exactly as the committed
+///      datatype column is built (`node_value_dict_datatype_column`).
+///   5. Recommit `ov`, `dt` (`0`-pad to `domain`, same layout) and require
+///      `Com(ov) == com_v_val`, `Com(dt) == com_v_dt`.
+/// All three group-equalities holding ⇒ `v_val`/`v_dt` are `OP-encode(Merkle term)` at every
+/// real row (padding self-annihilates at `0`). FAIL-CLOSED: a missing/tampered opening
+/// ([`verify_opening`] Err), a substituted `oid` (`Com(oid) ≠ com_obj_id`), or a forged
+/// `dict_value`/`dict_datatype` (recommit mismatch) all reject.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_dict_value_terms(
+    com_obj_id: &ArkGT,
+    com_v_val: &ArkGT,
+    com_v_dt: &ArkGT,
+    real_n: usize,
+    domain: usize,
+    oid: &[u64],
+    openings: &ResolutionOpenings,
+    layer: VerifierCommitmentRef<'_>,
+    trusted_resolution_root: ProofHash,
+) -> io::Result<Vec<CanonicalObject>> {
+    // Defense-in-depth β re-anchor: the openings resolve against `layer.nv_merkle_root`, bound
+    // to the external trust only via `resolution_root`. The BGP entry already pins this, but a
+    // reusable helper re-forces it so no caller can skip the anchor.
+    if layer.resolution_root() != trusted_resolution_root {
+        return Err(invalid(
+            "value↔term consistency: layer resolution_root does not match the trusted root",
+        ));
+    }
+    if domain == 0 || !domain.is_power_of_two() {
+        return Err(invalid("value↔term domain must be a non-zero power of two"));
+    }
+    if real_n > domain || oid.len() != real_n {
+        return Err(invalid(
+            "value↔term oid vector length does not match the real row count",
+        ));
+    }
+
+    // (2) Recommit the oid column (real rows from the vector, 0-pad beyond real_n — the SAME
+    // layout the honest lookup witness gathers over, and the SAME 0-padding the object column
+    // relocation zero-extends into `com_obj_id`) and bind it to the object-id commitment.
+    let mut oid_col = vec![ArkFr::zero(); domain];
+    for (slot, &raw) in oid_col.iter_mut().zip(oid.iter()) {
+        *slot = ArkFr::from_u64(raw);
+    }
+    if commit_column(&oid_col)? != *com_obj_id {
+        return Err(invalid(
+            "value↔term: recommitted oid column does not match the object-id commitment",
+        ));
+    }
+
+    // (3)-(4) Per-row re-derive (ov, dt) from the authenticated Merkle term. Distinct ids are
+    // opened once; padding/null rows (`id == 0`) never index a dict row — the honest lookup
+    // leaves them at the `0` sentinel (masked out downstream), so mirror that and skip.
+    let mut ov_col = vec![ArkFr::zero(); domain];
+    let mut dt_col = vec![ArkFr::zero(); domain];
+    let mut cache: std::collections::BTreeMap<u64, (ArkFr, ArkFr)> = std::collections::BTreeMap::new();
+    let mut touched: Vec<CanonicalObject> = Vec::new();
+    for (i, &raw) in oid.iter().enumerate() {
+        if raw == 0 {
+            continue;
+        }
+        let (ov, dt) = if let Some(entry) = cache.get(&raw) {
+            *entry
+        } else {
+            let opened =
+                resolve_node_value_id_via_merkle(&ArkFr::from_u64(raw), layer, None, Some(openings))?;
+            let ov = node_value_op_value(&opened)?;
+            // Byte-identical to `node_value_dict_datatype_column`: a `Value`'s discriminant,
+            // a `Node`'s `NODE_DATATYPE_TAG`.
+            let dt = ArkFr::from_u64(match &opened {
+                CanonicalObject::Node(_) => NODE_DATATYPE_TAG,
+                CanonicalObject::Value { datatype, .. } => *datatype as u8 as u64,
+            });
+            cache.insert(raw, (ov, dt));
+            touched.push(opened);
+            (ov, dt)
+        };
+        ov_col[i] = ov;
+        dt_col[i] = dt;
+    }
+
+    // (5) Bind the re-derived value/datatype columns to the committed lookup columns.
+    if commit_column(&ov_col)? != *com_v_val {
+        return Err(invalid(
+            "value↔term: recommitted value column does not match com_v_val (forged dict_value)",
+        ));
+    }
+    if commit_column(&dt_col)? != *com_v_dt {
+        return Err(invalid(
+            "value↔term: recommitted datatype column does not match com_v_dt (forged dict_datatype)",
+        ));
+    }
+    Ok(touched)
+}
+
 /// Open one predicate id against the root-bound `pred_merkle_root`, returning the
 /// authenticated predicate IRI as a `Node` (mirroring the legacy predicate resolver).
 /// Term-bearing rebuilds+opens `tree`; term-less (S3) consumes the prover-shipped `openings`

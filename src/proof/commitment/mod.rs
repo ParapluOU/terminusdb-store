@@ -141,6 +141,7 @@ pub use op_value::{node_value_op_value, NODE_DATATYPE_TAG};
 // was `pub(super)` (proof-visible) as an inline item; one level deeper it reaches
 // proof as `pub(crate)` — internal only, never part of the external `pub` surface.
 pub(crate) use columns::reject_nan_catalog;
+pub(crate) use columns::reject_nan_objects;
 pub(crate) use dict_merkle::{
     build_node_value_tree, build_predicate_tree, verify_opening, DictMerkleTree,
 };

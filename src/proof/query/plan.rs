@@ -316,6 +316,18 @@ pub struct RangeAtomSubproof {
     /// The compaction of the kept columns by `combined_sel` (kept commitments live on the
     /// enclosing [`LayerBgpAtomProof`]).
     pub compaction: CompactionOnlyProof,
+    /// Merkle-dict I2b step 3 (value↔term consistency, TERM-LESS range). The real object
+    /// ids of this atom's source rows (`oid[i]` = the object id at row `i`, length = the
+    /// atom's real row count `n`), and one positional Merkle opening per DISTINCT id
+    /// (node/value namespace). EMPTY / `None` on a TERM-BEARING artifact (the catalog re-MSM
+    /// ties value/datatype to real terms; the verifier ignores these). On a TERM-LESS
+    /// artifact the verifier recommits `oid` to `com_object_at_d` (binding the touched set)
+    /// and rederives `com_v_val`/`com_v_dt` from the Merkle-authenticated opened terms
+    /// (`verify_dict_value_terms`). UNCOMMITTED — never folded into
+    /// `commitment_root`/`resolution_root`; every opening is re-checked at verify, a missing
+    /// opening (or recommit mismatch) fails closed.
+    pub oid: Vec<u64>,
+    pub value_openings: Option<ResolutionOpenings>,
 }
 
 /// The per-atom half of a layer BGP proof: an optional dictionary binding for a constant

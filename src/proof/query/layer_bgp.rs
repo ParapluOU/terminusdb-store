@@ -356,6 +356,54 @@ pub fn attach_termless_bgp_openings(
         &result.real_columns(),
     )?;
     result.proof.openings = Some(openings);
+    // Merkle-dict I2b step 3: also mint the per-ranged-atom value↔term witness (a no-op when the
+    // proof has no ranged atom). A term-less range proof is verifiable ONLY with these.
+    build_termless_range_openings(layer, plan, &mut result.proof)?;
+    Ok(())
+}
+
+/// Merkle-dict I2b step 3 (producer): mint the TERM-LESS value↔term witness for every ranged
+/// atom of a proven base/rollup BGP. For each atom whose proof carries a [`RangeAtomSubproof`],
+/// re-derive the atom's source object column (the SAME [`source_layer_columns`] the prover ranged
+/// over), record its real object ids as `oid`, and open each DISTINCT id against the node/value
+/// tree ([`build_resolution_openings`]). Populates `sub.oid` + `sub.value_openings` IN PLACE.
+///
+/// The witness is UNCOMMITTED (never folded into `commitment_root`/`resolution_root`): at verify,
+/// [`verify_dict_value_terms`](super::result) recommits `oid` to `com_object_at_d` (binding the
+/// touched set) and rederives value/datatype from the opened terms, failing closed on any mismatch
+/// or missing opening. Over-inclusion is safe (the recommit pins the exact column); a term-bearing
+/// verifier ignores the witness. BASE/ROLLUP single-layer ONLY (delta range stays fail-closed).
+pub fn build_termless_range_openings(
+    layer: &LayerCommitment,
+    plan: &LayerBgpPlan,
+    proof: &mut LayerBgpProof,
+) -> io::Result<()> {
+    require_base_layer_for_query(layer.verifier_view().state)?;
+    if plan.atoms.len() != proof.atoms.len() {
+        return Err(invalid("range openings: plan/proof atom count mismatch"));
+    }
+    for (atom, ap) in plan.atoms.iter().zip(proof.atoms.iter_mut()) {
+        let Some(sub) = ap.range.as_mut() else {
+            continue;
+        };
+        // The SAME object column the prover ranged over (`prove_ranged_atom` receives exactly
+        // `source_layer_columns(layer, atom.source)`), so the recommit tie holds byte-for-byte.
+        let (_s, _p, o, n) = source_layer_columns(layer, atom.source)?;
+        let mut oid: Vec<u64> = Vec::with_capacity(n);
+        let mut nv_ids: Vec<u64> = Vec::new();
+        for value in o.iter().take(n) {
+            let raw = super::result::canonical_dictionary_id(value)?;
+            oid.push(raw);
+            // The reserved null id 0 never indexes a dict row (never opened; masked out).
+            if raw != 0 {
+                nv_ids.push(raw);
+            }
+        }
+        // `build_resolution_openings` dedups + routes each id to the layer's interval.
+        let openings = build_resolution_openings(&[layer.verifier_view()], &nv_ids, &[])?;
+        sub.oid = oid;
+        sub.value_openings = Some(openings);
+    }
     Ok(())
 }
 
@@ -752,6 +800,7 @@ fn verify_layer_bgp_impl(
                     &com_p,
                     &com_o,
                     layer,
+                    trusted_resolution_root,
                     sub,
                     &ap.kept_commitments,
                     ap.m,

@@ -220,6 +220,42 @@ pub(super) fn commit_node_value_dictionary_with_context(
     Ok((hash_commitment, commit_owned_field_column_with_context(context, ids)?))
 }
 
+/// Whether `object` is an IEEE NaN of the queried float datatype (`datatype_tag` must be
+/// the `Float32`/`Float64` tag; any other tag returns `false`). Shared by
+/// [`reject_nan_catalog`] (term-bearing, whole catalog) and [`reject_nan_objects`]
+/// (Merkle-dict I2b step-3 TERM-LESS, the opened touched terms).
+fn object_is_selected_nan(object: &CanonicalObject, datatype_tag: ArkFr) -> bool {
+    let f32_tag = ArkFr::from_u64(CanonicalDatatype::Float32 as u64);
+    let f64_tag = ArkFr::from_u64(CanonicalDatatype::Float64 as u64);
+    match object {
+        CanonicalObject::Value {
+            datatype: CanonicalDatatype::Float32,
+            lexical,
+        } if datatype_tag == f32_tag && lexical.len() == 4 => {
+            let encoded = u32::from_be_bytes(lexical.as_slice().try_into().unwrap());
+            let bits = if encoded & 0x8000_0000 != 0 {
+                encoded ^ 0x8000_0000
+            } else {
+                encoded ^ 0xffff_ffff
+            };
+            f32::from_bits(bits).is_nan()
+        }
+        CanonicalObject::Value {
+            datatype: CanonicalDatatype::Float64,
+            lexical,
+        } if datatype_tag == f64_tag && lexical.len() == 8 => {
+            let encoded = u64::from_be_bytes(lexical.as_slice().try_into().unwrap());
+            let bits = if encoded & 0x8000_0000_0000_0000 != 0 {
+                encoded ^ 0x8000_0000_0000_0000
+            } else {
+                encoded ^ 0xffff_ffff_ffff_ffff
+            };
+            f64::from_bits(bits).is_nan()
+        }
+        _ => false,
+    }
+}
+
 /// Reject IEEE NaNs before using the Store's total-order lexical encoding as
 /// WOQL numeric comparison order. Prolog's `X < Y` follows IEEE unordered-NaN
 /// semantics, whereas the storage encoding deliberately assigns every NaN a
@@ -235,36 +271,33 @@ pub(crate) fn reject_nan_catalog(
         return Ok(());
     }
     for record in catalog {
-        let is_nan = match &record.triple.object {
-            CanonicalObject::Value {
-                datatype: CanonicalDatatype::Float32,
-                lexical,
-            } if datatype_tag == f32_tag && lexical.len() == 4 => {
-                let encoded = u32::from_be_bytes(lexical.as_slice().try_into().unwrap());
-                let bits = if encoded & 0x8000_0000 != 0 {
-                    encoded ^ 0x8000_0000
-                } else {
-                    encoded ^ 0xffff_ffff
-                };
-                f32::from_bits(bits).is_nan()
-            }
-            CanonicalObject::Value {
-                datatype: CanonicalDatatype::Float64,
-                lexical,
-            } if datatype_tag == f64_tag && lexical.len() == 8 => {
-                let encoded = u64::from_be_bytes(lexical.as_slice().try_into().unwrap());
-                let bits = if encoded & 0x8000_0000_0000_0000 != 0 {
-                    encoded ^ 0x8000_0000_0000_0000
-                } else {
-                    encoded ^ 0xffff_ffff_ffff_ffff
-                };
-                f64::from_bits(bits).is_nan()
-            }
-            _ => false,
-        };
-        if is_nan {
+        if object_is_selected_nan(&record.triple.object, datatype_tag) {
             return Err(invalid(
                 "float range/group proof cannot match Prolog semantics in a catalog containing NaN",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Merkle-dict I2b step 3 (TERM-LESS): the NaN guard over the OPENED touched terms rather
+/// than the (dropped) clear catalog. Only touched rows affect a range/group answer, so
+/// rejecting a queried-float NaN among the authenticated touched terms is sufficient to
+/// keep the total-order encoding faithful to Prolog's unordered-NaN semantics. A non-float
+/// `datatype_tag` is a no-op (mirrors [`reject_nan_catalog`]).
+pub(crate) fn reject_nan_objects(
+    objects: &[CanonicalObject],
+    datatype_tag: ArkFr,
+) -> io::Result<()> {
+    let f32_tag = ArkFr::from_u64(CanonicalDatatype::Float32 as u64);
+    let f64_tag = ArkFr::from_u64(CanonicalDatatype::Float64 as u64);
+    if datatype_tag != f32_tag && datatype_tag != f64_tag {
+        return Ok(());
+    }
+    for object in objects {
+        if object_is_selected_nan(object, datatype_tag) {
+            return Err(invalid(
+                "float range proof cannot match Prolog semantics: a touched term is NaN",
             ));
         }
     }

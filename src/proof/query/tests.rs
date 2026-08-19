@@ -2901,7 +2901,7 @@
             &op,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("terms-bearing"), "range w/ openings: {err}");
+        assert!(err.to_string().contains("Merkle openings"), "range w/ openings: {err}");
     }
 
     #[test]
@@ -3408,4 +3408,165 @@
         // ...but `commitment_root` is computed independently of the Merkle roots and is
         // unchanged (byte-identity of the base anchor is preserved under I1).
         assert_eq!(view.recomputed_commitment_root().unwrap(), lc.state.commitment_root);
+    }
+
+    // =====================================================================================
+    // Merkle-dict I2b step 3 (value↔term consistency, RANGE). A TERM-LESS base/rollup range
+    // proof ties the committed value/datatype columns to the Merkle-authenticated terms via
+    // the prover-shipped `oid` vector + per-distinct value openings. N1–N6 below; term-bearing
+    // verify is unchanged (the catalog re-MSM still ties value/datatype there).
+    // =====================================================================================
+
+    // Prove the age-range + name-join plan and attach BOTH the BGP openings (predicate belt +
+    // resolved results) and the per-ranged-atom value↔term openings. Asserts the producer
+    // populated the range witness.
+    fn prove_attach_age_range(
+        lc: &LayerCommitment,
+        op: RangeOp,
+        c: u64,
+    ) -> (LayerBgpPlan, LayerBgpResult) {
+        let plan = age_range_plan(op, c);
+        let mut result = prove_layer_bgp_with_result(lc, &plan).unwrap();
+        attach_termless_bgp_openings(lc, &plan, &mut result).unwrap();
+        assert!(result.proof.openings.is_some(), "BGP openings attached");
+        let sub = result.proof.atoms[0].range.as_ref().expect("atom 0 is the ranged atom");
+        assert!(sub.value_openings.is_some(), "range value openings attached");
+        assert!(!sub.oid.is_empty(), "range oid vector minted");
+        (plan, result)
+    }
+
+    fn verify_bearing(
+        lc: &LayerCommitment,
+        plan: &LayerBgpPlan,
+        r: &LayerBgpResult,
+    ) -> std::io::Result<()> {
+        verify_layer_bgp(
+            lc,
+            lc.resolution_root(),
+            plan,
+            &r.predicate_ids,
+            &r.result_commitments,
+            r.result_len,
+            &r.proof,
+        )
+    }
+
+    fn verify_termless(
+        lc: &LayerCommitment,
+        plan: &LayerBgpPlan,
+        r: &LayerBgpResult,
+    ) -> std::io::Result<()> {
+        let termless = lc.verifier_commitment_termless().unwrap();
+        verify_layer_bgp(
+            &termless,
+            lc.resolution_root(),
+            plan,
+            &r.predicate_ids,
+            &r.result_commitments,
+            r.result_len,
+            &r.proof,
+        )
+    }
+
+    /// N5 (differential positive): a TERM-LESS range proof verifies EXACTLY like the
+    /// TERM-BEARING one — same accept (honest plan) AND same reject (mismatched-`c` plan).
+    #[test]
+    fn i2b_step3_range_termless_differential() {
+        let lc = build_age_name_layer();
+        let (plan, result) = prove_attach_age_range(&lc, RangeOp::Gt, 18);
+        verify_bearing(&lc, &plan, &result).unwrap();
+        verify_termless(&lc, &plan, &result).unwrap();
+        // Verified against a DIFFERENT range constant, BOTH artifacts reject identically.
+        let wrong = age_range_plan(RangeOp::Gt, 25);
+        assert!(verify_bearing(&lc, &wrong, &result).is_err());
+        assert!(verify_termless(&lc, &wrong, &result).is_err());
+    }
+
+    /// N1: a forged committed VALUE column (`com_v_val`) — the term-less I2b value forge — makes
+    /// the Merkle-rederived value column disagree ⇒ `Com(ov) != com_v_val` ⇒ REJECT.
+    #[test]
+    fn i2b_step3_range_termless_rejects_forged_value_column() {
+        let lc = build_age_name_layer();
+        let (plan, mut result) = prove_attach_age_range(&lc, RangeOp::Gt, 18);
+        let sub = result.proof.atoms[0].range.as_mut().unwrap();
+        // Swap in a DIFFERENT real commitment (the datatype column != the value column).
+        sub.object_range.lookup.com_v_val = sub.object_range.lookup.com_v_dt;
+        let err = verify_termless(&lc, &plan, &result).unwrap_err();
+        assert!(err.to_string().contains("com_v_val"), "{err}");
+    }
+
+    /// N6: a forged committed DATATYPE column (`com_v_dt`) ⇒ `Com(dt) != com_v_dt` ⇒ REJECT.
+    /// Plus the touched-terms NaN guard: a queried-float NaN rejects; a finite float is accepted;
+    /// a non-float datatype is a no-op (float/NaN stays gated).
+    #[test]
+    fn i2b_step3_range_termless_rejects_forged_datatype_and_nan_gated() {
+        let lc = build_age_name_layer();
+        let (plan, mut result) = prove_attach_age_range(&lc, RangeOp::Gt, 18);
+        let sub = result.proof.atoms[0].range.as_mut().unwrap();
+        sub.object_range.lookup.com_v_dt = sub.object_range.lookup.com_v_val;
+        let err = verify_termless(&lc, &plan, &result).unwrap_err();
+        assert!(err.to_string().contains("com_v_dt"), "{err}");
+
+        // T5 NaN guard over OPENED touched terms: a Float64 whose order-preserving lexical
+        // decodes to a NaN rejects for a float query; a finite float is accepted; a non-float
+        // datatype tag is a no-op (gated).
+        let f64_tag = fr(CanonicalDatatype::Float64 as u64);
+        let nan = CanonicalObject::Value {
+            datatype: CanonicalDatatype::Float64,
+            lexical: vec![0u8; 8],
+        };
+        let finite = CanonicalObject::Value {
+            datatype: CanonicalDatatype::Float64,
+            lexical: vec![0x80, 0, 0, 0, 0, 0, 0, 0],
+        };
+        assert!(reject_nan_objects(std::slice::from_ref(&nan), f64_tag).is_err());
+        assert!(reject_nan_objects(std::slice::from_ref(&finite), f64_tag).is_ok());
+        assert!(reject_nan_objects(std::slice::from_ref(&nan), fr(UINT32_TAG)).is_ok());
+    }
+
+    /// N2: a substituted `oid` vector no longer recommits to `com_object_at_d` ⇒ REJECT.
+    #[test]
+    fn i2b_step3_range_termless_rejects_forged_oid() {
+        let lc = build_age_name_layer();
+        let (plan, mut result) = prove_attach_age_range(&lc, RangeOp::Gt, 18);
+        let sub = result.proof.atoms[0].range.as_mut().unwrap();
+        sub.oid[0] = sub.oid[0].wrapping_add(1); // any change breaks the binding
+        let err = verify_termless(&lc, &plan, &result).unwrap_err();
+        assert!(err.to_string().contains("oid column"), "{err}");
+    }
+
+    /// N3: a tampered opening (wrong `term_bytes` for a real id) fails `verify_opening` ⇒ REJECT.
+    #[test]
+    fn i2b_step3_range_termless_rejects_tampered_opening() {
+        let lc = build_age_name_layer();
+        let (plan, mut result) = prove_attach_age_range(&lc, RangeOp::Gt, 18);
+        let sub = result.proof.atoms[0].range.as_mut().unwrap();
+        let mut nv: Vec<DictOpening> = sub
+            .value_openings
+            .as_ref()
+            .unwrap()
+            .node_value_openings()
+            .cloned()
+            .collect();
+        assert!(!nv.is_empty());
+        // Keep id/position/siblings; corrupt the authenticated term bytes.
+        nv[0].term_bytes.push(0xFF);
+        sub.value_openings = Some(ResolutionOpenings::from_wire(nv, Vec::new()).unwrap());
+        let err = verify_termless(&lc, &plan, &result).unwrap_err();
+        assert!(
+            err.to_string().contains("authenticate") || err.to_string().contains("merkle root"),
+            "{err}"
+        );
+    }
+
+    /// N4: a term-less range proof WITHOUT the value openings fails closed.
+    #[test]
+    fn i2b_step3_range_termless_rejects_missing_openings() {
+        let lc = build_age_name_layer();
+        let (plan, mut result) = prove_attach_age_range(&lc, RangeOp::Gt, 18);
+        result.proof.atoms[0].range.as_mut().unwrap().value_openings = None;
+        let err = verify_termless(&lc, &plan, &result).unwrap_err();
+        assert!(err.to_string().contains("value\u{2194}term Merkle openings"), "{err}");
+        // Term-bearing still verifies (the witness is irrelevant there).
+        verify_bearing(&lc, &plan, &result).unwrap();
     }
