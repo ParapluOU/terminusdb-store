@@ -1801,9 +1801,12 @@ fn delta_read_from_views_termless_head_matches_term_bearing_count() {
     assert_eq!(n_bearing, n_views, "term-less views must give the SAME count as term-bearing");
 }
 
-/// D2 NEGATIVE: a delta-read with an object-value RANGE atom must FAIL CLOSED when verified over a
-/// TERM-LESS view (the order-preserving value/datatype is not authenticated term-less). The SAME
-/// range query over all-term-bearing views still verifies (regression).
+/// D2/C2a FAIL-CLOSED DEFAULT: a delta-read with an object-value RANGE atom, verified over a
+/// TERM-LESS view with NO C2a value↔term openings shipped (the prover default), must FAIL CLOSED —
+/// the order-preserving value/datatype is not authenticated term-less unless the openings tie it
+/// (see the `c2a_delta_read_termless_range_*` differentials, which DO ship them and verify). The
+/// SAME range query over all-term-bearing views still verifies (regression). C2a moved the reject
+/// from a blanket per-view guard to this per-atom no-openings default.
 #[test]
 fn delta_read_from_views_range_termless_rejects() {
     use crate::proof::commitment::VerifierLayer;
@@ -2006,10 +2009,13 @@ fn c1_read_bgp_from_views_termless_head_matches_term_bearing_count() {
     assert_eq!(n_bearing, n_views, "term-less views must give the SAME count as term-bearing");
 }
 
-/// C1 D2 NEGATIVE: a materialized-present BGP with an object-value RANGE atom must FAIL CLOSED when
-/// verified over a TERM-LESS view (the order-preserving value/datatype is not authenticated
-/// term-less). The SAME range query over all-term-bearing views still verifies (regression). D2 is
-/// already placed in `verify_present_bgp` by E2a — this only exercises the reconcile views entry.
+/// C1 D2/C2a FAIL-CLOSED DEFAULT: a materialized-present BGP with an object-value RANGE atom,
+/// verified over a TERM-LESS view with NO C2a value↔term openings shipped (the prover default),
+/// must FAIL CLOSED — the order-preserving value/datatype is not authenticated term-less unless the
+/// openings tie it (see the `c2a_reconcile_termless_range_*` differentials, which DO ship them and
+/// verify). The SAME range query over all-term-bearing views still verifies (regression). The
+/// reject now lives per-atom in `verify_present_bgp` as the no-openings default (was a blanket
+/// per-view guard) — this exercises the reconcile views entry.
 #[test]
 fn c1_read_bgp_from_views_range_termless_rejects() {
     use crate::proof::commitment::VerifierLayer;
@@ -2177,6 +2183,232 @@ fn c1_read_bgp_termless_resolve_forged_opening_rejected() {
         )
         .is_err(),
         "a forged resolution opening must be rejected by verify_opening"
+    );
+}
+
+// ============================================================
+// C2a — numeric object-value RANGE over a TERM-LESS delta / reconciled present.
+//
+// The one construct E2a/C1 left fail-closed: a range reads the committed order-preserving
+// value/datatype columns whose tie to the real terms rests on the catalog re-MSM a term-less
+// artifact drops. C2a OPENS it by shipping value↔term Merkle openings (over the present OBJECT
+// column) and relaxing the D2 blanket reject to the openings path (mirroring the base T-series).
+// The differential shows a term-less range VERIFIES + RESOLVES identically to term-bearing; the
+// negatives show missing/forged openings and the no-openings default all fail closed.
+// ============================================================
+
+/// Full term-less-vs-term-bearing differential for a DELTA-read range query (over the head
+/// additions): the term-less-head COUNT equals the term-bearing count, and the resolved rows are
+/// bag-equal. Attaches BOTH the C2a value↔term range openings and the E2b result openings (the
+/// term-less RESOLVE needs both). Asserts the differential is non-vacuous.
+fn c2a_delta_range_diff(atoms: &[PresentBgpAtom]) {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = age_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let (mut proof, result) = prove_delta_read(&lref, DeltaSource::Additions, atoms, &[]).unwrap();
+
+    // C2a: the head additions' object ids ARE the delta present object column (`present_id_o`).
+    let head = *lref.last().unwrap();
+    let poids: Vec<ArkFr> = head.additions.iter().map(|r| ark(r.object_id)).collect();
+    attach_termless_present_range_openings(&mut proof.bgp, &lref, &poids).unwrap();
+    // E2b: the RESOLVE step still needs the result-id openings for the term-less head.
+    attach_termless_delta_openings(&mut proof, &lref, &result.columns).unwrap();
+
+    // Term-bearing (all views term-bearing): the D2 relaxation is a no-op.
+    let bearing_views: Vec<VerifierCommitmentRef<'_>> =
+        lref.iter().map(|l| l.verifier_view()).collect();
+    let n_bearing = verify_delta_read_from_views(
+        &bearing_views, head_root, DeltaSource::Additions, atoms, &[], &proof,
+    )
+    .unwrap();
+
+    // Term-less head + term-bearing ancestors: now VERIFIES via the shipped value↔term openings.
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut termless_views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    termless_views.push(head_termless.verifier_view());
+    let n_termless = verify_delta_read_from_views(
+        &termless_views, head_root, DeltaSource::Additions, atoms, &[], &proof,
+    )
+    .unwrap();
+    assert_eq!(n_bearing, n_termless, "term-less range count must equal term-bearing");
+
+    let bearing = verify_and_resolve_delta_read_from_views(
+        &bearing_views, head_root, DeltaSource::Additions, atoms, &[], &proof, &result.columns,
+    )
+    .unwrap();
+    let termless = verify_and_resolve_delta_read_from_views(
+        &termless_views, head_root, DeltaSource::Additions, atoms, &[], &proof, &result.columns,
+    )
+    .unwrap();
+    assert!(!rows_of(&bearing).is_empty(), "the differential must not be vacuous");
+    assert!(
+        bag_eq_rows(rows_of(&bearing), rows_of(&termless)),
+        "term-less delta range must resolve to the same rows as term-bearing"
+    );
+}
+
+/// C2a DELTA differential, single bound: `AddedTriple(?x, age, ?v)[?v >= 18]` over the head
+/// additions ({grace 25}) verifies + resolves identically term-less and term-bearing.
+#[test]
+fn c2a_delta_read_termless_range_single_bound() {
+    c2a_delta_range_diff(&[range_atom(RangeOp::Ge, 18, None)]);
+}
+
+/// C2a DELTA differential, InRange: `[?v >= 18 AND ?v < 30]` exercises the SECOND bound tie (its
+/// own separately-committed value/datatype columns must be opened too).
+#[test]
+fn c2a_delta_read_termless_range_in_range_second_bound() {
+    c2a_delta_range_diff(&[range_atom(RangeOp::Ge, 18, Some((RangeOp::Lt, 30)))]);
+}
+
+/// Full term-less-vs-term-bearing differential for a RECONCILED-PRESENT range query: the
+/// term-less-head COUNT equals the term-bearing count (== `expect`), and the resolved rows are
+/// bag-equal. Attaches BOTH the C2a value↔term range openings (over the reconciled present object
+/// column) and the C1b result openings.
+fn c2a_reconcile_range_diff(atoms: &[PresentBgpAtom], expect: usize) {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = age_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let (rec, mut bgp, result) = prove_read_bgp(&lref, atoms, &[]).unwrap();
+
+    // C2a: the reconciled present's object ids, in reconcile order, ARE `present_id_o`.
+    let poids: Vec<ArkFr> =
+        reconcile_present(&lref).unwrap().iter().map(|r| ark(r.object_id)).collect();
+    attach_termless_present_range_openings(&mut bgp, &lref, &poids).unwrap();
+    // C1b: the RESOLVE step still needs the result-id openings for the term-less head.
+    attach_termless_reconcile_openings(&mut bgp, &lref, &result.columns).unwrap();
+
+    let bearing_views: Vec<VerifierCommitmentRef<'_>> =
+        lref.iter().map(|l| l.verifier_view()).collect();
+    let n_bearing =
+        verify_read_bgp_from_views(&bearing_views, head_root, atoms, &[], &rec, &bgp).unwrap();
+    assert_eq!(n_bearing, expect, "term-bearing count must match the materialized ground");
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut termless_views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    termless_views.push(head_termless.verifier_view());
+    let n_termless =
+        verify_read_bgp_from_views(&termless_views, head_root, atoms, &[], &rec, &bgp).unwrap();
+    assert_eq!(n_bearing, n_termless, "term-less range count must equal term-bearing");
+
+    let bearing =
+        verify_and_resolve_bgp_from_views(&bearing_views, head_root, atoms, &[], &rec, &bgp, &result.columns)
+            .unwrap();
+    let termless =
+        verify_and_resolve_bgp_from_views(&termless_views, head_root, atoms, &[], &rec, &bgp, &result.columns)
+            .unwrap();
+    assert!(
+        bag_eq_rows(rows_of(&bearing), rows_of(&termless)),
+        "term-less present range must resolve to the same rows as term-bearing"
+    );
+}
+
+/// C2a RECONCILE differential, Ge boundary (carol/erin == 18 INCLUDED): 5 of {30,15,18,40,18,25}.
+#[test]
+fn c2a_reconcile_termless_range_ge_boundary() {
+    c2a_reconcile_range_diff(&[range_atom(RangeOp::Ge, 18, None)], 5);
+}
+
+/// C2a RECONCILE differential, Gt boundary (18 EXCLUDED): {30,40,25} = 3.
+#[test]
+fn c2a_reconcile_termless_range_gt_boundary() {
+    c2a_reconcile_range_diff(&[range_atom(RangeOp::Gt, 18, None)], 3);
+}
+
+/// C2a RECONCILE differential, Le: {15,18,18} = 3.
+#[test]
+fn c2a_reconcile_termless_range_le_boundary() {
+    c2a_reconcile_range_diff(&[range_atom(RangeOp::Le, 18, None)], 3);
+}
+
+/// C2a RECONCILE differential, EMPTY result: even with 0 answers the value↔term tie still runs
+/// over the FULL present object column (all touched terms opened) — 0 both ways.
+#[test]
+fn c2a_reconcile_termless_range_empty() {
+    c2a_reconcile_range_diff(&[range_atom(RangeOp::Gt, 1000, None)], 0);
+}
+
+/// C2a RECONCILE differential, InRange `[18, 30)`: {18,18,25} = 3 — exercises the SECOND bound tie.
+#[test]
+fn c2a_reconcile_termless_range_in_range() {
+    c2a_reconcile_range_diff(&[range_atom(RangeOp::Ge, 18, Some((RangeOp::Lt, 30)))], 3);
+}
+
+/// C2a NEGATIVE (missing value opening): a term-less range whose `range_value_openings` OMITS a
+/// needed present-object id (the head-minted largest) fails closed — the chain resolver cannot
+/// open that term. A missing opening is never a silent pass.
+#[test]
+fn c2a_reconcile_termless_range_missing_opening_fails_closed() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = age_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [range_atom(RangeOp::Ge, 18, None)];
+    let (rec, mut bgp, _result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+    let poids: Vec<ArkFr> =
+        reconcile_present(&lref).unwrap().iter().map(|r| ark(r.object_id)).collect();
+    attach_termless_present_range_openings(&mut bgp, &lref, &poids).unwrap();
+
+    // Drop the largest object id's value opening — it is head-minted, so its present row routes to
+    // the term-less head and now cannot be opened.
+    let full = bgp.range_value_openings.as_ref().unwrap();
+    let mut nv: Vec<_> = full.node_value_openings().cloned().collect();
+    let pred: Vec<_> = full.predicate_openings().cloned().collect();
+    let max_id = nv.iter().map(|o| o.id).max().unwrap();
+    nv.retain(|o| o.id != max_id);
+    bgp.range_value_openings = Some(ResolutionOpenings::from_wire(nv, pred).unwrap());
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut termless_views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    termless_views.push(head_termless.verifier_view());
+    assert!(
+        verify_read_bgp_from_views(&termless_views, head_root, &atoms, &[], &rec, &bgp).is_err(),
+        "a missing value↔term opening must fail closed"
+    );
+}
+
+/// C2a NEGATIVE (forged value opening): substituting a DIFFERENT id's valid Merkle data into a
+/// present-object opening (wrong term) is rejected — `verify_opening` fails the structural
+/// position / root, so the value forge cannot be re-opened.
+#[test]
+fn c2a_reconcile_termless_range_forged_opening_rejected() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = age_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [range_atom(RangeOp::Ge, 18, None)];
+    let (rec, mut bgp, _result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+    let poids: Vec<ArkFr> =
+        reconcile_present(&lref).unwrap().iter().map(|r| ark(r.object_id)).collect();
+    attach_termless_present_range_openings(&mut bgp, &lref, &poids).unwrap();
+
+    // Forge: give the largest object id's opening a DIFFERENT (also head-minted) id's Merkle data,
+    // keeping the queried id — the opened term is now wrong.
+    let full = bgp.range_value_openings.as_ref().unwrap();
+    let mut nv: Vec<_> = full.node_value_openings().cloned().collect();
+    let pred: Vec<_> = full.predicate_openings().cloned().collect();
+    nv.sort_by_key(|o| o.id);
+    let n = nv.len();
+    assert!(n >= 2, "need >=2 distinct object openings to forge");
+    let donor = nv[n - 2].clone();
+    nv[n - 1].term_bytes = donor.term_bytes;
+    nv[n - 1].datatype_tag = donor.datatype_tag;
+    nv[n - 1].position = donor.position;
+    nv[n - 1].siblings = donor.siblings;
+    bgp.range_value_openings = Some(ResolutionOpenings::from_wire(nv, pred).unwrap());
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut termless_views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    termless_views.push(head_termless.verifier_view());
+    assert!(
+        verify_read_bgp_from_views(&termless_views, head_root, &atoms, &[], &rec, &bgp).is_err(),
+        "a forged value↔term opening must be rejected"
     );
 }
 

@@ -322,6 +322,105 @@ impl<'a> ChainDictResolver<'a> {
     }
 }
 
+/// Merkle-dict I2b step 3 (CROSS-LAYER, C2a): the value↔term consistency verifier for a numeric
+/// object-value RANGE over a TERM-LESS delta / reconciled `present`. The chain analogue of
+/// [`verify_dict_value_terms`](crate::proof::query::result::verify_dict_value_terms): the object
+/// ids of a delta / reconciled range span LAYERS, so step (3)'s per-id resolution drives the
+/// audited [`ChainDictResolver`] (which ROUTES each id to its introducing view and opens it
+/// term-less against that view's root-bound `nv_merkle_root`, fail-closed on a missing/forged
+/// opening) instead of the single-layer `resolve_node_value_id_via_merkle`. Everything else is
+/// VERBATIM from the base helper:
+///   * step (2) recommits `oid` (real ids, `0`-padded to `domain`) and requires
+///     `Com(oid) == com_obj_id` — pinning the touched set to the EXACT authenticated object-id
+///     column (`auth_o.com_id`); a substituted/subset id shifts the commitment and rejects;
+///   * step (4) re-derives `ov = node_value_op_value(term)` (the single-source order-preserving
+///     encoder the committed value column is built with) and `dt` = the datatype discriminant /
+///     `NODE_DATATYPE_TAG`, byte-identically to the committed datatype column;
+///   * step (5) recommits `ov`/`dt` and requires `Com(ov) == com_v_val`, `Com(dt) == com_v_dt` —
+///     a forged `dict_value`/`dict_datatype` rejects.
+/// Returns the DISTINCT opened touched terms (for the residual NaN gate). TRANSCRIPT-FREE (pure
+/// commitment recompute, like the base helper). The chain re-anchor is the caller's
+/// `verify_reconcile_core` / `verify_delta_read_core` (every view `validate()`d + chained to the
+/// trusted head root before this runs), exactly as the sibling chain result-resolver relies on.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_dict_value_terms_chain(
+    views: &[VerifierCommitmentRef<'_>],
+    com_obj_id: &ArkGT,
+    com_v_val: &ArkGT,
+    com_v_dt: &ArkGT,
+    real_n: usize,
+    domain: usize,
+    oid: &[u64],
+    openings: &ResolutionOpenings,
+) -> io::Result<Vec<CanonicalObject>> {
+    if domain == 0 || !domain.is_power_of_two() {
+        return Err(invalid("value↔term domain must be a non-zero power of two"));
+    }
+    if real_n > domain || oid.len() != real_n {
+        return Err(invalid(
+            "value↔term oid vector length does not match the real row count",
+        ));
+    }
+
+    // (2) Recommit the oid column (real rows from the vector, 0-pad beyond real_n — the SAME
+    // layout the honest lookup gathers over, and the SAME 0-padding the object column commits
+    // into `com_obj_id`) and bind it to the object-id commitment.
+    let mut oid_col = vec![f0(); domain];
+    for (slot, &raw) in oid_col.iter_mut().zip(oid.iter()) {
+        *slot = ark(raw);
+    }
+    if commit_column(&oid_col)? != *com_obj_id {
+        return Err(invalid(
+            "value↔term: recommitted oid column does not match the object-id commitment",
+        ));
+    }
+
+    // (3)-(4) Per-row re-derive (ov, dt) from the CHAIN-routed authenticated Merkle term. Distinct
+    // ids are opened once; padding/null rows (`id == 0`) never index a dict row and are skipped.
+    let mut resolver = ChainDictResolver::new(views, Some(openings));
+    let mut ov_col = vec![f0(); domain];
+    let mut dt_col = vec![f0(); domain];
+    let mut cache: std::collections::BTreeMap<u64, (ArkFr, ArkFr)> = std::collections::BTreeMap::new();
+    let mut touched: Vec<CanonicalObject> = Vec::new();
+    for (i, &raw) in oid.iter().enumerate() {
+        if raw == 0 {
+            continue;
+        }
+        let (ov, dt) = if let Some(entry) = cache.get(&raw) {
+            *entry
+        } else {
+            // No belt-hash on the value-terms path (no proof-authenticated per-row hash exists);
+            // the recommit ties (2)/(5) are what bind the opened terms to the committed columns.
+            let opened = resolver.resolve_nv_id(raw, None)?;
+            let ov = node_value_op_value(&opened)?;
+            // Byte-identical to `node_value_dict_datatype_column`: a `Value`'s discriminant,
+            // a `Node`'s `NODE_DATATYPE_TAG`.
+            let dt = ark(match &opened {
+                CanonicalObject::Node(_) => NODE_DATATYPE_TAG,
+                CanonicalObject::Value { datatype, .. } => *datatype as u8 as u64,
+            });
+            cache.insert(raw, (ov, dt));
+            touched.push(opened);
+            (ov, dt)
+        };
+        ov_col[i] = ov;
+        dt_col[i] = dt;
+    }
+
+    // (5) Bind the re-derived value/datatype columns to the committed lookup columns.
+    if commit_column(&ov_col)? != *com_v_val {
+        return Err(invalid(
+            "value↔term: recommitted value column does not match com_v_val (forged dict_value)",
+        ));
+    }
+    if commit_column(&dt_col)? != *com_v_dt {
+        return Err(invalid(
+            "value↔term: recommitted datatype column does not match com_v_dt (forged dict_datatype)",
+        ));
+    }
+    Ok(touched)
+}
+
 /// Resolve authenticated result columns to `CanonicalObject`s. `claimed_columns` are the
 /// prover's real-prefix result values; they are bound to `com_out` (the proof's committed
 /// result, at `2^domain_log`) by re-commitment before resolution.

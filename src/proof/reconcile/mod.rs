@@ -80,8 +80,9 @@ use super::bgp::{
     RelationCommit, RelationWitness,
 };
 use super::commitment::{
-    build_node_value_tree, build_predicate_tree, verify_opening, DictMerkleTree, LayerCommitment,
-    ResolutionOpenings, VerifierCommitmentRef, VerifierLayer,
+    build_node_value_tree, build_predicate_tree, node_value_op_value, reject_nan_objects,
+    verify_opening, DictMerkleTree, LayerCommitment, ResolutionOpenings, VerifierCommitmentRef,
+    VerifierLayer, NODE_DATATYPE_TAG,
 };
 // Merkle-dict I2b S3 differential/negative tests: the prover-side opening builder is test-only
 // in the reconcile module (the term-less chain-resolver path is exercised via the `_with_openings`
@@ -196,7 +197,8 @@ pub use present_result::{
     verify_and_resolve_single_atom, verify_and_resolve_two_atom_join, ResolveKind,
 };
 pub use present_bgp::{
-    attach_termless_reconcile_openings, build_termless_reconcile_openings, prove_read_bgp,
+    attach_termless_present_range_openings, attach_termless_reconcile_openings,
+    build_termless_present_range_openings, build_termless_reconcile_openings, prove_read_bgp,
     verify_and_resolve_bgp, verify_and_resolve_bgp_from_views, verify_read_bgp,
     verify_read_bgp_from_views, ColumnDistinctProof, PresentAtomFilter, PresentBgpAtom,
     PresentBgpAtomProof, PresentBgpProof, PresentRangeSubproof, PresentSecondRange, PresentTerm,

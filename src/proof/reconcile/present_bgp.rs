@@ -162,6 +162,21 @@ pub struct PresentBgpProof {
     /// (`PresentBgpProof` is Clone/Debug in-memory only), so this adds no wire/golden/version
     /// change. Mirrors [`DeltaReadProof::openings`].
     pub openings: Option<ResolutionOpenings>,
+    /// C2a: UNCOMMITTED prover-shipped REAL present object-id column (the same `present_id_o`
+    /// prefix `auth_o.com_id` commits), used by [`verify_dict_value_terms_chain`] to recommit the
+    /// touched object column and pin it to `auth_o.com_id` when a numeric object-value RANGE is
+    /// verified over a TERM-LESS delta / reconciled view. Empty on the prover default and on
+    /// term-bearing artifacts; the term-less producer attaches it via
+    /// [`attach_termless_present_range_openings`]. In-memory only (no wire), like `openings`.
+    pub range_object_oid: Vec<u64>,
+    /// C2a: UNCOMMITTED prover-shipped Merkle value↔term openings for a TERM-LESS object-value
+    /// RANGE — one [`crate::proof::commitment::DictOpening`] per DISTINCT present object id,
+    /// re-verified per id against the root-bound `nv_merkle_root` by the chain resolver at verify
+    /// time. `None` on the prover default and on term-bearing artifacts (whose committed
+    /// value/datatype columns are tied by `validate()`'s catalog re-MSM); a term-less range with
+    /// this `None` fails closed (the D2 default). NEVER folded into `commitment_root` /
+    /// `resolution_root`; in-memory only (no wire/golden/version change). Mirrors `openings`.
+    pub range_value_openings: Option<ResolutionOpenings>,
 }
 
 /// Build the hash-space [`AtomFilterSpec`] (predicate/subject/object constants +
@@ -715,6 +730,10 @@ pub(crate) fn prove_present_bgp(
             // Prover default: the term-less producer attaches the openings witness separately via
             // `attach_termless_reconcile_openings`; a term-bearing artifact leaves this `None`.
             openings: None,
+            // C2a prover default: the term-less range producer attaches these separately via
+            // `attach_termless_present_range_openings`; a term-bearing artifact leaves them empty.
+            range_object_oid: Vec::new(),
+            range_value_openings: None,
         },
         // BGP output columns are combined-dict ids (resolved directly as ids); no I2a id-hints.
         PresentReadResult { columns, len: result_m, id_hints: Vec::new() },
@@ -830,19 +849,16 @@ pub(crate) fn verify_present_bgp(
 
     // (1r) The combined range dictionary — required iff (and only iff) some atom ranges.
     let needs_range = bgp_needs_range_dict(atoms);
-    // (1r-tl) Merkle-dict I2b / E2a-D2: a numeric object-value RANGE authenticates each object
-    // id's ORDER-PRESERVING VALUE + DATATYPE against the committed `node_value_dict_range_commitments`
-    // columns, whose tie to the REAL terms rests on the catalog re-MSM a TERM-LESS artifact drops.
-    // Fail closed on ANY term-less view BEFORE the range-dict branches / value+datatype columns are
-    // trusted below. No-op on the term-bearing materialized/reconciled-walk callers (their views are
-    // always `terms_present`).
-    if needs_range {
-        for view in views {
-            view.require_terms_present(
-                "delta/present BGP object-value range (order-preserving value/datatype not authenticated term-less)",
-            )?;
-        }
-    }
+    // (1r-tl) Merkle-dict I2b / E2a-D2 → C2a: a numeric object-value RANGE authenticates each
+    // object id's ORDER-PRESERVING VALUE + DATATYPE against the committed
+    // `node_value_dict_range_commitments` columns, whose tie to the REAL terms rests on the catalog
+    // re-MSM a TERM-LESS artifact drops. When EVERY view is term-bearing that re-MSM (in each
+    // `validate()`) restores the tie and the term-bearing range path below is UNCHANGED. When ANY
+    // view is term-less the tie is instead OPENED per range atom via prover-shipped value↔term
+    // Merkle openings ([`verify_dict_value_terms_chain`], in the RANGE arm below); a range atom
+    // shipping NO such openings fails CLOSED there (the old blanket-reject default, now atom-local
+    // so the openings path can relax it precisely).
+    let all_terms_present = views.iter().all(|v| v.terms_present);
     if needs_range != proof.range_dict.is_some() {
         return Err(invalid("present BGP: range-dict presence disagrees with the plan"));
     }
@@ -870,6 +886,47 @@ pub(crate) fn verify_present_bgp(
                     verified, range_dict, head_nv, &spec, &source_coms, range, sub,
                     &ap.com_kept, ap.m, &proof.auth_o, transcript,
                 )?;
+                // C2a: over a TERM-LESS view the committed order-preserving value/datatype columns
+                // the range gadget just authenticated are NOT tied to the real terms (the catalog
+                // re-MSM is dropped). Restore the tie: recommit the present object-id column to
+                // `auth_o.com_id` and re-derive value/datatype from the CHAIN-opened Merkle terms
+                // (`verify_dict_value_terms_chain`), then run the NaN gate over the opened touched
+                // terms (MANDATORY — present range supports Float64). No openings ⇒ fail CLOSED (the
+                // D2 default). Term-bearing: unchanged (each `validate()`'s re-MSM already ties them).
+                if !all_terms_present {
+                    let openings = proof.range_value_openings.as_ref().ok_or_else(|| {
+                        invalid("term-less present range requires prover-shipped value<->term openings")
+                    })?;
+                    let domain = 1usize << verified.working_log;
+                    // Primary object-range lookup: tie its committed value/datatype to the terms.
+                    let touched = verify_dict_value_terms_chain(
+                        views,
+                        &proof.auth_o.com_id,
+                        &sub.object_range.lookup.com_v_val,
+                        &sub.object_range.lookup.com_v_dt,
+                        m,
+                        domain,
+                        &proof.range_object_oid,
+                        openings,
+                    )?;
+                    reject_nan_objects(&touched, range.datatype)?;
+                    // A second bound ranges over the SAME object column (same `oid`/openings), but
+                    // its own separately-committed lookup value/datatype columns MUST be tied too —
+                    // else `InRange` re-opens the value forge on the second half.
+                    if let Some(second) = &sub.second {
+                        let touched2 = verify_dict_value_terms_chain(
+                            views,
+                            &proof.auth_o.com_id,
+                            &second.object_range.lookup.com_v_val,
+                            &second.object_range.lookup.com_v_dt,
+                            m,
+                            domain,
+                            &proof.range_object_oid,
+                            openings,
+                        )?;
+                        reject_nan_objects(&touched2, range.datatype)?;
+                    }
+                }
             }
             (None, PresentAtomFilter::Plain { selection, com_sel, compaction }) => {
                 verify_selection_only(
@@ -978,6 +1035,61 @@ pub fn attach_termless_reconcile_openings(
     result_columns: &[Vec<ArkFr>],
 ) -> io::Result<()> {
     proof.openings = Some(build_termless_reconcile_openings(layers, result_columns)?);
+    Ok(())
+}
+
+/// C2a (producer): mint the TERM-LESS value↔term witness for a numeric object-value RANGE over a
+/// delta / reconciled `present`. `present_object_ids` is the FULL REAL present object-id column —
+/// the SAME `artifacts.present_id_o[..present_len]` prefix `auth_o.com_id` commits (on the delta
+/// path the head group's object ids; on the reconcile path the reconciled present's object ids, in
+/// reconcile order). It records those ids as `oid` (for the verifier's `Com(oid) == auth_o.com_id`
+/// recommit), drops the reserved null id 0 for the opening set, and routes each DISTINCT id to its
+/// introducing layer via [`build_resolution_openings`] over the term-bearing prover views (empty
+/// predicate list — a range reads only node/value terms). Mirrors [`build_termless_delta_openings`]
+/// / [`build_termless_reconcile_openings`], except it opens the PRESENT OBJECT column (not the
+/// result columns) — the column the range gadget authenticated `(value, datatype)` against.
+///
+/// The witness is UNCOMMITTED (never folded into `commitment_root` / `resolution_root`): at verify,
+/// [`verify_dict_value_terms_chain`] recommits `oid` to `auth_o.com_id` (binding the touched set)
+/// and re-derives value/datatype from the chain-opened terms, failing closed on any recommit
+/// mismatch or missing/forged opening. Over-inclusion is safe (the recommit pins the exact column);
+/// a term-bearing verifier ignores the witness.
+pub fn build_termless_present_range_openings(
+    layers: &[&LayerCommitment],
+    present_object_ids: &[ArkFr],
+) -> io::Result<(Vec<u64>, ResolutionOpenings)> {
+    let mut oid: Vec<u64> = Vec::with_capacity(present_object_ids.len());
+    let mut nv_ids: Vec<u64> = Vec::new();
+    for value in present_object_ids {
+        let raw = canonical_dictionary_id(value)?;
+        oid.push(raw);
+        // The reserved null id 0 never indexes a dict row (never opened; masked out).
+        if raw != 0 {
+            nv_ids.push(raw);
+        }
+    }
+    // Term-bearing prover views: the prover holds the clear catalogs and rebuilds each id-indexed
+    // tree. Empty predicate id list — a range reads only node/value object terms.
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let openings = build_resolution_openings(&views, &nv_ids, &[])?;
+    Ok((oid, openings))
+}
+
+/// C2a (producer): attach the term-less value↔term range witness to a proven [`PresentBgpProof`],
+/// so an object-value RANGE resolves+verifies over a TERM-LESS delta / reconciled artifact.
+/// `present_object_ids` is the prover's real present object-id column (see
+/// [`build_termless_present_range_openings`]). On the delta path this is
+/// `proof.bgp` (pass `&mut proof.bgp`); on the reconcile path it is the BGP proof directly. A
+/// term-bearing verifier ignores both fields (its committed value/datatype are catalog-tied);
+/// leaving them unset keeps a term-less range fail-closed (the D2 default).
+pub fn attach_termless_present_range_openings(
+    proof: &mut PresentBgpProof,
+    layers: &[&LayerCommitment],
+    present_object_ids: &[ArkFr],
+) -> io::Result<()> {
+    let (oid, openings) = build_termless_present_range_openings(layers, present_object_ids)?;
+    proof.range_object_oid = oid;
+    proof.range_value_openings = Some(openings);
     Ok(())
 }
 
