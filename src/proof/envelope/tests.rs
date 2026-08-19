@@ -3525,7 +3525,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         // Verify reconcile + the edge leaf on a fresh mirrored transcript; get the authenticated commit.
         let mut vt = Transcript254::new(b"parture-delta-reconcile-envelope");
         let verified =
-            crate::proof::reconcile::verify_reconcile_core(&lref, head_root, &reconcile, &mut vt)
+            crate::proof::reconcile::verify_reconcile_core(&views, head_root, &reconcile, &mut vt)
                 .unwrap();
         let head_nv = lref.last().unwrap().verifier_view().state.node_value_count as usize;
         let edge_commit = super::reconciled::verify_reconciled_leaf(

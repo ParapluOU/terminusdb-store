@@ -228,7 +228,8 @@ pub fn verify_read_single_atom(
     filter: &PresentFilterProof,
 ) -> io::Result<usize> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let verified = verify_reconcile_core(&views, trusted_head_root, reconcile, &mut transcript)?;
     verify_present_filter(&verified, position, constant_hash, filter, &mut transcript)
 }
 

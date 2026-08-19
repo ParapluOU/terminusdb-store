@@ -1411,7 +1411,9 @@ pub fn verify_ordered_list_walk_reconciled(
 
     // Reconcile + the three leaves, replayed on the SHARED transcript in the SAME order as prove.
     let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
-    let verified = verify_reconcile_core(layers, trusted_head_root, &proof.reconcile, &mut transcript)?;
+    let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+        layers.iter().map(|l| l.verifier_view()).collect();
+    let verified = verify_reconcile_core(&views, trusted_head_root, &proof.reconcile, &mut transcript)?;
     let head_nv = layers
         .last()
         .ok_or_else(|| invalid("reconciled ordered-list-walk needs a head layer"))?
@@ -1464,8 +1466,6 @@ pub fn verify_ordered_list_walk_reconciled(
     let closure_commit = closure_set_commit(&reachable)?;
 
     // (4) strip nil.
-    let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
-        layers.iter().map(|l| l.verifier_view()).collect();
     let nil_id = resolve_combined_node_id(&views, RDF_NIL);
     let nil_commit = singleton_commit(nil_id)?;
     let cons_commit = RelationCommit {

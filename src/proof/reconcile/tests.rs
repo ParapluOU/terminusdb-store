@@ -1975,6 +1975,211 @@ fn e2b_delta_read_termless_resolve_forged_opening_rejected() {
     );
 }
 
+// --- C1 (E3): term-less MATERIALIZED-PRESENT plain-BGP verify + resolve (views entries) ---
+
+/// C1 POSITIVE differential (COUNT): a plain conjunctive `Triple(?x, p1, ?y)` over the reconciled
+/// present counts IDENTICALLY through the term-bearing `verify_read_bgp(&layers, ..)` and the views
+/// entry `verify_read_bgp_from_views(&views, ..)` built with a TERM-LESS head view (term-bearing
+/// ancestors). Plain BGP (no value/datatype read) is sound term-less, so the count must agree.
+#[test]
+fn c1_read_bgp_from_views_termless_head_matches_term_bearing_count() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (rec, bgp, _result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+
+    // Term-bearing sidecar entry.
+    let n_bearing = verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap();
+
+    // Views entry: TERM-LESS head + term-bearing ancestors. The owned term-less commitment must
+    // outlive the ref, so bind it in a `let` before building the views vec.
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    assert!(!head_termless.verifier_view().terms_present);
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    let n_views = verify_read_bgp_from_views(&views, head_root, &atoms, &[], &rec, &bgp).unwrap();
+
+    assert_eq!(n_bearing, 3, "present p1 has three rows (x1->y1, x2->y1, x4->y1)");
+    assert_eq!(n_bearing, n_views, "term-less views must give the SAME count as term-bearing");
+}
+
+/// C1 D2 NEGATIVE: a materialized-present BGP with an object-value RANGE atom must FAIL CLOSED when
+/// verified over a TERM-LESS view (the order-preserving value/datatype is not authenticated
+/// term-less). The SAME range query over all-term-bearing views still verifies (regression). D2 is
+/// already placed in `verify_present_bgp` by E2a — this only exercises the reconcile views entry.
+#[test]
+fn c1_read_bgp_from_views_range_termless_rejects() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = age_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    // Triple(?x, age, ?v)[?v >= 18] over present -> {30,18,40,18,25} = 5.
+    let atoms = [range_atom(RangeOp::Ge, 18, None)];
+    let (rec, bgp, _result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+
+    // Regression: all-term-bearing views verify the range read (D2 guard is a no-op).
+    let bearing_views: Vec<VerifierCommitmentRef<'_>> =
+        lref.iter().map(|l| l.verifier_view()).collect();
+    let n = verify_read_bgp_from_views(&bearing_views, head_root, &atoms, &[], &rec, &bgp).unwrap();
+    assert_eq!(n, 5, "present ages >= 18");
+
+    // D2: a TERM-LESS head view must fail closed on the object-value range.
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut termless_views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    termless_views.push(head_termless.verifier_view());
+    assert!(
+        verify_read_bgp_from_views(&termless_views, head_root, &atoms, &[], &rec, &bgp).is_err(),
+        "object-value range over a term-less view must fail closed (D2)"
+    );
+}
+
+/// C1 RESOLUTION fail-close: `verify_and_resolve_bgp_from_views` on a TERM-LESS head view Errs when
+/// no openings are shipped — term-less id->term resolution needs the prover-shipped Merkle openings.
+/// The result references x4 (minted by the head), which routes to the term-less head view and fails
+/// closed without an opening.
+#[test]
+fn c1_resolve_bgp_from_views_termless_head_fail_closes() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (rec, bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    assert!(
+        verify_and_resolve_bgp_from_views(
+            &views, head_root, &atoms, &[], &rec, &bgp, &result.columns,
+        )
+        .is_err(),
+        "term-less resolve without openings must Err"
+    );
+}
+
+/// C1 PAYOFF (verify-AND-resolve differential): a plain `Triple(?x, p1, ?y)` over the reconciled
+/// present RESOLVES to the SAME rows through the term-bearing path (rebuilds from catalogs) and the
+/// TERM-LESS views path (consumes the prover-shipped Merkle openings minted by
+/// `attach_termless_reconcile_openings`). ONE proof serves both. The result carries x4 — a
+/// HEAD-introduced node — so the term-less head opening is exercised.
+#[test]
+fn c1_read_bgp_termless_resolve_matches_term_bearing() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+
+    let (rec, mut bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+    attach_termless_reconcile_openings(&mut bgp, &lref, &result.columns).unwrap();
+
+    // Term-bearing resolution (rebuilds from catalogs; ignores bgp.openings).
+    let bearing =
+        verify_and_resolve_bgp(&lref, head_root, &atoms, &[], &rec, &bgp, &result.columns).unwrap();
+
+    // Term-less resolution: TERM-LESS head view + term-bearing ancestors, consuming the openings.
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    let termless = verify_and_resolve_bgp_from_views(
+        &views, head_root, &atoms, &[], &rec, &bgp, &result.columns,
+    )
+    .unwrap();
+
+    let bearing_rows = rows_of(&bearing);
+    assert_eq!(bearing_rows.len(), 3, "the differential must not be vacuous");
+    let x4 = CanonicalObject::Node(iri("x4").into_bytes());
+    assert!(
+        bearing_rows.iter().any(|r| r.contains(&x4)),
+        "a HEAD-introduced term (x4) must survive into the present result"
+    );
+    assert!(
+        bag_eq_rows(bearing_rows, rows_of(&termless)),
+        "term-less present results must resolve to the same rows as term-bearing"
+    );
+}
+
+/// C1 NEGATIVE (missing opening): a term-less resolve whose `bgp.openings` OMITS the head-minted
+/// result id's opening fails closed (`Err`) — a missing opening is never a silent empty resolution.
+/// x4 is head-minted, so its combined-dict id is the LARGEST among the result ids; dropping that
+/// opening removes exactly the one the term-less head view needs.
+#[test]
+fn c1_read_bgp_termless_resolve_missing_opening_fails_closed() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+
+    let (rec, mut bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+    attach_termless_reconcile_openings(&mut bgp, &lref, &result.columns).unwrap();
+
+    // Drop the head-minted id's opening (x4 == largest id).
+    let full = bgp.openings.as_ref().unwrap();
+    let mut nv: Vec<_> = full.node_value_openings().cloned().collect();
+    let pred: Vec<_> = full.predicate_openings().cloned().collect();
+    assert!(!nv.is_empty(), "present result ids must be opened");
+    let max_id = nv.iter().map(|o| o.id).max().unwrap();
+    nv.retain(|o| o.id != max_id);
+    bgp.openings = Some(ResolutionOpenings::from_wire(nv, pred).unwrap());
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    assert!(
+        verify_and_resolve_bgp_from_views(
+            &views, head_root, &atoms, &[], &rec, &bgp, &result.columns,
+        )
+        .is_err(),
+        "a missing head-minted resolution opening must fail closed"
+    );
+}
+
+/// C1 NEGATIVE (forged opening): tampering the head-minted result id's shipped opening (a wrong
+/// Merkle sibling) is rejected by `verify_opening` at resolve time — the opening no longer
+/// authenticates against the root-bound `nv_merkle_root`.
+#[test]
+fn c1_read_bgp_termless_resolve_forged_opening_rejected() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+
+    let (rec, mut bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+    attach_termless_reconcile_openings(&mut bgp, &lref, &result.columns).unwrap();
+
+    // Tamper the head-minted (largest id) opening's first Merkle sibling.
+    let full = bgp.openings.as_ref().unwrap();
+    let mut nv: Vec<_> = full.node_value_openings().cloned().collect();
+    let pred: Vec<_> = full.predicate_openings().cloned().collect();
+    let max_id = nv.iter().map(|o| o.id).max().unwrap();
+    let idx = nv.iter().position(|o| o.id == max_id).unwrap();
+    assert!(!nv[idx].siblings.is_empty(), "the head-minted opening must have a sibling to tamper");
+    nv[idx].siblings[0][0] ^= 0x01;
+    bgp.openings = Some(ResolutionOpenings::from_wire(nv, pred).unwrap());
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    assert!(
+        verify_and_resolve_bgp_from_views(
+            &views, head_root, &atoms, &[], &rec, &bgp, &result.columns,
+        )
+        .is_err(),
+        "a forged resolution opening must be rejected by verify_opening"
+    );
+}
+
 // ============================================================
 // Increment I3 — delta-stack (reconciled-present) id->term resolution via per-layer,
 // id-routed Merkle openings. The differential gate + the routing/root/hash negatives.

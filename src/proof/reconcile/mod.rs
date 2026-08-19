@@ -196,9 +196,10 @@ pub use present_result::{
     verify_and_resolve_single_atom, verify_and_resolve_two_atom_join, ResolveKind,
 };
 pub use present_bgp::{
-    prove_read_bgp, verify_and_resolve_bgp, verify_read_bgp, ColumnDistinctProof,
-    PresentAtomFilter, PresentBgpAtom, PresentBgpAtomProof, PresentBgpProof, PresentRangeSubproof,
-    PresentSecondRange, PresentTerm,
+    attach_termless_reconcile_openings, build_termless_reconcile_openings, prove_read_bgp,
+    verify_and_resolve_bgp, verify_and_resolve_bgp_from_views, verify_read_bgp,
+    verify_read_bgp_from_views, ColumnDistinctProof, PresentAtomFilter, PresentBgpAtom,
+    PresentBgpAtomProof, PresentBgpProof, PresentRangeSubproof, PresentSecondRange, PresentTerm,
 };
 pub use delta_read::{
     attach_termless_delta_openings, build_termless_delta_openings, prove_delta_read,

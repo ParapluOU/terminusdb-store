@@ -578,7 +578,8 @@ pub fn verify_reconcile(
     proof: &ReconcileProof,
 ) -> io::Result<usize> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let verified = verify_reconcile_core(layers, trusted_head_root, proof, &mut transcript)?;
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let verified = verify_reconcile_core(&views, trusted_head_root, proof, &mut transcript)?;
     Ok(verified.present_len)
 }
 
@@ -594,14 +595,13 @@ pub struct ReconcileVerified {
 }
 
 pub(crate) fn verify_reconcile_core(
-    layers: &[&LayerCommitment],
+    views: &[VerifierCommitmentRef<'_>],
     trusted_head_root: ProofHash,
     proof: &ReconcileProof,
     transcript: &mut Transcript254,
 ) -> io::Result<ReconcileVerified> {
-    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     // (1) Each layer authenticated against ITS OWN commitment root.
-    for view in &views {
+    for view in views {
         view.validate()?;
     }
     // (2) Whole parent chain + trusted head anchor.
@@ -642,14 +642,14 @@ pub(crate) fn verify_reconcile_core(
     }
 
     transcript.append_bytes(b"pow/reconcile/domain", RECONCILE_DOMAIN);
-    for view in &views {
+    for view in views {
         transcript.append_bytes(b"pow/reconcile/layer-root", &view.state.commitment_root);
     }
 
     // Combined dict branches (verifier side) — one per layer with a non-empty incremental dict.
     let mut nv_branches = Vec::new();
     let mut pred_branches = Vec::new();
-    for view in &views {
+    for view in views {
         let nv_incr = (view.state.node_value_count - view.state.parent_node_value_count) as usize;
         if nv_incr > 0 {
             nv_branches.push(RelationCommit {

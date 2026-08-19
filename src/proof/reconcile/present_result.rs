@@ -575,9 +575,9 @@ pub fn verify_and_resolve_single_atom(
     id_hints: &[Vec<u64>],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
-    let out_len = verify_present_filter(&verified, position, constant_hash, filter, &mut transcript)?;
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let verified = verify_reconcile_core(&views, trusted_head_root, reconcile, &mut transcript)?;
+    let out_len = verify_present_filter(&verified, position, constant_hash, filter, &mut transcript)?;
     let kinds = filter_output_kinds(position);
     resolve_result_columns(
         &views,
@@ -605,10 +605,10 @@ pub fn verify_and_resolve_two_atom_join(
     claimed_columns: &[Vec<ArkFr>],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let verified = verify_reconcile_core(&views, trusted_head_root, reconcile, &mut transcript)?;
     let head_nv = layers.last().unwrap().verifier_view().state.node_value_count as usize;
     let out_len = verify_present_join(reconcile, &verified, head_nv, const_p, const_q, join, &mut transcript)?;
-    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     // Join output [id_x, id_y, id_z] are all node/value combined-dict ids (no id-hints needed).
     let kinds = [ResolveKind::NodeValueId, ResolveKind::NodeValueId, ResolveKind::NodeValueId];
     resolve_result_columns(&views, claimed_columns, &join.com_join_out, out_len, join.join_log, &kinds, None, None)

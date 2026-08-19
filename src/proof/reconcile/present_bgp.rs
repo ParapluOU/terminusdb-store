@@ -9,6 +9,7 @@
 //! hash uniqueness) that make `present` a genuine set.
 
 use super::*;
+use crate::proof::commitment::build_resolution_openings;
 use crate::proof::lexdistinct::{
     prove_lex_strictly_sorted_with_context, verify_lex_strictly_sorted, LexDistinctProof,
 };
@@ -151,6 +152,16 @@ pub struct PresentBgpProof {
     pub result_len: usize,
     pub result_log_domain: usize,
     pub result_arity: usize,
+    /// C1b/E3: UNCOMMITTED prover-shipped Merkle resolution witness for a TERM-LESS reconciled
+    /// (materialized-present) BGP artifact. One [`DictOpening`] per DISTINCT resolved result id,
+    /// re-verified per id against the root-bound `nv_merkle_root` at resolve time. `None` on the
+    /// prover default and on term-bearing artifacts (whose resolver rebuilds from the clear
+    /// catalogs); the term-less producer attaches it via [`attach_termless_reconcile_openings`].
+    /// NEVER folded into `commitment_root`/`resolution_root` — bound solely by [`verify_opening`],
+    /// so a forged opening is rejected and a missing one fails closed. No wire serialization
+    /// (`PresentBgpProof` is Clone/Debug in-memory only), so this adds no wire/golden/version
+    /// change. Mirrors [`DeltaReadProof::openings`].
+    pub openings: Option<ResolutionOpenings>,
 }
 
 /// Build the hash-space [`AtomFilterSpec`] (predicate/subject/object constants +
@@ -701,6 +712,9 @@ pub(crate) fn prove_present_bgp(
             result_len: result_m,
             result_log_domain,
             result_arity: result_com_count,
+            // Prover default: the term-less producer attaches the openings witness separately via
+            // `attach_termless_reconcile_openings`; a term-bearing artifact leaves this `None`.
+            openings: None,
         },
         // BGP output columns are combined-dict ids (resolved directly as ids); no I2a id-hints.
         PresentReadResult { columns, len: result_m, id_hints: Vec::new() },
@@ -921,8 +935,55 @@ pub fn prove_read_bgp(
     Ok((reconcile, bgp, result))
 }
 
+/// C1b/E3 (producer): build the UNCOMMITTED term-less resolution witness for a proven reconciled
+/// (materialized-present) BGP, so its results can be RESOLVED to real IRIs/typed literals over a
+/// TERM-LESS head view. Every BGP kept result column is a combined-dict node/value id (predicates
+/// are constants, matched in committed hash space — there is NO catalog dict-membership step to
+/// open), so this opens ONLY node/value ids: it maps each column value via
+/// [`canonical_dictionary_id`], drops the reserved null id 0, and routes each distinct id to its
+/// introducing layer via [`build_resolution_openings`] over the term-bearing prover views (the
+/// prover still holds the full catalogs). BODY-IDENTICAL to [`build_termless_delta_openings`]. The
+/// witness is re-verified per id at the verifier by [`verify_opening`] against the root-bound
+/// `nv_merkle_root` (a forged opening is rejected, a missing one fails closed) and is NEVER folded
+/// into `commitment_root`/`resolution_root`.
+pub fn build_termless_reconcile_openings(
+    layers: &[&LayerCommitment],
+    result_columns: &[Vec<ArkFr>],
+) -> io::Result<ResolutionOpenings> {
+    let mut nv_ids: Vec<u64> = Vec::new();
+    for column in result_columns {
+        for value in column {
+            let raw = canonical_dictionary_id(value)?;
+            // The reserved null id 0 never indexes a dict row (never opened; masked out).
+            if raw != 0 {
+                nv_ids.push(raw);
+            }
+        }
+    }
+    // Term-bearing prover views: the prover holds the clear catalogs and rebuilds each id-indexed
+    // tree. Empty predicate id list — BGP result constants carry no dict-membership opening.
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    build_resolution_openings(&views, &nv_ids, &[])
+}
+
+/// C1b/E3 (producer): attach the term-less resolution witness to a proven [`PresentBgpProof`], so
+/// it can ship alongside a TERM-LESS reconciled artifact. `result_columns` are the prover's
+/// [`PresentReadResult::columns`] returned by [`prove_read_bgp`]. Mirrors
+/// [`attach_termless_delta_openings`]. Over-inclusion is safe (the verifier only looks up the ids
+/// it needs, each independently checked); under-inclusion fails closed. A term-bearing verifier
+/// ignores the witness entirely (it rebuilds from the clear catalogs).
+pub fn attach_termless_reconcile_openings(
+    proof: &mut PresentBgpProof,
+    layers: &[&LayerCommitment],
+    result_columns: &[Vec<ArkFr>],
+) -> io::Result<()> {
+    proof.openings = Some(build_termless_reconcile_openings(layers, result_columns)?);
+    Ok(())
+}
+
 /// Verify a general n-atom BGP read over `present`. On success returns the authenticated
-/// result row count.
+/// result row count. Thin wrapper over [`verify_read_bgp_from_views`] that builds term-bearing
+/// views from the full sidecars.
 pub fn verify_read_bgp(
     layers: &[&LayerCommitment],
     trusted_head_root: ProofHash,
@@ -931,12 +992,29 @@ pub fn verify_read_bgp(
     reconcile: &ReconcileProof,
     proof: &PresentBgpProof,
 ) -> io::Result<usize> {
-    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    verify_read_bgp_from_views(&views, trusted_head_root, atoms, joins, reconcile, proof)
+}
+
+/// Verify a general n-atom BGP read over the reconciled `present` FROM verifier VIEWS (C1/E3).
+/// The views-based core entry: it accepts the borrowed [`VerifierCommitmentRef`] slice directly,
+/// so a TERM-LESS reconcile view (built via [`LayerCommitment::verifier_commitment_termless`] on
+/// the head, term-bearing elsewhere) can be passed for the term-less remote verifier. Plain
+/// conjunctive BGP is sound term-less; an object-value RANGE atom fails closed inside
+/// `verify_present_bgp` (E2a-D2). Transcript init is identical to [`verify_read_bgp`].
+pub fn verify_read_bgp_from_views(
+    views: &[VerifierCommitmentRef<'_>],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    reconcile: &ReconcileProof,
+    proof: &PresentBgpProof,
+) -> io::Result<usize> {
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let verified = verify_reconcile_core(views, trusted_head_root, reconcile, &mut transcript)?;
     let head_nv = views.last().unwrap().state.node_value_count as usize;
     let (_coms, result_m, _log) = verify_present_bgp(
-        &views, &reconcile.combined_nv, &reconcile.combined_pred, &verified, head_nv, atoms, joins, proof,
+        views, &reconcile.combined_nv, &reconcile.combined_pred, &verified, head_nv, atoms, joins, proof,
         &mut transcript,
     )?;
     Ok(result_m)
@@ -944,7 +1022,8 @@ pub fn verify_read_bgp(
 
 /// Verify a general n-atom BGP read AND resolve its result bindings to `CanonicalObject`s.
 /// Every result column is a combined-dict node/value id (predicates are constants), so
-/// each resolves against the chain node/value catalogs.
+/// each resolves against the chain node/value catalogs. Thin wrapper over
+/// [`verify_and_resolve_bgp_from_views`] that builds term-bearing views.
 pub fn verify_and_resolve_bgp(
     layers: &[&LayerCommitment],
     trusted_head_root: ProofHash,
@@ -954,15 +1033,41 @@ pub fn verify_and_resolve_bgp(
     proof: &PresentBgpProof,
     claimed_columns: &[Vec<ArkFr>],
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
-    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    verify_and_resolve_bgp_from_views(
+        &views, trusted_head_root, atoms, joins, reconcile, proof, claimed_columns,
+    )
+}
+
+/// Verify a general n-atom BGP read AND resolve its result bindings FROM verifier VIEWS (C1/E3).
+/// Views-based analogue of [`verify_and_resolve_bgp`]. Resolution over a TERM-LESS view consumes
+/// the prover-shipped Merkle `proof.openings` (E2b, minted by
+/// [`attach_termless_reconcile_openings`]): each id is re-verified against the root-bound
+/// `nv_merkle_root`, so a forged opening is rejected and a MISSING/absent one fails closed. A
+/// term-bearing artifact leaves `proof.openings` `None` and the resolver rebuilds from catalogs.
+pub fn verify_and_resolve_bgp_from_views(
+    views: &[VerifierCommitmentRef<'_>],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    reconcile: &ReconcileProof,
+    proof: &PresentBgpProof,
+    claimed_columns: &[Vec<ArkFr>],
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
+    let verified = verify_reconcile_core(views, trusted_head_root, reconcile, &mut transcript)?;
     let head_nv = views.last().unwrap().state.node_value_count as usize;
     let (result_coms, result_m, result_log_domain) = verify_present_bgp(
-        &views, &reconcile.combined_nv, &reconcile.combined_pred, &verified, head_nv, atoms, joins, proof,
+        views, &reconcile.combined_nv, &reconcile.combined_pred, &verified, head_nv, atoms, joins, proof,
         &mut transcript,
     )?;
     let kinds = vec![ResolveKind::NodeValueId; result_coms.len()];
-    resolve_result_columns(&views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None, None)
+    // C1b: pass the prover-shipped term-less resolution openings (BGP results are combined-dict
+    // ids with no hash kinds, so `id_hints` stays `None`). `None` on a term-bearing artifact,
+    // whose resolver rebuilds from the clear catalogs instead.
+    resolve_result_columns(
+        views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None,
+        proof.openings.as_ref(),
+    )
 }
 

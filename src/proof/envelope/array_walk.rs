@@ -1490,7 +1490,7 @@ pub fn verify_ordered_array_walk_reconciled(
 
     // Reconcile + the four leaves, replayed on the SHARED transcript in the SAME order as prove.
     let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
-    let verified = verify_reconcile_core(layers, trusted_head_root, &proof.reconcile, &mut transcript)?;
+    let verified = verify_reconcile_core(&views, trusted_head_root, &proof.reconcile, &mut transcript)?;
     let head_nv = layers
         .last()
         .ok_or_else(|| invalid("reconciled ordered-array-walk needs a head layer"))?

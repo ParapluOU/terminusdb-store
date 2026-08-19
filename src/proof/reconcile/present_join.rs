@@ -191,7 +191,8 @@ pub fn verify_read_two_atom_join(
     join: &PresentJoinProof,
 ) -> io::Result<usize> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let verified = verify_reconcile_core(layers, trusted_head_root, reconcile, &mut transcript)?;
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let verified = verify_reconcile_core(&views, trusted_head_root, reconcile, &mut transcript)?;
     let head_nv = layers.last().unwrap().verifier_view().state.node_value_count as usize;
     verify_present_join(reconcile, &verified, head_nv, const_p, const_q, join, &mut transcript)
 }

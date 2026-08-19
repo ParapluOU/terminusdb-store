@@ -359,7 +359,8 @@ pub fn verify_reconciled_transitive_closure(
 ) -> io::Result<Vec<u64>> {
     let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
 
-    let verified = verify_reconcile_core(layers, trusted_head_root, &proof.reconcile, &mut transcript)?;
+    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
+    let verified = verify_reconcile_core(&views, trusted_head_root, &proof.reconcile, &mut transcript)?;
     let head_nv = layers
         .last()
         .ok_or_else(|| invalid("reconciled closure needs a head layer"))?
@@ -378,7 +379,6 @@ pub fn verify_reconciled_transitive_closure(
         &mut transcript,
     )?;
 
-    let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
     let seed_id = resolve_combined_node_id(&views, seed_iri);
     let digest = reconciled_closure_digest(edge_predicate, seed_id, reflexive);
     let mut nodes = 0usize;
