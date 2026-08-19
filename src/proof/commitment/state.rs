@@ -141,9 +141,14 @@ pub struct VerifierCommitment {
     /// term bytes are dropped; every fixed-size commitment + both id-indexed
     /// Merkle roots are retained, so the artifact is O(1) in dictionary size and
     /// still recomputes `commitment_root`/`resolution_root`. A term-less artifact
-    /// is BASE/ROLLUP ONLY (a delta needs cross-layer re-mint over faithful
-    /// hashes, blocked on I4) and is NOT yet queryable — S2–S4 add the
-    /// fail-close guards, opening-based resolution, and per-constant belt-hash.
+    /// may be BASE, ROLLUP, or DELTA (E1 permits a delta view: its no-re-mint
+    /// guarantee is the committed-data `verify_remint`, not the clear catalog).
+    /// A term-less DELTA is CONSTRUCTIBLE / decodable / validatable but NOT
+    /// verifiable on the single-layer envelope path (guarded there — a delta is
+    /// an increment, not the full state); delta querying opens through the
+    /// reconciled/delta-read path. A term-less artifact is NOT yet directly
+    /// queryable — S2–S4 add the fail-close guards, opening-based resolution,
+    /// and per-constant belt-hash.
     /// This flag lives in the verifier-artifact FRAMING only; it is NOT folded
     /// into `commitment_root` (which stays byte-identical to the term-bearing
     /// artifact of the same layer).
@@ -295,19 +300,16 @@ impl VerifierCommitmentRef<'_> {
             // catalog re-MSM (the only check tying the 6 committed Dory dict columns to
             // real terms) and the catalog-based Merkle-root RECOMPUTE are BOTH skipped.
             // The two Merkle roots are instead bound by the external `resolution_root`
-            // anchor a verifier checks (β re-anchor). We still fail closed on two
-            // structural invariants: the catalogs must genuinely be absent, and a
-            // term-less artifact is BASE/ROLLUP only (a delta needs cross-layer re-mint
-            // over faithful hashes = blocked on I4). Everything catalog-free below is
-            // KEPT — critically `recomputed_commitment_root()` (which recomputes from the
-            // STORED commitments + counts, NOT the catalog).
+            // anchor a verifier checks (β re-anchor). We still fail closed on the one
+            // structural invariant that the catalogs must genuinely be absent. A DELTA
+            // (`parent_state_root == Some`) term-less view is now PERMITTED (E1): its
+            // no-re-mint guarantee comes from the committed-data `verify_remint` proof
+            // (I4-cd), not from the clear catalog, so the delta rejection is gone.
+            // Everything catalog-free below is KEPT — critically
+            // `recomputed_commitment_root()` (which recomputes from the STORED
+            // commitments + counts, NOT the catalog).
             if !self.predicate_catalog.is_empty() || !self.node_value_catalog.is_empty() {
                 return Err(invalid("term-less verifier commitment must not carry catalogs"));
-            }
-            if self.state.parent_state_root.is_some() {
-                return Err(invalid(
-                    "term-less verifier commitment must be a base/rollup layer",
-                ));
             }
         }
         if self.recomputed_commitment_root()? != self.state.commitment_root {
@@ -459,21 +461,19 @@ impl LayerCommitment {
     /// queryable: resolution/range/order/group/re-mint all still read the (now
     /// absent) catalog and are wired to fail-close only in S2–S4.
     ///
-    /// BASE/ROLLUP ONLY. A delta layer (`parent_state_root == Some`) is rejected:
-    /// term-less delta querying needs cross-layer re-mint over faithful hashes,
-    /// which is blocked on I4; the base is the only directly-query-provable layer.
+    /// BASE, ROLLUP, or DELTA. A delta layer (`parent_state_root == Some`) is now
+    /// PERMITTED (E1): the term-less delta artifact is CONSTRUCTIBLE / decodable /
+    /// validatable, and its no-re-mint guarantee comes from the committed-data
+    /// `verify_remint` proof (I4-cd), not from shipping the clear catalog. It is
+    /// still NOT yet verifiable through the single-layer envelope path (that path
+    /// guards against it — a delta is an increment, not the full resolved state);
+    /// the reconciled/delta-read verify path (E2) opens delta querying.
     ///
     /// `commitment_root` is byte-identical to the term-bearing artifact of the
     /// same layer — the `terms_present` flag lives in the artifact FRAMING, not in
     /// `commitment_root`.
     pub fn verifier_commitment_termless(&self) -> io::Result<VerifierCommitment> {
         self.validate()?;
-        if self.state.parent_state_root.is_some() {
-            return Err(invalid(
-                "term-less verifier commitment requires a base/rollup layer \
-                 (delta needs cross-layer re-mint over faithful hashes, blocked on I4)",
-            ));
-        }
         let artifact = VerifierCommitment {
             state: self.state.clone(),
             terms_present: false,
@@ -1304,19 +1304,15 @@ impl VerifierCommitment {
             // re-MSM (the 3 `commit_*` checks above — the only verifier check tying the
             // committed Dory dict columns to real terms) and the catalog-based Merkle
             // recompute. The two Merkle roots are instead bound by `resolution_root`
-            // (the external anchor). Fail closed on the two structural invariants: no
-            // catalog may be smuggled in, and a term-less artifact is BASE/ROLLUP only
-            // (a delta needs cross-layer re-mint over faithful hashes = blocked on I4).
-            // Every catalog-free check is KEPT — the count-limit above and the
+            // (the external anchor). Fail closed on the one structural invariant that
+            // no catalog may be smuggled in. A DELTA (`parent_state_root == Some`)
+            // term-less artifact is now PERMITTED (E1): its no-re-mint guarantee comes
+            // from the committed-data `verify_remint` proof (I4-cd), not from the clear
+            // catalog. Every catalog-free check is KEPT — the count-limit above and the
             // `recomputed_commitment_root()` below (recomputed from the STORED
             // commitments + counts, NOT the catalog).
             if !self.predicate_catalog.is_empty() || !self.node_value_catalog.is_empty() {
                 return Err(invalid("term-less verifier commitment must not carry catalogs"));
-            }
-            if self.state.parent_state_root.is_some() {
-                return Err(invalid(
-                    "term-less verifier commitment must be a base/rollup layer",
-                ));
             }
         }
         if self.recomputed_commitment_root()? != self.state.commitment_root {

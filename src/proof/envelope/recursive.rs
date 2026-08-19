@@ -2196,6 +2196,21 @@ impl RecursiveRelationEnvelope {
             return Err(invalid("recursive relation verification exceeds structural limits"));
         }
         *nodes += 1;
+        // CROSS-PATH GUARD (E1): reject a TERM-LESS DELTA view on this single-layer envelope path.
+        // The top-level `verify` fail-closes ALL deltas earlier via `require_base_layer_for_query`,
+        // but the two-root `verify_cross_root` reaches `verify_bounded` on each per-graph side
+        // WITHOUT that gate. A term-less delta is now constructible/decodable (E1), so guard the
+        // single-layer choke itself: a delta is an increment, not the full resolved state, and must
+        // not verify against one layer's own root. Inert for every term-bearing layer and for a
+        // term-less BASE view (`parent_state_root == None`); only a term-less delta trips it. The
+        // reconciled/delta-read path (E2) is where delta querying is opened.
+        let view = layer.verifier_view();
+        if view.state.parent_state_root.is_some() && !view.terms_present {
+            return Err(invalid(
+                "term-less delta layer cannot be verified on the single-layer base/rollup envelope path \
+                 (a delta is an increment, not the full state); verify it through the reconciled/delta-read path",
+            ));
+        }
         if self.layer_root != expected_root {
             return Err(invalid("recursive relation root does not match trusted root"));
         }

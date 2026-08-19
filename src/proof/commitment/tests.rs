@@ -1301,18 +1301,35 @@ fn termless_base_artifact_roundtrips_and_drops_catalogs() {
 }
 
 #[test]
-fn termless_producer_rejects_a_delta_layer() {
+fn termless_producer_allows_a_delta_layer() {
     let (base_lc, head_lc) = store_base_and_delta();
     // The base (parent_state_root == None) produces a term-less artifact.
     assert!(base_lc.state.parent_state_root.is_none());
-    let termless = base_lc.verifier_commitment_termless().unwrap();
-    assert!(!termless.terms_present);
-    termless.validate().unwrap();
+    let base_termless = base_lc.verifier_commitment_termless().unwrap();
+    assert!(!base_termless.terms_present);
+    base_termless.validate().unwrap();
 
-    // The delta head (parent_state_root == Some) is rejected: term-less delta
-    // querying needs cross-layer re-mint over faithful hashes (blocked on I4).
+    // E1: the delta head (parent_state_root == Some) now ALSO produces a term-less
+    // artifact — its no-re-mint guarantee is the committed-data `verify_remint`, not the
+    // clear catalog. It is CONSTRUCTIBLE / decodable / validatable (previously rejected),
+    // though it is NOT verifiable on the single-layer envelope path (guarded there).
     assert!(head_lc.state.parent_state_root.is_some());
-    assert!(head_lc.verifier_commitment_termless().is_err());
+    let delta_termless = head_lc.verifier_commitment_termless().unwrap();
+    assert!(!delta_termless.terms_present);
+    assert!(delta_termless.predicate_catalog.is_empty());
+    assert!(delta_termless.node_value_catalog.is_empty());
+    // Owned validate() accepts the term-less delta (previously an Err on the delta rejection).
+    delta_termless.validate().unwrap();
+    // encode -> decode round-trips, and the decoded owned + borrowed views both validate() Ok.
+    let bytes = delta_termless.encode().unwrap();
+    let decoded = VerifierCommitment::decode(&bytes).unwrap();
+    assert!(!decoded.terms_present);
+    assert!(decoded.state.parent_state_root.is_some());
+    decoded.validate().unwrap();
+    decoded.verifier_view().validate().unwrap();
+    // commitment_root is byte-identical to the term-BEARING delta artifact (framing-only flag).
+    let bearing = head_lc.verifier_commitment().unwrap();
+    assert_eq!(delta_termless.state.commitment_root, bearing.state.commitment_root);
     // The term-BEARING producer still accepts the delta (unchanged behavior).
     assert!(head_lc.verifier_commitment().is_ok());
 }

@@ -611,12 +611,12 @@ mod tests {
         verify_group_extrema(&input.view(), 0, 1, CanonicalDatatype::UInt32, GroupExtremaKind::Min, &rows, &*layer, &result.proof, &mut Transcript254::new(b"g-step3")).unwrap();
     }
 
-    /// DELTA fail-closed (order + group + multi-order share this root guard): a term-less artifact
-    /// CANNOT be built for a delta layer, so term-less order/group verification over a delta is
-    /// unreachable. (`require_base_layer_for_query` in every term-less verify branch and `validate()`
-    /// re-assert it defense-in-depth.)
+    /// DELTA fail-closed (order + group + multi-order share this root guard). E1: a term-less
+    /// artifact is now CONSTRUCTIBLE for a delta layer, but term-less order/group verification over a
+    /// delta is STILL unreachable — the `require_base_layer_for_query` belt in every term-less verify
+    /// branch (and this direct assertion) fails closed on any delta view.
     #[test]
-    fn i2b_step3_delta_termless_artifact_rejected() {
+    fn i2b_step3_delta_termless_artifact_constructible_but_query_fails_closed() {
         let iri = |s: &str| format!("http://group.test/{s}");
         let store = open_sync_memory_store();
         let builder = store.create_base_layer().unwrap();
@@ -626,7 +626,12 @@ mod tests {
         child.add_value_triple(ValueTriple::new_value(&iri("b"), &iri("age"), u32::make_entry(&20u32))).unwrap();
         let delta = child.commit().unwrap().proof_commitment().unwrap();
         assert!(delta.state.parent_state_root.is_some(), "constructed a delta layer");
-        let err = delta.verifier_commitment_termless().unwrap_err();
-        assert!(err.to_string().contains("base/rollup"), "{err}");
+        // E1: the term-less delta artifact now BUILDS + validates (previously rejected).
+        let termless = delta.verifier_commitment_termless().unwrap();
+        assert!(!termless.terms_present);
+        termless.validate().unwrap();
+        // ... but the single-layer query belt still fails closed on the delta view.
+        let err = require_base_layer_for_query(termless.verifier_view().state).unwrap_err();
+        assert!(err.to_string().contains("not directly query-provable"), "{err}");
     }
 }

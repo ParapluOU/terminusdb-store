@@ -400,7 +400,8 @@ pub fn verify_exact_scalar_order(
     //     `n_dict` / the dict domain from the root-bound counts, and (once the lookup pins the
     //     per-row value/datatype below) tie them to the Merkle-authenticated terms via the prover-
     //     shipped `oid` + value openings. Missing openings ⇒ Err (fail-closed). DELTA order stays
-    //     fail-closed (`validate()` already rejects a term-less delta; re-asserted here).
+    //     fail-closed via the `require_base_layer_for_query` belt below (E1 makes a term-less delta
+    //     constructible/decodable, so `validate()` no longer rejects it — this belt is the gate).
     let (n_dict, dict_log_domain) = if layer.terms_present {
         super::commitment::reject_nan_catalog(
             layer.node_value_catalog,
