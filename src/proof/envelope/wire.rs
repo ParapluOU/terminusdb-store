@@ -108,7 +108,8 @@ use crate::proof::lexdistinct::LexDistinctProof;
 use crate::proof::reconcile::{
     ColumnDistinctFullFieldProof, ColumnDistinctProof, CombinedDictProof, CombinedRangeDictProof,
     CommittedGroupProof, DeltaReadProof, GroupHashProof, PresentAtomFilter, PresentBgpAtomProof,
-    PresentBgpProof, PresentIdAuth, PresentRangeSubproof, PresentSecondRange, RemintProof,
+    PresentBgpProof, PresentIdAuth, PresentRangeSubproof, PresentSecondRange, ReconcileProof,
+    ReconciledReadBgpProof, RemintProof,
 };
 pub(super) const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
 pub(super) const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
@@ -119,6 +120,10 @@ pub(super) const RECURSIVE_MAGIC: &[u8; 12] = b"TDBWQTREE\0\0\0";
 // `DeltaReadProof`, NOT a `LayerBgpEnvelope`), so it carries a fresh MAGIC/VERSION and never
 // touches the envelope `VERSION`/`UNION`/`ANTI`/`OUTER`/`RECURSIVE` constants above.
 pub(super) const DELTA_READ_MAGIC: &[u8; 12] = b"TDBWQDLTA\0\0\0";
+// C4-slice-2: the reconciled MATERIALIZED-present plain-BGP READ (a `ReconciledReadBgpProof` =
+// `ReconcileProof` + `PresentBgpProof`) gets its OWN independent wire format, distinct from the
+// delta-read (`DELTA_READ_*`) format and every envelope format above. Pure addition.
+pub(super) const RECONCILE_READ_MAGIC: &[u8; 12] = b"TDBWQRCON\0\0\0";
 
 /// Canonical hidden column for a zero-column relation: one on every real row and zero
 /// on commitment padding. This is the same representation used by all-ground BGPs.
@@ -273,6 +278,9 @@ pub(super) const OUTER_VERSION: u32 = 11;
 pub(super) const RECURSIVE_VERSION: u32 = 36;
 // C4: initial version of the independent delta-read plain-BGP wire format (see `DELTA_READ_MAGIC`).
 pub(super) const DELTA_READ_VERSION: u32 = 1;
+// C4-slice-2: initial version of the independent reconciled materialized-present read wire format
+// (see `RECONCILE_READ_MAGIC`).
+pub(super) const RECONCILE_READ_VERSION: u32 = 1;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1417,6 +1425,87 @@ impl DeltaReadProof {
         let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
         if version != DELTA_READ_VERSION {
             return Err(invalid("unsupported delta-read proof version"));
+        }
+        let proof = Self::get(&mut reader)?;
+        reader.finish()?;
+        Ok(proof)
+    }
+}
+
+// ===========================================================================
+// C4-slice-2: WIRE SERIALIZATION of the reconciled MATERIALIZED-present plain-BGP READ. Unlike a
+// delta-read (one `DeltaReadProof`), a reconciled present read carries TWO proof structs — the
+// `ReconcileProof` (proving `present` IS the head triple set) and the already-`Wire`
+// `PresentBgpProof` (the n-atom BGP over that `present`). Every field of `ReconcileProof` is
+// already `Wire` (all leaves shared with the base/delta families); the single new container just
+// forwards in field order, and the `ReconciledReadBgpProof` carrier ships both in one framed blob.
+// ===========================================================================
+// The full N-layer reconciliation proof. `remint` is `pub(crate)` — accessible here (same crate).
+wire_struct!(ReconcileProof {
+    combined_nv,
+    combined_pred,
+    remint,
+    working_log,
+    groups,
+    com_present_s,
+    com_present_p,
+    com_present_o,
+    link_gkr,
+    link_col_evals,
+    link_opening,
+    present_len
+});
+// The shippable reconciled materialized-present read: the reconciliation proof + the present BGP.
+wire_struct!(ReconciledReadBgpProof { reconcile, bgp });
+
+impl ReconciledReadBgpProof {
+    /// Frame this reconciled materialized-present read for shipping as BYTES:
+    /// MAGIC ‖ VERSION ‖ body ‖ SHA-256 checksum, byte-identically to
+    /// [`DeltaReadProof::encode`] but with the independent `RECONCILE_READ_*` constants.
+    /// Serialization does NOT change verification: the decoded proof is re-verified by the SAME
+    /// `verify_read_bgp{,_from_views}` function over the verifier's OWN query spec.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(RECONCILE_READ_MAGIC);
+        out.extend_from_slice(&RECONCILE_READ_VERSION.to_le_bytes());
+        self.put(&mut out)?;
+        if out
+            .len()
+            .checked_add(CHECKSUM_BYTES)
+            .map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES)
+        {
+            return Err(invalid("reconciled read proof too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    /// Decode a framed reconciled materialized-present read proof. This is ONLY parsing under the
+    /// strict size/item budgets — it performs NO trust checks; the decoded proof is handed back to
+    /// `verify_read_bgp*`.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < RECONCILE_READ_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid reconciled read proof size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("reconciled read proof checksum mismatch"));
+        }
+        let mut reader = Reader {
+            bytes: body,
+            pos: 0,
+            decoded_items: 0,
+        };
+        if reader.take(RECONCILE_READ_MAGIC.len())? != RECONCILE_READ_MAGIC {
+            return Err(invalid("unknown reconciled read proof magic"));
+        }
+        let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if version != RECONCILE_READ_VERSION {
+            return Err(invalid("unsupported reconciled read proof version"));
         }
         let proof = Self::get(&mut reader)?;
         reader.finish()?;

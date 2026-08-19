@@ -2814,3 +2814,164 @@ fn c4_delta_read_byte_in_matches_in_memory_and_rejects_substitution() {
         "byte-in verify with the WRONG source must fail (anti-substitution)"
     );
 }
+
+// ============================================================
+// C4-slice-2 — WIRE SERIALIZATION of the reconciled MATERIALIZED-present plain-BGP read + its
+// byte-in remote verifier.
+//
+// A reconciled present read ships TWO structs (`ReconcileProof` + `PresentBgpProof`) bundled in a
+// `ReconciledReadBgpProof` with its own independent framed wire format (`RECONCILE_READ_*`). A
+// remote party holding only bytes + the term-less `VerifierCommitment` chain + a trusted head root
+// re-verifies through the SAME audited `verify_read_bgp_from_views`. Serialization changes NO
+// verification logic. Plain-BGP gated (every atom Plain, `range_dict: None`).
+// ============================================================
+
+/// Round-trip re-verify: prove a plain-BGP materialized-present read, `encode` → `decode`, and
+/// assert the decoded proof STILL passes the term-bearing `verify_read_bgp` AND
+/// `verify_read_bgp_from_views` with a term-less head. Serialization is transparent to verification.
+#[test]
+fn c4_reconcile_read_wire_roundtrip_reverifies() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (reconcile, bgp, _result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+
+    let encoded = ReconciledReadBgpProof { reconcile, bgp }.encode().unwrap();
+    let decoded = ReconciledReadBgpProof::decode(&encoded).unwrap();
+
+    // Decoded proof still passes the term-bearing sidecar verify.
+    let n =
+        verify_read_bgp(&lref, head_root, &atoms, &[], &decoded.reconcile, &decoded.bgp).unwrap();
+    assert_eq!(n, 3, "present p1 has three rows (x1->y1, x2->y1, x4->y1)");
+
+    // ...and the views entry with a TERM-LESS head + term-bearing ancestors.
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    let n_views = verify_read_bgp_from_views(
+        &views, head_root, &atoms, &[], &decoded.reconcile, &decoded.bgp,
+    )
+    .unwrap();
+    assert_eq!(n, n_views, "decoded proof must re-verify identically through the views entry");
+}
+
+/// The UNCOMMITTED term-less resolution openings survive the wire: attach them to the BGP half,
+/// round-trip the bundled proof, and assert `verify_and_resolve_bgp_from_views` still RESOLVES over
+/// a term-less head (which needs the openings — a missing one fails closed).
+#[test]
+fn c4_reconcile_read_wire_roundtrip_preserves_openings() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (reconcile, mut bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+    attach_termless_reconcile_openings(&mut bgp, &lref, &result.columns).unwrap();
+
+    let decoded =
+        ReconciledReadBgpProof::decode(&ReconciledReadBgpProof { reconcile, bgp }.encode().unwrap())
+            .unwrap();
+
+    let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+    let mut views: Vec<VerifierCommitmentRef<'_>> =
+        lref[..lref.len() - 1].iter().map(|l| l.verifier_view()).collect();
+    views.push(head_termless.verifier_view());
+    let resolved = verify_and_resolve_bgp_from_views(
+        &views, head_root, &atoms, &[], &decoded.reconcile, &decoded.bgp, &result.columns,
+    )
+    .unwrap();
+    assert!(!rows_of(&resolved).is_empty(), "openings must survive the wire and resolve term-less");
+}
+
+/// Byte-identity golden + tamper-reject: the canonical encoding is a stable fixed point across
+/// decode/encode (deterministic given the fixed SRS + Fiat-Shamir transcript), and flipping one
+/// body byte breaks the trailing checksum so `decode` fails closed.
+#[test]
+fn c4_reconcile_read_wire_golden_and_tamper() {
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let atoms = [atom(var(), "http://ex/p1", var())];
+    let (reconcile, bgp, _result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+
+    // Golden: encode is a byte-identity fixed point (decode then re-encode reproduces the bytes).
+    let encoded = ReconciledReadBgpProof { reconcile, bgp }.encode().unwrap();
+    let reencoded = ReconciledReadBgpProof::decode(&encoded).unwrap().encode().unwrap();
+    assert_eq!(
+        encoded, reencoded,
+        "reconciled read wire encoding must be a stable byte-identity fixed point"
+    );
+
+    // Tamper: byte 20 is inside the framed body (past the 12-byte magic + 4-byte version); flipping
+    // it invalidates the SHA-256 checksum.
+    let mut corrupt = encoded.clone();
+    corrupt[20] ^= 1;
+    assert!(
+        ReconciledReadBgpProof::decode(&corrupt).is_err(),
+        "a flipped body byte must fail the checksum"
+    );
+}
+
+/// E2E BYTE-IN (the payoff): prove a plain-BGP materialized-present read (a genuine 3-atom join
+/// chain, so the join plan is load-bearing), then verify it holding ONLY bytes — the encoded
+/// `ReconciledReadBgpProof` + one encoded TERM-LESS `VerifierCommitment` per layer — through
+/// `decode_and_verify_read_bgp`. The count must equal the in-memory `verify_read_bgp`. Includes
+/// anti-substitution negatives: WRONG atoms or a WRONG join plan must Err.
+#[test]
+fn c4_reconcile_read_byte_in_matches_in_memory_and_rejects_substitution() {
+    use crate::proof::commitment::VerifierLayer;
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    // Triple(?x,p1,?y) & Triple(?y,p2,?z) & Triple(?z,p3,?w), joined on ?y and ?z => 9 solutions.
+    let atoms = [
+        atom(var(), "http://ex/p1", var()),
+        atom(var(), "http://ex/p2", var()),
+        atom(var(), "http://ex/p3", var()),
+    ];
+    let joins = [scalar_join(1, 0), scalar_join(2, 0)];
+    let (reconcile, bgp, _result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+
+    let n_mem = verify_read_bgp(&lref, head_root, &atoms, &joins, &reconcile, &bgp).unwrap();
+
+    // Cross the byte boundary: encode the proof + a TERM-LESS commitment per layer (all-term-less
+    // chain). Only `&[u8]` crosses to the remote verifier.
+    let proof_bytes = ReconciledReadBgpProof { reconcile, bgp }.encode().unwrap();
+    let commit_bytes: Vec<Vec<u8>> = lref
+        .iter()
+        .map(|l| l.verifier_commitment_termless().unwrap().encode().unwrap())
+        .collect();
+    let commit_refs: Vec<&[u8]> = commit_bytes.iter().map(|b| b.as_slice()).collect();
+
+    let n_bytes =
+        decode_and_verify_read_bgp(&proof_bytes, &commit_refs, head_root, &atoms, &joins).unwrap();
+    assert_eq!(n_mem, 9);
+    assert_eq!(n_mem, n_bytes, "byte-in reconciled read verify must match the in-memory count");
+
+    // (6) Surface the wire sizes the user asked about (compare to the ~969 KiB delta-read size).
+    println!("C4-slice-2 reconciled read (3-atom) encoded proof bytes = {}", proof_bytes.len());
+    for (i, b) in commit_bytes.iter().enumerate() {
+        println!("C4-slice-2 term-less VerifierCommitment[{i}] encoded bytes = {}", b.len());
+    }
+
+    // Anti-substitution: the verifier's OWN atoms/joins are load-bearing. A different predicate...
+    let wrong_atoms = [
+        atom(var(), "http://ex/p1", var()),
+        atom(var(), "http://ex/p2", var()),
+        atom(var(), "http://ex/p2", var()),
+    ];
+    assert!(
+        decode_and_verify_read_bgp(&proof_bytes, &commit_refs, head_root, &wrong_atoms, &joins)
+            .is_err(),
+        "byte-in verify with the WRONG atoms must fail (anti-substitution)"
+    );
+    // ...or a different join plan (swapping which kept columns are joined) must fail closed.
+    let wrong_joins = [scalar_join(2, 0), scalar_join(1, 0)];
+    assert!(
+        decode_and_verify_read_bgp(&proof_bytes, &commit_refs, head_root, &atoms, &wrong_joins)
+            .is_err(),
+        "byte-in verify with the WRONG joins must fail (anti-substitution)"
+    );
+}

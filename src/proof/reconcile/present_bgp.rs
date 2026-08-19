@@ -1186,3 +1186,51 @@ pub fn verify_and_resolve_bgp_from_views(
     )
 }
 
+
+// ===========================================================================
+// C4-slice-2: WIRE-SHIPPABLE reconciled materialized-present read + the DB-free byte-in verifier.
+// ===========================================================================
+
+/// The shippable reconciled MATERIALIZED-present plain-BGP read proof: the [`ReconcileProof`]
+/// (proving `present` IS the head triple set) plus the [`PresentBgpProof`] (the n-atom BGP over
+/// that `present`). Unlike a delta-read (a single `DeltaReadProof`), a reconciled present read
+/// carries BOTH structs, so this carrier bundles them into ONE framed blob. Its `encode`/`decode`
+/// (in `envelope::wire`, framed MAGIC ‖ VERSION ‖ body ‖ SHA-256 with the independent
+/// `RECONCILE_READ_*` constants) is transparent to verification: the decoded proof re-verifies
+/// through the SAME [`verify_read_bgp_from_views`].
+#[derive(Clone, Debug)]
+pub struct ReconciledReadBgpProof {
+    pub reconcile: ReconcileProof,
+    pub bgp: PresentBgpProof,
+}
+
+/// C4-slice-2 byte-in remote-verifier entry: verify a reconciled materialized-present plain-BGP
+/// read shipped as BYTES against a trusted head root, holding ONLY the encoded proof + the encoded
+/// term-less [`VerifierCommitment`](crate::proof::commitment::VerifierCommitment) chain (no
+/// `LayerCommitment` sidecars, no DB). Decodes each layer commitment and the read proof, then
+/// re-verifies through the audited [`verify_read_bgp_from_views`] — serialization does NOT change
+/// verification. `atoms`/`joins`/`trusted_head_root` are the VERIFIER's OWN parameters
+/// (anti-substitution): they are NEVER parsed from the proof bytes.
+pub fn decode_and_verify_read_bgp(
+    read_proof_bytes: &[u8],
+    verifier_commitment_bytes: &[&[u8]],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+) -> io::Result<usize> {
+    // Own the decoded commitments FIRST, so the borrowed views below cannot dangle.
+    let owned: Vec<crate::proof::commitment::VerifierCommitment> = verifier_commitment_bytes
+        .iter()
+        .map(|b| crate::proof::commitment::VerifierCommitment::decode(b))
+        .collect::<io::Result<_>>()?;
+    let views: Vec<VerifierCommitmentRef<'_>> = owned.iter().map(|c| c.verifier_view()).collect();
+    let proof = ReconciledReadBgpProof::decode(read_proof_bytes)?;
+    verify_read_bgp_from_views(
+        &views,
+        trusted_head_root,
+        atoms,
+        joins,
+        &proof.reconcile,
+        &proof.bgp,
+    )
+}
