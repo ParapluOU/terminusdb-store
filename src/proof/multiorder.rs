@@ -34,7 +34,7 @@ use super::commitment::{
 };
 use super::query::{
     build_resolution_openings, canonical_dictionary_id, require_base_layer_for_query,
-    resolve_node_value_id_via_merkle, verify_dict_value_terms,
+    resolve_node_value_id_via_merkle, verify_dict_value_terms, verify_result_columns,
 };
 use super::lexsort::{prove_lexicographically_nondecreasing_with_context, verify_lexicographically_nondecreasing, LexicographicSortedProof};
 use super::order::OrderDirection;
@@ -217,6 +217,19 @@ pub fn verify_exact_multi_order(source: &impl VerifierLayer, input: &RelationCom
     validate_shape(input.commitments.len(), datatypes, key_indices, directions)?; bind(transcript, datatypes, key_indices, directions, input.n);
     verify_relation_permutation(input, output_commitments, output_len, output_log_domain, &proof.permutation, transcript)?;
     if output_len != input.n || output_log_domain != input.log_domain || output_columns.len() != datatypes.len() { return Err(invalid("multi-order output shape mismatch")); }
+    // F2 (soundness): bind the CLEAR `output_columns` to the root-bound `output_commitments` BEFORE
+    // the term-bearing/term-less resolve branch. The permutation proof runs over `output_commitments`
+    // and the lexicographic proof runs over columns resolved from `output_columns`; without this tie
+    // a prover could commit an UNSORTED permutation while delivering SORTED clear columns. This pure
+    // commitment-recompute forces the sorted columns to be the committed permutation of the input. It
+    // is harmless on the term-less path (its `verify_dict_value_terms` oid re-commit stays redundant).
+    // `verify_result_columns` expects exactly `output_len` real rows per column (it re-zero-pads to
+    // the domain internally), while multi-order carries domain-padded columns, so trim to the proven
+    // length first (fail closed if any column is shorter than the proven length).
+    let bound_columns = output_columns.iter().map(|column| {
+        column.get(..output_len).map(<[ArkFr]>::to_vec).ok_or_else(|| invalid("multi-order output column too short"))
+    }).collect::<io::Result<Vec<_>>>()?;
+    verify_result_columns(output_commitments, &bound_columns, output_len, output_log_domain)?;
     let domain = 1usize << output_log_domain;
     let view = source.verifier_view();
     // Merkle-dict I2b step 3 (value↔term consistency). Each key column's sort values are its ids'
@@ -292,6 +305,47 @@ mod tests {
         // Merkle-dict I2b step 3: a term-less multi-order proof WITHOUT the value openings still
         // fails closed, now with the step-3 "value↔term Merkle openings" message.
         assert!(err.to_string().contains("Merkle openings"), "{err}");
+    }
+
+    /// F2 (HIGH soundness regression): on the TERM-BEARING path the verifier must BIND the clear
+    /// `output_columns` to `output_commitments`. Here we splice two individually valid sub-proofs on
+    /// ONE shared transcript: a permutation proof over the IDENTITY order (its commitments commit the
+    /// UNSORTED input rows) and a lexicographic proof over the genuinely SORTED clear columns (a
+    /// DIFFERENT relation). The permutation proof passes over the unsorted commitments and the
+    /// lexicographic proof passes over the sorted clear columns — yet neither conjunction ("the
+    /// committed permutation is sorted" / "the delivered columns are the committed permutation") was
+    /// established. Before the fix `verify_exact_multi_order` wrongly returned Ok; the added
+    /// `verify_result_columns` tie now rejects the split (recommit of the sorted columns ≠ the
+    /// unsorted commitments).
+    #[test]
+    fn multi_order_rejects_unbound_output_columns() {
+        let layer = fixture();
+        let input = RelationWitness::commit(vec![vec![id(&layer,2),id(&layer,1),id(&layer,1)], vec![id(&layer,8),id(&layer,3),id(&layer,9)]], 3).unwrap();
+        let types = [CanonicalDatatype::UInt32, CanonicalDatatype::UInt32];
+        let keys = [1usize, 0];
+        let dirs = [OrderDirection::Descending, OrderDirection::Ascending];
+        let ctx = StoreProverContext::cpu();
+        let domain = 1usize << input.log_domain;
+        // The honest SORTED answer (col1 descending, col0 ascending tie-break) — delivered as the
+        // clear `output_columns` (matches `exact_two_key_mixed_order_and_direction_tamper`).
+        let sorted_columns = vec![vec![id(&layer,1),id(&layer,2),id(&layer,1)], vec![id(&layer,9),id(&layer,8),id(&layer,3)]];
+        // Build the split proof on ONE transcript so BOTH sub-proofs verify against `verify`'s replay.
+        let mut t = Transcript254::new(b"f2-split");
+        bind(&mut t, &types, &keys, &dirs, input.n);
+        // Permutation over the IDENTITY order ⇒ `output_commitments` commit the UNSORTED input rows.
+        let perm = prove_relation_permutation_with_context(&ctx, &input, &[0usize,1,2], &mut t).unwrap();
+        // Lexicographic proof over the SORTED clear columns' resolved values (continues the transcript).
+        let sorted_values = resolve_values(&layer, &sorted_columns, input.n, &types, domain).unwrap();
+        let sorted_commitments = sorted_values.iter().map(|column| ctx.commit_column(column)).collect::<io::Result<Vec<_>>>().unwrap();
+        let mut chi = vec![ArkFr::zero(); domain]; chi[..input.n].fill(ArkFr::one());
+        let chi_commitment = ctx.commit_column(&chi).unwrap();
+        let ordered_key_values = keys.iter().map(|i| sorted_values[*i].clone()).collect::<Vec<_>>();
+        let ordered_key_commitments = keys.iter().map(|i| sorted_commitments[*i]).collect::<Vec<_>>();
+        let lexicographic = prove_lexicographically_nondecreasing_with_context(&ctx, &ordered_key_values, &ordered_key_commitments, &dirs, &chi_commitment, input.n, &mut t).unwrap();
+        let split = ExactMultiOrderProof { permutation: perm.proof, lexicographic, value_openings: None };
+        // output_commitments = the UNSORTED permutation's commitments; output_columns = the SORTED rows.
+        let err = verify_exact_multi_order(&layer, &input.view(), &sorted_columns, &types, &keys, &dirs, &perm.commitments, perm.n, perm.log_domain, &split, &mut Transcript254::new(b"f2-split")).unwrap_err();
+        assert!(err.to_string().contains("does not match its commitment"), "expected the F2 result-column binding to reject the split, got: {err}");
     }
 
     #[test]
@@ -431,8 +485,9 @@ mod tests {
     }
 
     /// A forged output-id column (`output_columns[k]`) no longer recommits to `output_commitments[k]`
-    /// ⇒ REJECT (the per-column tie binds it; the gadget is self-contained, not relying on the
-    /// enclosing `verify_result_columns`).
+    /// ⇒ REJECT. The F2 fix binds this UNCONDITIONALLY up front via `verify_result_columns` (which now
+    /// fires first, "does not match its commitment"); the term-less per-column `oid` tie in
+    /// `verify_dict_value_terms` ("oid column") remains as redundant-but-consistent defense-in-depth.
     #[test]
     fn i2b_step3_multi_order_termless_rejects_forged_output_ids() {
         let layer = fixture();
@@ -440,12 +495,12 @@ mod tests {
         let termless = layer.verifier_commitment_termless().unwrap();
         let mut forged = result.columns.clone();
         // Forge column 0 row 0 to a DIFFERENT real dict id that IS present in the shipped openings
-        // (id(8) appears in column 1), so the resolve opens it fine and the TIE's `oid` recommit is
-        // the load-bearing check: Com(oid) != output_commitments[0] ⇒ REJECT.
+        // (id(8) appears in column 1), so the resolve opens it fine and the recommit tie is the
+        // load-bearing check: Com(forged col 0) != output_commitments[0] ⇒ REJECT.
         forged[0][0] = id(&layer, 8);
         let err = verify_exact_multi_order(&termless, &input.view(), &forged, &types, &keys, &dirs, &result.commitments, result.n, result.log_domain, &result.proof, &mut Transcript254::new(b"mo-step3")).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("oid column"), "GOT: {}", msg);
+        assert!(msg.contains("does not match its commitment") || msg.contains("oid column"), "GOT: {}", msg);
     }
 
     /// A term-less multi-order proof WITHOUT the value openings fails closed; term-bearing verifies.
