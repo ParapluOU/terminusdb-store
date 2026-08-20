@@ -379,6 +379,48 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     }
 
     #[test]
+    fn cross_root_rejects_substituted_result_column() {
+        // F1 SOUNDNESS REGRESSION: `verify_cross_root` MUST bind the CLEAR delivered
+        // `result_columns` to the authenticated semi-join commitments (via `verify_result_columns`).
+        // A prover that keeps a genuine envelope but substitutes a DIFFERENT (still
+        // dictionary-authenticated) id into the delivered `?x` column must now be REJECTED. Before
+        // the fix `verify_cross_root` never opened `result_columns` against `result_commitments`, so
+        // the substitution wrongly verified and the verifier returned the WRONG answer.
+        let schema = node_layer(&[("aaa", "cls", "Cxxxx"), ("aaa", "zzz", "yyy")]);
+        let instance = node_layer(&[
+            ("Aearly", "rt", "Bearly"),
+            ("px", "rt", "Cxxxx"),
+            ("qx", "zzz", "yyy"),
+        ]);
+        let plan = cross_root_plan(
+            bgp_leaf(subject_bound_atom("aaa", "cls"), 1),
+            bgp_leaf(var_subject_atom("rt"), 2),
+        );
+        let mut env = RecursiveRelationEnvelope::prove_cross_root(&instance, &schema, &plan).unwrap();
+        let db_root = crate::proof::commitment::database_root(
+            &instance.resolution_root(),
+            &schema.resolution_root(),
+        );
+        // The genuine proof verifies (no over-rejection).
+        env.verify_cross_root(&instance, &schema, db_root, &plan).unwrap();
+        assert_eq!(env.result_len, 1, "px (class Cxxxx) is the only match");
+
+        // Substitute a DIFFERENT but genuinely-authenticated instance dict id (the class node
+        // "Cxxxx") for the delivered `?x`: an id that opens the dictionary but is the WRONG answer.
+        let inst_class = class_object_id(&instance, "Cxxxx").unwrap();
+        let substitute = ArkFr::from_u64(inst_class);
+        assert_ne!(
+            env.result_columns[0][0], substitute,
+            "the substitute id must differ from the genuine delivered id"
+        );
+        env.result_columns[0][0] = substitute;
+        assert!(
+            env.verify_cross_root(&instance, &schema, db_root, &plan).is_err(),
+            "substituted result_columns must now be rejected (F1 fix binds clear columns to the semi-join output)"
+        );
+    }
+
+    #[test]
     fn composite_join_rejects_non_store_id_key_namespace() {
         // The fixture BGP exposes two nonnullable NodeValue (Store-ID) columns.
         let (_commitment, bgp) = fixture();

@@ -3336,6 +3336,38 @@ impl RecursiveRelationEnvelope {
         {
             return Err(invalid("cross-root result does not match the semi-join output"));
         }
+
+        // (6) Bind the CLEAR delivered result columns to the now-authenticated semi-join
+        // commitments (mirrors the single-root `verify_bounded` postcondition at recursive.rs
+        // ~3091). Without this a prover could keep a genuine envelope yet substitute arbitrary
+        // authenticated dictionary ids into `self.result_columns`. The output is instance-anchored
+        // (established by the `self.layer_root != instance_root` check above), so result values
+        // resolve against the INSTANCE namespace.
+        verify_result_columns(
+            &self.result_commitments,
+            &self.result_columns,
+            self.result_len,
+            self.result_log_domain,
+        )?;
+        if self.ground_result {
+            if self.result_commitments.len() != 1
+                || self.result_columns.len() != 1
+                || !self.result_descriptors.is_empty()
+                || !self.result_values.is_empty()
+            {
+                return Err(invalid("invalid cross-root ground-result shape"));
+            }
+        } else {
+            let values = resolve_result_values(
+                instance,
+                instance.resolution_root(),
+                &self.result_columns,
+                &expected_descriptors,
+            )?;
+            if values != self.result_values {
+                return Err(invalid("cross-root canonical result mismatch"));
+            }
+        }
         Ok(())
     }
 
