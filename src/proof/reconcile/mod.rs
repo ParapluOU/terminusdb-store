@@ -80,9 +80,9 @@ use super::bgp::{
     RelationCommit, RelationWitness,
 };
 use super::commitment::{
-    build_node_value_tree, build_predicate_tree, node_value_op_value, reject_nan_objects,
-    verify_opening, DictMerkleTree, DictOpening, LayerCommitment, ResolutionOpenings,
-    VerifierCommitmentRef, VerifierLayer, NODE_DATATYPE_TAG,
+    build_node_value_tree, build_predicate_tree, node_value_op_value, reject_nan_catalog,
+    reject_nan_objects, verify_opening, DictMerkleTree, DictOpening, LayerCommitment,
+    ResolutionOpenings, VerifierCommitmentRef, VerifierLayer, NODE_DATATYPE_TAG,
 };
 // Merkle-dict I2b S3 differential/negative tests: the prover-side opening builder is test-only
 // in the reconcile module (the term-less chain-resolver path is exercised via the `_with_openings`

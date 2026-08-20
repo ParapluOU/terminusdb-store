@@ -2975,3 +2975,285 @@ fn c4_reconcile_read_byte_in_matches_in_memory_and_rejects_substitution() {
         "byte-in verify with the WRONG joins must fail (anti-substitution)"
     );
 }
+
+// ============================================================
+// C4 — RANGE byte-in: the numeric object-value RANGE case over the wire (delta + reconciled).
+//
+// The C4 byte-in verifiers (`decode_and_verify_delta_read`, `decode_and_verify_read_bgp`) call the
+// SAME audited `verify_*_from_views`, which already handle a term-less numeric object-value RANGE
+// via C2a's `range_object_oid` + `range_value_openings` on `PresentBgpProof` (C4-slice-1 serializes
+// both). The plain-BGP C4 tests never exercised the range path; these do — proving the serialized
+// range proof + value<->term openings round-trip and re-verify DB-free over an all-term-less chain.
+// NO code change was needed for range in the byte-in entry (verify_*_from_views handles it).
+// ============================================================
+
+/// C4 RANGE byte-in (delta): prove a numeric object-value RANGE delta-read over `age_stack`, attach
+/// the C2a value<->term range openings AND the E2b result openings, cross the byte boundary via
+/// `DeltaReadProof::encode`, and assert the all-term-less `decode_and_verify_delta_read` count
+/// equals the in-memory (term-bearing) `verify_delta_read`. The term-less range NEEDS the
+/// wire-preserved `range_value_openings`; a plain-BGP byte-in never exercised them.
+fn c4_delta_range_byte_in(atoms: &[PresentBgpAtom]) {
+    let layers = age_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let (mut proof, result) = prove_delta_read(&lref, DeltaSource::Additions, atoms, &[]).unwrap();
+
+    // C2a: the head additions' object ids ARE the delta present object column.
+    let head = *lref.last().unwrap();
+    let poids: Vec<ArkFr> = head.additions.iter().map(|r| ark(r.object_id)).collect();
+    attach_termless_present_range_openings(&mut proof.bgp, &lref, &poids).unwrap();
+    // E2b: the result-id openings (harmless to the count-only byte-in verify; mirrors C2a producer).
+    attach_termless_delta_openings(&mut proof, &lref, &result.columns).unwrap();
+
+    let n_mem =
+        verify_delta_read(&lref, head_root, DeltaSource::Additions, atoms, &[], &proof).unwrap();
+    assert!(n_mem >= 1, "differential must not be vacuous (grace 25 qualifies for >= 18)");
+
+    // Only `&[u8]` crosses: the encoded proof + a TERM-LESS commitment per layer.
+    let proof_bytes = proof.encode().unwrap();
+    let commit_bytes: Vec<Vec<u8>> = lref
+        .iter()
+        .map(|l| l.verifier_commitment_termless().unwrap().encode().unwrap())
+        .collect();
+    let commit_refs: Vec<&[u8]> = commit_bytes.iter().map(|b| b.as_slice()).collect();
+
+    let n_bytes = decode_and_verify_delta_read(
+        &proof_bytes, &commit_refs, head_root, DeltaSource::Additions, atoms, &[],
+    )
+    .unwrap();
+    assert_eq!(n_mem, n_bytes, "byte-in range delta verify must match the in-memory count");
+}
+
+/// C4 RANGE byte-in (delta): single bound `AddedTriple(?x, age, ?v)[?v >= 18]` AND the InRange
+/// `[?v >= 18 AND ?v < 30]` (the second bound rides the wire too), both over the head additions
+/// ({grace 25}) => 1 row each.
+#[test]
+fn c4_delta_read_byte_in_range_matches_in_memory() {
+    c4_delta_range_byte_in(&[range_atom(RangeOp::Ge, 18, None)]);
+    c4_delta_range_byte_in(&[range_atom(RangeOp::Ge, 18, Some((RangeOp::Lt, 30)))]);
+}
+
+/// C4 RANGE byte-in (reconciled materialized present): prove a numeric object-value RANGE read over
+/// `age_stack`, attach the C2a value<->term range openings AND the C1b reconcile result openings,
+/// cross the byte boundary via `ReconciledReadBgpProof::encode`, and assert the all-term-less
+/// `decode_and_verify_read_bgp` count equals the in-memory (term-bearing) `verify_read_bgp`.
+fn c4_reconcile_range_byte_in(atoms: &[PresentBgpAtom], expect: usize) {
+    let layers = age_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let (rec, mut bgp, result) = prove_read_bgp(&lref, atoms, &[]).unwrap();
+
+    // C2a: the reconciled present's object ids, in reconcile order, ARE the present object column.
+    let poids: Vec<ArkFr> =
+        reconcile_present(&lref).unwrap().iter().map(|r| ark(r.object_id)).collect();
+    attach_termless_present_range_openings(&mut bgp, &lref, &poids).unwrap();
+    // C1b: the result-id openings (harmless to the count-only byte-in verify).
+    attach_termless_reconcile_openings(&mut bgp, &lref, &result.columns).unwrap();
+
+    let n_mem = verify_read_bgp(&lref, head_root, atoms, &[], &rec, &bgp).unwrap();
+    assert_eq!(n_mem, expect, "in-memory count must match the materialized ground");
+
+    let proof_bytes = ReconciledReadBgpProof { reconcile: rec, bgp }.encode().unwrap();
+    let commit_bytes: Vec<Vec<u8>> = lref
+        .iter()
+        .map(|l| l.verifier_commitment_termless().unwrap().encode().unwrap())
+        .collect();
+    let commit_refs: Vec<&[u8]> = commit_bytes.iter().map(|b| b.as_slice()).collect();
+
+    let n_bytes =
+        decode_and_verify_read_bgp(&proof_bytes, &commit_refs, head_root, atoms, &[]).unwrap();
+    assert_eq!(n_mem, n_bytes, "byte-in range reconciled read must match the in-memory count");
+}
+
+/// C4 RANGE byte-in (reconciled): Ge 18 boundary (carol/erin == 18 INCLUDED) => 5; InRange [18, 30)
+/// (the second bound rides the wire) => {18, 18, 25} = 3.
+#[test]
+fn c4_reconcile_read_byte_in_range_matches_in_memory() {
+    c4_reconcile_range_byte_in(&[range_atom(RangeOp::Ge, 18, None)], 5);
+    c4_reconcile_range_byte_in(&[range_atom(RangeOp::Ge, 18, Some((RangeOp::Lt, 30)))], 3);
+}
+
+/// C4 RANGE byte-in NEGATIVE: a term-less range byte-in whose `range_value_openings` are DROPPED
+/// (None) must fail CLOSED — the term-less range arm requires the value<->term openings (the D2
+/// default), preserved across the wire. Covers BOTH carriers (delta + reconciled).
+#[test]
+fn c4_range_byte_in_dropped_openings_fails_closed() {
+    let layers = age_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [range_atom(RangeOp::Ge, 18, None)];
+
+    // Delta carrier: attach the openings, then DROP the value<->term set (keep range_object_oid).
+    let (mut proof, result) = prove_delta_read(&lref, DeltaSource::Additions, &atoms, &[]).unwrap();
+    let head = *lref.last().unwrap();
+    let poids: Vec<ArkFr> = head.additions.iter().map(|r| ark(r.object_id)).collect();
+    attach_termless_present_range_openings(&mut proof.bgp, &lref, &poids).unwrap();
+    attach_termless_delta_openings(&mut proof, &lref, &result.columns).unwrap();
+    proof.bgp.range_value_openings = None;
+    let proof_bytes = proof.encode().unwrap();
+    let commit_bytes: Vec<Vec<u8>> = lref
+        .iter()
+        .map(|l| l.verifier_commitment_termless().unwrap().encode().unwrap())
+        .collect();
+    let commit_refs: Vec<&[u8]> = commit_bytes.iter().map(|b| b.as_slice()).collect();
+    assert!(
+        decode_and_verify_delta_read(
+            &proof_bytes, &commit_refs, head_root, DeltaSource::Additions, &atoms, &[],
+        )
+        .is_err(),
+        "a term-less range byte-in with DROPPED value openings must fail closed (delta)"
+    );
+
+    // Reconciled carrier: same drop.
+    let (rec, mut bgp, result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+    let poids: Vec<ArkFr> =
+        reconcile_present(&lref).unwrap().iter().map(|r| ark(r.object_id)).collect();
+    attach_termless_present_range_openings(&mut bgp, &lref, &poids).unwrap();
+    attach_termless_reconcile_openings(&mut bgp, &lref, &result.columns).unwrap();
+    bgp.range_value_openings = None;
+    let proof_bytes = ReconciledReadBgpProof { reconcile: rec, bgp }.encode().unwrap();
+    let commit_bytes: Vec<Vec<u8>> = lref
+        .iter()
+        .map(|l| l.verifier_commitment_termless().unwrap().encode().unwrap())
+        .collect();
+    let commit_refs: Vec<&[u8]> = commit_bytes.iter().map(|b| b.as_slice()).collect();
+    assert!(
+        decode_and_verify_read_bgp(&proof_bytes, &commit_refs, head_root, &atoms, &[]).is_err(),
+        "a term-less range byte-in with DROPPED value openings must fail closed (reconciled)"
+    );
+}
+
+// ============================================================
+// #49 — the term-BEARING present-range Float64 NaN fidelity guard.
+//
+// The base range path (`query/range_atom.rs`, the `layer.terms_present` arm) rejects a queried-float
+// NaN in the catalog via `reject_nan_catalog`, because the order-preserving VALUE encoding assigns
+// every IEEE NaN a total-order position (Prolog treats NaN as unordered), so a range over a NaN
+// would prove different semantics. C2a's TERM-LESS present-range path already NaN-guards over the
+// opened touched terms; the TERM-BEARING reconciled/delta present-range path did NOT. These gate
+// the added guard: a Float64 range over a NaN present-object REJECTS; a non-NaN Float64 range and an
+// integer range are unaffected (no regression).
+// ============================================================
+
+fn float64_tag() -> ArkFr {
+    ArkFr::from_u64(crate::proof::CanonicalDatatype::Float64 as u64)
+}
+
+/// The order-preserving OP-encoding of a float bound `v`, as the range gadget's constant `c` — the
+/// SAME `node_value_op_value` the prover/verifier use over the stored value column.
+fn f64_op_c(v: f64) -> ArkFr {
+    use tdb_succinct::TdbDataType;
+    let obj = CanonicalObject::from_store_object(
+        &ValueTriple::new_value("", "", f64::make_entry(&v)).object,
+    );
+    node_value_op_value(&obj).unwrap()
+}
+
+/// Decode a stored Float64 object's order-preserving lexical back to an `f64` (mirrors the store's
+/// total-order `from_lexical` and the `reject_nan` decoder). Used to compute the materialized ground.
+fn f64_of(object: &CanonicalObject) -> Option<f64> {
+    match object {
+        CanonicalObject::Value {
+            datatype: crate::proof::CanonicalDatatype::Float64,
+            lexical,
+        } if lexical.len() == 8 => {
+            let encoded = u64::from_be_bytes([
+                lexical[0], lexical[1], lexical[2], lexical[3],
+                lexical[4], lexical[5], lexical[6], lexical[7],
+            ]);
+            let bits = if encoded & 0x8000_0000_0000_0000 != 0 {
+                encoded ^ 0x8000_0000_0000_0000
+            } else {
+                encoded ^ 0xffff_ffff_ffff_ffff
+            };
+            Some(f64::from_bits(bits))
+        }
+        _ => None,
+    }
+}
+
+fn score_range_atom(op: RangeOp, bound: f64, second: Option<(RangeOp, f64)>) -> PresentBgpAtom {
+    PresentBgpAtom {
+        subject: var(),
+        predicate_hash: hash_pred("http://ex/score"),
+        object: var(),
+        subject_object_equal: false,
+        object_range: Some(ObjectRangeSpec {
+            op,
+            datatype: float64_tag(),
+            c: f64_op_c(bound),
+            b_bits: OBJECT_RANGE_B_BITS,
+            second: second
+                .map(|(op, c)| crate::proof::query::ObjectRangeBound { op, c: f64_op_c(c) }),
+        }),
+    }
+}
+
+/// A base+head stack of `t(person, score, <Float64>)`. present scores: alice=10, bob=20, and carol
+/// = NaN (if `nan`) else 25. carol also gets a `name` node (so the head addition group is non-trivial
+/// and mirrors `age_stack`'s shape); the range atom filters on `score`, so `name` rows are ignored.
+fn score_stack(nan: bool) -> Vec<Arc<LayerCommitment>> {
+    use tdb_succinct::TdbDataType;
+    let store = open_sync_memory_store();
+    let b = store.create_base_layer().unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("alice"), &iri("score"), f64::make_entry(&10.0f64))).unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("bob"), &iri("score"), f64::make_entry(&20.0f64))).unwrap();
+    let base = b.commit().unwrap();
+    let base_lc = base.proof_commitment().unwrap();
+    let child = base.open_write().unwrap();
+    let carol_score = if nan { f64::NAN } else { 25.0f64 };
+    child.add_value_triple(ValueTriple::new_value(&iri("carol"), &iri("score"), f64::make_entry(&carol_score))).unwrap();
+    child.add_value_triple(ValueTriple::new_node(&iri("carol"), &iri("name"), &iri("carol_n"))).unwrap();
+    let head = child.commit().unwrap();
+    vec![base_lc, head.proof_commitment().unwrap()]
+}
+
+/// #49: the term-BEARING reconciled-present Float64 range guard. A NaN present-object of the queried
+/// float datatype must be REJECTED (today it would wrongly verify, because the OP encoding gives NaN
+/// a total-order position). No regression: a non-NaN Float64 range still verifies with the right
+/// count, and an integer (UInt32) range is unaffected (the guard is a no-op for non-float / no NaN).
+#[test]
+fn present_range_termbearing_rejects_float_nan() {
+    // NEGATIVE: a NaN carol.score + a Float64 range => term-bearing verify_read_bgp REJECTS, and the
+    // rejection is the NaN fidelity guard (not some incidental failure — the proof is otherwise valid).
+    let layers = score_stack(true);
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [score_range_atom(RangeOp::Ge, 0.0, None)];
+    let (rec, bgp, _result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+    let err = verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap_err();
+    assert!(
+        err.to_string().contains("NaN"),
+        "a term-bearing Float64 range over a NaN present-object must reject via the NaN guard: {err}"
+    );
+
+    // POSITIVE (no regression): a non-NaN Float64 range still verifies with the correct count.
+    let layers = score_stack(false);
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [score_range_atom(RangeOp::Ge, 15.0, None)];
+    let (rec, bgp, _result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+    let n = verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap();
+    let ground = reconcile_present(&lref)
+        .unwrap()
+        .iter()
+        .filter(|r| r.triple.predicate == b"http://ex/score")
+        .filter_map(|r| f64_of(&r.triple.object))
+        .filter(|v| *v >= 15.0)
+        .count();
+    assert_eq!(n, ground, "non-NaN Float64 range count must equal the materialized ground");
+    assert_eq!(n, 2, "scores {{10,20,25}} with >= 15.0 => {{20,25}} = 2");
+
+    // NO-OP for non-float: an integer (UInt32) range over `age_stack` still verifies (the guard only
+    // triggers for a float `range.datatype`).
+    let layers = age_stack();
+    let lref = refs(&layers);
+    let head_root = lref.last().unwrap().resolution_root();
+    let atoms = [range_atom(RangeOp::Ge, 18, None)];
+    let (rec, bgp, _result) = prove_read_bgp(&lref, &atoms, &[]).unwrap();
+    assert_eq!(
+        verify_read_bgp(&lref, head_root, &atoms, &[], &rec, &bgp).unwrap(),
+        5,
+        "an integer range is unaffected by the float NaN guard"
+    );
+}

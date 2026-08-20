@@ -929,6 +929,22 @@ pub(crate) fn verify_present_bgp(
                         )?;
                         reject_nan_objects(&touched2, range.datatype)?;
                     }
+                } else {
+                    // #49 term-BEARING present range: mirror the base path's fidelity guard
+                    // (`query/range_atom.rs`, the `layer.terms_present` arm runs
+                    // `reject_nan_catalog`). A Float64/Float32 range reads the order-preserving
+                    // VALUE encoding, which assigns every IEEE NaN a total-order position — so a
+                    // catalog NaN of the queried float datatype would give a wrong-but-verifying
+                    // answer (Prolog treats NaN as unordered). The term-less arm above already
+                    // NaN-guards over the opened touched terms; the term-bearing arm (the C2a
+                    // re-pin runs ONLY when `!all_terms_present`) previously did NOT. Scan each
+                    // term-bearing view's clear node/value catalog, keyed on `range.datatype`
+                    // (`range.datatype` covers BOTH bounds — the second bound shares it). No-op for
+                    // a non-float range (`reject_nan_catalog` returns early) and for the term-less
+                    // path (handled above).
+                    for view in views {
+                        reject_nan_catalog(view.node_value_catalog, range.datatype)?;
+                    }
                 }
             }
             (None, PresentAtomFilter::Plain { selection, com_sel, compaction }) => {
