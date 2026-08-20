@@ -544,3 +544,35 @@ pub fn verify_reconciled_transitive_closure_from_views(
         &mut nodes,
     )
 }
+
+/// C4-slice-3 byte-in remote-verifier entry: verify a reconciled transitive-closure proof shipped
+/// as BYTES against a trusted head root, holding ONLY the encoded proof + the encoded term-less
+/// [`VerifierCommitment`](crate::proof::commitment::VerifierCommitment) chain (no `LayerCommitment`
+/// sidecars, no DB). Decodes each layer commitment and the closure proof, then re-verifies through
+/// the audited [`verify_reconciled_transitive_closure_from_views`] — serialization does NOT change
+/// verification. `edge_predicate`/`seed_iri`/`reflexive`/`trusted_head_root` are the VERIFIER's OWN
+/// query parameters (anti-substitution): they are NEVER parsed from the proof bytes.
+pub fn decode_and_verify_reconciled_transitive_closure(
+    closure_proof_bytes: &[u8],
+    verifier_commitment_bytes: &[&[u8]],
+    trusted_head_root: ProofHash,
+    edge_predicate: &[u8],
+    seed_iri: &[u8],
+    reflexive: bool,
+) -> io::Result<Vec<u64>> {
+    // Own the decoded commitments FIRST, so the borrowed views below cannot dangle.
+    let owned: Vec<crate::proof::commitment::VerifierCommitment> = verifier_commitment_bytes
+        .iter()
+        .map(|b| crate::proof::commitment::VerifierCommitment::decode(b))
+        .collect::<io::Result<_>>()?;
+    let views: Vec<VerifierCommitmentRef<'_>> = owned.iter().map(|c| c.verifier_view()).collect();
+    let proof = ReconciledClosureProof::decode(closure_proof_bytes)?;
+    verify_reconciled_transitive_closure_from_views(
+        &views,
+        trusted_head_root,
+        edge_predicate,
+        seed_iri,
+        reflexive,
+        &proof,
+    )
+}

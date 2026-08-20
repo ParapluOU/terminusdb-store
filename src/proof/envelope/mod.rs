@@ -118,19 +118,19 @@ pub use recursive::{
 // stays `pub(crate)` in the submodule — it is the shared enabler consumed by the reconciled list
 // walk (6c-ii) and schema closure (6e), not a standalone public entry.
 pub use reconciled::{
-    attach_termless_closure_openings, prove_reconciled_transitive_closure,
-    resolve_reconciled_node_ids, resolve_reconciled_node_ids_from_views,
-    verify_reconciled_transitive_closure, verify_reconciled_transitive_closure_from_views,
-    ReconciledClosureProof,
+    attach_termless_closure_openings, decode_and_verify_reconciled_transitive_closure,
+    prove_reconciled_transitive_closure, resolve_reconciled_node_ids,
+    resolve_reconciled_node_ids_from_views, verify_reconciled_transitive_closure,
+    verify_reconciled_transitive_closure_from_views, ReconciledClosureProof,
 };
 
 // The reconciled ordered `rdf:List` walk over a delta head's `present` (ReadDocument 6c-ii) — the
 // standalone prove/verify pair the compiler lift (6c-iii) routes a delta-path `List` to. Built on the
 // 6c-i foundation; the materialized `OrderedListWalk` composite stays byte-identical (a PARALLEL entry).
 pub use list_walk::{
-    attach_termless_list_walk_openings, prove_ordered_list_walk_reconciled,
-    verify_ordered_list_walk_reconciled, verify_ordered_list_walk_reconciled_from_views,
-    OrderedListWalkReconciledProof,
+    attach_termless_list_walk_openings, decode_and_verify_ordered_list_walk_reconciled,
+    prove_ordered_list_walk_reconciled, verify_ordered_list_walk_reconciled,
+    verify_ordered_list_walk_reconciled_from_views, OrderedListWalkReconciledProof,
 };
 
 // The reconciled ordered `sys:Array` walk over a delta head's `present` (ReadDocument 6d) — the
@@ -139,9 +139,9 @@ pub use list_walk::{
 // combined `(id, value, datatype)` range-dict authentication; the materialized `OrderedArrayWalk`
 // composite stays byte-identical (a PARALLEL entry).
 pub use array_walk::{
-    attach_termless_array_walk_openings, prove_ordered_array_walk_reconciled,
-    verify_ordered_array_walk_reconciled, verify_ordered_array_walk_reconciled_from_views,
-    OrderedArrayWalkReconciledProof,
+    attach_termless_array_walk_openings, decode_and_verify_ordered_array_walk_reconciled,
+    prove_ordered_array_walk_reconciled, verify_ordered_array_walk_reconciled,
+    verify_ordered_array_walk_reconciled_from_views, OrderedArrayWalkReconciledProof,
 };
 
 #[cfg(test)]

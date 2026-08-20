@@ -5097,3 +5097,452 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     fn reconciled_array_walk_termless_forged_order() {
         big_stack(assert_reconciled_array_walk_termless_forged_order);
     }
+
+    // =======================================================================
+    // C4-slice-3 — WIRE SERIALIZATION of the three reconciled WALK/CLOSURE proofs (ReadDocument
+    // composites) + their DB-free byte-in remote verifiers. Each walk is SELF-CONTAINED (it carries
+    // its own `reconcile` + leaves + walk-structure sub-proofs), so the container IS the shippable
+    // proof, framed with its OWN independent format (`CLOSURE_READ_*` / `LIST_WALK_READ_*` /
+    // `ARRAY_WALK_READ_*`). A remote party holding only bytes + the term-less `VerifierCommitment`
+    // chain + a trusted head root re-verifies through the SAME audited `verify_*_from_views`.
+    // Serialization changes NO verification logic. Term-less openings are attached first so the
+    // all-term-less byte-in chain can resolve (fail-closed without them).
+    // =======================================================================
+
+    // ---- reconciled TRANSITIVE CLOSURE ------------------------------------
+
+    /// Round-trip re-verify: prove a reconciled closure, attach term-less openings, `encode` →
+    /// `decode`, and assert the decoded proof STILL passes the term-bearing verify AND the
+    /// term-less-head `_from_views` entry (same reachable set). Serialization is transparent.
+    fn assert_c4_closure_wire_roundtrip_reverifies() {
+        let stack = closure_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let rest = rdf_rest_iri();
+        let seed = iri("cell0");
+
+        let (mut proof, prover_ids) = super::reconciled::prove_reconciled_transitive_closure(
+            &lref, rest.as_bytes(), seed.as_bytes(), true,
+        )
+        .unwrap();
+        super::reconciled::attach_termless_closure_openings(
+            &mut proof, &lref, seed.as_bytes(), &prover_ids,
+        )
+        .unwrap();
+
+        let encoded = proof.encode().unwrap();
+        let decoded = super::reconciled::ReconciledClosureProof::decode(&encoded).unwrap();
+
+        // Decoded proof still passes the term-bearing sidecar verify.
+        let bearing = super::reconciled::verify_reconciled_transitive_closure(
+            &lref, head_root, rest.as_bytes(), seed.as_bytes(), true, &decoded,
+        )
+        .unwrap();
+
+        // ...and the views entry with a TERM-LESS head + term-bearing ancestors.
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+        let termless = super::reconciled::verify_reconciled_transitive_closure_from_views(
+            &termless_views, head_root, rest.as_bytes(), seed.as_bytes(), true, &decoded,
+        )
+        .unwrap();
+
+        let set = |v: &[u64]| v.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(set(&bearing), set(&termless), "decoded closure must re-verify identically");
+        println!("C4-slice-3 reconciled closure encoded proof bytes = {}", encoded.len());
+    }
+
+    /// Byte-identity golden + tamper-reject: the canonical encoding is a stable fixed point across
+    /// decode/encode, and flipping one body byte breaks the trailing checksum so `decode` fails.
+    fn assert_c4_closure_wire_golden_and_tamper() {
+        let stack = closure_delta_stack();
+        let lref = arc_refs(&stack);
+        let rest = rdf_rest_iri();
+        let seed = iri("cell0");
+
+        let (mut proof, prover_ids) = super::reconciled::prove_reconciled_transitive_closure(
+            &lref, rest.as_bytes(), seed.as_bytes(), true,
+        )
+        .unwrap();
+        super::reconciled::attach_termless_closure_openings(
+            &mut proof, &lref, seed.as_bytes(), &prover_ids,
+        )
+        .unwrap();
+
+        let encoded = proof.encode().unwrap();
+        let reencoded = super::reconciled::ReconciledClosureProof::decode(&encoded)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(encoded, reencoded, "closure wire encoding must be a byte-identity fixed point");
+
+        let mut corrupt = encoded.clone();
+        corrupt[20] ^= 1; // inside the framed body (past 12-byte magic + 4-byte version)
+        assert!(
+            super::reconciled::ReconciledClosureProof::decode(&corrupt).is_err(),
+            "a flipped body byte must fail the checksum"
+        );
+    }
+
+    /// E2E BYTE-IN: prove a reconciled closure, then verify it holding ONLY bytes — the encoded
+    /// proof + one encoded TERM-LESS `VerifierCommitment` per layer (all-term-less chain) — through
+    /// `decode_and_verify_reconciled_transitive_closure`. The reachable set must equal the in-memory
+    /// verify. Anti-substitution: a WRONG edge predicate or WRONG seed IRI must Err.
+    fn assert_c4_closure_byte_in() {
+        let stack = closure_delta_stack();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let rest = rdf_rest_iri();
+        let seed = iri("cell0");
+
+        let (mut proof, prover_ids) = super::reconciled::prove_reconciled_transitive_closure(
+            &lref, rest.as_bytes(), seed.as_bytes(), true,
+        )
+        .unwrap();
+        super::reconciled::attach_termless_closure_openings(
+            &mut proof, &lref, seed.as_bytes(), &prover_ids,
+        )
+        .unwrap();
+
+        let mem = super::reconciled::verify_reconciled_transitive_closure(
+            &lref, head_root, rest.as_bytes(), seed.as_bytes(), true, &proof,
+        )
+        .unwrap();
+
+        // Cross the byte boundary: proof bytes + a TERM-LESS commitment per layer. Only `&[u8]`.
+        let proof_bytes = proof.encode().unwrap();
+        let commit_bytes: Vec<Vec<u8>> = lref
+            .iter()
+            .map(|l| l.verifier_commitment_termless().unwrap().encode().unwrap())
+            .collect();
+        let commit_refs: Vec<&[u8]> = commit_bytes.iter().map(|b| b.as_slice()).collect();
+
+        let ids = super::reconciled::decode_and_verify_reconciled_transitive_closure(
+            &proof_bytes, &commit_refs, head_root, rest.as_bytes(), seed.as_bytes(), true,
+        )
+        .unwrap();
+        let set = |v: &[u64]| v.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(set(&mem), set(&ids), "byte-in closure reachable set must match in-memory");
+        println!("C4-slice-3 closure byte-in encoded proof bytes = {}", proof_bytes.len());
+        for (i, b) in commit_bytes.iter().enumerate() {
+            println!("C4-slice-3 closure term-less VerifierCommitment[{i}] bytes = {}", b.len());
+        }
+
+        // Anti-substitution: verifier's OWN predicate + seed are load-bearing.
+        let wrong_pred = iri("wrongpred");
+        assert!(
+            super::reconciled::decode_and_verify_reconciled_transitive_closure(
+                &proof_bytes, &commit_refs, head_root, wrong_pred.as_bytes(), seed.as_bytes(), true,
+            )
+            .is_err(),
+            "byte-in with the WRONG edge predicate must fail (anti-substitution)"
+        );
+        let wrong_seed = iri("cell1");
+        assert!(
+            super::reconciled::decode_and_verify_reconciled_transitive_closure(
+                &proof_bytes, &commit_refs, head_root, rest.as_bytes(), wrong_seed.as_bytes(), true,
+            )
+            .is_err(),
+            "byte-in with the WRONG seed IRI must fail (anti-substitution)"
+        );
+    }
+
+    #[test]
+    fn c4_closure_wire_roundtrip_reverifies() {
+        big_stack(assert_c4_closure_wire_roundtrip_reverifies);
+    }
+
+    #[test]
+    fn c4_closure_wire_golden_and_tamper() {
+        big_stack(assert_c4_closure_wire_golden_and_tamper);
+    }
+
+    #[test]
+    fn c4_closure_byte_in_matches_in_memory_and_rejects_substitution() {
+        big_stack(assert_c4_closure_byte_in);
+    }
+
+    // ---- reconciled ordered rdf:List WALK ---------------------------------
+
+    fn list_walk_wire_fixture() -> (
+        Vec<std::sync::Arc<LayerCommitment>>,
+        CanonicalObject,
+        String,
+    ) {
+        let stack = list_delta_stack_head_elements();
+        let subj = CanonicalObject::Node(iri("doc").into_bytes());
+        let pred = iri("tracks");
+        (stack, subj, pred)
+    }
+
+    fn prove_attach_list_walk(
+        lref: &[&LayerCommitment],
+        subj: &CanonicalObject,
+        pbytes: &[u8],
+    ) -> super::list_walk::OrderedListWalkReconciledProof {
+        let (mut proof, _elems) =
+            super::list_walk::prove_ordered_list_walk_reconciled(lref, subj, pbytes).unwrap();
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let nil_id =
+            super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
+        let element_ids = proof.element_ids.clone();
+        super::list_walk::attach_termless_list_walk_openings(&mut proof, lref, &element_ids, nil_id)
+            .unwrap();
+        proof
+    }
+
+    fn assert_c4_list_walk_wire_roundtrip_reverifies() {
+        let (stack, subj, pred) = list_walk_wire_fixture();
+        let lref = arc_refs(&stack);
+        let pbytes = pred.as_bytes();
+        let head_root = lref.last().unwrap().resolution_root();
+        let proof = prove_attach_list_walk(&lref, &subj, pbytes);
+
+        let encoded = proof.encode().unwrap();
+        let decoded =
+            super::list_walk::OrderedListWalkReconciledProof::decode(&encoded).unwrap();
+
+        let bearing = super::list_walk::verify_ordered_list_walk_reconciled(
+            &lref, head_root, &subj, pbytes, &decoded,
+        )
+        .unwrap();
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+        let termless = super::list_walk::verify_ordered_list_walk_reconciled_from_views(
+            &termless_views, head_root, &subj, pbytes, &decoded,
+        )
+        .unwrap();
+        assert_eq!(object_iris(&bearing), object_iris(&termless), "decoded list walk re-verify");
+        assert_eq!(object_iris(&termless), vec![iri("a"), iri("c"), iri("d")]);
+        println!("C4-slice-3 reconciled list-walk encoded proof bytes = {}", encoded.len());
+    }
+
+    fn assert_c4_list_walk_wire_golden_and_tamper() {
+        let (stack, subj, pred) = list_walk_wire_fixture();
+        let lref = arc_refs(&stack);
+        let proof = prove_attach_list_walk(&lref, &subj, pred.as_bytes());
+
+        let encoded = proof.encode().unwrap();
+        let reencoded = super::list_walk::OrderedListWalkReconciledProof::decode(&encoded)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(encoded, reencoded, "list-walk wire encoding must be a byte-identity fixed point");
+
+        let mut corrupt = encoded.clone();
+        corrupt[20] ^= 1;
+        assert!(
+            super::list_walk::OrderedListWalkReconciledProof::decode(&corrupt).is_err(),
+            "a flipped body byte must fail the checksum"
+        );
+    }
+
+    fn assert_c4_list_walk_byte_in() {
+        let (stack, subj, pred) = list_walk_wire_fixture();
+        let lref = arc_refs(&stack);
+        let pbytes = pred.as_bytes();
+        let head_root = lref.last().unwrap().resolution_root();
+        let proof = prove_attach_list_walk(&lref, &subj, pbytes);
+
+        let mem = super::list_walk::verify_ordered_list_walk_reconciled(
+            &lref, head_root, &subj, pbytes, &proof,
+        )
+        .unwrap();
+
+        let proof_bytes = proof.encode().unwrap();
+        let commit_bytes: Vec<Vec<u8>> = lref
+            .iter()
+            .map(|l| l.verifier_commitment_termless().unwrap().encode().unwrap())
+            .collect();
+        let commit_refs: Vec<&[u8]> = commit_bytes.iter().map(|b| b.as_slice()).collect();
+
+        let elems = super::list_walk::decode_and_verify_ordered_list_walk_reconciled(
+            &proof_bytes, &commit_refs, head_root, &subj, pbytes,
+        )
+        .unwrap();
+        assert_eq!(object_iris(&mem), object_iris(&elems), "byte-in list walk must match in-memory");
+        assert_eq!(object_iris(&elems), vec![iri("a"), iri("c"), iri("d")]);
+        println!("C4-slice-3 list-walk byte-in encoded proof bytes = {}", proof_bytes.len());
+        for (i, b) in commit_bytes.iter().enumerate() {
+            println!("C4-slice-3 list-walk term-less VerifierCommitment[{i}] bytes = {}", b.len());
+        }
+
+        // Anti-substitution: wrong subject or wrong predicate must fail closed.
+        let wrong_subj = CanonicalObject::Node(iri("other").into_bytes());
+        assert!(
+            super::list_walk::decode_and_verify_ordered_list_walk_reconciled(
+                &proof_bytes, &commit_refs, head_root, &wrong_subj, pbytes,
+            )
+            .is_err(),
+            "byte-in with the WRONG subject must fail (anti-substitution)"
+        );
+        let wrong_pred = iri("wrongpred");
+        assert!(
+            super::list_walk::decode_and_verify_ordered_list_walk_reconciled(
+                &proof_bytes, &commit_refs, head_root, &subj, wrong_pred.as_bytes(),
+            )
+            .is_err(),
+            "byte-in with the WRONG predicate must fail (anti-substitution)"
+        );
+    }
+
+    #[test]
+    fn c4_list_walk_wire_roundtrip_reverifies() {
+        big_stack(assert_c4_list_walk_wire_roundtrip_reverifies);
+    }
+
+    #[test]
+    fn c4_list_walk_wire_golden_and_tamper() {
+        big_stack(assert_c4_list_walk_wire_golden_and_tamper);
+    }
+
+    #[test]
+    fn c4_list_walk_byte_in_matches_in_memory_and_rejects_substitution() {
+        big_stack(assert_c4_list_walk_byte_in);
+    }
+
+    // ---- reconciled ordered sys:Array WALK --------------------------------
+
+    fn array_walk_wire_fixture() -> (
+        Vec<std::sync::Arc<LayerCommitment>>,
+        CanonicalObject,
+        String,
+    ) {
+        let p = iri("items");
+        let s = iri("atldoc");
+        let subj = CanonicalObject::Node(s.clone().into_bytes());
+        let cells = vec![(0u64, "x"), (1, "y"), (2, "z")];
+        let stack = array_delta_stack(&s, &p, &cells);
+        (stack, subj, p)
+    }
+
+    fn prove_attach_array_walk(
+        lref: &[&LayerCommitment],
+        subj: &CanonicalObject,
+        pbytes: &[u8],
+    ) -> super::array_walk::OrderedArrayWalkReconciledProof {
+        let (mut proof, _vals) =
+            super::array_walk::prove_ordered_array_walk_reconciled(lref, subj, pbytes).unwrap();
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let sys_array_id =
+            super::reconciled::resolve_combined_node_id(&bearing_views, sys_array().as_bytes());
+        let value_ids = proof.value_ids.clone();
+        let index_ids = proof.index_oid.clone();
+        super::array_walk::attach_termless_array_walk_openings(
+            &mut proof, lref, &value_ids, sys_array_id, &index_ids,
+        )
+        .unwrap();
+        proof
+    }
+
+    fn assert_c4_array_walk_wire_roundtrip_reverifies() {
+        let (stack, subj, pred) = array_walk_wire_fixture();
+        let lref = arc_refs(&stack);
+        let pbytes = pred.as_bytes();
+        let head_root = lref.last().unwrap().resolution_root();
+        let proof = prove_attach_array_walk(&lref, &subj, pbytes);
+
+        let encoded = proof.encode().unwrap();
+        let decoded =
+            super::array_walk::OrderedArrayWalkReconciledProof::decode(&encoded).unwrap();
+
+        let bearing = super::array_walk::verify_ordered_array_walk_reconciled(
+            &lref, head_root, &subj, pbytes, &decoded,
+        )
+        .unwrap();
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        let termless_views = termless_head_views(&lref, &head_termless);
+        let termless = super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+            &termless_views, head_root, &subj, pbytes, &decoded,
+        )
+        .unwrap();
+        assert_eq!(object_iris(&bearing), object_iris(&termless), "decoded array walk re-verify");
+        assert_eq!(object_iris(&termless), vec![iri("x"), iri("y"), iri("z")]);
+        println!("C4-slice-3 reconciled array-walk encoded proof bytes = {}", encoded.len());
+    }
+
+    fn assert_c4_array_walk_wire_golden_and_tamper() {
+        let (stack, subj, pred) = array_walk_wire_fixture();
+        let lref = arc_refs(&stack);
+        let proof = prove_attach_array_walk(&lref, &subj, pred.as_bytes());
+
+        let encoded = proof.encode().unwrap();
+        let reencoded = super::array_walk::OrderedArrayWalkReconciledProof::decode(&encoded)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(encoded, reencoded, "array-walk wire encoding must be a byte-identity fixed point");
+
+        let mut corrupt = encoded.clone();
+        corrupt[20] ^= 1;
+        assert!(
+            super::array_walk::OrderedArrayWalkReconciledProof::decode(&corrupt).is_err(),
+            "a flipped body byte must fail the checksum"
+        );
+    }
+
+    fn assert_c4_array_walk_byte_in() {
+        let (stack, subj, pred) = array_walk_wire_fixture();
+        let lref = arc_refs(&stack);
+        let pbytes = pred.as_bytes();
+        let head_root = lref.last().unwrap().resolution_root();
+        let proof = prove_attach_array_walk(&lref, &subj, pbytes);
+
+        let mem = super::array_walk::verify_ordered_array_walk_reconciled(
+            &lref, head_root, &subj, pbytes, &proof,
+        )
+        .unwrap();
+
+        let proof_bytes = proof.encode().unwrap();
+        let commit_bytes: Vec<Vec<u8>> = lref
+            .iter()
+            .map(|l| l.verifier_commitment_termless().unwrap().encode().unwrap())
+            .collect();
+        let commit_refs: Vec<&[u8]> = commit_bytes.iter().map(|b| b.as_slice()).collect();
+
+        let vals = super::array_walk::decode_and_verify_ordered_array_walk_reconciled(
+            &proof_bytes, &commit_refs, head_root, &subj, pbytes,
+        )
+        .unwrap();
+        assert_eq!(object_iris(&mem), object_iris(&vals), "byte-in array walk must match in-memory");
+        assert_eq!(object_iris(&vals), vec![iri("x"), iri("y"), iri("z")]);
+        println!("C4-slice-3 array-walk byte-in encoded proof bytes = {}", proof_bytes.len());
+        for (i, b) in commit_bytes.iter().enumerate() {
+            println!("C4-slice-3 array-walk term-less VerifierCommitment[{i}] bytes = {}", b.len());
+        }
+
+        // Anti-substitution: wrong subject or wrong predicate must fail closed.
+        let wrong_subj = CanonicalObject::Node(iri("other").into_bytes());
+        assert!(
+            super::array_walk::decode_and_verify_ordered_array_walk_reconciled(
+                &proof_bytes, &commit_refs, head_root, &wrong_subj, pbytes,
+            )
+            .is_err(),
+            "byte-in with the WRONG subject must fail (anti-substitution)"
+        );
+        let wrong_pred = iri("wrongpred");
+        assert!(
+            super::array_walk::decode_and_verify_ordered_array_walk_reconciled(
+                &proof_bytes, &commit_refs, head_root, &subj, wrong_pred.as_bytes(),
+            )
+            .is_err(),
+            "byte-in with the WRONG predicate must fail (anti-substitution)"
+        );
+    }
+
+    #[test]
+    fn c4_array_walk_wire_roundtrip_reverifies() {
+        big_stack(assert_c4_array_walk_wire_roundtrip_reverifies);
+    }
+
+    #[test]
+    fn c4_array_walk_wire_golden_and_tamper() {
+        big_stack(assert_c4_array_walk_wire_golden_and_tamper);
+    }
+
+    #[test]
+    fn c4_array_walk_byte_in_matches_in_memory_and_rejects_substitution() {
+        big_stack(assert_c4_array_walk_byte_in);
+    }

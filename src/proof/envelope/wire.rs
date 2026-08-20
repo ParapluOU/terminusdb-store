@@ -26,6 +26,16 @@ use super::recursive::{
     TransitiveClosureFixpoint, TransitiveClosurePairsFixpoint, TransitiveClosurePairsRound,
     TransitiveClosurePairsSeed, TransitiveClosureRound, TransitiveClosureSeed,
 };
+// C4-slice-3: the three reconciled WALK/CLOSURE proof CONTAINERS (ReadDocument composites). Every
+// walk sub-proof LEAF already implements `Wire` above (shared with the base materialized
+// `RecursiveRelationProof` walk family — TransitiveClosureSeed/Round/Fixpoint, InnerJoinProof,
+// LeftAntiJoinProof, RelationEqualityProof, RelationDistinctProof, DictLookupProof, FilterProof,
+// SuccessorProof, RelationPermutationProof, RelocationProof, BagUnionProof, CombinedRangeDictProof,
+// PresentBgpProof, ReconcileProof, ColumnOpening/DictOpening/ResolutionOpenings, ArkGT/ArkFr), so
+// ONLY these three CONTAINERS get new `wire_struct!` + framing impls near the bottom of this file.
+use super::array_walk::OrderedArrayWalkReconciledProof;
+use super::list_walk::OrderedListWalkReconciledProof;
+use super::reconciled::ReconciledClosureProof;
 use std::convert::{TryFrom, TryInto};
 use std::io::{self, Cursor};
 
@@ -124,6 +134,13 @@ pub(super) const DELTA_READ_MAGIC: &[u8; 12] = b"TDBWQDLTA\0\0\0";
 // `ReconcileProof` + `PresentBgpProof`) gets its OWN independent wire format, distinct from the
 // delta-read (`DELTA_READ_*`) format and every envelope format above. Pure addition.
 pub(super) const RECONCILE_READ_MAGIC: &[u8; 12] = b"TDBWQRCON\0\0\0";
+// C4-slice-3: each of the three reconciled WALK/CLOSURE proofs is a SELF-CONTAINED shippable
+// container (it carries its own `reconcile` + leaves + walk-structure sub-proofs), so each gets its
+// OWN independent wire format — a fresh DISTINCT 12-byte magic, disjoint from every format above and
+// from each other. Pure additions: no existing MAGIC/VERSION/golden is touched.
+pub(super) const CLOSURE_READ_MAGIC: &[u8; 12] = b"TDBWQCLOS\0\0\0";
+pub(super) const LIST_WALK_READ_MAGIC: &[u8; 12] = b"TDBWQLIST\0\0\0";
+pub(super) const ARRAY_WALK_READ_MAGIC: &[u8; 12] = b"TDBWQARRY\0\0\0";
 
 /// Canonical hidden column for a zero-column relation: one on every real row and zero
 /// on commitment padding. This is the same representation used by all-ground BGPs.
@@ -281,6 +298,11 @@ pub(super) const DELTA_READ_VERSION: u32 = 1;
 // C4-slice-2: initial version of the independent reconciled materialized-present read wire format
 // (see `RECONCILE_READ_MAGIC`).
 pub(super) const RECONCILE_READ_VERSION: u32 = 1;
+// C4-slice-3: initial version of each independent reconciled WALK/CLOSURE read wire format (see the
+// `CLOSURE_READ_MAGIC` / `LIST_WALK_READ_MAGIC` / `ARRAY_WALK_READ_MAGIC` constants).
+pub(super) const CLOSURE_READ_VERSION: u32 = 1;
+pub(super) const LIST_WALK_READ_VERSION: u32 = 1;
+pub(super) const ARRAY_WALK_READ_VERSION: u32 = 1;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -1506,6 +1528,285 @@ impl ReconciledReadBgpProof {
         let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
         if version != RECONCILE_READ_VERSION {
             return Err(invalid("unsupported reconciled read proof version"));
+        }
+        let proof = Self::get(&mut reader)?;
+        reader.finish()?;
+        Ok(proof)
+    }
+}
+
+// ===========================================================================
+// C4-slice-3: WIRE SERIALIZATION of the three reconciled WALK/CLOSURE proofs (ReadDocument
+// composites). Unlike the plain/present reads, each walk is SELF-CONTAINED — it carries its own
+// `reconcile` + per-leaf `PresentBgpProof`s + the C3 term-less openings + the walk-structure
+// sub-proofs — so the container IS the shippable proof (no extra carrier wrapper). Every field type
+// is ALREADY `Wire` (the walk sub-proof leaves are shared with the base materialized
+// `RecursiveRelationProof` walk family), so the three containers just forward in field order via
+// `wire_struct!`; each then gets its OWN independent framed format, byte-identically to
+// `DeltaReadProof::encode`/`ReconciledReadBgpProof::encode` but with distinct `*_READ_*` constants.
+// Serialization changes NO verification: each decoded proof is re-verified by the SAME audited
+// `verify_*_reconciled_from_views` / `verify_reconciled_transitive_closure_from_views`.
+// ===========================================================================
+// 1. The reconciled bounded transitive-closure proof (FOUNDATION-B).
+wire_struct!(ReconciledClosureProof {
+    reconcile,
+    edge_leaf,
+    seed,
+    rounds,
+    fixpoint,
+    seed_opening,
+    reachable_openings
+});
+
+impl ReconciledClosureProof {
+    /// Frame this reconciled transitive-closure proof for shipping as BYTES: MAGIC ‖ VERSION ‖
+    /// body ‖ SHA-256 checksum, byte-identically to [`DeltaReadProof::encode`] but with the
+    /// independent `CLOSURE_READ_*` constants. Serialization does NOT change verification: the
+    /// decoded proof is re-verified by the SAME
+    /// `verify_reconciled_transitive_closure{,_from_views}` over the verifier's OWN query spec.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CLOSURE_READ_MAGIC);
+        out.extend_from_slice(&CLOSURE_READ_VERSION.to_le_bytes());
+        self.put(&mut out)?;
+        if out
+            .len()
+            .checked_add(CHECKSUM_BYTES)
+            .map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES)
+        {
+            return Err(invalid("reconciled closure proof too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    /// Decode a framed reconciled transitive-closure proof. This is ONLY parsing under the strict
+    /// size/item budgets — it performs NO trust checks; the decoded proof is handed back to
+    /// `verify_reconciled_transitive_closure*`.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < CLOSURE_READ_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid reconciled closure proof size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("reconciled closure proof checksum mismatch"));
+        }
+        let mut reader = Reader {
+            bytes: body,
+            pos: 0,
+            decoded_items: 0,
+        };
+        if reader.take(CLOSURE_READ_MAGIC.len())? != CLOSURE_READ_MAGIC {
+            return Err(invalid("unknown reconciled closure proof magic"));
+        }
+        let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if version != CLOSURE_READ_VERSION {
+            return Err(invalid("unsupported reconciled closure proof version"));
+        }
+        let proof = Self::get(&mut reader)?;
+        reader.finish()?;
+        Ok(proof)
+    }
+}
+
+// 2. The reconciled ordered `rdf:List` walk proof. Every field already `Wire`; forwarded in def
+// order (the C3 term-less `element_openings`/`nil_opening` ride the `Option<…>` `Wire` impls and
+// stay uncommitted witnesses re-verified at resolve time).
+wire_struct!(OrderedListWalkReconciledProof {
+    reconcile,
+    anchor_leaf,
+    anchor_opening,
+    head_id,
+    rest_edge_leaf,
+    first_edge_leaf,
+    seed,
+    rounds,
+    fixpoint,
+    strip_nil,
+    cons_commitments,
+    cons_len,
+    cons_log_domain,
+    walk_perm,
+    com_walk,
+    head_opening,
+    rest_join,
+    rest_join_out,
+    rest_reloc_subj,
+    rest_reloc_obj,
+    com_next,
+    successor,
+    terminator,
+    terminator_out,
+    first_join,
+    first_join_out,
+    first_reloc_subj,
+    first_reloc_obj,
+    com_elements,
+    nested_join,
+    nested_join_out,
+    element_ids,
+    element_openings,
+    nil_opening
+});
+
+impl OrderedListWalkReconciledProof {
+    /// Frame this reconciled ordered `rdf:List` walk proof for shipping as BYTES: MAGIC ‖ VERSION ‖
+    /// body ‖ SHA-256 checksum, byte-identically to [`DeltaReadProof::encode`] but with the
+    /// independent `LIST_WALK_READ_*` constants. Serialization does NOT change verification: the
+    /// decoded proof is re-verified by the SAME `verify_ordered_list_walk_reconciled{,_from_views}`.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(LIST_WALK_READ_MAGIC);
+        out.extend_from_slice(&LIST_WALK_READ_VERSION.to_le_bytes());
+        self.put(&mut out)?;
+        if out
+            .len()
+            .checked_add(CHECKSUM_BYTES)
+            .map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES)
+        {
+            return Err(invalid("reconciled list-walk proof too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    /// Decode a framed reconciled ordered `rdf:List` walk proof. ONLY parsing under the strict
+    /// size/item budgets — NO trust checks; the decoded proof is handed back to
+    /// `verify_ordered_list_walk_reconciled*`.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < LIST_WALK_READ_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid reconciled list-walk proof size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("reconciled list-walk proof checksum mismatch"));
+        }
+        let mut reader = Reader {
+            bytes: body,
+            pos: 0,
+            decoded_items: 0,
+        };
+        if reader.take(LIST_WALK_READ_MAGIC.len())? != LIST_WALK_READ_MAGIC {
+            return Err(invalid("unknown reconciled list-walk proof magic"));
+        }
+        let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if version != LIST_WALK_READ_VERSION {
+            return Err(invalid("unsupported reconciled list-walk proof version"));
+        }
+        let proof = Self::get(&mut reader)?;
+        reader.finish()?;
+        Ok(proof)
+    }
+}
+
+// 3. The reconciled ordered `sys:Array` walk proof. Every field already `Wire` (incl. the
+// `CombinedRangeDictProof` density-dict, the `DictLookupProof`/`FilterProof` datatype gadgets, and
+// the C3 term-less `value_openings`/`sys_array_opening`/`index_value_openings` witnesses).
+wire_struct!(OrderedArrayWalkReconciledProof {
+    reconcile,
+    cells_leaf,
+    index_edge_leaf,
+    value_edge_leaf,
+    type_edge_leaf,
+    n,
+    cell_log_domain,
+    index_join,
+    index_join_out,
+    index_reloc_subj,
+    index_reloc_obj,
+    com_index,
+    value_join,
+    value_join_out,
+    value_reloc_subj,
+    value_reloc_obj,
+    com_value,
+    type_join,
+    type_join_out,
+    type_reloc_subj,
+    type_reloc_obj,
+    com_type,
+    type_equality,
+    type_equality_out,
+    range_dict,
+    common_log_domain,
+    reloc_index_at_d,
+    com_index_at_d,
+    reloc_value_at_d,
+    com_value_at_d,
+    reloc_dict_id,
+    com_dict_id_at_d,
+    reloc_dict_value,
+    com_dict_value_at_d,
+    reloc_dict_datatype,
+    com_dict_datatype_at_d,
+    lookup,
+    datatype_filter,
+    datatype_selection_commitment,
+    datatype_inverse_commitment,
+    order_perm,
+    com_out,
+    value_ids,
+    value_openings,
+    sys_array_opening,
+    index_oid,
+    index_value_openings
+});
+
+impl OrderedArrayWalkReconciledProof {
+    /// Frame this reconciled ordered `sys:Array` walk proof for shipping as BYTES: MAGIC ‖ VERSION ‖
+    /// body ‖ SHA-256 checksum, byte-identically to [`DeltaReadProof::encode`] but with the
+    /// independent `ARRAY_WALK_READ_*` constants. Serialization does NOT change verification: the
+    /// decoded proof is re-verified by the SAME `verify_ordered_array_walk_reconciled{,_from_views}`.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(ARRAY_WALK_READ_MAGIC);
+        out.extend_from_slice(&ARRAY_WALK_READ_VERSION.to_le_bytes());
+        self.put(&mut out)?;
+        if out
+            .len()
+            .checked_add(CHECKSUM_BYTES)
+            .map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES)
+        {
+            return Err(invalid("reconciled array-walk proof too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    /// Decode a framed reconciled ordered `sys:Array` walk proof. ONLY parsing under the strict
+    /// size/item budgets — NO trust checks; the decoded proof is handed back to
+    /// `verify_ordered_array_walk_reconciled*`.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < ARRAY_WALK_READ_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid reconciled array-walk proof size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("reconciled array-walk proof checksum mismatch"));
+        }
+        let mut reader = Reader {
+            bytes: body,
+            pos: 0,
+            decoded_items: 0,
+        };
+        if reader.take(ARRAY_WALK_READ_MAGIC.len())? != ARRAY_WALK_READ_MAGIC {
+            return Err(invalid("unknown reconciled array-walk proof magic"));
+        }
+        let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if version != ARRAY_WALK_READ_VERSION {
+            return Err(invalid("unsupported reconciled array-walk proof version"));
         }
         let proof = Self::get(&mut reader)?;
         reader.finish()?;

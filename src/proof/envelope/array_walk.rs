@@ -1658,6 +1658,37 @@ pub fn verify_ordered_array_walk_reconciled_from_views(
     )
 }
 
+/// C4-slice-3 byte-in remote-verifier entry: verify a reconciled ordered `sys:Array` walk proof
+/// shipped as BYTES against a trusted head root, holding ONLY the encoded proof + the encoded
+/// term-less [`VerifierCommitment`](crate::proof::commitment::VerifierCommitment) chain (no
+/// `LayerCommitment` sidecars, no DB). Decodes each layer commitment and the walk proof, then
+/// re-verifies through the audited [`verify_ordered_array_walk_reconciled_from_views`] —
+/// serialization does NOT change verification. `subject`/`predicate`/`trusted_head_root` are the
+/// VERIFIER's OWN query parameters (anti-substitution): they are NEVER parsed from the proof bytes.
+pub fn decode_and_verify_ordered_array_walk_reconciled(
+    array_walk_proof_bytes: &[u8],
+    verifier_commitment_bytes: &[&[u8]],
+    trusted_head_root: ProofHash,
+    subject: &CanonicalObject,
+    predicate: &[u8],
+) -> io::Result<Vec<CanonicalObject>> {
+    // Own the decoded commitments FIRST, so the borrowed views below cannot dangle.
+    let owned: Vec<crate::proof::commitment::VerifierCommitment> = verifier_commitment_bytes
+        .iter()
+        .map(|b| crate::proof::commitment::VerifierCommitment::decode(b))
+        .collect::<io::Result<_>>()?;
+    let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+        owned.iter().map(|c| c.verifier_view()).collect();
+    let proof = OrderedArrayWalkReconciledProof::decode(array_walk_proof_bytes)?;
+    verify_ordered_array_walk_reconciled_from_views(
+        &views,
+        trusted_head_root,
+        subject,
+        predicate,
+        &proof,
+    )
+}
+
 /// Verify the reconciled density+order certificate. Re-verifies the combined range dict against the
 /// root-bound per-layer branches, each relocation, the authenticated dict lookup, the datatype filter,
 /// and the permutation whose OUTPUT index column the verifier reconstructs as the public identity
