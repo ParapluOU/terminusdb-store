@@ -351,6 +351,14 @@ const LABEL_RHO: &[u8] = b"pow/sumcheck/batch-rho";
 pub(crate) const LABEL_ROUND_POLY: &[u8] = b"pow/sumcheck/round-poly";
 pub(crate) const LABEL_ROUND_CHALLENGE: &[u8] = b"pow/sumcheck/round-challenge";
 const LABEL_DORY_GAMMA: &[u8] = b"pow/dory/batch-gamma";
+// Fiat-Shamir binding of the batched-opening challenge `gamma` to the exact
+// per-column claimed evaluations. These MUST be absorbed (count first, then each
+// eval in column order 0..m) immediately BEFORE `gamma` is drawn, symmetrically
+// on the prove and verify sides; otherwise `gamma` is independent of the
+// individual evals and a prover can forge them on the opening hyperplane
+// `Sum_j gamma^j * eval_j = C` while keeping the combined value fixed.
+const LABEL_DORY_EVAL_COUNT: &[u8] = b"pow/dory/eval-count";
+const LABEL_DORY_EVAL: &[u8] = b"pow/dory/claimed-eval";
 
 #[inline]
 fn f0() -> ArkFr {
@@ -1013,6 +1021,18 @@ pub fn prove_column_openings_with_context(
     }
     let (nu, sigma) = column_dims(size)?;
     transcript.append_bytes(b"pow/dory/parameter-set", &setup_parameter_id(r.len())?);
+    // Bind `gamma` to the exact per-column evaluations at `r` BEFORE drawing it.
+    // For a sumcheck-backed caller these equal `proof.claimed_evals[j]`; for a
+    // direct caller they equal the honest `col_evals[j]` the verifier passes.
+    // The verifier appends the IDENTICAL bytes (see `verify_column_openings`).
+    transcript.append_bytes(
+        LABEL_DORY_EVAL_COUNT,
+        &(column_tables.len() as u64).to_le_bytes(),
+    );
+    for table in column_tables.iter() {
+        let eval_j = mle_full_eval(table, r);
+        transcript.append_field(LABEL_DORY_EVAL, &eval_j);
+    }
     let gamma = transcript.challenge_scalar(LABEL_DORY_GAMMA);
     let gammas = powers(gamma, column_tables.len());
 
@@ -1061,6 +1081,17 @@ pub fn verify_column_openings(
         return Err(invalid("commitment/eval count mismatch in batched opening"));
     }
     transcript.append_bytes(b"pow/dory/parameter-set", &setup_parameter_id(r.len())?);
+    // Bind `gamma` to the exact per-column claimed evaluations BEFORE drawing it.
+    // MUST append byte-identically to the prover (see
+    // `prove_column_openings_with_context`): the count as u64 le-bytes, then each
+    // eval in column order 0..m.
+    transcript.append_bytes(
+        LABEL_DORY_EVAL_COUNT,
+        &(claimed_evals.len() as u64).to_le_bytes(),
+    );
+    for eval_j in claimed_evals.iter() {
+        transcript.append_field(LABEL_DORY_EVAL, eval_j);
+    }
     let gamma = transcript.challenge_scalar(LABEL_DORY_GAMMA);
     let (combined_commitment, combined_eval) = combine(column_commitments, claimed_evals, gamma);
     verify::<_, BN254, G1Routines, G2Routines, _>(
@@ -1207,6 +1238,74 @@ mod tests {
         proof.claimed_evals[0] = proof.claimed_evals[0] + f1();
         let mut vt = transcript();
         assert!(verify_sumcheck(&shape, &proof, &mut vt).is_err());
+    }
+
+    #[test]
+    fn forged_multicolumn_evals_on_opening_hyperplane_are_rejected() {
+        // Regression for the Fiat-Shamir soundness bug in the shared batched
+        // column opening: `gamma` was drawn BEFORE the per-column claimed
+        // evaluations were absorbed into the transcript. With `gamma`
+        // independent of the individual evals, the batched Dory opening only
+        // pins down the gamma-COMBINATION `Sum_j gamma^j * eval_j = C`, so a
+        // prover could replace the honest eval vector with ANY other vector on
+        // that same opening hyperplane (same combination, different individual
+        // values) and STILL verify -- a false per-column statement accepted.
+        //
+        // Form used: the "same gamma-combination" regression. The fully
+        // adaptive attack (choose the forged evals AFTER seeing `gamma`) is by
+        // construction UNCONSTRUCTIBLE against the fixed code -- once the evals
+        // are absorbed before `gamma`, the prover can no longer pick them after
+        // the challenge. So the faithful residue is: forge a distinct eval
+        // vector with the same honest-`gamma` combination and assert rejection.
+        //
+        // Under the OLD (buggy) code `gamma` did not depend on the evals, so the
+        // honest opening and the verifier used the same fixed `gamma` regardless
+        // of the eval vector, and this forgery VERIFIED. Under the fix the
+        // verifier re-derives `gamma` from the forged vector, gets a DIFFERENT
+        // `gamma`, and rejects.
+        let k = 5;
+        let c0 = column(k, 71);
+        let c1 = column(k, 137);
+        let coms = [commit_column(&c0).unwrap(), commit_column(&c1).unwrap()];
+
+        // Honest point + honest per-column evaluations at r.
+        let r: Vec<ArkFr> = (0..k).map(|i| fr(9 * i as u64 + 4)).collect();
+        let e0 = mle_full_eval(&c0, &r);
+        let e1 = mle_full_eval(&c1, &r);
+
+        // Honest multi-column opening at r.
+        let mut pt = transcript();
+        let opening = prove_column_openings(&[c0, c1], &r, &mut pt).unwrap();
+
+        // Positive control: the honest eval vector verifies.
+        let mut vt = transcript();
+        verify_column_openings(&coms, &r, &[e0, e1], &opening, &mut vt).unwrap();
+
+        // Reconstruct the honest transcript's `gamma` exactly as the fixed
+        // opener/verifier derive it: parameter-set, eval-count, each claimed
+        // eval in column order, then the `gamma` challenge.
+        let mut gt = transcript();
+        gt.append_bytes(b"pow/dory/parameter-set", &setup_parameter_id(r.len()).unwrap());
+        gt.append_bytes(LABEL_DORY_EVAL_COUNT, &(2u64).to_le_bytes());
+        gt.append_field(LABEL_DORY_EVAL, &e0);
+        gt.append_field(LABEL_DORY_EVAL, &e1);
+        let gamma = gt.challenge_scalar(LABEL_DORY_GAMMA);
+
+        // Forge a DISTINCT eval vector on the SAME opening hyperplane:
+        //   (e0 + gamma) + gamma * (e1 - 1) == e0 + gamma * e1  (the honest C).
+        let forged = [e0 + gamma, e1 - f1()];
+        assert_ne!(forged[0], e0, "gamma must be nonzero whp");
+        assert_ne!(forged[1], e1);
+        // Sanity: the forgery really does preserve the gamma-combination.
+        assert_eq!(forged[0] + gamma * forged[1], e0 + gamma * e1);
+
+        // The fixed verifier binds `gamma` to the eval vector, so the forged
+        // vector yields a different `gamma` and the opening is rejected.
+        let mut vt_bad = transcript();
+        assert!(
+            verify_column_openings(&coms, &r, &forged, &opening, &mut vt_bad).is_err(),
+            "forged eval vector on the honest opening hyperplane must be rejected"
+        );
     }
 
     #[test]

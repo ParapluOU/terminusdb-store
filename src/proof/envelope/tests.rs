@@ -542,15 +542,15 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let hash = sha2::Sha256::digest(&bytes);
         let hash_hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
         assert_eq!(bytes.len(), 177242, "materialized proof byte length changed");
-        // Length + hash REGENERATED for Merkle-dict I2b S5: `LayerBgpProof` gained the optional
-        // term-less resolution witness `openings` (`Option<ResolutionOpenings>`). This is a
-        // TERM-BEARING proof, so `openings == None` — exactly ONE added option tag byte (177241 ->
-        // 177242); the trailing `0u8` also perturbs the whole-proof SHA-256. Nothing about the
-        // committed proof/transcript changed; `commitment_root` is byte-identical (the witness is
-        // never committed). Prior image was the LogUp-GKR keyed-join-links (Inc 3) migration.
+        // Hash REGENERATED for the FS-ordering soundness fix (FABLE-1): the batched Dory opener now
+        // absorbs the per-column claimed evaluations into the transcript before drawing `gamma`, so
+        // every opening's challenge-derived content changes. The proof STRUCTURE/length is unchanged
+        // (177242, transcript-only change) and `commitment_root` is byte-identical (the query proof's
+        // transcript never feeds the committed state root); only the whole-proof SHA-256 moves. Prior
+        // image was the Merkle-dict I2b S5 `openings` option-tag byte; before that, LogUp-GKR Inc 3.
         assert_eq!(
             hash_hex,
-            "5c42a8dab253a6dc8fd8ed32324ab852981f4287e81b28ce9b91e410d8b646de",
+            "ba7d2f4047bce14f9eec5550e9cace6984d87008641cfa5585fa2deb69dffc5e",
             "materialized multi-atom proof transcript/commitments changed (byte-identity regression)"
         );
     }
