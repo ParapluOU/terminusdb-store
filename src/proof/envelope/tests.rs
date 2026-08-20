@@ -4167,6 +4167,49 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         vec![base_lc, head.proof_commitment().unwrap()]
     }
 
+    /// #50 EVIDENCE fixture: a base + 1 delta stack whose reconciled `present` is `doc -tracks-> [a,
+    /// b, e]` where the WALK'S QUERY SUBJECT `doc` is a node introduced ONLY by the HEAD layer (the
+    /// anchor `doc -tracks-> cell0` is a head ADDITION, so `doc`'s canonical bytes live ONLY in the
+    /// head catalog — dropped by a term-less head view). Base stores the WHOLE cons chain
+    /// `cell0..cell2 -rest-> nil` (+ `first` edges to a/b/e) with NO `doc`; the delta ADDS `doc
+    /// -tracks-> cell0` (the anchor) and an inert `doc -type-> ListDoc` second edge (2 additions,
+    /// satisfying the reconcile >=2-per-group floor; removals are empty). All cons cells, elements
+    /// (a, b, e) and `rdf:nil` stay BASE-minted, so the ONLY head-minted node the walk reads is the
+    /// anchor SUBJECT `doc` — which the anchor leaf matches in HASH-space (`bound_subject_leaf_atom`
+    /// = `PresentTerm::Constant(hash_object(doc))` over the root-bound `present_s` column), needing
+    /// NO dict opening. This isolates the C3a #50 question: does a head-minted, hash-matched query
+    /// subject need a leaf opening the walk producer does not attach?
+    fn list_delta_stack_head_subject() -> Vec<std::sync::Arc<LayerCommitment>> {
+        let rest = rdf_rest();
+        let first = rdf_first();
+        let nil = rdf_nil();
+        let doc = iri("doc");
+        let tracks = iri("tracks");
+        let store = open_sync_memory_store();
+        let builder = store.create_base_layer().unwrap();
+        for (s, p, o) in [
+            (cell(0), first.clone(), iri("a")),
+            (cell(0), rest.clone(), cell(1)),
+            (cell(1), first.clone(), iri("b")),
+            (cell(1), rest.clone(), cell(2)),
+            (cell(2), first.clone(), iri("e")),
+            (cell(2), rest.clone(), nil.clone()),
+        ] {
+            builder.add_value_triple(ValueTriple::new_node(&s, &p, &o)).unwrap();
+        }
+        let base = builder.commit().unwrap();
+        let base_lc = base.proof_commitment().unwrap();
+
+        let child = base.open_write().unwrap();
+        // The anchor is HEAD-minted: `doc` first appears here (a head addition), so its canonical
+        // bytes live ONLY in the head catalog. A second inert `doc -type-> ListDoc` edge (a DIFFERENT
+        // predicate, so it never matches the `tracks` anchor read) satisfies the >=2 additions floor.
+        child.add_value_triple(ValueTriple::new_node(&doc, &tracks, &cell(0))).unwrap();
+        child.add_value_triple(ValueTriple::new_node(&doc, &iri("type"), &iri("ListDoc"))).unwrap();
+        let head = child.commit().unwrap();
+        vec![base_lc, head.proof_commitment().unwrap()]
+    }
+
     /// C3a THE-WIN differential: a reconciled list walk whose HEAD view is TERM-LESS delivers the
     /// SAME ordered element list as the term-bearing path — the two HEAD-minted elements (c, d) are
     /// rendered purely from the prover-shipped Merkle openings (no clear head catalog).
@@ -4387,6 +4430,81 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
             "injected non-cons node must reject over a term-less head"
         );
         assert!(forge(vec![c0, c1, c2, c0]).is_err(), "appended/gap cell must reject over a term-less head");
+    }
+
+    /// #50 EVIDENCE: a reconciled list walk whose QUERY SUBJECT `doc` is HEAD-minted verifies over a
+    /// TERM-LESS head, delivering the exact ordered `[a, b, e]`. The C3a audit asked whether a
+    /// head-minted query constant (subject/predicate) needs a leaf opening the walk producer does not
+    /// attach — so honest verify would FAIL CLOSED. It does NOT: the anchor leaf matches the subject
+    /// in HASH-space (`PresentTerm::Constant(hash_object(doc))` over the reconciliation's root-bound
+    /// `present_s` hash column, which INCLUDES the head addition), a value the verifier derives from
+    /// its OWN query IRI — never from the (term-less-dropped) head catalog — so it needs no opening.
+    /// The only constants the walk RESOLVES (rdf:nil, elements) stay base-minted here and already
+    /// carry the producer-attached openings. So the head-minted subject rides the hash-match with no
+    /// extra opening: #50 is a non-issue.
+    fn assert_reconciled_list_walk_termless_head_minted_subject_verifies() {
+        let stack = list_delta_stack_head_subject();
+        let lref = arc_refs(&stack);
+        let head_root = lref.last().unwrap().resolution_root();
+        let subj = CanonicalObject::Node(iri("doc").into_bytes());
+        let pred = iri("tracks");
+        let pbytes = pred.as_bytes();
+
+        // Sanity: the query subject `doc` really is HEAD-minted (absent from the BASE catalog, present
+        // in the HEAD catalog) — so a term-less head view drops its canonical bytes.
+        let base_view = lref[0].verifier_view();
+        let doc_target = CanonicalObject::Node(iri("doc").into_bytes());
+        assert!(
+            !base_view.node_value_catalog.iter().any(|r| r.triple.object == doc_target),
+            "fixture invariant: the query subject `doc` must NOT be minted in the base layer"
+        );
+        let head_view = lref[1].verifier_view();
+        assert!(
+            head_view.node_value_catalog.iter().any(|r| r.triple.object == doc_target),
+            "fixture invariant: the query subject `doc` must be minted in the head layer"
+        );
+
+        let (mut proof, prover_elements) =
+            super::list_walk::prove_ordered_list_walk_reconciled(&lref, &subj, pbytes).unwrap();
+        assert_eq!(object_iris(&prover_elements), vec![iri("a"), iri("b"), iri("e")]);
+
+        // Attach the term-less openings (element render + rdf:nil belt-hash) — all base-minted here;
+        // crucially NO opening is minted for the head-minted subject `doc` (the producer never
+        // touches the subject, matched in hash-space).
+        let bearing_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            lref.iter().map(|l| l.verifier_view()).collect();
+        let nil_id = super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
+        let element_ids = proof.element_ids.clone();
+        super::list_walk::attach_termless_list_walk_openings(&mut proof, &lref, &element_ids, nil_id)
+            .unwrap();
+
+        // Term-bearing baseline.
+        let bearing_elements = super::list_walk::verify_ordered_list_walk_reconciled(
+            &lref, head_root, &subj, pbytes, &proof,
+        )
+        .unwrap();
+
+        // TERM-LESS head view: `doc`'s bytes are dropped, yet the hash-space anchor match resolves
+        // the walk — honest verify must NOT fail closed.
+        let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
+        assert!(!head_termless.verifier_view().terms_present);
+        let termless_views = termless_head_views(&lref, &head_termless);
+        let termless_elements = super::list_walk::verify_ordered_list_walk_reconciled_from_views(
+            &termless_views, head_root, &subj, pbytes, &proof,
+        )
+        .unwrap();
+
+        assert_eq!(object_iris(&bearing_elements), object_iris(&termless_elements));
+        assert_eq!(
+            object_iris(&termless_elements),
+            vec![iri("a"), iri("b"), iri("e")],
+            "a HEAD-minted query subject verifies over a term-less head (hash-matched, no opening)"
+        );
+    }
+
+    #[test]
+    fn reconciled_list_walk_termless_head_minted_subject_verifies() {
+        big_stack(assert_reconciled_list_walk_termless_head_minted_subject_verifies);
     }
 
     #[test]
