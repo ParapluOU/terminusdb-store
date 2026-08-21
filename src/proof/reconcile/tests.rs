@@ -933,6 +933,60 @@ fn three_atom_bgp_over_present() {
     assert!(bag_eq_rows(rows_of(&resolved), ground), "resolved 3-chain must equal materialized");
 }
 
+// ============================================================================================
+// COUNT — `Count(BGP)` over the reconciled materialized present. The cardinality is the
+// present-BGP result-relation row count (`result_len`), already chain-authenticated (the
+// join-count identity inside the BGP chain, resp. the single-atom filter count). `verify_read_bgp`
+// returns that authenticated cardinality; no value-authentication and no new gadget is required.
+// ============================================================================================
+
+#[test]
+fn count_over_present_bgp_returns_authenticated_cardinality() {
+    // Triple(?x, p1, ?y) & Triple(?y, p2, ?z) & Triple(?z, p3, ?w) has 9 present solutions, so
+    // Count(BGP) = 9 — the chain-authenticated result-relation row count `verify_read_bgp` returns.
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let atoms = [
+        atom(var(), "http://ex/p1", var()),
+        atom(var(), "http://ex/p2", var()),
+        atom(var(), "http://ex/p3", var()),
+    ];
+    let joins = [scalar_join(1, 0), scalar_join(2, 0)];
+    let (rec, bgp, _result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    // The count answer IS the authenticated cardinality.
+    let count = verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).unwrap();
+    assert_eq!(count, 9, "Count(3-atom BGP) over the delta stack must be 9");
+    assert_eq!(bgp.result_len, 9, "the prover's result_len equals the authenticated count");
+}
+
+#[test]
+fn count_over_present_bgp_tampered_count_rejects() {
+    // A prover who inflates/deflates the claimed cardinality (`result_len`) fails the present-BGP
+    // result-shape bind against the chain-verified row count: a wrong count reject-closes.
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let atoms = [
+        atom(var(), "http://ex/p1", var()),
+        atom(var(), "http://ex/p2", var()),
+        atom(var(), "http://ex/p3", var()),
+    ];
+    let joins = [scalar_join(1, 0), scalar_join(2, 0)];
+    let head_root = lref.last().unwrap().resolution_root();
+    let (rec, mut bgp, _result) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+    bgp.result_len = 8; // claim one fewer solution than the authenticated 9
+    assert!(
+        verify_read_bgp(&lref, head_root, &atoms, &joins, &rec, &bgp).is_err(),
+        "a tampered (understated) count must reject-close"
+    );
+    let (rec2, mut bgp2, _r2) = prove_read_bgp(&lref, &atoms, &joins).unwrap();
+    bgp2.result_len = 10; // claim one more
+    assert!(
+        verify_read_bgp(&lref, head_root, &atoms, &joins, &rec2, &bgp2).is_err(),
+        "a tampered (overstated) count must reject-close"
+    );
+}
+
 #[test]
 fn multi_constant_bgp_over_present() {
     // Triple(x1, p1, ?y) & Triple(?y, p2, ?z): subject constant on atom 0 pins ?y=y1,
