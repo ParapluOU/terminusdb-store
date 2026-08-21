@@ -119,8 +119,9 @@ use crate::proof::reconcile::{
     ColumnDistinctFullFieldProof, ColumnDistinctProof, CombinedDictProof, CombinedRangeDictProof,
     CommittedGroupProof, DeltaReadProof, GroupHashProof, PresentAtomFilter, PresentBgpAtomProof,
     PresentBgpProof, PresentIdAuth, PresentRangeDatatypeGuardProof, PresentRangeSubproof,
-    GroupReadAgg, GroupReadSpec, PresentSecondRange, ReconcileProof,
-    ReconciledGroupReadProof, ReconciledReadBgpProof, RemintProof,
+    GroupReadAgg, GroupReadSpec, OrderReadSpec, PresentScalarOrderProof, PresentSecondRange,
+    ReconcileProof, ReconciledGroupReadProof, ReconciledOrderReadProof, ReconciledReadBgpProof,
+    RemintProof,
 };
 pub(super) const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
 pub(super) const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
@@ -142,6 +143,12 @@ pub(super) const RECONCILE_READ_MAGIC: &[u8; 12] = b"TDBWQRCON\0\0\0";
 // touched. The child columns cross the wire (they are root-authenticated at verify); the GroupSpec
 // does NOT (it is the verifier's own re-lowered query — anti-substitution).
 pub(super) const GROUP_READ_MAGIC: &[u8; 12] = b"TDBWQGRUP\0\0\0";
+// C4 ORDER byte-in: the reconciled single-column numeric `OrderBy` read (a `ReconciledOrderReadProof`
+// = `ReconcileProof` + `PresentBgpProof` + `PresentScalarOrderProof` + the delivered ordered column +
+// the `OrderReadSpec` witness) gets its OWN independent framed wire format, disjoint from every other.
+// Pure addition — no existing format is touched. The ordered column + order proof cross the wire
+// (root-authenticated at verify); the order direction/datatype are the verifier's re-lowered query.
+pub(super) const ORDER_READ_MAGIC: &[u8; 12] = b"TDBWQORDR\0\0\0";
 // C4-slice-3: each of the three reconciled WALK/CLOSURE proofs is a SELF-CONTAINED shippable
 // container (it carries its own `reconcile` + leaves + walk-structure sub-proofs), so each gets its
 // OWN independent wire format — a fresh DISTINCT 12-byte magic, disjoint from every format above and
@@ -309,6 +316,9 @@ pub(super) const RECONCILE_READ_VERSION: u32 = 1;
 // C4 GROUP byte-in: initial version of the independent reconciled group-aggregate read wire format
 // (see `GROUP_READ_MAGIC`).
 pub(super) const GROUP_READ_VERSION: u32 = 1;
+// C4 ORDER byte-in: initial version of the independent reconciled order read wire format (see
+// `ORDER_READ_MAGIC`).
+pub(super) const ORDER_READ_VERSION: u32 = 1;
 // C4-slice-3: initial version of each independent reconciled WALK/CLOSURE read wire format (see the
 // `CLOSURE_READ_MAGIC` / `LIST_WALK_READ_MAGIC` / `ARRAY_WALK_READ_MAGIC` constants).
 pub(super) const CLOSURE_READ_VERSION: u32 = 1;
@@ -1657,6 +1667,97 @@ impl ReconciledGroupReadProof {
         let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
         if version != GROUP_READ_VERSION {
             return Err(invalid("unsupported reconciled group read proof version"));
+        }
+        let proof = Self::get(&mut reader)?;
+        reader.finish()?;
+        Ok(proof)
+    }
+}
+
+// ===========================================================================
+// C4 ORDER byte-in: WIRE SERIALIZATION of the reconciled single-column numeric OrderBy read. The
+// order proof `PresentScalarOrderProof` carries real crypto (the permutation + combined-range-dict +
+// authenticated-value lookup + datatype filter + nondecreasing-sort subproofs); every field is
+// ALREADY `Wire` (all leaves shared with the base/BGP families), so it just gets a `wire_struct!`.
+// The container adds the reconcile + BGP proofs, the delivered ordered column, and the `OrderReadSpec`
+// witness, and gets its OWN independent framed format (`ORDER_READ_*`). Serialization changes NO
+// verification: the decoded proof re-verifies through the SAME `verify_and_resolve_order_bgp_from_views`.
+// ===========================================================================
+// C2a value↔term witness (`oid` + `value_openings`) rides the existing Vec/Option/ResolutionOpenings
+// `Wire` impls; empty/`None` on a term-bearing artifact.
+wire_struct!(PresentScalarOrderProof {
+    permutation,
+    com_output,
+    range_dict,
+    lookup,
+    datatype_filter,
+    datatype_selection_commitment,
+    datatype_inverse_commitment,
+    sorted,
+    oid,
+    value_openings
+});
+// The wire-carried order spec (anti-substitution witness): datatype as a `u8` tag via
+// `CanonicalDatatype`, direction via its existing `Wire` impl.
+impl Wire for OrderReadSpec {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        (self.datatype as u8).put(out)?;
+        self.direction.put(out)
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        Ok(Self {
+            datatype: CanonicalDatatype::try_from(u8::get(reader)?)?,
+            direction: Wire::get(reader)?,
+        })
+    }
+}
+wire_struct!(ReconciledOrderReadProof { reconcile, bgp, order, ordered_columns, spec });
+
+impl ReconciledOrderReadProof {
+    /// Frame this reconciled order read for shipping as BYTES: MAGIC ‖ VERSION ‖ body ‖ SHA-256
+    /// checksum, byte-identically to [`ReconciledGroupReadProof::encode`] but with the independent
+    /// `ORDER_READ_*` constants.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(ORDER_READ_MAGIC);
+        out.extend_from_slice(&ORDER_READ_VERSION.to_le_bytes());
+        self.put(&mut out)?;
+        if out
+            .len()
+            .checked_add(CHECKSUM_BYTES)
+            .map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES)
+        {
+            return Err(invalid("reconciled order read proof too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    /// Decode a framed reconciled order read proof. ONLY parsing under the strict size/item budgets —
+    /// NO trust checks; the decoded proof is handed back to `verify_and_resolve_order_bgp_from_views`.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < ORDER_READ_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid reconciled order read proof size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("reconciled order read proof checksum mismatch"));
+        }
+        let mut reader = Reader {
+            bytes: body,
+            pos: 0,
+            decoded_items: 0,
+        };
+        if reader.take(ORDER_READ_MAGIC.len())? != ORDER_READ_MAGIC {
+            return Err(invalid("unknown reconciled order read proof magic"));
+        }
+        let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if version != ORDER_READ_VERSION {
+            return Err(invalid("unsupported reconciled order read proof version"));
         }
         let proof = Self::get(&mut reader)?;
         reader.finish()?;

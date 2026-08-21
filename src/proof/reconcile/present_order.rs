@@ -567,3 +567,112 @@ pub fn verify_and_resolve_order_bgp_from_views(
         order.value_openings.as_ref(),
     )
 }
+
+// ============================================================================================
+// C4 ORDER byte-in: DB-free reconciled single-column numeric OrderBy over the TERM-LESS chain.
+//
+// Unlike a plain/count read (which delivers only a row count), an OrderBy RESOLVES the ordered rows,
+// so — like the group path — the byte-in bundle ships the reconcile + present-BGP proof PLUS the
+// order proof PLUS the delivered ORDERED result column, and the prover mints the term-less openings:
+//   * the child BGP's numeric range atom (the `?v >= 0` datatype pin) needs the value<->term RANGE
+//     openings over the reconciled present object column for term-less BGP verification;
+//   * the order gadget's value<->term tie AND the ordered-result RESOLUTION both consume the ORDERED
+//     output ids' openings (`attach_termless_present_order_openings`).
+// The order DIRECTION/DATATYPE come from the VERIFIER's re-lowered query — never the proof bytes: the
+// crypto transcript binds them (a wrong direction/datatype diverges Fiat-Shamir and rejects), and the
+// wire-carried `OrderReadSpec` is COMPARED to the verifier's spec as an early anti-substitution belt
+// (the byte analogue of the in-memory `expected.order == proof.order` check).
+// ============================================================================================
+
+/// The `OrderBy` spec an order read was PROVED for (sort datatype + direction). Carried ONLY as an
+/// anti-substitution witness: the byte-in verifier compares it to its OWN re-lowered query spec and
+/// reject-closes on mismatch. The recompute/verify always uses the VERIFIER's params (which the
+/// transcript also binds). Mirrors the compiler's `OrderSpec`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderReadSpec {
+    pub datatype: CanonicalDatatype,
+    pub direction: OrderDirection,
+}
+
+/// The shippable reconciled single-column numeric `OrderBy` read: the [`ReconcileProof`] + the child
+/// [`PresentBgpProof`] + the [`PresentScalarOrderProof`] + the delivered ORDERED result column + the
+/// [`OrderReadSpec`] witness. Its `encode`/`decode` (framed MAGIC ‖ VERSION ‖ body ‖ SHA-256 with the
+/// independent `ORDER_READ_*` constants) is transparent to verification: the decoded proof re-verifies
+/// through the SAME `verify_and_resolve_order_bgp_from_views` over the verifier's OWN spec.
+#[derive(Clone, Debug)]
+pub struct ReconciledOrderReadProof {
+    pub reconcile: ReconcileProof,
+    pub bgp: PresentBgpProof,
+    pub order: PresentScalarOrderProof,
+    pub ordered_columns: Vec<Vec<ArkFr>>,
+    pub spec: OrderReadSpec,
+}
+
+/// Prover-side: mint ALL term-less resolution witnesses a byte-in ORDER read needs into the proven
+/// child BGP + order proofs, so the SAME proof also verifies + RESOLVES the ordered rows DB-free over
+/// a TERM-LESS `VerifierCommitment` chain. Mirrors [`attach_termless_group_openings`]:
+///   * for a ranged child (the `?v >= 0` datatype pin), the value↔term RANGE openings over the
+///     reconciled present object column (on the BGP proof);
+///   * the ORDERED output ids' openings (on the order proof) — they serve BOTH the order gadget's
+///     value tie and the ordered-result resolution.
+/// A term-bearing verifier ignores every witness; leaving them unattached keeps a term-less order
+/// fail-closed. Call once after proving.
+pub fn attach_termless_order_openings(
+    bgp: &mut PresentBgpProof,
+    order: &mut PresentScalarOrderProof,
+    layers: &[&LayerCommitment],
+    atoms: &[PresentBgpAtom],
+    ordered_ids: &[ArkFr],
+) -> io::Result<()> {
+    if atoms.iter().any(|a| a.object_range.is_some()) {
+        let poids: Vec<ArkFr> =
+            reconcile_present(layers)?.iter().map(|r| ark(r.object_id)).collect();
+        attach_termless_present_range_openings(bgp, layers, &poids)?;
+    }
+    attach_termless_present_order_openings(order, layers, ordered_ids)?;
+    Ok(())
+}
+
+/// C4 byte-in remote-verifier entry: verify + resolve a reconciled single-column numeric `OrderBy`
+/// read shipped as BYTES against a trusted head root, holding ONLY the encoded proof + the encoded
+/// term-less `VerifierCommitment` chain. `atoms`/`joins`/`datatype`/`direction`/`trusted_head_root`
+/// are the VERIFIER's OWN parameters (anti-substitution): NEVER parsed from the proof bytes. The
+/// wire-carried `OrderReadSpec` is compared to `(datatype, direction)` and reject-closes on mismatch;
+/// the audited [`verify_and_resolve_order_bgp_from_views`] then re-verifies + resolves the ordered
+/// rows (the transcript also binds direction/datatype, so a wrong direction independently rejects).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_and_verify_order(
+    order_proof_bytes: &[u8],
+    verifier_commitment_bytes: &[&[u8]],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    datatype: CanonicalDatatype,
+    direction: OrderDirection,
+) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    let owned: Vec<crate::proof::commitment::VerifierCommitment> = verifier_commitment_bytes
+        .iter()
+        .map(|b| crate::proof::commitment::VerifierCommitment::decode(b))
+        .collect::<io::Result<_>>()?;
+    let proof = ReconciledOrderReadProof::decode(order_proof_bytes)?;
+    // Anti-substitution belt: the wire-carried order spec must equal the VERIFIER's re-lowered spec.
+    let expected = OrderReadSpec { datatype, direction };
+    if proof.spec != expected {
+        return Err(invalid(
+            "reconciled order byte-in: the proof's order spec (datatype/direction) does not match the verifier's query (anti-substitution)",
+        ));
+    }
+    let views: Vec<VerifierCommitmentRef<'_>> = owned.iter().map(|c| c.verifier_view()).collect();
+    verify_and_resolve_order_bgp_from_views(
+        &views,
+        trusted_head_root,
+        atoms,
+        joins,
+        datatype,
+        direction,
+        &proof.reconcile,
+        &proof.bgp,
+        &proof.order,
+        &proof.ordered_columns,
+    )
+}

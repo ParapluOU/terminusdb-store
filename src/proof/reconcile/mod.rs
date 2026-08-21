@@ -213,9 +213,10 @@ pub use delta_read::{
     verify_delta_read, verify_delta_read_from_views, DeltaReadProof, DeltaSource,
 };
 pub use present_order::{
-    attach_termless_present_order_openings, prove_read_order_bgp, verify_and_resolve_order_bgp,
-    verify_and_resolve_order_bgp_from_views, verify_read_order_bgp, verify_read_order_bgp_from_views,
-    PresentScalarOrderProof,
+    attach_termless_order_openings, attach_termless_present_order_openings, decode_and_verify_order,
+    prove_read_order_bgp, verify_and_resolve_order_bgp, verify_and_resolve_order_bgp_from_views,
+    verify_read_order_bgp, verify_read_order_bgp_from_views, OrderReadSpec, PresentScalarOrderProof,
+    ReconciledOrderReadProof,
 };
 pub use present_group::{
     attach_termless_group_openings, decode_and_verify_group_count, decode_and_verify_group_extrema,
