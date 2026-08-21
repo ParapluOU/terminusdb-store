@@ -78,6 +78,13 @@ const COL_MULT: usize = 2;
 
 const LABEL_BETA: &[u8] = b"pow/dict/fingerprint-beta";
 const LABEL_ALPHA: &[u8] = b"pow/dict/reciprocal-alpha";
+// Fiat-Shamir binding of the PUBLIC query pair `(q_hash, id)` BEFORE beta/alpha.
+// Without this the folded target `q_fold = beta*q_hash + id` is not pinned to the
+// challenge, enabling a prob-1 standalone forge (`id' = id_i + beta*(h_i - q)`
+// yields the same `q_fold`). Both prover and verifier absorb the pair here,
+// symmetrically, right after the data-column commitments and before `beta`.
+const LABEL_QUERY_HASH: &[u8] = b"pow/dict/query-hash";
+const LABEL_QUERY_ID: &[u8] = b"pow/dict/query-id";
 
 #[inline]
 fn f0() -> ArkFr {
@@ -257,6 +264,11 @@ pub fn prove_dict_membership_with_context(
     transcript.append_group(b"pow/dict/com-hash", com_dict_hash);
     transcript.append_group(b"pow/dict/com-id", com_dict_id);
     transcript.append_group(b"pow/dict/com-mult", &mult_commitment);
+    // Bind the PUBLIC query pair `(q_hash, id)` BEFORE drawing beta/alpha so the
+    // folded target `q_fold = beta*q_hash + id` is fixed against the challenge.
+    // MUST append byte-identically to the verifier (see `verify_dict_membership`).
+    transcript.append_field(LABEL_QUERY_HASH, &q_hash);
+    transcript.append_field(LABEL_QUERY_ID, &id);
     let beta = transcript.challenge_scalar(LABEL_BETA);
     let alpha = transcript.challenge_scalar(LABEL_ALPHA);
     let q_fold = query_fold(beta, q_hash, id);
@@ -314,6 +326,10 @@ pub fn verify_dict_membership(
     transcript.append_group(b"pow/dict/com-hash", com_dict_hash);
     transcript.append_group(b"pow/dict/com-id", com_dict_id);
     transcript.append_group(b"pow/dict/com-mult", &proof.mult_commitment);
+    // Bind the PUBLIC query pair `(q_hash, id)` BEFORE drawing beta/alpha. MUST
+    // append byte-identically to the prover (see `prove_dict_membership_with_context`).
+    transcript.append_field(LABEL_QUERY_HASH, &q_hash);
+    transcript.append_field(LABEL_QUERY_ID, &id);
     let beta = transcript.challenge_scalar(LABEL_BETA);
     let alpha = transcript.challenge_scalar(LABEL_ALPHA);
     let q_fold = query_fold(beta, q_hash, id);
@@ -427,6 +443,70 @@ mod tests {
         let (hash_a, _id_a) = entries[0]; // alice's hash
         let (_hash_b, id_b) = entries[1]; // bob's id
         assert!(run(&dict_hash, &dict_id, hash_a, ArkFr::from_u64(id_b), |_| {}).is_err());
+    }
+
+    #[test]
+    fn query_fold_collision_forge_is_rejected() {
+        // Regression for the Fiat-Shamir soundness bug: `(q_hash, id)` was NOT
+        // absorbed before `beta`/`alpha`, so the folded target
+        //   q_fold = beta*q_hash + id
+        // was not pinned to the challenge. That enabled a prob-1 standalone
+        // forge: take an HONEST proof for a real row `(h_i, id_i)` (which fixes
+        //   q_fold = beta*h_i + id_i),
+        // then present a DIFFERENT query hash `q` with
+        //   id' = id_i + beta*(h_i - q)
+        // so that beta*q + id' == beta*h_i + id_i == the honest q_fold. Pre-fix
+        // the verifier drew the SAME `beta` (query not bound), reconstructed the
+        // IDENTICAL fraction instance, and ACCEPTED the forged pair `(q, id')`.
+        //
+        // Form used: the CONCRETE forge. We reconstruct the prover's honestly
+        // derived `beta` by replaying the fixed transcript prefix (data-column
+        // commitments, then the bound query pair), build `id'`, and assert the
+        // fixed verifier REJECTS `(q, id')` -- because it now binds `(q, id')`
+        // before `beta`, derives a DIFFERENT `beta'`, and no longer reconstructs
+        // the instance the honest proof was produced against.
+        let (dict_hash, dict_id, entries) = dictionary(&["alice", "bob", "carol", "dave"]);
+        let (h_i, id_i_u64) = entries[1]; // the real "bob" row
+        let id_i = ArkFr::from_u64(id_i_u64);
+
+        let com_h = commit(&dict_hash);
+        let com_i = commit(&dict_id);
+
+        // Honest proof for the real row `(h_i, id_i)`.
+        let mut pt = transcript();
+        let proof =
+            prove_dict_membership(&dict_hash, &dict_id, &com_h, &com_i, h_i, id_i, &mut pt).unwrap();
+
+        // Positive control: the honest pair verifies.
+        let mut vt_ok = transcript();
+        assert!(verify_dict_membership(&com_h, &com_i, h_i, id_i, &proof, &mut vt_ok).is_ok());
+
+        // Reconstruct the prover's `beta` EXACTLY as the fixed opener derives it:
+        // com-hash, com-id, com-mult, then the bound query pair (h_i, id_i),
+        // then the beta challenge.
+        let mut bt = transcript();
+        bt.append_group(b"pow/dict/com-hash", &com_h);
+        bt.append_group(b"pow/dict/com-id", &com_i);
+        bt.append_group(b"pow/dict/com-mult", &proof.mult_commitment);
+        bt.append_field(LABEL_QUERY_HASH, &h_i);
+        bt.append_field(LABEL_QUERY_ID, &id_i);
+        let beta = bt.challenge_scalar(LABEL_BETA);
+
+        // Forge: a DIFFERENT query hash `q` with a matching `q_fold`.
+        let q = hash_term(b"mallory"); // not the bob hash
+        assert_ne!(q, h_i, "the forged query hash must differ from the real row");
+        let id_prime = id_i + beta * (h_i - q);
+        assert_ne!(id_prime, id_i, "the forged id must differ (beta*(h_i-q) != 0)");
+        // Sanity: under the prover's `beta` the forge preserves the fold value.
+        assert_eq!(beta * q + id_prime, beta * h_i + id_i);
+
+        // The fixed verifier binds `(q, id')` before `beta`, so it re-derives a
+        // different challenge and REJECTS the forged pair against the honest proof.
+        let mut vt_bad = transcript();
+        assert!(
+            verify_dict_membership(&com_h, &com_i, q, id_prime, &proof, &mut vt_bad).is_err(),
+            "query-fold collision forge must be rejected"
+        );
     }
 
     #[test]

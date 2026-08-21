@@ -359,6 +359,15 @@ const LABEL_DORY_GAMMA: &[u8] = b"pow/dory/batch-gamma";
 // `Sum_j gamma^j * eval_j = C` while keeping the combined value fixed.
 const LABEL_DORY_EVAL_COUNT: &[u8] = b"pow/dory/eval-count";
 const LABEL_DORY_EVAL: &[u8] = b"pow/dory/claimed-eval";
+// Fiat-Shamir binding of `gamma` to the batched opening's per-column
+// COMMITMENTS. These MUST be absorbed (count first, then each commitment in
+// column order 0..m) immediately BEFORE the eval block (hence before `gamma`),
+// symmetrically on prove and verify. Without this the standalone opener/Dory
+// verifier is unsound for adaptively-chosen commitments: `gamma` would be
+// independent of the individual commitments and a malicious caller could
+// substitute a different commitment set on the combined opening.
+const LABEL_DORY_COMMIT_COUNT: &[u8] = b"pow/dory/commit-count";
+const LABEL_DORY_COMMIT: &[u8] = b"pow/dory/column-commitment";
 
 #[inline]
 fn f0() -> ArkFr {
@@ -1021,6 +1030,20 @@ pub fn prove_column_openings_with_context(
     }
     let (nu, sigma) = column_dims(size)?;
     transcript.append_bytes(b"pow/dory/parameter-set", &setup_parameter_id(r.len())?);
+    // Bind `gamma` to the per-column COMMITMENTS BEFORE drawing it. The prover
+    // RECOMPUTES each column commitment; for any opening that verifies these
+    // equal the `column_commitments[j]` the verifier appends (Dory binds the
+    // gamma-combined commitment to the gamma-combined polynomial, forcing
+    // per-column equality), so honest prove/verify stay byte-identical.
+    // The verifier appends the IDENTICAL bytes (see `verify_column_openings`).
+    transcript.append_bytes(
+        LABEL_DORY_COMMIT_COUNT,
+        &(column_tables.len() as u64).to_le_bytes(),
+    );
+    for table in column_tables.iter() {
+        let com = commit_column_with_context(context, table)?;
+        transcript.append_group(LABEL_DORY_COMMIT, &com);
+    }
     // Bind `gamma` to the exact per-column evaluations at `r` BEFORE drawing it.
     // For a sumcheck-backed caller these equal `proof.claimed_evals[j]`; for a
     // direct caller they equal the honest `col_evals[j]` the verifier passes.
@@ -1081,6 +1104,16 @@ pub fn verify_column_openings(
         return Err(invalid("commitment/eval count mismatch in batched opening"));
     }
     transcript.append_bytes(b"pow/dory/parameter-set", &setup_parameter_id(r.len())?);
+    // Bind `gamma` to the per-column COMMITMENTS BEFORE drawing it. MUST append
+    // byte-identically to the prover (see `prove_column_openings_with_context`):
+    // the count as u64 le-bytes, then each commitment in column order 0..m.
+    transcript.append_bytes(
+        LABEL_DORY_COMMIT_COUNT,
+        &(column_commitments.len() as u64).to_le_bytes(),
+    );
+    for c in column_commitments.iter() {
+        transcript.append_group(LABEL_DORY_COMMIT, c);
+    }
     // Bind `gamma` to the exact per-column claimed evaluations BEFORE drawing it.
     // MUST append byte-identically to the prover (see
     // `prove_column_openings_with_context`): the count as u64 le-bytes, then each
@@ -1305,6 +1338,58 @@ mod tests {
         assert!(
             verify_column_openings(&coms, &r, &forged, &opening, &mut vt_bad).is_err(),
             "forged eval vector on the honest opening hyperplane must be rejected"
+        );
+    }
+
+    #[test]
+    fn altered_column_commitments_are_rejected() {
+        // Regression for the Fiat-Shamir soundness bug in the shared batched
+        // column opening: the opener drew `gamma` WITHOUT first absorbing the
+        // per-column COMMITMENTS. With `gamma` independent of the commitments, a
+        // malicious caller could hand `verify_column_openings` a DIFFERENT
+        // commitment set than the one the honest proof was produced against and
+        // still verify. The fix absorbs the commitments (count + each in column
+        // order) before `gamma`, so any change re-derives a different `gamma`
+        // (and a different gamma-combined commitment) and the opening is
+        // rejected.
+        let k = 5;
+        let c0 = column(k, 71);
+        let c1 = column(k, 137);
+        let com0 = commit_column(&c0).unwrap();
+        let com1 = commit_column(&c1).unwrap();
+        assert_ne!(com0, com1, "distinct columns must have distinct commitments");
+
+        // Honest point + honest per-column evaluations at r.
+        let r: Vec<ArkFr> = (0..k).map(|i| fr(9 * i as u64 + 4)).collect();
+        let e0 = mle_full_eval(&c0, &r);
+        let e1 = mle_full_eval(&c1, &r);
+
+        // Honest multi-column opening at r over columns [c0, c1].
+        let mut pt = transcript();
+        let opening = prove_column_openings(&[c0.clone(), c1.clone()], &r, &mut pt).unwrap();
+
+        // Positive control: the honest commitment set + evals verify.
+        let mut vt = transcript();
+        verify_column_openings(&[com0, com1], &r, &[e0, e1], &opening, &mut vt).unwrap();
+
+        // Attack A: swap the two column commitments, keep everything else from
+        // the honest proof (same r, same evals, same opening). The commitments
+        // are now transcript-bound, so the verifier re-derives a different
+        // `gamma` and rejects.
+        let mut vt_swap = transcript();
+        assert!(
+            verify_column_openings(&[com1, com0], &r, &[e0, e1], &opening, &mut vt_swap).is_err(),
+            "swapped column commitments must be rejected"
+        );
+
+        // Attack B: replace one commitment with a re-commitment of a DIFFERENT
+        // column while keeping the honest evals/opening. Also rejected.
+        let c2 = column(k, 271);
+        let com2 = commit_column(&c2).unwrap();
+        let mut vt_repl = transcript();
+        assert!(
+            verify_column_openings(&[com0, com2], &r, &[e0, e1], &opening, &mut vt_repl).is_err(),
+            "substituted column commitment must be rejected"
         );
     }
 

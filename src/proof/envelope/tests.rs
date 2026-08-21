@@ -542,15 +542,16 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let hash = sha2::Sha256::digest(&bytes);
         let hash_hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
         assert_eq!(bytes.len(), 177242, "materialized proof byte length changed");
-        // Hash REGENERATED for the FS-ordering soundness fix (FABLE-1): the batched Dory opener now
-        // absorbs the per-column claimed evaluations into the transcript before drawing `gamma`, so
-        // every opening's challenge-derived content changes. The proof STRUCTURE/length is unchanged
-        // (177242, transcript-only change) and `commitment_root` is byte-identical (the query proof's
-        // transcript never feeds the committed state root); only the whole-proof SHA-256 moves. Prior
-        // image was the Merkle-dict I2b S5 `openings` option-tag byte; before that, LogUp-GKR Inc 3.
+        // Hash REGENERATED for the FS self-binding hardening (FABLE-2/3): the batched Dory opener now
+        // also absorbs the per-column COMMITMENTS into the transcript before `gamma` (on top of the
+        // FABLE-1 eval absorption), so every opening's challenge-derived content changes again. The
+        // proof STRUCTURE/length is unchanged (177242, transcript-only) and `commitment_root` is
+        // byte-identical (the query proof's transcript never feeds the committed state root); only the
+        // whole-proof SHA-256 moves. Prior image was FABLE-1 (eval absorption); before that Merkle-dict
+        // I2b S5 `openings` option-tag byte; before that LogUp-GKR Inc 3.
         assert_eq!(
             hash_hex,
-            "ba7d2f4047bce14f9eec5550e9cace6984d87008641cfa5585fa2deb69dffc5e",
+            "4060ba59d02425d2152a77ae7a8abf3d2f782cd180ab1240734126ffbdc40092",
             "materialized multi-atom proof transcript/commitments changed (byte-identity regression)"
         );
     }
