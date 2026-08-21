@@ -229,6 +229,49 @@ impl<'a> ChainDictResolver<'a> {
         Ok(object)
     }
 
+    /// READABLE-ANSWER `NodeValueId` resolution (join/BGP/delta/walk output → `CanonicalObject`).
+    ///
+    /// SOUNDNESS BELT (delta-reconcile TERM-LESS fix). Unlike [`resolve_nv_id`]'s value-terms
+    /// caller ([`verify_dict_value_terms_chain`], which belts every opened term by RE-COMMITTING its
+    /// order-preserving `(value, datatype)` to the root-bound range-dict columns), this readable
+    /// path has NO external belt: the delivered value IS the combined-dict id and the opened term is
+    /// returned VERBATIM as the answer. So it must never open an UNBELTED id against a view whose
+    /// `nv_merkle_root` is not bound to the trusted head anchor. Exactly two view kinds have a
+    /// root-bound `nv_merkle_root`:
+    ///   * a TERM-BEARING view — [`nv_tree`](Self::nv_tree) rebuilds the tree from the root-bound
+    ///     catalog and re-checks it equals the carried root (`validate()`'s catalog re-MSM binds the
+    ///     catalog to `commitment_root`), and
+    ///   * the TERM-LESS HEAD — `verify_reconcile_core` checks `head.resolution_root() ==
+    ///     trusted_head_root`, and `resolution_root = H(commitment_root, nv_merkle_root,
+    ///     pred_merkle_root)` binds the head's Merkle root directly.
+    /// A NON-HEAD TERM-LESS view has NEITHER: its Merkle root is not folded into `commitment_root`
+    /// (the chain only carries the root forward), its `resolution_root` is never checked, and
+    /// `validate()` skips the catalog re-MSM — so the carried `nv_merkle_root` is prover-controlled.
+    /// An unbelted open there would authenticate a FORGED term: the confirmed audit forgery ships a
+    /// non-head term-less ancestor whose replaced `nv_merkle_root` holds `ex:Evil` at `id(ex:A)` plus
+    /// a matching fake opening, resolving `triple(?s, ex:p, ?o)`'s `?o` to `ex:Evil`. FAIL-CLOSED.
+    ///
+    /// Honest term-less remote verification uses a TERM-LESS HEAD with TERM-BEARING ancestors (see
+    /// `termless_head_views`), so this never rejects an honest readable resolution. A fully
+    /// term-less chain would need a root-bound `id -> hash` belt (a prover combined-dict lookup over
+    /// the result column, mirroring `PresentIdAuth`/`verify_dict_value_terms_chain`) to resolve
+    /// ancestor-minted result ids; that is a cross-cutting proof-format change, out of scope for this
+    /// localized soundness fix, so until then such a resolution fails closed rather than trust an
+    /// unbound ancestor root.
+    fn resolve_nv_id_readable(&mut self, id: u64) -> io::Result<CanonicalObject> {
+        let i = self.nv_layer(id)?;
+        let view = self.views[i];
+        let is_head = i + 1 == self.views.len();
+        if !view.terms_present && !is_head {
+            return Err(invalid(
+                "resolve: unbelted NodeValueId routed to a NON-HEAD term-less view whose \
+                 nv_merkle_root is not root-bound; refusing to resolve an unauthenticated term \
+                 (delta-reconcile term-less fix — fail-closed)",
+            ));
+        }
+        self.resolve_nv_id(id, None)
+    }
+
     /// Route + open a predicate id to its authenticated IRI (as a `Node`, mirroring the legacy
     /// predicate resolver). `expected_hash`, when supplied, requires `hash_term(iri)` to equal the
     /// proof-authenticated hash.
@@ -287,8 +330,11 @@ impl<'a> ChainDictResolver<'a> {
     /// Resolve one authenticated result value by its column kind and (for the hash kinds) an
     /// UNTRUSTED prover `id_hint` (I2a).
     ///
-    /// * `NodeValueId` — the value IS the combined-dict id; route + open it (I3). No separate
-    ///   authenticated term-hash exists on this path, so no belt-hash (`None`).
+    /// * `NodeValueId` — the value IS the combined-dict id; route + open it (I3) via the
+    ///   readable-answer guard [`resolve_nv_id_readable`](Self::resolve_nv_id_readable), which
+    ///   FAIL-CLOSES an unbelted open routed to a NON-HEAD term-less view (whose `nv_merkle_root` is
+    ///   not root-bound — the confirmed forgery). No per-row authenticated term-hash exists on this
+    ///   path, so there is no belt-hash to pass.
     /// * `NodeValueHash` / `PredicateHash` — the single-atom filter output binding, delivered as
     ///   the proof-authenticated present hash (`present_o`/`present_s`/`present_p`) with NO id. The
     ///   prover ships an id-hint; we ROUTE it to its layer's tree and open it under a MANDATORY
@@ -304,7 +350,9 @@ impl<'a> ChainDictResolver<'a> {
         id_hint: Option<u64>,
     ) -> io::Result<CanonicalObject> {
         match kind {
-            ResolveKind::NodeValueId => self.resolve_nv_id(canonical_dictionary_id(&value)?, None),
+            ResolveKind::NodeValueId => {
+                self.resolve_nv_id_readable(canonical_dictionary_id(&value)?)
+            }
             ResolveKind::NodeValueHash => {
                 let id = id_hint.ok_or_else(|| {
                     invalid("resolve: node/value hash result requires a prover id-hint (I2a)")

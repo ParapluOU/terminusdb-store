@@ -3024,6 +3024,144 @@ fn s3_termless_chain_resolution_matches_term_bearing() {
     .is_err());
 }
 
+/// DELTA-RECONCILE TERM-LESS SOUNDNESS FIX (readable `NodeValueId` belt / fail-close).
+///
+/// Reproduces the confirmed audit forgery on the term-less remote-verification path: a malicious
+/// prover supplies a NON-HEAD TERM-LESS ancestor whose `nv_merkle_root` is REPLACED so its leaf at
+/// `victim_id` holds `ex:EVIL-FORGED` (plus a matching fake opening). Because a non-head term-less
+/// view's Merkle root is neither folded into `commitment_root` nor pinned by a `resolution_root`
+/// check (only the HEAD's is), an UNBELTED readable `NodeValueId` resolution (`triple(?s,p,?o)` → the
+/// term for `?o`) opened against that root would return the forged term. The fix routes the readable
+/// `NodeValueId` path through `resolve_nv_id_readable`, which FAIL-CLOSES on a non-head term-less
+/// view. Asserts: (attack primitive) the forged opening authenticates `ex:EVIL-FORGED` against the
+/// swapped root; (THE FIX) the readable resolver now REJECTS it; (positive control 1) an honest
+/// term-bearing chain still resolves the true term; (positive control 2) an honest TERM-LESS HEAD
+/// (anchor-bound root) still resolves; and a BELTED open over the same forged view still rejects the
+/// forgery (why belted paths — NodeValueHash / closure constants — stay allowed).
+///
+/// (Predicate ids have no unbelted readable path — production resolves predicates only via the
+/// MANDATORY-belt `PredicateHash` kind — so no predicate forgery variant is reachable.)
+#[test]
+fn termless_nonhead_readable_nodevalueid_forgery_is_rejected() {
+    let layers = base_plus_three();
+    let lref = refs(&layers);
+    let views: Vec<VerifierCommitmentRef<'_>> = lref.iter().map(|l| l.verifier_view()).collect();
+    assert_eq!(views.len(), 4, "base + 3 deltas");
+    let base = views[0];
+    let head = views[3];
+
+    // victim: a BASE-minted (NON-HEAD) node/value id.
+    assert!(!base.node_value_catalog.is_empty());
+    let victim_id = base.node_value_catalog[0].object_id;
+    assert!(
+        victim_id > base.state.parent_node_value_count && victim_id <= base.state.node_value_count,
+        "victim id must lie in the base (non-head) introduced interval"
+    );
+    let honest_term = resolve_node_value_id_via_chain_merkle(&views, victim_id, None).unwrap();
+
+    // The forged term the attacker wants `?o` to resolve to.
+    let evil = CanonicalObject::Node(iri("EVIL-FORGED").into_bytes());
+    assert_ne!(hash_object(&evil), hash_object(&honest_term));
+
+    // Forge the base's node/value tree: same catalog, but `victim_id`'s term swapped to ex:Evil.
+    let mut forged_cat: Vec<ProofRecord> = base.node_value_catalog.to_vec();
+    forged_cat
+        .iter_mut()
+        .find(|r| r.object_id == victim_id)
+        .unwrap()
+        .triple
+        .object = evil.clone();
+    let forged_tree = build_node_value_tree(
+        &forged_cat,
+        base.state.parent_node_value_count,
+        base.state.node_value_count,
+    )
+    .unwrap();
+    let forged_root = forged_tree.root();
+    let forged_opening = forged_tree.open(victim_id).unwrap();
+
+    // Attack primitive: the forged opening authenticates ex:Evil against the swapped root — so
+    // WITHOUT the fix the resolver would return ex:Evil.
+    let reopened = verify_opening(
+        &forged_root,
+        base.state.parent_node_value_count,
+        base.state.node_value_count,
+        victim_id,
+        &forged_opening,
+    )
+    .unwrap();
+    assert_eq!(reopened, evil, "forged opening authenticates ex:Evil against the swapped root");
+
+    // Malicious view: a NON-HEAD (index 0) TERM-LESS ancestor carrying the swapped root.
+    let empty: Vec<ProofRecord> = Vec::new();
+    let forged_base = VerifierCommitmentRef {
+        terms_present: false,
+        node_value_catalog: &empty,
+        predicate_catalog: &empty,
+        nv_merkle_root: forged_root,
+        ..base
+    };
+    let mut forged_views = views.clone();
+    forged_views[0] = forged_base;
+
+    let mut forged_openings = ResolutionOpenings::default();
+    forged_openings.insert_node_value(forged_opening.clone());
+    let com = commit_col(&[ark(victim_id), ark(0)]);
+
+    // THE FIX: the readable `NodeValueId` path fails CLOSED over the non-head term-less view
+    // (was resolving ex:EVIL-FORGED).
+    assert!(
+        resolve_node_value_id_column(&forged_views, &[victim_id], com, 1, Some(&forged_openings))
+            .is_err(),
+        "readable NodeValueId over a NON-HEAD term-less view must fail closed (audit forgery)"
+    );
+
+    // A BELTED open over the SAME forged view still catches the forgery (belted paths stay allowed).
+    assert!(
+        resolve_node_value_id_via_chain_merkle_with_openings(
+            &forged_views,
+            victim_id,
+            Some(hash_object(&honest_term)),
+            &forged_openings,
+        )
+        .is_err(),
+        "belt-hash mismatch: opened ex:Evil != honest hash → rejected"
+    );
+
+    // Positive control 1: an honest term-bearing chain resolves the TRUE term (readable path OK).
+    let honest_resolved =
+        resolve_node_value_id_column(&views, &[victim_id], com, 1, None).unwrap();
+    assert_eq!(
+        honest_resolved,
+        vec![honest_term.clone()],
+        "honest term-bearing readable NodeValueId resolves the true term"
+    );
+
+    // Positive control 2: an honest TERM-LESS HEAD (its root anchor-bound) still resolves readable
+    // NodeValueId for a head-minted id.
+    assert!(!head.node_value_catalog.is_empty(), "head mints node/value ids");
+    let head_id = head.node_value_catalog[0].object_id;
+    let head_term = resolve_node_value_id_via_chain_merkle(&views, head_id, None).unwrap();
+    let head_openings = build_resolution_openings(&[head], &[head_id], &[]).unwrap();
+    let tl_head = VerifierCommitmentRef {
+        terms_present: false,
+        node_value_catalog: &empty,
+        predicate_catalog: &empty,
+        ..head
+    };
+    let mut head_tl_views = views.clone();
+    head_tl_views[3] = tl_head;
+    let com_head = commit_col(&[ark(head_id), ark(0)]);
+    let head_resolved =
+        resolve_node_value_id_column(&head_tl_views, &[head_id], com_head, 1, Some(&head_openings))
+            .unwrap();
+    assert_eq!(
+        head_resolved,
+        vec![head_term],
+        "honest TERM-LESS HEAD readable NodeValueId still resolves (anchor-bound root)"
+    );
+}
+
 // ============================================================
 // C4 — WIRE SERIALIZATION of the delta-read plain-BGP proof + the byte-in remote verifier.
 //
