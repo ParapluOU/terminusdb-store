@@ -119,8 +119,8 @@ use crate::proof::reconcile::{
     ColumnDistinctFullFieldProof, ColumnDistinctProof, CombinedDictProof, CombinedRangeDictProof,
     CommittedGroupProof, DeltaReadProof, GroupHashProof, PresentAtomFilter, PresentBgpAtomProof,
     PresentBgpProof, PresentIdAuth, PresentRangeDatatypeGuardProof, PresentRangeSubproof,
-    PresentSecondRange, ReconcileProof,
-    ReconciledReadBgpProof, RemintProof,
+    GroupReadAgg, GroupReadSpec, PresentSecondRange, ReconcileProof,
+    ReconciledGroupReadProof, ReconciledReadBgpProof, RemintProof,
 };
 pub(super) const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
 pub(super) const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
@@ -135,6 +135,13 @@ pub(super) const DELTA_READ_MAGIC: &[u8; 12] = b"TDBWQDLTA\0\0\0";
 // `ReconcileProof` + `PresentBgpProof`) gets its OWN independent wire format, distinct from the
 // delta-read (`DELTA_READ_*`) format and every envelope format above. Pure addition.
 pub(super) const RECONCILE_READ_MAGIC: &[u8; 12] = b"TDBWQRCON\0\0\0";
+// C4 GROUP byte-in: the reconciled `GroupBy`-aggregate read (a `ReconciledGroupReadProof` =
+// `ReconcileProof` + `PresentBgpProof` + the delivered child result columns) gets its OWN
+// independent framed wire format, distinct from the plain reconcile-read (`RECONCILE_READ_*`),
+// delta-read (`DELTA_READ_*`), and every envelope format. Pure addition — no existing format is
+// touched. The child columns cross the wire (they are root-authenticated at verify); the GroupSpec
+// does NOT (it is the verifier's own re-lowered query — anti-substitution).
+pub(super) const GROUP_READ_MAGIC: &[u8; 12] = b"TDBWQGRUP\0\0\0";
 // C4-slice-3: each of the three reconciled WALK/CLOSURE proofs is a SELF-CONTAINED shippable
 // container (it carries its own `reconcile` + leaves + walk-structure sub-proofs), so each gets its
 // OWN independent wire format — a fresh DISTINCT 12-byte magic, disjoint from every format above and
@@ -299,6 +306,9 @@ pub(super) const DELTA_READ_VERSION: u32 = 1;
 // C4-slice-2: initial version of the independent reconciled materialized-present read wire format
 // (see `RECONCILE_READ_MAGIC`).
 pub(super) const RECONCILE_READ_VERSION: u32 = 1;
+// C4 GROUP byte-in: initial version of the independent reconciled group-aggregate read wire format
+// (see `GROUP_READ_MAGIC`).
+pub(super) const GROUP_READ_VERSION: u32 = 1;
 // C4-slice-3: initial version of each independent reconciled WALK/CLOSURE read wire format (see the
 // `CLOSURE_READ_MAGIC` / `LIST_WALK_READ_MAGIC` / `ARRAY_WALK_READ_MAGIC` constants).
 pub(super) const CLOSURE_READ_VERSION: u32 = 1;
@@ -1546,6 +1556,107 @@ impl ReconciledReadBgpProof {
         let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
         if version != RECONCILE_READ_VERSION {
             return Err(invalid("unsupported reconciled read proof version"));
+        }
+        let proof = Self::get(&mut reader)?;
+        reader.finish()?;
+        Ok(proof)
+    }
+}
+
+// ===========================================================================
+// C4 GROUP byte-in: WIRE SERIALIZATION of the reconciled GroupBy-aggregate read. Its bytes are the
+// reconcile + present-BGP proof (both already `Wire`) PLUS the delivered child result columns
+// (`Vec<Vec<ArkFr>>`, via the existing Vec/ArkFr `Wire` impls). The container forwards in field
+// order via `wire_struct!` and gets its OWN independent framed format (`GROUP_READ_*`), disjoint
+// from every format above. The GroupSpec is NOT on the wire (anti-substitution). Serialization
+// changes NO verification: the decoded proof re-verifies through the SAME
+// `verify_and_resolve_group_*_bgp_from_views`.
+// ===========================================================================
+// The wire-carried GroupSpec (anti-substitution witness). `key_columns` rides the `Vec<usize>` Wire
+// impl; the aggregate is a hand-written tag (Count / Sum / Extrema) carrying the value column, the
+// datatype (as a `u8` tag via `CanonicalDatatype`), and the min/max kind (already `Wire`).
+impl Wire for GroupReadAgg {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Count => 0u8.put(out),
+            Self::Sum { value_column, datatype } => {
+                1u8.put(out)?;
+                value_column.put(out)?;
+                (*datatype as u8).put(out)
+            }
+            Self::Extrema { value_column, datatype, kind } => {
+                2u8.put(out)?;
+                value_column.put(out)?;
+                (*datatype as u8).put(out)?;
+                kind.put(out)
+            }
+        }
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        match u8::get(reader)? {
+            0 => Ok(Self::Count),
+            1 => Ok(Self::Sum {
+                value_column: Wire::get(reader)?,
+                datatype: CanonicalDatatype::try_from(u8::get(reader)?)?,
+            }),
+            2 => Ok(Self::Extrema {
+                value_column: Wire::get(reader)?,
+                datatype: CanonicalDatatype::try_from(u8::get(reader)?)?,
+                kind: Wire::get(reader)?,
+            }),
+            _ => Err(invalid("invalid group-read aggregate tag")),
+        }
+    }
+}
+wire_struct!(GroupReadSpec { key_columns, agg });
+wire_struct!(ReconciledGroupReadProof { reconcile, bgp, child_columns, spec });
+
+impl ReconciledGroupReadProof {
+    /// Frame this reconciled group-aggregate read for shipping as BYTES:
+    /// MAGIC ‖ VERSION ‖ body ‖ SHA-256 checksum, byte-identically to
+    /// [`ReconciledReadBgpProof::encode`] but with the independent `GROUP_READ_*` constants.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(GROUP_READ_MAGIC);
+        out.extend_from_slice(&GROUP_READ_VERSION.to_le_bytes());
+        self.put(&mut out)?;
+        if out
+            .len()
+            .checked_add(CHECKSUM_BYTES)
+            .map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES)
+        {
+            return Err(invalid("reconciled group read proof too large"));
+        }
+        let checksum = Sha256::digest(&out);
+        out.extend_from_slice(&checksum);
+        Ok(out)
+    }
+
+    /// Decode a framed reconciled group-aggregate read proof. ONLY parsing under the strict
+    /// size/item budgets — NO trust checks; the decoded proof is handed back to
+    /// `verify_and_resolve_group_*_bgp_from_views`.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < GROUP_READ_MAGIC.len() + 4 + CHECKSUM_BYTES
+            || bytes.len() > MAX_QUERY_ENVELOPE_BYTES
+        {
+            return Err(invalid("invalid reconciled group read proof size"));
+        }
+        let body_len = bytes.len() - CHECKSUM_BYTES;
+        let (body, checksum) = bytes.split_at(body_len);
+        if Sha256::digest(body).as_slice() != checksum {
+            return Err(invalid("reconciled group read proof checksum mismatch"));
+        }
+        let mut reader = Reader {
+            bytes: body,
+            pos: 0,
+            decoded_items: 0,
+        };
+        if reader.take(GROUP_READ_MAGIC.len())? != GROUP_READ_MAGIC {
+            return Err(invalid("unknown reconciled group read proof magic"));
+        }
+        let version = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        if version != GROUP_READ_VERSION {
+            return Err(invalid("unsupported reconciled group read proof version"));
         }
         let proof = Self::get(&mut reader)?;
         reader.finish()?;

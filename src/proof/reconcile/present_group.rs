@@ -500,3 +500,256 @@ pub fn verify_and_resolve_group_extrema_bgp(
     )?;
     recompute_group_extrema(&resolved, key_columns, value_column, datatype, kind)
 }
+
+// ============================================================================================
+// C4 byte-in: DB-free reconciled GroupBy-aggregate reads over the TERM-LESS VerifierCommitment chain.
+//
+// A group aggregate is a VERIFIER-RECOMPUTE over the root-authenticated resolved child rows (see the
+// module doc), so — unlike a plain present read, which delivers only the row COUNT — the byte-in
+// group path must ship the reconcile + present-BGP proof PLUS the delivered CHILD result columns
+// (the grouped-over rows), then re-run the SAME `verify_and_resolve_bgp_from_views` + recompute over
+// verifier VIEWS. The GroupSpec (key columns / aggregate kind / value column / datatype) and the BGP
+// atoms/joins are the VERIFIER's OWN re-lowered query parameters — NEVER parsed from the proof bytes
+// (anti-substitution). The child columns ARE in the bytes (they are the delivered answer data), but
+// they are root-authenticated inside `verify_and_resolve_bgp_from_views`, so a tampered / fabricated
+// child row rejects there before any grouping.
+// ============================================================================================
+
+/// Prover-side: mint ALL term-less resolution witnesses a byte-in GROUP read needs into a proven
+/// child [`PresentBgpProof`], so the SAME proof also verifies + RESOLVES DB-free over a TERM-LESS
+/// `VerifierCommitment` chain. A group aggregate is a verifier-recompute over the RESOLVED child
+/// rows, so — unlike a plain present/count read (which delivers only the row count and needs no
+/// openings) — the group byte-in must resolve, which term-less requires the prover-shipped Merkle
+/// witnesses:
+///   * the result-id openings (always — the node/value child result columns);
+///   * for a ranged child (an object-value range atom, i.e. the sum/extrema numeric VALUE column),
+///     the value↔term range openings over the reconciled present object column.
+/// A term-bearing verifier ignores every witness (it rebuilds from the clear catalogs); leaving them
+/// unattached keeps a term-less RESOLVE fail-closed (the D2 default). Call once after proving.
+pub fn attach_termless_group_openings(
+    bgp: &mut PresentBgpProof,
+    layers: &[&LayerCommitment],
+    atoms: &[PresentBgpAtom],
+    result_columns: &[Vec<ArkFr>],
+) -> io::Result<()> {
+    attach_termless_reconcile_openings(bgp, layers, result_columns)?;
+    // A numeric object-value RANGE atom (the sum/extrema value column is authenticated through the
+    // child BGP's `>= 0` range) needs the value↔term openings over the reconciled present object
+    // column, in reconcile order (the SAME `present_id_o` prefix `auth_o.com_id` commits).
+    if atoms.iter().any(|a| a.object_range.is_some()) {
+        let poids: Vec<ArkFr> =
+            reconcile_present(layers)?.iter().map(|r| ark(r.object_id)).collect();
+        attach_termless_present_range_openings(bgp, layers, &poids)?;
+    }
+    Ok(())
+}
+
+/// Views-based `GroupCount` verify+recompute (the byte-in remote core). Analogue of
+/// [`verify_and_resolve_group_count_bgp`] over borrowed [`VerifierCommitmentRef`]s (so a TERM-LESS
+/// head view can be passed for the DB-free remote verifier).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_resolve_group_count_bgp_from_views(
+    views: &[VerifierCommitmentRef<'_>],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    key_columns: &[usize],
+    reconcile: &ReconcileProof,
+    bgp: &PresentBgpProof,
+    child_columns: &[Vec<ArkFr>],
+) -> io::Result<Vec<GroupCountEntry>> {
+    let resolved = verify_and_resolve_bgp_from_views(
+        views, trusted_head_root, atoms, joins, reconcile, bgp, child_columns,
+    )?;
+    recompute_group_count(&resolved, key_columns)
+}
+
+/// Views-based `GroupSum` verify+recompute (the byte-in remote core). Analogue of
+/// [`verify_and_resolve_group_sum_bgp`] over borrowed [`VerifierCommitmentRef`]s.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_resolve_group_sum_bgp_from_views(
+    views: &[VerifierCommitmentRef<'_>],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    key_columns: &[usize],
+    value_column: usize,
+    datatype: CanonicalDatatype,
+    reconcile: &ReconcileProof,
+    bgp: &PresentBgpProof,
+    child_columns: &[Vec<ArkFr>],
+) -> io::Result<Vec<GroupSumEntry>> {
+    let resolved = verify_and_resolve_bgp_from_views(
+        views, trusted_head_root, atoms, joins, reconcile, bgp, child_columns,
+    )?;
+    recompute_group_sum(&resolved, key_columns, value_column, datatype)
+}
+
+/// Views-based group `Min`/`Max` verify+recompute (the byte-in remote core). Analogue of
+/// [`verify_and_resolve_group_extrema_bgp`] over borrowed [`VerifierCommitmentRef`]s.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_resolve_group_extrema_bgp_from_views(
+    views: &[VerifierCommitmentRef<'_>],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    key_columns: &[usize],
+    value_column: usize,
+    datatype: CanonicalDatatype,
+    kind: GroupExtremaKind,
+    reconcile: &ReconcileProof,
+    bgp: &PresentBgpProof,
+    child_columns: &[Vec<ArkFr>],
+) -> io::Result<Vec<GroupExtremumEntry>> {
+    let resolved = verify_and_resolve_bgp_from_views(
+        views, trusted_head_root, atoms, joins, reconcile, bgp, child_columns,
+    )?;
+    recompute_group_extrema(&resolved, key_columns, value_column, datatype, kind)
+}
+
+/// Which per-group aggregate a wire group read was PROVED for. Carried in the proof only as an
+/// ANTI-SUBSTITUTION WITNESS (the byte-in verifier compares it to its OWN re-lowered query spec and
+/// reject-closes on mismatch — the byte-level analogue of the in-memory `expected.group ==
+/// proof.group` check). The actual recompute ALWAYS uses the VERIFIER's params, never these bytes.
+/// Mirrors the compiler's `GroupAgg`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupReadAgg {
+    /// Per-group cardinality (`GroupCount`).
+    Count,
+    /// Per-group numeric sum over `value_column` (pinned fixed-width integral `datatype`).
+    Sum { value_column: usize, datatype: CanonicalDatatype },
+    /// Per-group numeric min/max over `value_column` (pinned fixed-width integral `datatype`).
+    Extrema { value_column: usize, datatype: CanonicalDatatype, kind: GroupExtremaKind },
+}
+
+/// The `GroupBy` spec a wire group read was PROVED for (key columns + aggregate). Carried ONLY as an
+/// anti-substitution witness (see [`GroupReadAgg`]); the recompute uses the verifier's own params.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupReadSpec {
+    pub key_columns: Vec<usize>,
+    pub agg: GroupReadAgg,
+}
+
+/// The shippable reconciled `GroupBy`-aggregate read: the [`ReconcileProof`] + the child
+/// [`PresentBgpProof`] + the delivered child result columns (the grouped-over rows) + the
+/// [`GroupReadSpec`] the proof was produced for. Its `encode`/`decode` (in `envelope::wire`, framed
+/// MAGIC ‖ VERSION ‖ body ‖ SHA-256 with the independent `GROUP_READ_*` constants) is transparent to
+/// verification: the decoded proof re-verifies through the SAME
+/// `verify_and_resolve_group_*_bgp_from_views`, and its carried `spec` is COMPARED to the verifier's
+/// re-lowered spec (reject on mismatch) — it is a witness, never the source of the recompute params.
+#[derive(Clone, Debug)]
+pub struct ReconciledGroupReadProof {
+    pub reconcile: ReconcileProof,
+    pub bgp: PresentBgpProof,
+    pub child_columns: Vec<Vec<ArkFr>>,
+    pub spec: GroupReadSpec,
+}
+
+/// Decode the term-less commitment chain, own it, and decode the group read bundle. Shared by the
+/// three byte-in group verifiers below (the returned owned commitments must outlive the views).
+fn decode_group_bundle(
+    group_proof_bytes: &[u8],
+    verifier_commitment_bytes: &[&[u8]],
+) -> io::Result<(Vec<crate::proof::commitment::VerifierCommitment>, ReconciledGroupReadProof)> {
+    let owned: Vec<crate::proof::commitment::VerifierCommitment> = verifier_commitment_bytes
+        .iter()
+        .map(|b| crate::proof::commitment::VerifierCommitment::decode(b))
+        .collect::<io::Result<_>>()?;
+    let proof = ReconciledGroupReadProof::decode(group_proof_bytes)?;
+    Ok((owned, proof))
+}
+
+/// C4 byte-in remote-verifier entry: verify a reconciled `GroupCount(BGP)` shipped as BYTES against
+/// a trusted head root, holding ONLY the encoded proof + the encoded term-less `VerifierCommitment`
+/// chain. `atoms`/`joins`/`key_columns`/`trusted_head_root` are the VERIFIER's OWN parameters
+/// (anti-substitution): NEVER parsed from the proof bytes.
+pub fn decode_and_verify_group_count(
+    group_proof_bytes: &[u8],
+    verifier_commitment_bytes: &[&[u8]],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    key_columns: &[usize],
+) -> io::Result<Vec<GroupCountEntry>> {
+    let (owned, proof) = decode_group_bundle(group_proof_bytes, verifier_commitment_bytes)?;
+    // Anti-substitution: the wire-carried GroupSpec must equal the VERIFIER's re-lowered spec (agg
+    // kind + key columns). A proof produced for a different aggregate / different keys reject-closes
+    // here — the byte-level analogue of the in-memory `expected.group == proof.group` check. The
+    // recompute below uses the VERIFIER's params, never the bytes.
+    let expected = GroupReadSpec { key_columns: key_columns.to_vec(), agg: GroupReadAgg::Count };
+    if proof.spec != expected {
+        return Err(invalid(
+            "reconciled group-count byte-in: the proof's group spec does not match the verifier's query (anti-substitution)",
+        ));
+    }
+    let views: Vec<VerifierCommitmentRef<'_>> = owned.iter().map(|c| c.verifier_view()).collect();
+    verify_and_resolve_group_count_bgp_from_views(
+        &views, trusted_head_root, atoms, joins, key_columns, &proof.reconcile, &proof.bgp,
+        &proof.child_columns,
+    )
+}
+
+/// C4 byte-in remote-verifier entry for a reconciled `GroupSum(BGP)`. See
+/// [`decode_and_verify_group_count`]; `value_column`/`datatype` are the verifier's re-lowered spec.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_and_verify_group_sum(
+    group_proof_bytes: &[u8],
+    verifier_commitment_bytes: &[&[u8]],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    key_columns: &[usize],
+    value_column: usize,
+    datatype: CanonicalDatatype,
+) -> io::Result<Vec<GroupSumEntry>> {
+    let (owned, proof) = decode_group_bundle(group_proof_bytes, verifier_commitment_bytes)?;
+    // Anti-substitution: the wire-carried GroupSpec must equal the VERIFIER's re-lowered spec (agg
+    // kind + key columns + value column + datatype). See `decode_and_verify_group_count`.
+    let expected = GroupReadSpec {
+        key_columns: key_columns.to_vec(),
+        agg: GroupReadAgg::Sum { value_column, datatype },
+    };
+    if proof.spec != expected {
+        return Err(invalid(
+            "reconciled group-sum byte-in: the proof's group spec does not match the verifier's query (anti-substitution)",
+        ));
+    }
+    let views: Vec<VerifierCommitmentRef<'_>> = owned.iter().map(|c| c.verifier_view()).collect();
+    verify_and_resolve_group_sum_bgp_from_views(
+        &views, trusted_head_root, atoms, joins, key_columns, value_column, datatype,
+        &proof.reconcile, &proof.bgp, &proof.child_columns,
+    )
+}
+
+/// C4 byte-in remote-verifier entry for a reconciled group `Min`/`Max`. See
+/// [`decode_and_verify_group_count`]; `value_column`/`datatype`/`kind` are the verifier's spec.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_and_verify_group_extrema(
+    group_proof_bytes: &[u8],
+    verifier_commitment_bytes: &[&[u8]],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    key_columns: &[usize],
+    value_column: usize,
+    datatype: CanonicalDatatype,
+    kind: GroupExtremaKind,
+) -> io::Result<Vec<GroupExtremumEntry>> {
+    let (owned, proof) = decode_group_bundle(group_proof_bytes, verifier_commitment_bytes)?;
+    // Anti-substitution: the wire-carried GroupSpec must equal the VERIFIER's re-lowered spec (agg
+    // kind + key columns + value column + datatype + min/max kind). See `decode_and_verify_group_count`.
+    let expected = GroupReadSpec {
+        key_columns: key_columns.to_vec(),
+        agg: GroupReadAgg::Extrema { value_column, datatype, kind },
+    };
+    if proof.spec != expected {
+        return Err(invalid(
+            "reconciled group-extrema byte-in: the proof's group spec does not match the verifier's query (anti-substitution)",
+        ));
+    }
+    let views: Vec<VerifierCommitmentRef<'_>> = owned.iter().map(|c| c.verifier_view()).collect();
+    verify_and_resolve_group_extrema_bgp_from_views(
+        &views, trusted_head_root, atoms, joins, key_columns, value_column, datatype, kind,
+        &proof.reconcile, &proof.bgp, &proof.child_columns,
+    )
+}
