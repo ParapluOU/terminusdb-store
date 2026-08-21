@@ -1070,6 +1070,104 @@ fn group_count_over_present_fabricated_group_rejects() {
     .is_err());
 }
 
+// ============================================================================================
+// GROUP-SUM — `GroupBy(keys) + Sum(value)` over the reconciled materialized present via
+// VERIFIER-RECOMPUTE over the C2a value↔term-authenticated numeric VALUE column. The per-group
+// sum uses the base path's fixed-width bounded accumulator (u64 unsigned / i128->i64 signed) with
+// overflow reject; a tampered value / mixed datatype reject-closes.
+// ============================================================================================
+
+/// present `salary` (UInt32) = {d1->[100,200,50], d2->[300,400,50]} (base d3->999,d3->888 removed;
+/// delta adds d1->50, d2->50). Group by the SUBJECT ?dept => d1:350, d2:750. Each committed delta
+/// group has >= 2 records.
+fn group_sum_stack() -> Vec<Arc<LayerCommitment>> {
+    use tdb_succinct::TdbDataType;
+    let store = open_sync_memory_store();
+    let b = store.create_base_layer().unwrap();
+    for (dept, sal) in [("d1", 100u32), ("d1", 200), ("d2", 300), ("d2", 400), ("d3", 999), ("d3", 888)] {
+        b.add_value_triple(ValueTriple::new_value(&iri(dept), &iri("salary"), u32::make_entry(&sal))).unwrap();
+    }
+    let base = b.commit().unwrap();
+    let base_lc = base.proof_commitment().unwrap();
+    let child = base.open_write().unwrap();
+    child.remove_value_triple(ValueTriple::new_value(&iri("d3"), &iri("salary"), u32::make_entry(&999u32))).unwrap();
+    child.remove_value_triple(ValueTriple::new_value(&iri("d3"), &iri("salary"), u32::make_entry(&888u32))).unwrap();
+    child.add_value_triple(ValueTriple::new_value(&iri("d1"), &iri("salary"), u32::make_entry(&50u32))).unwrap();
+    child.add_value_triple(ValueTriple::new_value(&iri("d2"), &iri("salary"), u32::make_entry(&50u32))).unwrap();
+    let head = child.commit().unwrap();
+    vec![base_lc, head.proof_commitment().unwrap()]
+}
+
+/// The reconciled group-sum's per-group total, rendered as the store renders it (UInt64 for an
+/// unsigned datatype).
+fn usum(total: u64) -> CanonicalObject {
+    CanonicalObject::Value { datatype: crate::proof::CanonicalDatatype::UInt64, lexical: total.to_be_bytes().to_vec() }
+}
+
+#[test]
+fn group_sum_over_present_recomputes_per_group() {
+    let layers = group_sum_stack();
+    let lref = refs(&layers);
+    // Triple(?dept, salary, ?sal) => columns [dept, sal]; group by dept (0), sum sal (1) as UInt32.
+    let atoms = [atom(var(), "http://ex/salary", var())];
+    let (rec, bgp, result) = prove_read_group_sum_bgp(&lref, &atoms, &[]).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let groups = verify_and_resolve_group_sum_bgp(
+        &lref, head_root, &atoms, &[], &[0], 1, crate::proof::CanonicalDatatype::UInt32, &rec, &bgp, &result.columns,
+    )
+    .unwrap();
+    let dept = |s: &str| CanonicalObject::Node(iri(s).into_bytes());
+    assert_eq!(groups, vec![(vec![dept("d1")], usum(350)), (vec![dept("d2")], usum(750))]);
+}
+
+#[test]
+fn group_sum_over_present_tampered_value_rejects() {
+    // Tampering a delivered VALUE cell fails the resolution re-commitment inside the store recompute
+    // — the sum is over the authenticated value column, so no forged total is producible.
+    let layers = group_sum_stack();
+    let lref = refs(&layers);
+    let atoms = [atom(var(), "http://ex/salary", var())];
+    let (rec, bgp, result) = prove_read_group_sum_bgp(&lref, &atoms, &[]).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let mut tampered = result.columns.clone();
+    tampered[1][0] = ark(987_654_321);
+    assert!(verify_and_resolve_group_sum_bgp(
+        &lref, head_root, &atoms, &[], &[0], 1, crate::proof::CanonicalDatatype::UInt32, &rec, &bgp, &tampered,
+    )
+    .is_err());
+}
+
+#[test]
+fn group_sum_over_present_mixed_datatype_rejects() {
+    // A MIXED value column (d1 has an Int32 alongside UInt32 salaries) reject-closes: the per-value
+    // decode asserts the exact planned datatype, so a non-UInt32 value never under-reports the sum.
+    use tdb_succinct::TdbDataType;
+    let store = open_sync_memory_store();
+    let b = store.create_base_layer().unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("d1"), &iri("salary"), u32::make_entry(&100u32))).unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("d1"), &iri("salary"), u32::make_entry(&200u32))).unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("d1"), &iri("salary"), i32::make_entry(&50i32))).unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("z1"), &iri("salary"), u32::make_entry(&9u32))).unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("z2"), &iri("salary"), u32::make_entry(&8u32))).unwrap();
+    let base = b.commit().unwrap();
+    let base_lc = base.proof_commitment().unwrap();
+    let child = base.open_write().unwrap();
+    child.remove_value_triple(ValueTriple::new_value(&iri("z1"), &iri("salary"), u32::make_entry(&9u32))).unwrap();
+    child.remove_value_triple(ValueTriple::new_value(&iri("z2"), &iri("salary"), u32::make_entry(&8u32))).unwrap();
+    child.add_value_triple(ValueTriple::new_value(&iri("d2"), &iri("salary"), u32::make_entry(&300u32))).unwrap();
+    child.add_value_triple(ValueTriple::new_value(&iri("d2"), &iri("salary"), u32::make_entry(&400u32))).unwrap();
+    let layers = vec![base_lc, child.commit().unwrap().proof_commitment().unwrap()];
+    let lref = refs(&layers);
+    let atoms = [atom(var(), "http://ex/salary", var())];
+    let (rec, bgp, result) = prove_read_group_sum_bgp(&lref, &atoms, &[]).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let err = verify_and_resolve_group_sum_bgp(
+        &lref, head_root, &atoms, &[], &[0], 1, crate::proof::CanonicalDatatype::UInt32, &rec, &bgp, &result.columns,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("datatype"), "mixed value column must reject on datatype: {err}");
+}
+
 #[test]
 fn multi_constant_bgp_over_present() {
     // Triple(x1, p1, ?y) & Triple(?y, p2, ?z): subject constant on atom 0 pins ?y=y1,

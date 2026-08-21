@@ -218,7 +218,8 @@ pub use present_order::{
     PresentScalarOrderProof,
 };
 pub use present_group::{
-    prove_read_group_count_bgp, verify_and_resolve_group_count_bgp, GroupCountEntry,
+    prove_read_group_count_bgp, prove_read_group_sum_bgp, verify_and_resolve_group_count_bgp,
+    verify_and_resolve_group_sum_bgp, GroupCountEntry, GroupSumEntry,
 };
 
 // ---------------------------------------------------------------------------
