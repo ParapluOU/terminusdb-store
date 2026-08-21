@@ -95,6 +95,18 @@ pub struct PresentSecondRange {
     pub com_intersection_sel: ArkGT,
 }
 
+/// The NUMERIC-FAMILY datatype guard for a `present` ranged atom (fail-closed fidelity). Same
+/// circuit as the base path's [`RangeDatatypeGuardProof`], minus the relocation: `present`'s
+/// object column and equality selection already share the working domain, so the
+/// `numeric_mismatch` column feeds the `equality_sel ⊙ numeric_mismatch == 0` product directly.
+#[derive(Clone, Debug)]
+pub struct PresentRangeDatatypeGuardProof {
+    pub numeric: RangeNumericFamilyProof,
+    /// `equality_sel ⊙ numeric_mismatch`; verification asserts its commitment is `Com(0)`.
+    pub bad: BooleanProductProof,
+    pub com_bad: ArkGT,
+}
+
 /// A ranged atom's sub-proofs over `present`: the authenticated object-value range selection
 /// (optionally intersected with a second bound), the constant-equality selection, their
 /// boolean product, and the compaction of the kept id columns by that combined selection.
@@ -105,6 +117,14 @@ pub struct PresentRangeSubproof {
     pub second: Option<PresentSecondRange>,
     pub equality: SelectionOnlyProof,
     pub com_equality_sel: ArkGT,
+    /// NUMERIC-FAMILY datatype guard (fail-closed fidelity). `present`'s object id column, the
+    /// combined range dict, and the equality selection share the working domain (no relocation).
+    /// Authenticates `numeric_mismatch = [v_dt numeric-family] · [v_dt != pinned]` over the
+    /// object-range gadget's committed v_dt/dt_match and asserts
+    /// `Com(equality_sel ⊙ numeric_mismatch) == Com(0)` — no predicate-matched present row is a
+    /// numeric-family datatype mismatch (a rational sibling TDB compares by value / a
+    /// cross-family float TDB errors on). Non-numeric rows are allowed (excluded faithfully).
+    pub datatype_guard: PresentRangeDatatypeGuardProof,
     pub combine: BooleanProductProof,
     pub com_combined_sel: ArkGT,
     pub compaction: CompactionOnlyProof,
@@ -595,6 +615,50 @@ pub(super) fn prove_present_range_atom(
         &artifacts.com_present_s, &artifacts.com_present_p, &artifacts.com_present_o, transcript,
     )?;
 
+    // (2h) NUMERIC-FAMILY datatype guard (fail-closed fidelity). The object-range gadget masks
+    // out every matched present row whose object datatype != range.datatype; that under-reports
+    // ONLY when the dropped row is itself NUMERIC-family (a rational sibling TDB compares by
+    // value / a cross-family float TDB errors on). Non-numeric rows (nodes, strings, …) are
+    // excluded faithfully. `present`'s object id column, range dict, and equality selection
+    // share the working domain (no relocation): authenticate `numeric_mismatch` and require
+    // `Com(equality_sel ⊙ numeric_mismatch) == Com(0)`. (Same KNOWN LIMITATION as the base
+    // path: a value-returning numeric FILTER over a column that ALSO holds non-numeric literals
+    // — where TDB's structural `compare/3` could include a string — is not covered here.)
+    let v_dt = object_range_vdt_column(
+        &artifacts.present_id_o, &range_dict.id_at_k, &range_dict.value_at_k,
+        &range_dict.datatype_at_k, head_nv, m,
+    );
+    let dt_match = object_range_dtmatch_column(
+        &artifacts.present_id_o, &range_dict.id_at_k, &range_dict.value_at_k,
+        &range_dict.datatype_at_k, head_nv, range.datatype, m,
+    );
+    let (numeric, nm_col, com_nm) = prove_range_numeric_family_mismatch_with_context(
+        context, &v_dt, &object_range.lookup.com_v_dt, &dt_match, &object_range.com_dt_match, m,
+        transcript,
+    )?;
+    for i in 0..m {
+        if eq_sel[i] != f0() && nm_col[i] != f0() {
+            return Err(invalid(
+                "RangeDatatypeNotHomogeneous: a predicate-matched present row's object has a \
+                 NUMERIC datatype other than the range constant's; TerminusDB compares \
+                 rational-family numerics across subtypes by value (and errors on \
+                 rational-vs-float), so the exact-datatype range mask cannot answer this query \
+                 faithfully — reject-closed",
+            ));
+        }
+    }
+    let (bad, com_bad) = prove_boolean_product_with_context(
+        context, &eq_sel, &nm_col, &com_equality_sel, &com_nm, transcript,
+    )?;
+    let com_zero = context.commit_column(&vec![f0(); artifacts.present_id_o.len()])?;
+    if com_bad != com_zero {
+        return Err(invalid(
+            "RangeDatatypeNotHomogeneous: a predicate-matched present row is a numeric-family \
+             datatype mismatch with the range constant — reject-closed",
+        ));
+    }
+    let datatype_guard = PresentRangeDatatypeGuardProof { numeric, bad, com_bad };
+
     // (3) Combined selection = equality_sel · range_sel (both boolean, chi_n-masked).
     let (combine, com_combined_sel) = prove_boolean_product_with_context(
         context, &eq_sel, &effective_range_sel, &com_equality_sel, &com_effective, transcript,
@@ -614,6 +678,7 @@ pub(super) fn prove_present_range_atom(
             second,
             equality,
             com_equality_sel,
+            datatype_guard,
             combine,
             com_combined_sel,
             compaction,
@@ -791,6 +856,26 @@ pub(super) fn verify_present_range_atom(
         spec, m, &verified.com_present_s, &verified.com_present_p, &verified.com_present_o,
         &sub.com_equality_sel, &sub.equality, transcript,
     )?;
+    // (2h) NUMERIC-FAMILY datatype guard (fail-closed fidelity): authenticate `numeric_mismatch`
+    // over the object-range gadget's committed v_dt/dt_match (working domain), then require
+    // `Com(equality_sel ⊙ numeric_mismatch) == Com(0)` — no predicate-matched present row is a
+    // numeric-family datatype mismatch. Non-numeric rows are allowed (excluded faithfully).
+    let domain = 1usize << verified.working_log;
+    let com_nm = verify_range_numeric_family_mismatch(
+        &sub.object_range.lookup.com_v_dt, &sub.object_range.com_dt_match, m, domain,
+        &sub.datatype_guard.numeric, transcript,
+    )?;
+    verify_boolean_product(
+        &sub.com_equality_sel, &com_nm, &sub.datatype_guard.com_bad, &sub.datatype_guard.bad,
+        transcript,
+    )?;
+    let com_zero = commit_column(&vec![f0(); domain])?;
+    if sub.datatype_guard.com_bad != com_zero {
+        return Err(invalid(
+            "RangeDatatypeNotHomogeneous: a predicate-matched present row is a numeric-family \
+             datatype mismatch with the range constant — reject-closed",
+        ));
+    }
     // (3) Combined selection = equality_sel · range_sel.
     verify_boolean_product(
         &sub.com_equality_sel, &com_effective, &sub.com_combined_sel, &sub.combine, transcript,

@@ -101,11 +101,12 @@ use crate::proof::query::{
     DictionaryAbsence,
     DictionaryAbsencePosition, LayerBgpAtom,
     LayerBgpAtomProof, LayerBgpPlan, LayerBgpProof, ObjectKindFilter, ObjectRangeBound,
-    ObjectRangeSpec, RangeAtomSubproof, ResultColumnDescriptor, ResultIdNamespace,
-    SecondRangeSubproof,
+    ObjectRangeSpec, RangeAtomSubproof, RangeDatatypeGuardProof, ResultColumnDescriptor,
+    ResultIdNamespace, SecondRangeSubproof,
 };
 use crate::proof::range::{
-    DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp, RangeSelectProof,
+    ClusterMembershipProof, DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp,
+    RangeNumericFamilyProof, RangeSelectProof,
 };
 use crate::proof::union::{prove_bag_union_with_context, BagUnionResult};
 use crate::proof::relocate::{prove_column_relocation_with_context, verify_column_relocation, RelocationProof};
@@ -118,7 +119,8 @@ use crate::proof::lexdistinct::LexDistinctProof;
 use crate::proof::reconcile::{
     ColumnDistinctFullFieldProof, ColumnDistinctProof, CombinedDictProof, CombinedRangeDictProof,
     CommittedGroupProof, DeltaReadProof, GroupHashProof, PresentAtomFilter, PresentBgpAtomProof,
-    PresentBgpProof, PresentIdAuth, PresentRangeSubproof, PresentSecondRange, ReconcileProof,
+    PresentBgpProof, PresentIdAuth, PresentRangeDatatypeGuardProof, PresentRangeSubproof,
+    PresentSecondRange, ReconcileProof,
     ReconciledReadBgpProof, RemintProof,
 };
 pub(super) const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
@@ -956,6 +958,9 @@ wire_struct!(RangeAtomSubproof {
     second,
     equality,
     com_equality_sel,
+    // NUMERIC-FAMILY datatype guard (fail-closed fidelity): `Some` only for a genuine numeric
+    // range; `None` for datatype-agnostic object-KIND filters.
+    datatype_guard,
     combine,
     com_combined_sel,
     compaction,
@@ -963,6 +968,27 @@ wire_struct!(RangeAtomSubproof {
     // term-bearing artifact). Uncommitted — re-checked per id by `verify_dict_value_terms`.
     oid,
     value_openings
+});
+// The NUMERIC-FAMILY datatype guard sub-proof (present only for a genuine numeric range atom).
+wire_struct!(ClusterMembershipProof {
+    ge,
+    com_ge,
+    le,
+    com_le,
+    product,
+    com_cluster
+});
+wire_struct!(RangeNumericFamilyProof {
+    clusters,
+    numeric_mismatch,
+    com_numeric_mismatch
+});
+wire_struct!(RangeDatatypeGuardProof {
+    numeric,
+    relocate_mismatch,
+    com_mismatch_at_table,
+    bad,
+    com_bad
 });
 wire_struct!(LayerBgpAtomProof {
     predicate_membership,
@@ -1332,9 +1358,17 @@ wire_struct!(PresentRangeSubproof {
     second,
     equality,
     com_equality_sel,
+    // NUMERIC-FAMILY datatype guard (fail-closed fidelity): `Com(equality_sel ⊙
+    // numeric_mismatch) == Com(0)` over the authenticated v_dt/dt_match (same working domain).
+    datatype_guard,
     combine,
     com_combined_sel,
     compaction
+});
+wire_struct!(PresentRangeDatatypeGuardProof {
+    numeric,
+    bad,
+    com_bad
 });
 // 12. The per-atom filter: a PLAIN equality atom or a RANGED object atom (hand-written enum tag,
 // mirroring `AtomFilterProof` above). Which arm is used is fixed by the PUBLIC atom, not the proof.

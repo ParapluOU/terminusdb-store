@@ -193,10 +193,16 @@ pub fn prove_layer_bgp_with_result_and_context(
             op: RangeOp::Ge, datatype: ArkFr::from_u64(NODE_DATATYPE_TAG),
             c: ArkFr::zero(), b_bits: 64, second: None,
         };
-        let (effective_range, complement_range) = match atom.object_kind {
-            ObjectKindFilter::Any => (atom.object_range.as_ref(), false),
-            ObjectKindFilter::Node => (Some(&node_kind_range), false),
-            ObjectKindFilter::Literal => (Some(&node_kind_range), true),
+        // `enforce_homogeneity` is TRUE only for a GENUINE numeric range (`Any` + a numeric
+        // `object_range`): there the exact-datatype mask could silently DROP a comparable
+        // rational-family row (the under-report the guard forbids). Object-KIND filters
+        // (`Node`/`Literal`) reach the ranged path via the synthetic `node_kind_range` but are
+        // datatype-AGNOSTIC (they return every matching row regardless of datatype, like
+        // TerminusDB), so the homogeneity guard must NOT fire for them.
+        let (effective_range, complement_range, enforce_homogeneity) = match atom.object_kind {
+            ObjectKindFilter::Any => (atom.object_range.as_ref(), false, true),
+            ObjectKindFilter::Node => (Some(&node_kind_range), false, false),
+            ObjectKindFilter::Literal => (Some(&node_kind_range), true, false),
         };
         let (filter, range, kept_commitments, kept_columns, m) = match effective_range {
             None => {
@@ -222,6 +228,7 @@ pub fn prove_layer_bgp_with_result_and_context(
                     context, &spec,
                     object_range,
                     complement_range,
+                    enforce_homogeneity,
                     &s,
                     &p,
                     &o,
@@ -754,10 +761,16 @@ fn verify_layer_bgp_impl(
             op: RangeOp::Ge, datatype: ArkFr::from_u64(NODE_DATATYPE_TAG),
             c: ArkFr::zero(), b_bits: 64, second: None,
         };
-        let (effective_range, complement_range) = match atom.object_kind {
-            ObjectKindFilter::Any => (atom.object_range.as_ref(), false),
-            ObjectKindFilter::Node => (Some(&node_kind_range), false),
-            ObjectKindFilter::Literal => (Some(&node_kind_range), true),
+        // `enforce_homogeneity` is TRUE only for a GENUINE numeric range (`Any` + a numeric
+        // `object_range`): there the exact-datatype mask could silently DROP a comparable
+        // rational-family row (the under-report the guard forbids). Object-KIND filters
+        // (`Node`/`Literal`) reach the ranged path via the synthetic `node_kind_range` but are
+        // datatype-AGNOSTIC (they return every matching row regardless of datatype, like
+        // TerminusDB), so the homogeneity guard must NOT fire for them.
+        let (effective_range, complement_range, enforce_homogeneity) = match atom.object_kind {
+            ObjectKindFilter::Any => (atom.object_range.as_ref(), false, true),
+            ObjectKindFilter::Node => (Some(&node_kind_range), false, false),
+            ObjectKindFilter::Literal => (Some(&node_kind_range), true, false),
         };
         match effective_range {
             None => {
@@ -794,6 +807,7 @@ fn verify_layer_bgp_impl(
                     &spec,
                     object_range,
                     complement_range,
+                    enforce_homogeneity,
                     n,
                     a,
                     &com_s,

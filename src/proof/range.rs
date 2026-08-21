@@ -79,9 +79,9 @@ use super::argument::{
     ClaimShape, ColumnOpening, Expr, Operand, StoreProverContext, SumcheckClaim, SumcheckProof,
     SumcheckShape, Term, Transcript254,
 };
-#[cfg(test)]
 use super::argument::commit_column;
-use super::filter::{self, FilterProof};
+use super::filter::{self, BooleanProductProof, FilterProof};
+use crate::proof::CanonicalDatatype;
 use super::invalid;
 use super::logup_gkr::{
     bind_and_verify_fraction_tree, check_leaf_tie, prove_fraction_sum_zero, FractionInstance,
@@ -1383,6 +1383,236 @@ pub fn object_range_sel_column(
         .collect()
 }
 
+/// The honest datatype-mask column `dt_match[i] = χ_n[i] · [datatype(obj_id[i]) == T]`
+/// that [`prove_object_range_select`] commits internally as `com_dt_match` (its
+/// `datatype` filter's `Com(sel)`). Exposed so a composing layer (the base/present ranged
+/// atom) can obtain the SAME committed column WITHOUT re-deriving the private lookup —
+/// needed for the DATATYPE-HOMOGENEITY guard, which asserts every predicate-matched row of
+/// the compared column carries the pinned datatype `T`.
+///
+/// # Why the caller needs this (fail-closed fidelity)
+/// The object-range gadget MASKS out every row whose object datatype `!= T` (its `sel` is
+/// `dt_match ⊙ range_sel`). That mask silently DROPS a matched row of a *different* numeric
+/// datatype — but TerminusDB (`woql_compile.pl` `woql_less_normalized` /
+/// `numeric_types_compatible_for_comparison`) compares ALL rational-family numerics
+/// (`xsd:integer`, `xsd:decimal` and every subtype: `int`, `long`, `unsignedInt`, …) by
+/// VALUE across subtypes, and *errors* on rational-vs-IEEE754; it never silently excludes
+/// such a row. Non-numeric rows fall to Prolog's structural `compare/3`, which for the
+/// `Greater`/`Gte` direction places strings ABOVE numbers and so INCLUDES them — again not
+/// a silent exclusion. So masking-drop is a wrong-but-verifying UNDER-report whenever a
+/// matched row's datatype differs from `T`. The caller therefore reject-closes unless the
+/// matched set is datatype-homogeneous (== `T`); see the base/present ranged-atom paths.
+#[allow(clippy::too_many_arguments)]
+pub fn object_range_dtmatch_column(
+    obj_id: &[ArkFr],
+    dict_id: &[ArkFr],
+    dict_value: &[ArkFr],
+    dict_datatype: &[ArkFr],
+    n_dict: usize,
+    datatype_t: ArkFr,
+    real_n: usize,
+) -> Vec<ArkFr> {
+    let (_v_val, v_dt, _w) =
+        honest_dict_lookup(obj_id, dict_id, dict_value, dict_datatype, real_n, n_dict);
+    filter::honest_witness(&v_dt, datatype_t, real_n).0
+}
+
+/// The AUTHENTICATED object-datatype column `v_dt[i]` (the pinned-datatype filter's predicate
+/// column), recomputed for the composing ranged-atom guard WITHOUT re-deriving the private
+/// lookup. Same shape as [`object_range_dtmatch_column`] but returns the raw datatype tag per
+/// row (padding rows read the `0` sentinel = `String`, which is non-numeric).
+#[allow(clippy::too_many_arguments)]
+pub fn object_range_vdt_column(
+    obj_id: &[ArkFr],
+    dict_id: &[ArkFr],
+    dict_value: &[ArkFr],
+    dict_datatype: &[ArkFr],
+    n_dict: usize,
+    real_n: usize,
+) -> Vec<ArkFr> {
+    honest_dict_lookup(obj_id, dict_id, dict_value, dict_datatype, real_n, n_dict).1
+}
+
+// ===========================================================================
+// NUMERIC-FAMILY datatype classification for the range-atom fidelity guard.
+//
+// TerminusDB (`woql_compile.pl`) compares numbers with `woql_less_normalized`:
+//   * `is_rational_family_type` = `basetype_subsumption_of(T, xsd:decimal)` — xsd:decimal,
+//     xsd:integer, and EVERY integer subtype (int/long/short/byte, unsigned*, {non,}Neg/Pos
+//     Integer, …). These compare BY VALUE across subtypes.
+//   * `is_ieee754_family_type` = {xsd:float, xsd:double}.
+//   * rational-vs-IEEE754 ⇒ TDB ERRORS (query fails).
+//   * a NON-numeric row (node IRI, xsd:string, boolean, date, …) is NOT numerically compared
+//     — it falls to Prolog structural `compare/3`. That case is a documented KNOWN LIMITATION
+//     (see the ranged-atom guard): our numeric mask excludes such rows, which is faithful for
+//     the common aggregate/empty cases (a node column yields an empty numeric result) but can
+//     diverge for a value-returning FILTER whose structural comparison would include a string.
+//
+// The exact-datatype range mask under-reports ONLY when a matched row is NUMERIC-family but a
+// DIFFERENT datatype than the pinned one (a rational sibling TDB includes by value, or a
+// cross-family float TDB errors on). So the guard reject-closes iff a matched row's datatype is
+// numeric-family AND ≠ pinned; non-numeric rows are ALLOWED.
+// ===========================================================================
+
+/// The datatype tag fits in a byte (`CanonicalDatatype` discriminants < 47, node sentinel 255),
+/// so an 8-bit range gadget on the authenticated `v_dt` column is exact (`v_dt < 2^8`).
+pub const DATATYPE_TAG_BITS: usize = 8;
+
+/// The inclusive `CanonicalDatatype`-discriminant intervals that are NUMERIC-family
+/// (rational-family ∪ IEEE754), used as PUBLIC range bounds for the classification circuit.
+/// MUST stay in sync with [`is_numeric_family_tag`] — asserted by
+/// `numeric_family_intervals_match_classification`.
+pub(crate) const NUMERIC_FAMILY_TAG_INTERVALS: [(u64, u64); 3] = [(1, 8), (23, 26), (39, 42)];
+
+/// `true` iff `dt` is a NUMERIC-family datatype per `woql_compile.pl`
+/// (`is_rational_family_type` ∪ `is_ieee754_family_type`). EXHAUSTIVE match: a newly-added
+/// `CanonicalDatatype` variant forces an explicit classification here (and must be reflected in
+/// [`NUMERIC_FAMILY_TAG_INTERVALS`], guarded by a unit test).
+pub(crate) fn is_numeric_family_tag(dt: CanonicalDatatype) -> bool {
+    use CanonicalDatatype::*;
+    match dt {
+        // Rational-family (subsumes xsd:decimal): xsd:decimal, xsd:integer + fixed-width and
+        // named integer subtypes.
+        UInt32 | Int32 | UInt64 | Int64 | Decimal | BigInt | UInt8 | Int8 | UInt16 | Int16
+        | PositiveInteger | NonNegativeInteger | NonPositiveInteger | NegativeInteger => true,
+        // IEEE 754 family.
+        Float32 | Float64 => true,
+        // Everything else is NON-numeric (structural comparison in TDB) → allowed by the guard.
+        String | Boolean | LangString | AnyUri | Language | NormalizedString | Token | NmToken
+        | Name | NcName | Notation | QName | Id | IdRef | Entity | Date | DateTime
+        | DateTimeStamp | Time | GYear | GMonth | GDay | GYearMonth | GMonthDay | Duration
+        | YearMonthDuration | DayTimeDuration | Base64Binary | HexBinary | AnySimpleType
+        | DateTimeInterval => false,
+    }
+}
+
+/// One numeric-family cluster's membership circuit over the authenticated `v_dt` column:
+/// `cluster[i] = [v_dt[i] >= lo] · [v_dt[i] <= hi]` (an 8-bit closed interval).
+#[derive(Clone, Debug)]
+pub struct ClusterMembershipProof {
+    pub ge: RangeSelectProof,
+    pub com_ge: ArkGT,
+    pub le: RangeSelectProof,
+    pub com_le: ArkGT,
+    pub product: BooleanProductProof,
+    pub com_cluster: ArkGT,
+}
+
+/// The numeric-family MISMATCH circuit over the authenticated `v_dt`/`dt_match` columns:
+/// proves `com_numeric_mismatch` commits `numeric_mismatch[i] = [v_dt[i] numeric-family] ·
+/// (1 − dt_match[i])` — i.e. the rows that are numeric but a DIFFERENT datatype than pinned.
+/// The composing ranged atom then requires `equality_sel ⊙ numeric_mismatch == 0`.
+#[derive(Clone, Debug)]
+pub struct RangeNumericFamilyProof {
+    pub clusters: Vec<ClusterMembershipProof>,
+    pub numeric_mismatch: BooleanProductProof,
+    pub com_numeric_mismatch: ArkGT,
+}
+
+/// Prove the numeric-family mismatch column over the authenticated `v_dt` (the pinned-datatype
+/// filter's predicate column) and `dt_match` (`= [v_dt == pinned]`). Runs entirely at `v_dt`'s
+/// domain. Returns the proof, the `numeric_mismatch` column, and its commitment.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_range_numeric_family_mismatch_with_context(
+    context: &StoreProverContext<'_>,
+    v_dt: &[ArkFr],
+    com_v_dt: &ArkGT,
+    dt_match: &[ArkFr],
+    com_dt_match: &ArkGT,
+    real_n: usize,
+    transcript: &mut Transcript254,
+) -> io::Result<(RangeNumericFamilyProof, Vec<ArkFr>, ArkGT)> {
+    let size = v_dt.len();
+    if dt_match.len() != size {
+        return Err(invalid("numeric-family guard column length mismatch"));
+    }
+    let mut clusters = Vec::with_capacity(NUMERIC_FAMILY_TAG_INTERVALS.len());
+    let mut num_col = vec![f0(); size];
+    for (lo, hi) in NUMERIC_FAMILY_TAG_INTERVALS {
+        let lo = ArkFr::from_u64(lo);
+        let hi = ArkFr::from_u64(hi);
+        let (ge, com_ge) = prove_range_select_with_context(
+            context, v_dt, com_v_dt, RangeOp::Ge, lo, DATATYPE_TAG_BITS, real_n, transcript,
+        )?;
+        let (le, com_le) = prove_range_select_with_context(
+            context, v_dt, com_v_dt, RangeOp::Le, hi, DATATYPE_TAG_BITS, real_n, transcript,
+        )?;
+        let (_gb, ge_sel) = honest_witness(v_dt, real_n, RangeOp::Ge, lo, DATATYPE_TAG_BITS);
+        let (_lb, le_sel) = honest_witness(v_dt, real_n, RangeOp::Le, hi, DATATYPE_TAG_BITS);
+        let (product, com_cluster) = filter::prove_boolean_product_with_context(
+            context, &ge_sel, &le_sel, &com_ge, &com_le, transcript,
+        )?;
+        for i in 0..size {
+            num_col[i] = num_col[i] + ge_sel[i] * le_sel[i];
+        }
+        clusters.push(ClusterMembershipProof { ge, com_ge, le, com_le, product, com_cluster });
+    }
+    // com(num) = Σ com(cluster) (the clusters are DISJOINT, so num ∈ {0,1}); additively.
+    let com_num = clusters
+        .iter()
+        .skip(1)
+        .fold(clusters[0].com_cluster, |acc, c| acc + c.com_cluster);
+    // one_minus_dt = 1 − dt_match (χ_n-agnostic: padding dt_match = 0 ⇒ 1, but num = 0 there).
+    let one_minus_dt: Vec<ArkFr> = dt_match.iter().map(|d| f1() - *d).collect();
+    let com_ones = context.commit_column(&vec![f1(); size])?;
+    let com_one_minus_dt = com_ones - *com_dt_match;
+    let (numeric_mismatch, com_numeric_mismatch) = filter::prove_boolean_product_with_context(
+        context, &num_col, &one_minus_dt, &com_num, &com_one_minus_dt, transcript,
+    )?;
+    let nm_col: Vec<ArkFr> = num_col
+        .iter()
+        .zip(one_minus_dt.iter())
+        .map(|(a, b)| *a * *b)
+        .collect();
+    Ok((
+        RangeNumericFamilyProof { clusters, numeric_mismatch, com_numeric_mismatch },
+        nm_col,
+        com_numeric_mismatch,
+    ))
+}
+
+/// Verify the numeric-family mismatch circuit, returning the authenticated
+/// `com_numeric_mismatch`. Mirrors the prover on the shared transcript.
+pub fn verify_range_numeric_family_mismatch(
+    com_v_dt: &ArkGT,
+    com_dt_match: &ArkGT,
+    real_n: usize,
+    domain: usize,
+    proof: &RangeNumericFamilyProof,
+    transcript: &mut Transcript254,
+) -> io::Result<ArkGT> {
+    if proof.clusters.len() != NUMERIC_FAMILY_TAG_INTERVALS.len() {
+        return Err(invalid("numeric-family guard cluster count does not match the plan"));
+    }
+    for ((lo, hi), cluster) in NUMERIC_FAMILY_TAG_INTERVALS.iter().zip(&proof.clusters) {
+        let lo = ArkFr::from_u64(*lo);
+        let hi = ArkFr::from_u64(*hi);
+        verify_range_select(
+            com_v_dt, RangeOp::Ge, lo, DATATYPE_TAG_BITS, real_n, &cluster.com_ge, &cluster.ge,
+            transcript,
+        )?;
+        verify_range_select(
+            com_v_dt, RangeOp::Le, hi, DATATYPE_TAG_BITS, real_n, &cluster.com_le, &cluster.le,
+            transcript,
+        )?;
+        filter::verify_boolean_product(
+            &cluster.com_ge, &cluster.com_le, &cluster.com_cluster, &cluster.product, transcript,
+        )?;
+    }
+    let com_num = proof
+        .clusters
+        .iter()
+        .skip(1)
+        .fold(proof.clusters[0].com_cluster, |acc, c| acc + c.com_cluster);
+    let com_ones = commit_column(&vec![f1(); domain])?;
+    let com_one_minus_dt = com_ones - *com_dt_match;
+    filter::verify_boolean_product(
+        &com_num, &com_one_minus_dt, &proof.com_numeric_mismatch, &proof.numeric_mismatch,
+        transcript,
+    )?;
+    Ok(proof.com_numeric_mismatch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2303,5 +2533,46 @@ mod object_range_tests {
             let expected = expected_sel(&fx, &rows, real_n, UINT32_TAG, op, c);
             assert_eq!(com_sel, commit(&expected), "op {:?}", op);
         }
+    }
+}
+
+#[cfg(test)]
+mod numeric_family_classification_tests {
+    use super::*;
+    use crate::proof::commitment::NODE_DATATYPE_TAG;
+    use std::convert::TryFrom;
+
+    /// The PUBLIC range-bound intervals used by the classification circuit MUST cover EXACTLY
+    /// the datatypes [`is_numeric_family_tag`] deems numeric-family. If a new `CanonicalDatatype`
+    /// variant is added, the exhaustive match in `is_numeric_family_tag` forces a decision, and
+    /// this test forces `NUMERIC_FAMILY_TAG_INTERVALS` to stay in sync (else a numeric variant
+    /// outside the intervals would be silently allowed = an UNDER-report soundness hole).
+    #[test]
+    fn numeric_family_intervals_match_classification() {
+        let in_intervals = |tag: u64| {
+            NUMERIC_FAMILY_TAG_INTERVALS
+                .iter()
+                .any(|(lo, hi)| tag >= *lo && tag <= *hi)
+        };
+        for tag in 0u16..=255 {
+            let tag8 = tag as u8;
+            match CanonicalDatatype::try_from(tag8) {
+                Ok(dt) => assert_eq!(
+                    is_numeric_family_tag(dt),
+                    in_intervals(tag as u64),
+                    "datatype tag {tag} ({dt:?}) classification disagrees with the interval circuit"
+                ),
+                Err(_) => {
+                    // Unassigned tags (incl. the node sentinel) are NOT numeric-family and must
+                    // fall OUTSIDE the numeric intervals (so a node/unknown row is allowed).
+                    assert!(
+                        !in_intervals(tag as u64),
+                        "unassigned datatype tag {tag} must not be inside a numeric interval"
+                    );
+                }
+            }
+        }
+        // The node sentinel is explicitly non-numeric (allowed by the guard).
+        assert!(!in_intervals(NODE_DATATYPE_TAG));
     }
 }

@@ -287,6 +287,27 @@ impl LayerBgpPlan {
 /// `d_log`/`n_dict` are re-derived by the verifier from the (root-verified) layer, so
 /// they are NOT carried here; every commitment below is authenticated against a
 /// root-bound source (the relocations) or the shared transcript.
+/// The NUMERIC-FAMILY datatype guard sub-proof for a numeric range atom (fail-closed
+/// fidelity). The object-range gadget masks out every predicate-matched row whose object
+/// datatype `!=` the pinned datatype. That is a wrong-but-verifying UNDER-report ONLY when the
+/// dropped row is itself NUMERIC-family but a different datatype (a rational sibling TerminusDB
+/// compares by value, or a cross-family float TDB errors on); NON-numeric rows (node IRIs,
+/// strings, …) are correctly excluded by the numeric mask. So this circuit authenticates the
+/// `numeric_mismatch` column (`[v_dt numeric-family] · [v_dt != pinned]`) over the object-range
+/// gadget's committed `v_dt`/`dt_match` (at `D`), relocates it to the table domain, and proves
+/// `Com(equality_sel ⊙ numeric_mismatch) == Com(0)` — i.e. NO predicate-matched row is a
+/// numeric-family mismatch. See [`terminus_store::proof::range::RangeNumericFamilyProof`].
+#[derive(Clone, Debug)]
+pub struct RangeDatatypeGuardProof {
+    pub numeric: RangeNumericFamilyProof,
+    /// `numeric_mismatch` relocated from the dict domain `D` to the table domain.
+    pub relocate_mismatch: RelocationProof,
+    pub com_mismatch_at_table: ArkGT,
+    /// `equality_sel ⊙ numeric_mismatch`; verification asserts its commitment is `Com(0)`.
+    pub bad: BooleanProductProof,
+    pub com_bad: ArkGT,
+}
+
 #[derive(Clone, Debug)]
 pub struct RangeAtomSubproof {
     /// Object column (table -> D) + the three dict columns (dict -> D) relocations.
@@ -310,6 +331,14 @@ pub struct RangeAtomSubproof {
     /// The constant-equality selection (predicate + any subject constant) and `Com(sel)`.
     pub equality: SelectionOnlyProof,
     pub com_equality_sel: ArkGT,
+    /// NUMERIC-FAMILY datatype guard (fail-closed fidelity) — present ONLY for a GENUINE numeric
+    /// range atom that pins a numeric datatype and masks to it (`ObjectKindFilter::Any` + a
+    /// numeric `object_range`). `None` for object-KIND filters (`Node`/`Literal`, which reach
+    /// this same code path via a synthetic `node_kind_range`): those are datatype-agnostic —
+    /// they faithfully return every matching row regardless of datatype — so no reject-close
+    /// applies. The presence is fixed by the PUBLIC atom (its `object_kind` + `object_range`),
+    /// reconstructed identically by the verifier, so a prover cannot skip an enforced guard.
+    pub datatype_guard: Option<RangeDatatypeGuardProof>,
     /// The product `combined_sel = equality_sel · range_sel` and its commitment.
     pub combine: BooleanProductProof,
     pub com_combined_sel: ArkGT,

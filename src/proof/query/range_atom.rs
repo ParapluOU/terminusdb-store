@@ -87,6 +87,12 @@ pub(super) fn prove_ranged_atom(
     spec: &AtomFilterSpec,
     range: &ObjectRangeSpec,
     complement_range: bool,
+    // TRUE only for a GENUINE numeric range (a pinned numeric datatype whose exact-datatype
+    // mask could silently DROP a comparable rational-family row). FALSE for object-KIND
+    // filters (`Node`/`Literal`) that reach this path via a synthetic `node_kind_range`:
+    // those are datatype-agnostic (return every matching row regardless of datatype), so the
+    // homogeneity reject-close must NOT fire.
+    enforce_homogeneity: bool,
     s: &[ArkFr],
     p: &[ArkFr],
     o: &[ArkFr],
@@ -291,6 +297,73 @@ pub(super) fn prove_ranged_atom(
             context, spec, s, p, o, n, com_s, com_p, com_o, transcript,
         )?;
 
+    // (d2) NUMERIC-FAMILY datatype guard (fail-closed fidelity) — ONLY for a GENUINE numeric
+    // range. The object-range gadget's datatype mask silently DROPS a predicate-matched row
+    // whose object datatype != range.datatype. That is a wrong-but-verifying UNDER-report ONLY
+    // when the dropped row is itself NUMERIC-family (rational-family per
+    // `woql_compile.pl` `is_rational_family_type`, or IEEE754 float/double): TerminusDB
+    // compares rational siblings BY VALUE and ERRORS on rational-vs-float, so it never silently
+    // drops such a row. A NON-numeric row (node IRI, xsd:string, boolean, date, …) IS correctly
+    // excluded by the numeric mask (its numeric comparison yields no membership) — so those are
+    // ALLOWED and must NOT reject. KNOWN LIMITATION: a value-returning numeric FILTER over a
+    // column that ALSO holds non-numeric literals, where TerminusDB's Prolog structural
+    // `compare/3` would INCLUDE e.g. a string, is NOT covered here (documented; avoids
+    // over-rejecting aggregates / value-selection over non-numeric columns). So: authenticate
+    // `numeric_mismatch = [v_dt numeric-family] · [v_dt != pinned]` over the object-range
+    // gadget's committed v_dt/dt_match (at `D`), relocate it to the table domain, and prove NO
+    // predicate-matched row is a numeric-family mismatch (`Com(equality_sel ⊙ numeric_mismatch)
+    // == Com(0)`). SKIPPED for an object-KIND filter (`Node`/`Literal`), which is agnostic.
+    let datatype_guard = if enforce_homogeneity {
+        let v_dt_at_d = object_range_vdt_column(
+            &o_at_d, &dict_id_at_d, &dict_value_at_d, &dict_datatype_at_d, n_dict, n,
+        );
+        let dt_match_at_d = object_range_dtmatch_column(
+            &o_at_d, &dict_id_at_d, &dict_value_at_d, &dict_datatype_at_d, n_dict, range.datatype, n,
+        );
+        let (numeric, nm_at_d, com_nm_at_d) = prove_range_numeric_family_mismatch_with_context(
+            context,
+            &v_dt_at_d,
+            &object_range.lookup.com_v_dt,
+            &dt_match_at_d,
+            &object_range.com_dt_match,
+            n,
+            transcript,
+        )?;
+        // Relocate the numeric-mismatch column D -> table (its support is [0, n) ⊆ table).
+        let nm_at_table = nm_at_d[..table].to_vec();
+        // Descriptive early reject (the boolean product + zero-commitment check below is the
+        // authoritative, verifier-checked enforcement).
+        for i in 0..n {
+            if eq_sel[i] != ArkFr::zero() && nm_at_table[i] != ArkFr::zero() {
+                return Err(invalid(
+                    "RangeDatatypeNotHomogeneous: a predicate-matched row's object has a NUMERIC                      datatype other than the range constant's; TerminusDB compares rational-family                      numerics across subtypes by value (and errors on rational-vs-float), so the                      exact-datatype range mask cannot answer this query faithfully — reject-closed",
+                ));
+            }
+        }
+        let com_mismatch_at_table = context.commit_column(&nm_at_table)?;
+        let relocate_mismatch = prove_column_relocation_with_context(
+            context, &nm_at_d, &com_nm_at_d, &nm_at_table, &com_mismatch_at_table, transcript,
+        )?;
+        let (bad, com_bad) = prove_boolean_product_with_context(
+            context, &eq_sel, &nm_at_table, &com_equality_sel, &com_mismatch_at_table, transcript,
+        )?;
+        let com_zero = context.commit_column(&vec![ArkFr::zero(); table])?;
+        if com_bad != com_zero {
+            return Err(invalid(
+                "RangeDatatypeNotHomogeneous: a predicate-matched row is a numeric-family datatype                  mismatch with the range constant — reject-closed",
+            ));
+        }
+        Some(RangeDatatypeGuardProof {
+            numeric,
+            relocate_mismatch,
+            com_mismatch_at_table,
+            bad,
+            com_bad,
+        })
+    } else {
+        None
+    };
+
     // (e) Combined selection = equality_sel ⊙ range_sel (both boolean + χ_n-masked).
     let (combine, com_combined_sel) = prove_boolean_product_with_context(
         context, &eq_sel,
@@ -341,6 +414,7 @@ pub(super) fn prove_ranged_atom(
             second,
             equality,
             com_equality_sel,
+            datatype_guard,
             combine,
             com_combined_sel,
             compaction,
@@ -367,6 +441,9 @@ pub(super) fn verify_ranged_atom(
     spec: &AtomFilterSpec,
     range: &ObjectRangeSpec,
     complement_range: bool,
+    // See `prove_ranged_atom`: TRUE only for a genuine numeric range (public, from the atom's
+    // `object_kind` + `object_range`); FALSE for datatype-agnostic object-KIND filters.
+    enforce_homogeneity: bool,
     n: usize,
     a: usize,
     com_s: &ArkGT,
@@ -453,6 +530,13 @@ pub(super) fn verify_ranged_atom(
         if rounds != expected {
             return Err(invalid(
                 "ranged atom sub-proof dimension does not match the layer's committed domains",
+            ));
+        }
+    }
+    if let Some(g) = &sub.datatype_guard {
+        if g.bad.sumcheck.round_polys.len() != a {
+            return Err(invalid(
+                "ranged atom datatype-guard sub-proof dimension does not match the table domain",
             ));
         }
     }
@@ -600,6 +684,53 @@ pub(super) fn verify_ranged_atom(
         &sub.equality,
         transcript,
     )?;
+
+    // (d2) NUMERIC-FAMILY datatype guard (fail-closed fidelity) — enforced ONLY for a genuine
+    // numeric range (`enforce_homogeneity`, reconstructed from the PUBLIC atom); an object-KIND
+    // filter carries no such sub-proof. Authenticate `numeric_mismatch` over the object-range
+    // gadget's committed v_dt/dt_match (at `D`), relocate it to the table domain, then require
+    // `Com(equality_sel ⊙ numeric_mismatch) == Com(0)`: NO predicate-matched row is a
+    // numeric-family datatype mismatch (a rational sibling TDB compares by value / a
+    // cross-family float TDB errors on). Non-numeric rows are allowed (excluded faithfully).
+    match (enforce_homogeneity, &sub.datatype_guard) {
+        (true, Some(g)) => {
+            let com_nm_at_d = verify_range_numeric_family_mismatch(
+                &sub.object_range.lookup.com_v_dt,
+                &sub.object_range.com_dt_match,
+                n,
+                1usize << d_log,
+                &g.numeric,
+                transcript,
+            )?;
+            verify_column_relocation(
+                &com_nm_at_d,
+                d_log,
+                &g.com_mismatch_at_table,
+                a,
+                &g.relocate_mismatch,
+                transcript,
+            )?;
+            verify_boolean_product(
+                &sub.com_equality_sel,
+                &g.com_mismatch_at_table,
+                &g.com_bad,
+                &g.bad,
+                transcript,
+            )?;
+            let com_zero = commit_column(&vec![ArkFr::zero(); 1usize << a])?;
+            if g.com_bad != com_zero {
+                return Err(invalid(
+                    "RangeDatatypeNotHomogeneous: a predicate-matched row is a numeric-family                      datatype mismatch with the range constant — reject-closed",
+                ));
+            }
+        }
+        (false, None) => {}
+        _ => {
+            return Err(invalid(
+                "ranged atom datatype-guard sub-proof presence does not match the public plan",
+            ))
+        }
+    }
 
     // (e) Verify the combined selection = equality_sel · range_sel.
     verify_boolean_product(
