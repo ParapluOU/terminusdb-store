@@ -171,6 +171,7 @@ mod delta_read;
 mod present_bgp;
 mod present_filter;
 mod present_join;
+mod present_order;
 mod present_result;
 mod reconcile_core;
 #[cfg(test)]
@@ -208,6 +209,11 @@ pub use delta_read::{
     attach_termless_delta_openings, build_termless_delta_openings, decode_and_verify_delta_read,
     prove_delta_read, verify_and_resolve_delta_read, verify_and_resolve_delta_read_from_views,
     verify_delta_read, verify_delta_read_from_views, DeltaReadProof, DeltaSource,
+};
+pub use present_order::{
+    attach_termless_present_order_openings, prove_read_order_bgp, verify_and_resolve_order_bgp,
+    verify_and_resolve_order_bgp_from_views, verify_read_order_bgp, verify_read_order_bgp_from_views,
+    PresentScalarOrderProof,
 };
 
 // ---------------------------------------------------------------------------

@@ -3257,3 +3257,160 @@ fn present_range_termbearing_rejects_float_nan() {
         "an integer range is unaffected by the float NaN guard"
     );
 }
+
+// ============================================================
+// ORDER — single-column, full-key, numeric OrderBy over the reconciled present.
+// ============================================================
+
+use crate::proof::order::OrderDirection;
+
+/// A base+delta stack where subject `item` has many `score` (UInt32) values, so
+/// `Triple(<item>, score, ?score)` binds ONE numeric object column with several rows.
+/// present item scores = {30, 10, 20, 25, 40}  (base 5, 50 removed; 25, 40 added).
+fn order_stack() -> Vec<Arc<LayerCommitment>> {
+    use tdb_succinct::TdbDataType;
+    let store = open_sync_memory_store();
+    let b = store.create_base_layer().unwrap();
+    for score in [30u32, 10, 20, 50, 5] {
+        b.add_value_triple(ValueTriple::new_value(&iri("item"), &iri("score"), u32::make_entry(&score)))
+            .unwrap();
+    }
+    let base = b.commit().unwrap();
+    let base_lc = base.proof_commitment().unwrap();
+    let child = base.open_write().unwrap();
+    child.remove_value_triple(ValueTriple::new_value(&iri("item"), &iri("score"), u32::make_entry(&5u32))).unwrap();
+    child.remove_value_triple(ValueTriple::new_value(&iri("item"), &iri("score"), u32::make_entry(&50u32))).unwrap();
+    child.add_value_triple(ValueTriple::new_value(&iri("item"), &iri("score"), u32::make_entry(&25u32))).unwrap();
+    child.add_value_triple(ValueTriple::new_value(&iri("item"), &iri("score"), u32::make_entry(&40u32))).unwrap();
+    let head = child.commit().unwrap();
+    vec![base_lc, head.proof_commitment().unwrap()]
+}
+
+fn uint32_obj(v: u32) -> CanonicalObject {
+    CanonicalObject::Value {
+        datatype: crate::proof::CanonicalDatatype::UInt32,
+        lexical: v.to_be_bytes().to_vec(),
+    }
+}
+
+/// `Triple(<item>, score, ?score)` — subject constant, so the ONLY kept column is the numeric
+/// object value (a single-column full-key order input).
+fn item_score_atom() -> PresentBgpAtom {
+    PresentBgpAtom {
+        subject: node_const("http://ex/item"),
+        predicate_hash: hash_pred("http://ex/score"),
+        object: var(),
+        subject_object_equal: false,
+        object_range: None,
+    }
+}
+
+#[test]
+fn present_scalar_order_ascending_over_delta_stack() {
+    let layers = order_stack();
+    let lref = refs(&layers);
+    let atoms = [item_score_atom()];
+    let (rec, bgp, order, result) = prove_read_order_bgp(
+        &lref, &atoms, &[], crate::proof::CanonicalDatatype::UInt32, OrderDirection::Ascending,
+    )
+    .unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let n = verify_read_order_bgp(
+        &lref, head_root, &atoms, &[], crate::proof::CanonicalDatatype::UInt32,
+        OrderDirection::Ascending, &rec, &bgp, &order,
+    )
+    .unwrap();
+    assert_eq!(n, 5, "present item has 5 scores");
+
+    let resolved = verify_and_resolve_order_bgp(
+        &lref, head_root, &atoms, &[], crate::proof::CanonicalDatatype::UInt32,
+        OrderDirection::Ascending, &rec, &bgp, &order, &result.columns,
+    )
+    .unwrap();
+    // Exactly one ORDERED column, ascending by numeric value (NOT raw dictionary id order).
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0],
+        vec![uint32_obj(10), uint32_obj(20), uint32_obj(25), uint32_obj(30), uint32_obj(40)],
+        "resolved scores must come back in ASCENDING numeric order"
+    );
+
+    // Soundness: a wrong chain anchor (the base root, not the head) rejects.
+    let base_root = lref[0].resolution_root();
+    assert!(verify_read_order_bgp(
+        &lref, base_root, &atoms, &[], crate::proof::CanonicalDatatype::UInt32,
+        OrderDirection::Ascending, &rec, &bgp, &order,
+    )
+    .is_err());
+}
+
+#[test]
+fn present_scalar_order_descending_over_delta_stack() {
+    let layers = order_stack();
+    let lref = refs(&layers);
+    let atoms = [item_score_atom()];
+    let (rec, bgp, order, result) = prove_read_order_bgp(
+        &lref, &atoms, &[], crate::proof::CanonicalDatatype::UInt32, OrderDirection::Descending,
+    )
+    .unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let resolved = verify_and_resolve_order_bgp(
+        &lref, head_root, &atoms, &[], crate::proof::CanonicalDatatype::UInt32,
+        OrderDirection::Descending, &rec, &bgp, &order, &result.columns,
+    )
+    .unwrap();
+    assert_eq!(
+        resolved[0],
+        vec![uint32_obj(40), uint32_obj(30), uint32_obj(25), uint32_obj(20), uint32_obj(10)],
+        "resolved scores must come back in DESCENDING numeric order"
+    );
+}
+
+#[test]
+fn present_scalar_order_rejects_direction_substitution() {
+    // An ASCENDING order proof must NOT verify as DESCENDING: the nondecreasing sort key is over the
+    // authenticated value column, so a wrong sort order (the affine complement is not nondecreasing)
+    // is rejected — the wrong-order rejection the ORDER gadget guarantees.
+    let layers = order_stack();
+    let lref = refs(&layers);
+    let atoms = [item_score_atom()];
+    let (rec, bgp, order, _result) = prove_read_order_bgp(
+        &lref, &atoms, &[], crate::proof::CanonicalDatatype::UInt32, OrderDirection::Ascending,
+    )
+    .unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    // Sanity: it verifies as ascending.
+    assert!(verify_read_order_bgp(
+        &lref, head_root, &atoms, &[], crate::proof::CanonicalDatatype::UInt32,
+        OrderDirection::Ascending, &rec, &bgp, &order,
+    )
+    .is_ok());
+    // ... but NOT as descending.
+    assert!(verify_read_order_bgp(
+        &lref, head_root, &atoms, &[], crate::proof::CanonicalDatatype::UInt32,
+        OrderDirection::Descending, &rec, &bgp, &order,
+    )
+    .is_err());
+}
+
+#[test]
+fn present_scalar_order_rejects_permuted_output() {
+    // A PERMUTED (out-of-order) claimed result column fails the resolution re-commitment bind to the
+    // authenticated ordered output — a fabricated/reordered answer is rejected.
+    let layers = order_stack();
+    let lref = refs(&layers);
+    let atoms = [item_score_atom()];
+    let (rec, bgp, order, result) = prove_read_order_bgp(
+        &lref, &atoms, &[], crate::proof::CanonicalDatatype::UInt32, OrderDirection::Ascending,
+    )
+    .unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    // Swap two adjacent rows of the claimed ordered column.
+    let mut tampered = result.columns.clone();
+    tampered[0].swap(0, 1);
+    assert!(verify_and_resolve_order_bgp(
+        &lref, head_root, &atoms, &[], crate::proof::CanonicalDatatype::UInt32,
+        OrderDirection::Ascending, &rec, &bgp, &order, &tampered,
+    )
+    .is_err());
+}
