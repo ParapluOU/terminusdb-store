@@ -57,10 +57,8 @@ use super::join::{
     self_join_domain, verify_self_join_complete, SelfJoinCommitments, SelfJoinCompleteProof,
 };
 use super::range::{
-    object_range_dtmatch_column, object_range_sel_column, object_range_vdt_column,
-    prove_object_range_select_with_context, prove_range_numeric_family_mismatch_with_context,
-    verify_object_range_select, verify_range_numeric_family_mismatch, ObjectRangeProof, RangeOp,
-    RangeNumericFamilyProof,
+    object_range_dtmatch_column, object_range_sel_column, prove_object_range_select_with_context,
+    verify_object_range_select, ObjectRangeProof, RangeOp,
 };
 use super::relocate::{
     prove_column_relocation_with_context, verify_column_relocation, RelocationProof,

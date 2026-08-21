@@ -95,14 +95,15 @@ pub struct PresentSecondRange {
     pub com_intersection_sel: ArkGT,
 }
 
-/// The NUMERIC-FAMILY datatype guard for a `present` ranged atom (fail-closed fidelity). Same
-/// circuit as the base path's [`RangeDatatypeGuardProof`], minus the relocation: `present`'s
-/// object column and equality selection already share the working domain, so the
-/// `numeric_mismatch` column feeds the `equality_sel ⊙ numeric_mismatch == 0` product directly.
+/// The DATATYPE-HOMOGENEITY guard for a `present` ranged atom (fail-closed fidelity). Same as
+/// the base path's [`RangeDatatypeGuardProof`], minus the relocation: `present`'s object column
+/// and equality selection already share the working domain, so `(1 − dt_match)` feeds the
+/// `equality_sel ⊙ (1 − dt_match) == 0` product directly. A datatype-heterogeneous compared
+/// column reject-closes (we refuse rather than under-report TerminusDB's cross-datatype
+/// comparison); homogeneous data is unaffected.
 #[derive(Clone, Debug)]
 pub struct PresentRangeDatatypeGuardProof {
-    pub numeric: RangeNumericFamilyProof,
-    /// `equality_sel ⊙ numeric_mismatch`; verification asserts its commitment is `Com(0)`.
+    /// `equality_sel ⊙ (1 − dt_match)`; verification asserts its commitment is `Com(0)`.
     pub bad: BooleanProductProof,
     pub com_bad: ArkGT,
 }
@@ -117,13 +118,11 @@ pub struct PresentRangeSubproof {
     pub second: Option<PresentSecondRange>,
     pub equality: SelectionOnlyProof,
     pub com_equality_sel: ArkGT,
-    /// NUMERIC-FAMILY datatype guard (fail-closed fidelity). `present`'s object id column, the
-    /// combined range dict, and the equality selection share the working domain (no relocation).
-    /// Authenticates `numeric_mismatch = [v_dt numeric-family] · [v_dt != pinned]` over the
-    /// object-range gadget's committed v_dt/dt_match and asserts
-    /// `Com(equality_sel ⊙ numeric_mismatch) == Com(0)` — no predicate-matched present row is a
-    /// numeric-family datatype mismatch (a rational sibling TDB compares by value / a
-    /// cross-family float TDB errors on). Non-numeric rows are allowed (excluded faithfully).
+    /// DATATYPE-HOMOGENEITY guard (fail-closed fidelity). `present`'s object id column and
+    /// equality selection share the working domain (no relocation): asserts
+    /// `Com(equality_sel ⊙ (1 − dt_match)) == Com(0)` over the object-range gadget's committed
+    /// `dt_match` — every predicate-matched present row carries the pinned datatype, else the
+    /// heterogeneous column is reject-closed (we refuse rather than under-report).
     pub datatype_guard: PresentRangeDatatypeGuardProof,
     pub combine: BooleanProductProof,
     pub com_combined_sel: ArkGT,
@@ -615,49 +614,42 @@ pub(super) fn prove_present_range_atom(
         &artifacts.com_present_s, &artifacts.com_present_p, &artifacts.com_present_o, transcript,
     )?;
 
-    // (2h) NUMERIC-FAMILY datatype guard (fail-closed fidelity). The object-range gadget masks
-    // out every matched present row whose object datatype != range.datatype; that under-reports
-    // ONLY when the dropped row is itself NUMERIC-family (a rational sibling TDB compares by
-    // value / a cross-family float TDB errors on). Non-numeric rows (nodes, strings, …) are
-    // excluded faithfully. `present`'s object id column, range dict, and equality selection
-    // share the working domain (no relocation): authenticate `numeric_mismatch` and require
-    // `Com(equality_sel ⊙ numeric_mismatch) == Com(0)`. (Same KNOWN LIMITATION as the base
-    // path: a value-returning numeric FILTER over a column that ALSO holds non-numeric literals
-    // — where TDB's structural `compare/3` could include a string — is not covered here.)
-    let v_dt = object_range_vdt_column(
-        &artifacts.present_id_o, &range_dict.id_at_k, &range_dict.value_at_k,
-        &range_dict.datatype_at_k, head_nv, m,
-    );
+    // (2h) DATATYPE-HOMOGENEITY guard (fail-closed fidelity). The object-range gadget masks out
+    // every matched present row whose object datatype != range.datatype; we CANNOT faithfully
+    // answer such a query (rational siblings compared by value / rational-vs-float errors /
+    // non-numeric rows reaching Prolog structural `compare/3`, which can INCLUDE a string/node
+    // the mask drops = under-report). So we FAIL CLOSED. `present`'s object id column and
+    // equality selection share the working domain (no relocation): require
+    // `Com(equality_sel ⊙ (1 − dt_match)) == Com(0)`.
     let dt_match = object_range_dtmatch_column(
         &artifacts.present_id_o, &range_dict.id_at_k, &range_dict.value_at_k,
         &range_dict.datatype_at_k, head_nv, range.datatype, m,
     );
-    let (numeric, nm_col, com_nm) = prove_range_numeric_family_mismatch_with_context(
-        context, &v_dt, &object_range.lookup.com_v_dt, &dt_match, &object_range.com_dt_match, m,
-        transcript,
-    )?;
+    let one_minus_dt: Vec<ArkFr> = dt_match.iter().map(|d| f1() - *d).collect();
     for i in 0..m {
-        if eq_sel[i] != f0() && nm_col[i] != f0() {
+        if eq_sel[i] != f0() && one_minus_dt[i] != f0() {
             return Err(invalid(
                 "RangeDatatypeNotHomogeneous: a predicate-matched present row's object has a \
-                 NUMERIC datatype other than the range constant's; TerminusDB compares \
-                 rational-family numerics across subtypes by value (and errors on \
-                 rational-vs-float), so the exact-datatype range mask cannot answer this query \
-                 faithfully — reject-closed",
+                 datatype other than the range constant's; a numeric range/order/aggregate over \
+                 a datatype-heterogeneous column cannot faithfully match TerminusDB's \
+                 cross-datatype value+structural comparison — reject-closed (fail-closed)",
             ));
         }
     }
+    let domain = artifacts.present_id_o.len();
+    let com_ones = context.commit_column(&vec![f1(); domain])?;
+    let com_one_minus_dt = com_ones - object_range.com_dt_match;
     let (bad, com_bad) = prove_boolean_product_with_context(
-        context, &eq_sel, &nm_col, &com_equality_sel, &com_nm, transcript,
+        context, &eq_sel, &one_minus_dt, &com_equality_sel, &com_one_minus_dt, transcript,
     )?;
-    let com_zero = context.commit_column(&vec![f0(); artifacts.present_id_o.len()])?;
+    let com_zero = context.commit_column(&vec![f0(); domain])?;
     if com_bad != com_zero {
         return Err(invalid(
-            "RangeDatatypeNotHomogeneous: a predicate-matched present row is a numeric-family \
-             datatype mismatch with the range constant — reject-closed",
+            "RangeDatatypeNotHomogeneous: the compared present column is not datatype-homogeneous \
+             over the predicate-matched rows — reject-closed (fail-closed)",
         ));
     }
-    let datatype_guard = PresentRangeDatatypeGuardProof { numeric, bad, com_bad };
+    let datatype_guard = PresentRangeDatatypeGuardProof { bad, com_bad };
 
     // (3) Combined selection = equality_sel · range_sel (both boolean, chi_n-masked).
     let (combine, com_combined_sel) = prove_boolean_product_with_context(
@@ -856,24 +848,23 @@ pub(super) fn verify_present_range_atom(
         spec, m, &verified.com_present_s, &verified.com_present_p, &verified.com_present_o,
         &sub.com_equality_sel, &sub.equality, transcript,
     )?;
-    // (2h) NUMERIC-FAMILY datatype guard (fail-closed fidelity): authenticate `numeric_mismatch`
-    // over the object-range gadget's committed v_dt/dt_match (working domain), then require
-    // `Com(equality_sel ⊙ numeric_mismatch) == Com(0)` — no predicate-matched present row is a
-    // numeric-family datatype mismatch. Non-numeric rows are allowed (excluded faithfully).
+    // (2h) DATATYPE-HOMOGENEITY guard (fail-closed fidelity): require
+    // `Com(equality_sel ⊙ (1 − dt_match)) == Com(0)` over the object-range gadget's committed
+    // `dt_match` (working domain) — every predicate-matched present row carries the pinned
+    // datatype, else the heterogeneous column is reject-closed (we refuse rather than
+    // under-report TerminusDB's cross-datatype comparison).
     let domain = 1usize << verified.working_log;
-    let com_nm = verify_range_numeric_family_mismatch(
-        &sub.object_range.lookup.com_v_dt, &sub.object_range.com_dt_match, m, domain,
-        &sub.datatype_guard.numeric, transcript,
-    )?;
+    let com_ones = commit_column(&vec![f1(); domain])?;
+    let com_one_minus_dt = com_ones - sub.object_range.com_dt_match;
     verify_boolean_product(
-        &sub.com_equality_sel, &com_nm, &sub.datatype_guard.com_bad, &sub.datatype_guard.bad,
-        transcript,
+        &sub.com_equality_sel, &com_one_minus_dt, &sub.datatype_guard.com_bad,
+        &sub.datatype_guard.bad, transcript,
     )?;
     let com_zero = commit_column(&vec![f0(); domain])?;
     if sub.datatype_guard.com_bad != com_zero {
         return Err(invalid(
-            "RangeDatatypeNotHomogeneous: a predicate-matched present row is a numeric-family \
-             datatype mismatch with the range constant — reject-closed",
+            "RangeDatatypeNotHomogeneous: the compared present column is not datatype-homogeneous \
+             over the predicate-matched rows — reject-closed (fail-closed)",
         ));
     }
     // (3) Combined selection = equality_sel · range_sel.

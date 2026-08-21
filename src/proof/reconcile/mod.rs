@@ -111,10 +111,8 @@ use super::sort::{
     prove_strictly_sorted_bits_with_context, verify_strictly_sorted_bits, SortedProof,
 };
 use super::range::{
-    object_range_dtmatch_column, object_range_sel_column, object_range_vdt_column,
-    prove_object_range_select_with_context, prove_range_numeric_family_mismatch_with_context,
-    verify_object_range_select, verify_range_numeric_family_mismatch, ObjectRangeProof,
-    RangeNumericFamilyProof, OBJECT_RANGE_B_BITS,
+    object_range_dtmatch_column, object_range_sel_column, prove_object_range_select_with_context,
+    verify_object_range_select, ObjectRangeProof, OBJECT_RANGE_B_BITS,
 };
 use super::relocate::{
     prove_column_relocation_with_context, verify_column_relocation, RelocationProof,

@@ -297,66 +297,58 @@ pub(super) fn prove_ranged_atom(
             context, spec, s, p, o, n, com_s, com_p, com_o, transcript,
         )?;
 
-    // (d2) NUMERIC-FAMILY datatype guard (fail-closed fidelity) — ONLY for a GENUINE numeric
+    // (d2) DATATYPE-HOMOGENEITY guard (fail-closed fidelity) — ONLY for a GENUINE numeric
     // range. The object-range gadget's datatype mask silently DROPS a predicate-matched row
-    // whose object datatype != range.datatype. That is a wrong-but-verifying UNDER-report ONLY
-    // when the dropped row is itself NUMERIC-family (rational-family per
-    // `woql_compile.pl` `is_rational_family_type`, or IEEE754 float/double): TerminusDB
-    // compares rational siblings BY VALUE and ERRORS on rational-vs-float, so it never silently
-    // drops such a row. A NON-numeric row (node IRI, xsd:string, boolean, date, …) IS correctly
-    // excluded by the numeric mask (its numeric comparison yields no membership) — so those are
-    // ALLOWED and must NOT reject. KNOWN LIMITATION: a value-returning numeric FILTER over a
-    // column that ALSO holds non-numeric literals, where TerminusDB's Prolog structural
-    // `compare/3` would INCLUDE e.g. a string, is NOT covered here (documented; avoids
-    // over-rejecting aggregates / value-selection over non-numeric columns). So: authenticate
-    // `numeric_mismatch = [v_dt numeric-family] · [v_dt != pinned]` over the object-range
-    // gadget's committed v_dt/dt_match (at `D`), relocate it to the table domain, and prove NO
-    // predicate-matched row is a numeric-family mismatch (`Com(equality_sel ⊙ numeric_mismatch)
-    // == Com(0)`). SKIPPED for an object-KIND filter (`Node`/`Literal`), which is agnostic.
+    // whose object datatype != range.datatype. We CANNOT faithfully answer such a query:
+    // TerminusDB compares rational-family numerics across subtypes BY VALUE, ERRORS on
+    // rational-vs-float, and a NON-numeric row reaches Prolog structural `compare/3` (which can
+    // INCLUDE a string/node the exact-numeric mask drops = a wrong-but-verifying UNDER-report).
+    // So we FAIL CLOSED: reject-close unless EVERY predicate-matched row carries the pinned
+    // datatype (strict homogeneity). Homogeneous (schema-constrained) data is unaffected.
+    // Recompute the authenticated `dt_match` at `D`, relocate it to the table domain (tied to
+    // the object-range gadget's committed `com_dt_match`), and prove
+    // `Com(equality_sel ⊙ (1 − dt_match)) == Com(0)`. SKIPPED for an object-KIND filter
+    // (`Node`/`Literal`), which is datatype-agnostic (returns every matching row).
     let datatype_guard = if enforce_homogeneity {
-        let v_dt_at_d = object_range_vdt_column(
-            &o_at_d, &dict_id_at_d, &dict_value_at_d, &dict_datatype_at_d, n_dict, n,
-        );
         let dt_match_at_d = object_range_dtmatch_column(
             &o_at_d, &dict_id_at_d, &dict_value_at_d, &dict_datatype_at_d, n_dict, range.datatype, n,
         );
-        let (numeric, nm_at_d, com_nm_at_d) = prove_range_numeric_family_mismatch_with_context(
-            context,
-            &v_dt_at_d,
-            &object_range.lookup.com_v_dt,
-            &dt_match_at_d,
-            &object_range.com_dt_match,
-            n,
-            transcript,
+        let dt_match_at_table = dt_match_at_d[..table].to_vec();
+        let com_dt_match_at_table = context.commit_column(&dt_match_at_table)?;
+        let relocate_dt_match = prove_column_relocation_with_context(
+            context, &dt_match_at_d, &object_range.com_dt_match, &dt_match_at_table,
+            &com_dt_match_at_table, transcript,
         )?;
-        // Relocate the numeric-mismatch column D -> table (its support is [0, n) ⊆ table).
-        let nm_at_table = nm_at_d[..table].to_vec();
+        // bad = equality_sel ⊙ (1 − dt_match); require Com(bad) == Com(0).
+        let one_minus_dt: Vec<ArkFr> =
+            dt_match_at_table.iter().map(|d| ArkFr::one() - *d).collect();
         // Descriptive early reject (the boolean product + zero-commitment check below is the
         // authoritative, verifier-checked enforcement).
         for i in 0..n {
-            if eq_sel[i] != ArkFr::zero() && nm_at_table[i] != ArkFr::zero() {
+            if eq_sel[i] != ArkFr::zero() && one_minus_dt[i] != ArkFr::zero() {
                 return Err(invalid(
-                    "RangeDatatypeNotHomogeneous: a predicate-matched row's object has a NUMERIC                      datatype other than the range constant's; TerminusDB compares rational-family                      numerics across subtypes by value (and errors on rational-vs-float), so the                      exact-datatype range mask cannot answer this query faithfully — reject-closed",
+                    "RangeDatatypeNotHomogeneous: a predicate-matched row's object has a datatype \
+                     other than the range constant's; a numeric range/order/aggregate over a \
+                     datatype-heterogeneous column cannot faithfully match TerminusDB's \
+                     cross-datatype value+structural comparison — reject-closed (fail-closed)",
                 ));
             }
         }
-        let com_mismatch_at_table = context.commit_column(&nm_at_table)?;
-        let relocate_mismatch = prove_column_relocation_with_context(
-            context, &nm_at_d, &com_nm_at_d, &nm_at_table, &com_mismatch_at_table, transcript,
-        )?;
+        let com_ones = context.commit_column(&vec![ArkFr::one(); table])?;
+        let com_one_minus_dt = com_ones - com_dt_match_at_table;
         let (bad, com_bad) = prove_boolean_product_with_context(
-            context, &eq_sel, &nm_at_table, &com_equality_sel, &com_mismatch_at_table, transcript,
+            context, &eq_sel, &one_minus_dt, &com_equality_sel, &com_one_minus_dt, transcript,
         )?;
         let com_zero = context.commit_column(&vec![ArkFr::zero(); table])?;
         if com_bad != com_zero {
             return Err(invalid(
-                "RangeDatatypeNotHomogeneous: a predicate-matched row is a numeric-family datatype                  mismatch with the range constant — reject-closed",
+                "RangeDatatypeNotHomogeneous: the compared column is not datatype-homogeneous over \
+                 the predicate-matched rows — reject-closed (fail-closed)",
             ));
         }
         Some(RangeDatatypeGuardProof {
-            numeric,
-            relocate_mismatch,
-            com_mismatch_at_table,
+            relocate_dt_match,
+            com_dt_match_at_table,
             bad,
             com_bad,
         })
@@ -685,34 +677,27 @@ pub(super) fn verify_ranged_atom(
         transcript,
     )?;
 
-    // (d2) NUMERIC-FAMILY datatype guard (fail-closed fidelity) — enforced ONLY for a genuine
+    // (d2) DATATYPE-HOMOGENEITY guard (fail-closed fidelity) — enforced ONLY for a genuine
     // numeric range (`enforce_homogeneity`, reconstructed from the PUBLIC atom); an object-KIND
-    // filter carries no such sub-proof. Authenticate `numeric_mismatch` over the object-range
-    // gadget's committed v_dt/dt_match (at `D`), relocate it to the table domain, then require
-    // `Com(equality_sel ⊙ numeric_mismatch) == Com(0)`: NO predicate-matched row is a
-    // numeric-family datatype mismatch (a rational sibling TDB compares by value / a
-    // cross-family float TDB errors on). Non-numeric rows are allowed (excluded faithfully).
+    // filter carries no such sub-proof. `dt_match` (authenticated by the object-range gadget as
+    // `com_dt_match` at `D`) relocated to the table domain, then
+    // `Com(equality_sel ⊙ (1 − dt_match)) == Com(0)`: EVERY predicate-matched real row carries
+    // the pinned datatype, else the heterogeneous column is reject-closed (fail-closed).
     match (enforce_homogeneity, &sub.datatype_guard) {
         (true, Some(g)) => {
-            let com_nm_at_d = verify_range_numeric_family_mismatch(
-                &sub.object_range.lookup.com_v_dt,
-                &sub.object_range.com_dt_match,
-                n,
-                1usize << d_log,
-                &g.numeric,
-                transcript,
-            )?;
             verify_column_relocation(
-                &com_nm_at_d,
+                &sub.object_range.com_dt_match,
                 d_log,
-                &g.com_mismatch_at_table,
+                &g.com_dt_match_at_table,
                 a,
-                &g.relocate_mismatch,
+                &g.relocate_dt_match,
                 transcript,
             )?;
+            let com_ones = commit_column(&vec![ArkFr::one(); 1usize << a])?;
+            let com_one_minus_dt = com_ones - g.com_dt_match_at_table;
             verify_boolean_product(
                 &sub.com_equality_sel,
-                &g.com_mismatch_at_table,
+                &com_one_minus_dt,
                 &g.com_bad,
                 &g.bad,
                 transcript,
@@ -720,7 +705,8 @@ pub(super) fn verify_ranged_atom(
             let com_zero = commit_column(&vec![ArkFr::zero(); 1usize << a])?;
             if g.com_bad != com_zero {
                 return Err(invalid(
-                    "RangeDatatypeNotHomogeneous: a predicate-matched row is a numeric-family                      datatype mismatch with the range constant — reject-closed",
+                    "RangeDatatypeNotHomogeneous: the compared column is not datatype-homogeneous \
+                     over the predicate-matched rows — reject-closed (fail-closed)",
                 ));
             }
         }

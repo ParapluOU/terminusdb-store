@@ -287,23 +287,21 @@ impl LayerBgpPlan {
 /// `d_log`/`n_dict` are re-derived by the verifier from the (root-verified) layer, so
 /// they are NOT carried here; every commitment below is authenticated against a
 /// root-bound source (the relocations) or the shared transcript.
-/// The NUMERIC-FAMILY datatype guard sub-proof for a numeric range atom (fail-closed
-/// fidelity). The object-range gadget masks out every predicate-matched row whose object
-/// datatype `!=` the pinned datatype. That is a wrong-but-verifying UNDER-report ONLY when the
-/// dropped row is itself NUMERIC-family but a different datatype (a rational sibling TerminusDB
-/// compares by value, or a cross-family float TDB errors on); NON-numeric rows (node IRIs,
-/// strings, …) are correctly excluded by the numeric mask. So this circuit authenticates the
-/// `numeric_mismatch` column (`[v_dt numeric-family] · [v_dt != pinned]`) over the object-range
-/// gadget's committed `v_dt`/`dt_match` (at `D`), relocates it to the table domain, and proves
-/// `Com(equality_sel ⊙ numeric_mismatch) == Com(0)` — i.e. NO predicate-matched row is a
-/// numeric-family mismatch. See [`terminus_store::proof::range::RangeNumericFamilyProof`].
+/// The DATATYPE-HOMOGENEITY guard sub-proof for a numeric range atom (fail-closed fidelity).
+/// A numeric range/order/aggregate over a datatype-HETEROGENEOUS column reject-closes: we
+/// cannot faithfully match TerminusDB's cross-datatype comparison (rational siblings compared
+/// by value, rational-vs-float errors, and NON-numeric rows reaching Prolog structural
+/// `compare/3` — which can INCLUDE a string/node the exact-numeric mask drops), so we REFUSE
+/// rather than under-report. Homogeneous (schema-constrained) data is unaffected. The atom's
+/// authenticated `dt_match` column (`object_range.com_dt_match`, at `D`) is relocated to the
+/// table domain; the guard proves `Com(equality_sel ⊙ (1 − dt_match)) == Com(0)` — i.e. EVERY
+/// predicate-matched real row carries the pinned datatype.
 #[derive(Clone, Debug)]
 pub struct RangeDatatypeGuardProof {
-    pub numeric: RangeNumericFamilyProof,
-    /// `numeric_mismatch` relocated from the dict domain `D` to the table domain.
-    pub relocate_mismatch: RelocationProof,
-    pub com_mismatch_at_table: ArkGT,
-    /// `equality_sel ⊙ numeric_mismatch`; verification asserts its commitment is `Com(0)`.
+    /// `dt_match` relocated from the dict domain `D` to the table domain.
+    pub relocate_dt_match: RelocationProof,
+    pub com_dt_match_at_table: ArkGT,
+    /// `equality_sel ⊙ (1 − dt_match)`; verification asserts its commitment is `Com(0)`.
     pub bad: BooleanProductProof,
     pub com_bad: ArkGT,
 }

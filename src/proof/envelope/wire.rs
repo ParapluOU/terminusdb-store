@@ -105,8 +105,7 @@ use crate::proof::query::{
     ResultIdNamespace, SecondRangeSubproof,
 };
 use crate::proof::range::{
-    ClusterMembershipProof, DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp,
-    RangeNumericFamilyProof, RangeSelectProof,
+    DictLookupProof, ObjectRangeCombineProof, ObjectRangeProof, RangeOp, RangeSelectProof,
 };
 use crate::proof::union::{prove_bag_union_with_context, BagUnionResult};
 use crate::proof::relocate::{prove_column_relocation_with_context, verify_column_relocation, RelocationProof};
@@ -969,24 +968,10 @@ wire_struct!(RangeAtomSubproof {
     oid,
     value_openings
 });
-// The NUMERIC-FAMILY datatype guard sub-proof (present only for a genuine numeric range atom).
-wire_struct!(ClusterMembershipProof {
-    ge,
-    com_ge,
-    le,
-    com_le,
-    product,
-    com_cluster
-});
-wire_struct!(RangeNumericFamilyProof {
-    clusters,
-    numeric_mismatch,
-    com_numeric_mismatch
-});
+// The DATATYPE-HOMOGENEITY guard sub-proof (present only for a genuine numeric range atom).
 wire_struct!(RangeDatatypeGuardProof {
-    numeric,
-    relocate_mismatch,
-    com_mismatch_at_table,
+    relocate_dt_match,
+    com_dt_match_at_table,
     bad,
     com_bad
 });
@@ -1366,7 +1351,6 @@ wire_struct!(PresentRangeSubproof {
     compaction
 });
 wire_struct!(PresentRangeDatatypeGuardProof {
-    numeric,
     bad,
     com_bad
 });
