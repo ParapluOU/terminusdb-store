@@ -481,23 +481,28 @@ mod tests {
         let mut vt_ok = transcript();
         assert!(verify_dict_membership(&com_h, &com_i, h_i, id_i, &proof, &mut vt_ok).is_ok());
 
-        // Reconstruct the prover's `beta` EXACTLY as the fixed opener derives it:
-        // com-hash, com-id, com-mult, then the bound query pair (h_i, id_i),
-        // then the beta challenge.
+        // Reconstruct `beta` the OLD, PRE-FABLE-3 way: com-hash, com-id, com-mult,
+        // then the beta challenge -- deliberately WITHOUT absorbing the query pair
+        // `(h_i, id_i)` first. This is the challenge a regressed (query-unbound)
+        // prover/verifier would draw, and it is the value the forge below must use:
+        // under such a schedule the forged pair `(q, id')` folds to the SAME
+        // `q_fold` as the honest row and WOULD be accepted. The FIXED verifier
+        // binds `(q, id')` before `beta`, re-derives a DIFFERENT challenge, and
+        // rejects -- so this test FAILS if production ever reverted the query
+        // binding (then `beta_old` would match and the forge would be accepted).
         let mut bt = transcript();
         bt.append_group(b"pow/dict/com-hash", &com_h);
         bt.append_group(b"pow/dict/com-id", &com_i);
         bt.append_group(b"pow/dict/com-mult", &proof.mult_commitment);
-        bt.append_field(LABEL_QUERY_HASH, &h_i);
-        bt.append_field(LABEL_QUERY_ID, &id_i);
         let beta = bt.challenge_scalar(LABEL_BETA);
 
-        // Forge: a DIFFERENT query hash `q` with a matching `q_fold`.
+        // Forge: a DIFFERENT query hash `q` with a matching `q_fold` under
+        // `beta_old` (the query-unbound challenge reconstructed above).
         let q = hash_term(b"mallory"); // not the bob hash
         assert_ne!(q, h_i, "the forged query hash must differ from the real row");
         let id_prime = id_i + beta * (h_i - q);
         assert_ne!(id_prime, id_i, "the forged id must differ (beta*(h_i-q) != 0)");
-        // Sanity: under the prover's `beta` the forge preserves the fold value.
+        // Sanity: under `beta_old` the forge preserves the fold value.
         assert_eq!(beta * q + id_prime, beta * h_i + id_i);
 
         // The fixed verifier binds `(q, id')` before `beta`, so it re-derives a
@@ -587,6 +592,22 @@ mod tests {
         // A witness with TWO ones (wrong multiplicity, Sum mult = 2) -> reject:
         // build it explicitly and drive prove/verify with that mult column.
         let size = dict_hash.len();
+
+        // Positive control through the SAME synthesized flow: the HONEST
+        // multiplicity indicator (a single 1 at the matching row) verifies. This
+        // proves the synthesized transcript is aligned with production -- so the
+        // rejections below are the multiplicity/position constraint, NOT a bare
+        // transcript mismatch. It also makes this test fail if the query-pair
+        // binding is removed from production: `prove_with_explicit_mult` (which
+        // binds it) would then diverge from the verifier at `beta` and even the
+        // honest mult would be rejected.
+        let mut honest_mult = vec![f0(); size];
+        honest_mult[2] = f1();
+        assert!(
+            prove_with_explicit_mult(&dict_hash, &dict_id, q_hash, id, &honest_mult).is_ok(),
+            "honest multiplicity must verify through the synthesized flow"
+        );
+
         let mut two_ones = vec![f0(); size];
         two_ones[2] = f1();
         two_ones[0] = f1(); // a spurious second 1
@@ -616,6 +637,15 @@ mod tests {
         pt.append_group(b"pow/dict/com-hash", &com_h);
         pt.append_group(b"pow/dict/com-id", &com_i);
         pt.append_group(b"pow/dict/com-mult", &mult_commitment);
+        // Reproduce the CURRENT production schedule: bind the query pair before
+        // `beta` (see `prove_dict_membership_with_context` / `verify_dict_membership`).
+        // Without these two appends the synthesized transcript diverges from the
+        // verifier's at `beta` and every proof would reject on a bare transcript
+        // MISMATCH -- masking the multiplicity constraint this test exists to
+        // exercise. With them, `beta`/`alpha` match the verifier, so rejection is
+        // the multiplicity/position violation itself.
+        pt.append_field(LABEL_QUERY_HASH, &q_hash);
+        pt.append_field(LABEL_QUERY_ID, &id);
         let beta = pt.challenge_scalar(LABEL_BETA);
         let alpha = pt.challenge_scalar(LABEL_ALPHA);
         let q_fold = query_fold(beta, q_hash, id);
@@ -662,7 +692,7 @@ mod tests {
         assert_eq!(dict_len, 4);
 
         // The (non-member) query claims carol's id for a hash that is NOT in the dict.
-        let (_carol_hash, carol_id) = entries[2];
+        let (carol_hash, carol_id) = entries[2];
         let q_hash = hash_term(b"mallory");
         let id = ArkFr::from_u64(carol_id);
 
@@ -674,10 +704,32 @@ mod tests {
         mult[2] = f1();
         let mult_commitment = commit(&mult);
 
+        // Positive control through the SAME synthesized flow: GENUINE membership of
+        // carol (her real hash + id, this honest single-1 mult) verifies. This
+        // proves the query-pair binding replayed below is aligned with the
+        // verifier, so the forge's rejection is the leaf tie catching the pole
+        // shift -- not a bare transcript mismatch. It also makes this test fail if
+        // the query binding is removed from production: `prove_with_explicit_mult`
+        // (which binds it) would diverge from the verifier at `beta` and this
+        // honest membership would be rejected.
+        assert!(
+            prove_with_explicit_mult(&dict_hash, &dict_id, carol_hash, id, &mult).is_ok(),
+            "genuine carol membership must verify (synthesized transcript aligned)"
+        );
+
         let mut pt = transcript();
         pt.append_group(b"pow/dict/com-hash", &com_h);
         pt.append_group(b"pow/dict/com-id", &com_i);
         pt.append_group(b"pow/dict/com-mult", &mult_commitment);
+        // Reproduce the CURRENT production schedule: bind the query pair before
+        // `beta` (see `prove_dict_membership_with_context` / `verify_dict_membership`).
+        // Without these the synthesized transcript diverges from the verifier's at
+        // `beta` and the proof would reject on a bare transcript MISMATCH -- masking
+        // the pole-shift (leaf-tie) rejection this test exists to exercise. With
+        // them, `beta`/`alpha` match the verifier, so rejection is the forged
+        // target pole being caught by the leaf tie.
+        pt.append_field(LABEL_QUERY_HASH, &q_hash);
+        pt.append_field(LABEL_QUERY_ID, &id);
         let beta = pt.challenge_scalar(LABEL_BETA);
         let alpha = pt.challenge_scalar(LABEL_ALPHA);
         let q_fold = query_fold(beta, q_hash, id);

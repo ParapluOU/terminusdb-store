@@ -1314,14 +1314,22 @@ mod tests {
         let mut vt = transcript();
         verify_column_openings(&coms, &r, &[e0, e1], &opening, &mut vt).unwrap();
 
-        // Reconstruct the honest transcript's `gamma` exactly as the fixed
-        // opener/verifier derive it: parameter-set, eval-count, each claimed
-        // eval in column order, then the `gamma` challenge.
+        // Reconstruct the `gamma` that a REGRESSED, eval-UNBOUND opener would
+        // draw -- i.e. the pre-FABLE-1 schedule where the per-column evals are
+        // NOT absorbed before `gamma`. We DO absorb the parameter-set and the
+        // per-column COMMITMENTS (that binding, FABLE-2, is a separate fix and is
+        // still present in such a regression), then draw `gamma` WITHOUT the eval
+        // block. This is exactly the challenge such a regressed prove/verify pair
+        // would use, so the forged eval vector below lands on the opening
+        // hyperplane THAT verifier checks and it would be ACCEPTED there. The
+        // FIXED verifier instead absorbs the evals before `gamma`, re-derives a
+        // DIFFERENT challenge, and rejects -- which is what makes this test fail
+        // if production ever reverted the eval binding.
         let mut gt = transcript();
         gt.append_bytes(b"pow/dory/parameter-set", &setup_parameter_id(r.len()).unwrap());
-        gt.append_bytes(LABEL_DORY_EVAL_COUNT, &(2u64).to_le_bytes());
-        gt.append_field(LABEL_DORY_EVAL, &e0);
-        gt.append_field(LABEL_DORY_EVAL, &e1);
+        gt.append_bytes(LABEL_DORY_COMMIT_COUNT, &(2u64).to_le_bytes());
+        gt.append_group(LABEL_DORY_COMMIT, &coms[0]);
+        gt.append_group(LABEL_DORY_COMMIT, &coms[1]);
         let gamma = gt.challenge_scalar(LABEL_DORY_GAMMA);
 
         // Forge a DISTINCT eval vector on the SAME opening hyperplane:
@@ -1390,6 +1398,51 @@ mod tests {
         assert!(
             verify_column_openings(&[com0, com2], &r, &[e0, e1], &opening, &mut vt_repl).is_err(),
             "substituted column commitment must be rejected"
+        );
+
+        // Attack C (the ISOLATING one). Attacks A/B also change the gamma-COMBINED
+        // commitment, so a commitment-unbound (pre-FABLE-2) Dory opening would
+        // reject them anyway -- they don't prove the commitment BINDING does any
+        // work. This attack hands the verifier a DIFFERENT commitment set whose
+        // combined commitment is IDENTICAL to the honest one under the challenge a
+        // commitment-unbound opener would draw, so the Dory opening alone cannot
+        // tell them apart: ONLY the FABLE-2 pre-`gamma` commitment binding catches
+        // it. Hence this assertion FLIPS to accept -- and the test FAILS -- if the
+        // commitment appends are ever removed from production.
+        //
+        // `gamma_old` = the challenge a commitment-unbound schedule draws:
+        // parameter-set, then the eval block, then `gamma` (NO commitment block).
+        let mut gt = transcript();
+        gt.append_bytes(b"pow/dory/parameter-set", &setup_parameter_id(r.len()).unwrap());
+        gt.append_bytes(LABEL_DORY_EVAL_COUNT, &(2u64).to_le_bytes());
+        gt.append_field(LABEL_DORY_EVAL, &e0);
+        gt.append_field(LABEL_DORY_EVAL, &e1);
+        let gamma_old = gt.challenge_scalar(LABEL_DORY_GAMMA);
+        let gamma_old_inv = gamma_old.inv().expect("gamma_old must be nonzero whp");
+
+        // Combined-preserving perturbation: com0' = com0 + delta,
+        // com1' = com1 - gamma_old^{-1} * delta, so under gamma_old
+        //   com0' + gamma_old*com1' == com0 + gamma_old*com1
+        // (the honest combined commitment the opening certifies), while
+        // (com0', com1') != (com0, com1).
+        let delta = com0; // any nonzero group element
+        let com0_prime = com0 + delta;
+        let com1_prime = com1 - delta.scale(&gamma_old_inv);
+        assert_ne!(com0_prime, com0, "forged commitment 0 must differ");
+        assert_ne!(com1_prime, com1, "forged commitment 1 must differ");
+        // Sanity: under gamma_old the two sets share the SAME combined commitment.
+        let (combined_honest, _) = combine(&[com0, com1], &[f0(), f0()], gamma_old);
+        let (combined_forged, _) = combine(&[com0_prime, com1_prime], &[f0(), f0()], gamma_old);
+        assert_eq!(
+            combined_honest, combined_forged,
+            "the forged set must be indistinguishable to a commitment-unbound opening"
+        );
+
+        let mut vt_iso = transcript();
+        assert!(
+            verify_column_openings(&[com0_prime, com1_prime], &r, &[e0, e1], &opening, &mut vt_iso)
+                .is_err(),
+            "a commitment set only the pre-gamma commitment binding can distinguish must be rejected"
         );
     }
 
