@@ -987,6 +987,89 @@ fn count_over_present_bgp_tampered_count_rejects() {
     );
 }
 
+// ============================================================================================
+// GROUP-COUNT — `GroupBy(keys, ..) + Length` over the reconciled materialized present via
+// VERIFIER-RECOMPUTE. The child relation is authenticated + resolved (verify_and_resolve_bgp),
+// then grouped by the authenticated key IRIs and counted per group. No value-authentication (a
+// count is cardinality-based); the grouping is bound to the authenticated key column, so a
+// fabricated / tampered child row rejects at resolution before any grouping.
+// ============================================================================================
+
+/// present `dept` = {a1->d1, a2->d1, a3->d2, a4->d2, a6->d1, a7->d2} (base a5->d3, a8->d3 removed;
+/// delta adds a6->d1, a7->d2). Group by the object (dept) => d1:3, d2:3. Each committed delta group
+/// has >= 2 records (the reconcile pass requires it).
+fn group_stack() -> Vec<Arc<LayerCommitment>> {
+    let store = open_sync_memory_store();
+    let b = store.create_base_layer().unwrap();
+    for (s, o) in [("a1", "d1"), ("a2", "d1"), ("a3", "d2"), ("a4", "d2"), ("a5", "d3"), ("a8", "d3")] {
+        b.add_value_triple(ValueTriple::new_node(&iri(s), &iri("dept"), &iri(o))).unwrap();
+    }
+    let base = b.commit().unwrap();
+    let base_lc = base.proof_commitment().unwrap();
+    let child = base.open_write().unwrap();
+    child.remove_value_triple(ValueTriple::new_node(&iri("a5"), &iri("dept"), &iri("d3"))).unwrap();
+    child.remove_value_triple(ValueTriple::new_node(&iri("a8"), &iri("dept"), &iri("d3"))).unwrap();
+    child.add_value_triple(ValueTriple::new_node(&iri("a6"), &iri("dept"), &iri("d1"))).unwrap();
+    child.add_value_triple(ValueTriple::new_node(&iri("a7"), &iri("dept"), &iri("d2"))).unwrap();
+    let head = child.commit().unwrap();
+    vec![base_lc, head.proof_commitment().unwrap()]
+}
+
+#[test]
+fn group_count_over_present_recomputes_per_group() {
+    let layers = group_stack();
+    let lref = refs(&layers);
+    // Triple(?person, dept, ?d) => columns [person, d]; group by the object column (?d = index 1).
+    let atoms = [atom(var(), "http://ex/dept", var())];
+    let (rec, bgp, result) = prove_read_group_count_bgp(&lref, &atoms, &[]).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let groups = verify_and_resolve_group_count_bgp(
+        &lref, head_root, &atoms, &[], &[1], &rec, &bgp, &result.columns,
+    )
+    .unwrap();
+    // Groups sorted by key IRI bytes: d1 then d2, each count 3.
+    let dept = |s: &str| CanonicalObject::Node(iri(s).into_bytes());
+    assert_eq!(groups, vec![(vec![dept("d1")], 3u64), (vec![dept("d2")], 3u64)]);
+}
+
+#[test]
+fn group_count_over_present_tampered_group_value_rejects() {
+    // Tampering a delivered child row (moving row 0 into a FABRICATED group key id) fails the
+    // resolution re-commitment inside verify_and_resolve_bgp: no forged/mis-grouped count is
+    // producible because the verifier recomputes groups only from the authenticated rows.
+    let layers = group_stack();
+    let lref = refs(&layers);
+    let atoms = [atom(var(), "http://ex/dept", var())];
+    let (rec, bgp, result) = prove_read_group_count_bgp(&lref, &atoms, &[]).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let mut tampered = result.columns.clone();
+    tampered[1][0] = ark(987_654_321);
+    assert!(verify_and_resolve_group_count_bgp(
+        &lref, head_root, &atoms, &[], &[1], &rec, &bgp, &tampered,
+    )
+    .is_err());
+}
+
+#[test]
+fn group_count_over_present_fabricated_group_rejects() {
+    // Appending a fabricated child row (an extra key with no authenticated backing) changes the
+    // delivered relation length away from the authenticated result — verify_and_resolve_bgp rejects
+    // (the claimed columns must open the authenticated result commitment at the real length).
+    let layers = group_stack();
+    let lref = refs(&layers);
+    let atoms = [atom(var(), "http://ex/dept", var())];
+    let (rec, bgp, result) = prove_read_group_count_bgp(&lref, &atoms, &[]).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let mut fabricated = result.columns.clone();
+    for col in &mut fabricated {
+        col.push(ark(424_242));
+    }
+    assert!(verify_and_resolve_group_count_bgp(
+        &lref, head_root, &atoms, &[], &[1], &rec, &bgp, &fabricated,
+    )
+    .is_err());
+}
+
 #[test]
 fn multi_constant_bgp_over_present() {
     // Triple(x1, p1, ?y) & Triple(?y, p2, ?z): subject constant on atom 0 pins ?y=y1,

@@ -170,6 +170,7 @@ mod combined_dict;
 mod delta_read;
 mod present_bgp;
 mod present_filter;
+mod present_group;
 mod present_join;
 mod present_order;
 mod present_result;
@@ -215,6 +216,9 @@ pub use present_order::{
     attach_termless_present_order_openings, prove_read_order_bgp, verify_and_resolve_order_bgp,
     verify_and_resolve_order_bgp_from_views, verify_read_order_bgp, verify_read_order_bgp_from_views,
     PresentScalarOrderProof,
+};
+pub use present_group::{
+    prove_read_group_count_bgp, verify_and_resolve_group_count_bgp, GroupCountEntry,
 };
 
 // ---------------------------------------------------------------------------
