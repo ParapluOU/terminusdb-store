@@ -1168,6 +1168,131 @@ fn group_sum_over_present_mixed_datatype_rejects() {
     assert!(err.to_string().contains("datatype"), "mixed value column must reject on datatype: {err}");
 }
 
+// ============================================================================================
+// GROUP MIN/MAX (extrema) — `GroupBy(keys) + RangeMin/RangeMax(value)` over the reconciled present
+// via VERIFIER-RECOMPUTE over the C2a-authenticated numeric VALUE column. The extremum is one of
+// the group's own authenticated values, compared by TRUE numeric value (signed offset-binary
+// decoded to real i128, so a negative orders below a positive). A tampered value / mixed datatype
+// reject-closes.
+// ============================================================================================
+
+/// The UInt32 value object as the reconciled resolver renders it (for the unsigned extrema).
+fn u32_obj(v: u32) -> CanonicalObject {
+    CanonicalObject::Value { datatype: crate::proof::CanonicalDatatype::UInt32, lexical: v.to_be_bytes().to_vec() }
+}
+
+/// The Int32 value object as the store renders it (offset-binary sign-flipped big-endian).
+fn i32_obj(v: i32) -> CanonicalObject {
+    CanonicalObject::Value {
+        datatype: crate::proof::CanonicalDatatype::Int32,
+        lexical: ((v as u32) ^ 0x8000_0000u32).to_be_bytes().to_vec(),
+    }
+}
+
+#[test]
+fn group_extrema_over_present_min_and_max_per_group() {
+    // present salary (UInt32) d1->{100,200,50}, d2->{300,400,50}. Min: d1=50, d2=50; Max: d1=200, d2=400.
+    let layers = group_sum_stack();
+    let lref = refs(&layers);
+    let atoms = [atom(var(), "http://ex/salary", var())];
+    let (rec, bgp, result) = prove_read_group_extrema_bgp(&lref, &atoms, &[]).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let dept = |s: &str| CanonicalObject::Node(iri(s).into_bytes());
+    let mins = verify_and_resolve_group_extrema_bgp(
+        &lref, head_root, &atoms, &[], &[0], 1, crate::proof::CanonicalDatatype::UInt32,
+        crate::proof::group::GroupExtremaKind::Min, &rec, &bgp, &result.columns,
+    ).unwrap();
+    assert_eq!(mins, vec![(vec![dept("d1")], u32_obj(50)), (vec![dept("d2")], u32_obj(50))]);
+    let maxs = verify_and_resolve_group_extrema_bgp(
+        &lref, head_root, &atoms, &[], &[0], 1, crate::proof::CanonicalDatatype::UInt32,
+        crate::proof::group::GroupExtremaKind::Max, &rec, &bgp, &result.columns,
+    ).unwrap();
+    assert_eq!(maxs, vec![(vec![dept("d1")], u32_obj(200)), (vec![dept("d2")], u32_obj(400))]);
+}
+
+/// present `temp` (Int32) d1->{-5,3,10}, d2->{-20,7} (base z1->0,z2->1 removed; delta adds d2->-20,7).
+fn signed_temp_stack() -> Vec<Arc<LayerCommitment>> {
+    use tdb_succinct::TdbDataType;
+    let store = open_sync_memory_store();
+    let b = store.create_base_layer().unwrap();
+    for (d, t) in [("d1", -5i32), ("d1", 3), ("d1", 10), ("z1", 0), ("z2", 1)] {
+        b.add_value_triple(ValueTriple::new_value(&iri(d), &iri("temp"), i32::make_entry(&t))).unwrap();
+    }
+    let base = b.commit().unwrap();
+    let base_lc = base.proof_commitment().unwrap();
+    let child = base.open_write().unwrap();
+    child.remove_value_triple(ValueTriple::new_value(&iri("z1"), &iri("temp"), i32::make_entry(&0i32))).unwrap();
+    child.remove_value_triple(ValueTriple::new_value(&iri("z2"), &iri("temp"), i32::make_entry(&1i32))).unwrap();
+    child.add_value_triple(ValueTriple::new_value(&iri("d2"), &iri("temp"), i32::make_entry(&-20i32))).unwrap();
+    child.add_value_triple(ValueTriple::new_value(&iri("d2"), &iri("temp"), i32::make_entry(&7i32))).unwrap();
+    vec![base_lc, child.commit().unwrap().proof_commitment().unwrap()]
+}
+
+#[test]
+fn group_extrema_over_present_signed_negative_ordering() {
+    // The NEGATIVE-ordering check: a negative value must order below a positive one (offset-binary
+    // decoded to real i128). Min: d1=-5, d2=-20; Max: d1=10, d2=7 — NOT the raw-lexical order.
+    let layers = signed_temp_stack();
+    let lref = refs(&layers);
+    let atoms = [atom(var(), "http://ex/temp", var())];
+    let (rec, bgp, result) = prove_read_group_extrema_bgp(&lref, &atoms, &[]).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let dept = |s: &str| CanonicalObject::Node(iri(s).into_bytes());
+    let mins = verify_and_resolve_group_extrema_bgp(
+        &lref, head_root, &atoms, &[], &[0], 1, crate::proof::CanonicalDatatype::Int32,
+        crate::proof::group::GroupExtremaKind::Min, &rec, &bgp, &result.columns,
+    ).unwrap();
+    assert_eq!(mins, vec![(vec![dept("d1")], i32_obj(-5)), (vec![dept("d2")], i32_obj(-20))]);
+    let maxs = verify_and_resolve_group_extrema_bgp(
+        &lref, head_root, &atoms, &[], &[0], 1, crate::proof::CanonicalDatatype::Int32,
+        crate::proof::group::GroupExtremaKind::Max, &rec, &bgp, &result.columns,
+    ).unwrap();
+    assert_eq!(maxs, vec![(vec![dept("d1")], i32_obj(10)), (vec![dept("d2")], i32_obj(7))]);
+}
+
+#[test]
+fn group_extrema_over_present_tampered_value_rejects() {
+    let layers = group_sum_stack();
+    let lref = refs(&layers);
+    let atoms = [atom(var(), "http://ex/salary", var())];
+    let (rec, bgp, result) = prove_read_group_extrema_bgp(&lref, &atoms, &[]).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let mut tampered = result.columns.clone();
+    tampered[1][0] = ark(987_654_321);
+    assert!(verify_and_resolve_group_extrema_bgp(
+        &lref, head_root, &atoms, &[], &[0], 1, crate::proof::CanonicalDatatype::UInt32,
+        crate::proof::group::GroupExtremaKind::Min, &rec, &bgp, &tampered,
+    ).is_err());
+}
+
+#[test]
+fn group_extrema_over_present_mixed_datatype_rejects() {
+    use tdb_succinct::TdbDataType;
+    let store = open_sync_memory_store();
+    let b = store.create_base_layer().unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("d1"), &iri("salary"), u32::make_entry(&100u32))).unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("d1"), &iri("salary"), i32::make_entry(&50i32))).unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("z1"), &iri("salary"), u32::make_entry(&9u32))).unwrap();
+    b.add_value_triple(ValueTriple::new_value(&iri("z2"), &iri("salary"), u32::make_entry(&8u32))).unwrap();
+    let base = b.commit().unwrap();
+    let base_lc = base.proof_commitment().unwrap();
+    let child = base.open_write().unwrap();
+    child.remove_value_triple(ValueTriple::new_value(&iri("z1"), &iri("salary"), u32::make_entry(&9u32))).unwrap();
+    child.remove_value_triple(ValueTriple::new_value(&iri("z2"), &iri("salary"), u32::make_entry(&8u32))).unwrap();
+    child.add_value_triple(ValueTriple::new_value(&iri("d2"), &iri("salary"), u32::make_entry(&300u32))).unwrap();
+    child.add_value_triple(ValueTriple::new_value(&iri("d2"), &iri("salary"), u32::make_entry(&400u32))).unwrap();
+    let layers = vec![base_lc, child.commit().unwrap().proof_commitment().unwrap()];
+    let lref = refs(&layers);
+    let atoms = [atom(var(), "http://ex/salary", var())];
+    let (rec, bgp, result) = prove_read_group_extrema_bgp(&lref, &atoms, &[]).unwrap();
+    let head_root = lref.last().unwrap().resolution_root();
+    let err = verify_and_resolve_group_extrema_bgp(
+        &lref, head_root, &atoms, &[], &[0], 1, crate::proof::CanonicalDatatype::UInt32,
+        crate::proof::group::GroupExtremaKind::Max, &rec, &bgp, &result.columns,
+    ).unwrap_err();
+    assert!(err.to_string().contains("datatype"), "mixed value column must reject on datatype: {err}");
+}
+
 #[test]
 fn multi_constant_bgp_over_present() {
     // Triple(x1, p1, ?y) & Triple(?y, p2, ?z): subject constant on atom 0 pins ?y=y1,

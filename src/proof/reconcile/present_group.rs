@@ -201,6 +201,18 @@ impl SumTerm {
             }
         }
     }
+
+    /// Compare two terms by TRUE numeric value (not raw offset-binary lexical) — a negative signed
+    /// value orders below a positive one. Both operands share the group's single (homogeneous)
+    /// datatype, so they are both `Unsigned` or both `Signed`; a mix reject-closes. Mirrors the base
+    /// `GroupSumValue::cmp_same_domain`.
+    fn cmp_same_domain(self, rhs: Self) -> io::Result<Ordering> {
+        match (self, rhs) {
+            (Self::Unsigned(a), Self::Unsigned(b)) => Ok(a.cmp(&b)),
+            (Self::Signed(a), Self::Signed(b)) => Ok(a.cmp(&b)),
+            _ => Err(invalid("reconciled group-extrema mixes signed and unsigned values")),
+        }
+    }
 }
 
 /// Decode ONE resolved value to its exact integer term, asserting its datatype matches the planned
@@ -347,4 +359,144 @@ pub fn verify_and_resolve_group_sum_bgp(
         child_columns,
     )?;
     recompute_group_sum(&resolved, key_columns, value_column, datatype)
+}
+
+// ============================================================================================
+// GROUP MIN/MAX (extrema) — `GroupBy(keys) + RangeMin/RangeMax(value)` over the reconciled present.
+//
+// Same verifier-recompute skeleton as GroupSum over the C2a value↔term-authenticated VALUE column,
+// but the per-group answer is the group's numeric MINIMUM (resp. MAXIMUM) — one of the group's own
+// authenticated values, returned in its ORIGINAL resolved datatype. There is NO overflow concern
+// (the extremum is a member value, not an accumulation). Ordering is by TRUE numeric value via
+// [`SumTerm::cmp_same_domain`] over the decoded integer (`integral_value` decodes signed offset-
+// binary lexicals to their real i128), so a negative signed value orders below a positive one —
+// never by the raw offset-binary lexical. Same integral + STRICT datatype-homogeneity guards as
+// GroupSum: a mixed / non-numeric / float value column reject-closes.
+
+use std::cmp::Ordering;
+
+use crate::proof::group::GroupExtremaKind;
+
+/// One recomputed group extremum: the group's resolved key objects and the min/max VALUE object
+/// (in its original resolved datatype — the extremum is one of the group's authenticated values).
+pub type GroupExtremumEntry = (Vec<CanonicalObject>, CanonicalObject);
+
+/// Recompute the `GroupBy + RangeMin/RangeMax` output from the root-authenticated resolved child
+/// rows: group by the key `CanonicalObject` tuple (each a Node IRI) and pick the per-group numeric
+/// minimum (`Min`) or maximum (`Max`) of the authenticated VALUE column, compared by true numeric
+/// value. Groups sorted by the canonical key-IRI-bytes.
+pub(super) fn recompute_group_extrema(
+    resolved: &[Vec<CanonicalObject>],
+    key_columns: &[usize],
+    value_column: usize,
+    datatype: CanonicalDatatype,
+    kind: GroupExtremaKind,
+) -> io::Result<Vec<GroupExtremumEntry>> {
+    // Float / non-integral datatypes reject-close (IEEE total-order != WOQL numeric order).
+    SumTerm::zero(datatype)?;
+    if key_columns.is_empty() {
+        return Err(invalid("reconciled group-extrema requires at least one key column"));
+    }
+    let n = resolved.first().map_or(0, Vec::len);
+    let value_col = resolved
+        .get(value_column)
+        .ok_or_else(|| invalid("reconciled group-extrema value column out of range"))?;
+    if value_col.len() != n {
+        return Err(invalid("reconciled group-extrema value column length mismatch"));
+    }
+    for &kc in key_columns {
+        if kc == value_column {
+            return Err(invalid("reconciled group-extrema key column aliases the value column"));
+        }
+        let column = resolved
+            .get(kc)
+            .ok_or_else(|| invalid("reconciled group-extrema key column out of range"))?;
+        if column.len() != n {
+            return Err(invalid("reconciled group-extrema key column length mismatch"));
+        }
+    }
+    // Per group: (resolved key objects, best decoded numeric value, best VALUE object).
+    let mut groups: BTreeMap<Vec<Vec<u8>>, (Vec<CanonicalObject>, SumTerm, CanonicalObject)> =
+        BTreeMap::new();
+    for row in 0..n {
+        let decoded = integral_value(&value_col[row], datatype)?;
+        let object = value_col[row].clone();
+        let mut key_bytes = Vec::with_capacity(key_columns.len());
+        let mut key_objects = Vec::with_capacity(key_columns.len());
+        for &kc in key_columns {
+            match &resolved[kc][row] {
+                keyobj @ CanonicalObject::Node(iri) => {
+                    key_bytes.push(iri.clone());
+                    key_objects.push(keyobj.clone());
+                }
+                _ => {
+                    return Err(invalid(
+                        "reconciled group-extrema key is not a node IRI (value-keyed grouping is unsupported)",
+                    ))
+                }
+            }
+        }
+        match groups.entry(key_bytes) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert((key_objects, decoded, object));
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                let entry = slot.get_mut();
+                let ordering = decoded.cmp_same_domain(entry.1)?;
+                let replace = match kind {
+                    GroupExtremaKind::Min => ordering == Ordering::Less,
+                    GroupExtremaKind::Max => ordering == Ordering::Greater,
+                };
+                if replace {
+                    entry.1 = decoded;
+                    entry.2 = object;
+                }
+            }
+        }
+    }
+    Ok(groups
+        .into_values()
+        .map(|(keys, _best, object)| (keys, object))
+        .collect())
+}
+
+/// Prove `GroupBy + RangeMin/RangeMax(BGP)` over an N-layer delta stack: reconcile + present-BGP
+/// over the child relation (IDENTICAL to [`prove_read_bgp`]); the extrema are recomputed at verify
+/// over the C2a-authenticated value column.
+pub fn prove_read_group_extrema_bgp(
+    layers: &[&LayerCommitment],
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+) -> io::Result<(ReconcileProof, PresentBgpProof, PresentReadResult)> {
+    prove_read_bgp(layers, atoms, joins)
+}
+
+/// Verify + resolve a reconciled `GroupBy + RangeMin/RangeMax(BGP)` read against the trusted head
+/// root, then RECOMPUTE the per-group min/max over the root-authenticated resolved child rows. A
+/// tampered value / mixed datatype rejects inside `verify_and_resolve_bgp` (resp. the per-value
+/// decode). Returns the groups, sorted by key.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_resolve_group_extrema_bgp(
+    layers: &[&LayerCommitment],
+    trusted_head_root: ProofHash,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    key_columns: &[usize],
+    value_column: usize,
+    datatype: CanonicalDatatype,
+    kind: GroupExtremaKind,
+    reconcile: &ReconcileProof,
+    bgp: &PresentBgpProof,
+    child_columns: &[Vec<ArkFr>],
+) -> io::Result<Vec<GroupExtremumEntry>> {
+    let resolved = verify_and_resolve_bgp(
+        layers,
+        trusted_head_root,
+        atoms,
+        joins,
+        reconcile,
+        bgp,
+        child_columns,
+    )?;
+    recompute_group_extrema(&resolved, key_columns, value_column, datatype, kind)
 }
