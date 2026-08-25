@@ -1,6 +1,20 @@
 //! Q1 filter selection-indicator (IsZero) gadget — the first real query-correctness
 //! proof of the Proof-of-WOQL argument.
 //!
+//! For a developer: this [gadget](crate::proof::primer) proves a `WHERE column = const`
+//! selection was applied faithfully — the committed boolean `sel` marks EXACTLY the
+//! real rows whose value equals the constant. It is discharged by
+//! [sumcheck](crate::proof::primer) (primer §5): two polynomial identities force `sel`
+//! to be the true 0/1 indicator (the "IsZero" trick — a row is selected iff its
+//! difference from the constant is zero, witnessed by a pseudo-inverse). The real-row
+//! count `n` is a PUBLIC value baked into the [layer root](crate::proof::primer)
+//! (primer §9), so the padding-collision hazard is closed without committing it. The
+//! full atom filter additionally *compacts* the kept rows into dense output columns via
+//! a [LogUp](crate::proof::primer) link (primer §7). See [the
+//! primer](crate::proof::primer) for [commitments](crate::proof::primer) (§3), the
+//! [transcript invariant](crate::proof::primer) (§8), and
+//! [prove → verify](crate::proof::primer) (§10).
+//!
 //! Given a committed predicate column `Com(P)` over `N = 2^k` rows (`n` of them
 //! real, the rest padding) and a PUBLIC constant predicate id `pred`, this gadget
 //! proves that a committed selection vector `sel` equals EXACTLY
@@ -55,7 +69,7 @@ const CHI_N: usize = 0;
 // (claims A, B over [S, P, O, sel, w]; filter on ANY subset of {S,P,O}). The base
 // columns come first so a constant position folds directly into claims A/B. The
 // compaction multiset link (kept outputs vs selected inputs) is proven separately by
-// a GKR fraction tree ([`filter_link_instance`]) with its OWN block-disjoint layout.
+// a GKR fraction tree (`filter_link_instance`) with its OWN block-disjoint layout.
 const A_COL_S: usize = 0;
 const A_COL_P: usize = 1;
 const A_COL_O: usize = 2;
@@ -75,7 +89,9 @@ fn f1() -> ArkFr {
 /// plus one batched Dory opening of `[P, sel, w]` at the sumcheck point `r`.
 #[derive(Clone, Debug)]
 pub struct FilterProof {
+    /// Batched sumcheck over the two Identity claims A and B.
     pub sumcheck: SumcheckProof,
+    /// Batched Dory opening of `[P, sel, w]` at the sumcheck point `r`.
     pub opening: ColumnOpening,
 }
 
@@ -319,23 +335,31 @@ pub fn verify_filter_indicator(
 ///     (`cstar`/`dstar`) and the C/D/E link sumcheck; no reciprocal is committed.
 #[derive(Clone, Debug)]
 pub struct FullFilterProof {
+    /// Batched sumcheck over the two IsZero selection claims (A, B) on `[S, P, O, sel, w]`.
     pub sumcheck: SumcheckProof,
+    /// Batched Dory opening of the selection columns at the sumcheck point.
     pub opening: ColumnOpening,
+    /// Commitment to the selection indicator column `sel`.
     pub sel_commitment: ArkGT,
+    /// Commitment to the pseudo-inverse witness column `w`.
     pub w_commitment: ArkGT,
     /// GKR fraction tree for `Σ sel·(α−in_fold)⁻¹ − Σ [j<m]·(α−out_fold)⁻¹ = 0`.
     pub link: GkrFractionProof,
     /// Evaluations of `[sources.., kept_out.., sel]` at `r_low` (the low `num_vars`
     /// bits of the GKR leaf point), bound to their commitments by `link_opening`.
     pub link_col_evals: Vec<ArkFr>,
+    /// Batched Dory opening authenticating `link_col_evals` at the leaf point.
     pub link_opening: ColumnOpening,
 }
 
 /// The variable/constant positions of a triple atom.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Position {
+    /// The subject position.
     S,
+    /// The predicate position.
     P,
+    /// The object position.
     O,
 }
 
@@ -361,7 +385,9 @@ impl Position {
 /// constant positions.
 #[derive(Clone, Debug)]
 pub struct AtomFilterSpec {
+    /// The constant positions and their fixed ids (the `WHERE position = const` filters).
     pub constants: Vec<(Position, ArkFr)>,
+    /// The kept (variable) output positions in atom order (`{S,P,O}` minus the constants).
     pub kept: Vec<Position>,
     /// Same-row equality constraints. The right-hand position is an alias of the left
     /// and is therefore omitted from `kept`.
@@ -425,14 +451,31 @@ impl AtomFilterSpec {
             self.kept.iter().map(|p| KeptSource::Base(*p)).collect()
         }
     }
+
+    /// True iff the atom applies NO row selection — no constant positions AND no same-row
+    /// equalities — so the kept columns ARE the base columns and the honest proof is
+    /// `AtomFilterProof::Identity`. An atom with ANY intra-atom equality (e.g. a
+    /// subject==object self-loop `t(?u, ?w, ?u)`, whose `equalities = [(S, O)]`) MUST take
+    /// the compacted selection path even when it carries no CONSTANT (a variable-predicate
+    /// self-loop has an empty `constants` set), otherwise the equality residual is proven
+    /// but never applied to the result — every row leaks through unfiltered. Gating the
+    /// Identity fast-path on `constants` ALONE was exactly that soundness/fidelity bug.
+    fn is_identity(&self) -> bool {
+        self.constants.is_empty() && self.equalities.is_empty()
+    }
 }
 
-/// A per-atom filter proof. `Identity` is the |C| = 0 case (`t(?s,?p,?o)`): the result
-/// is every real row, so the kept columns ARE the base columns and no sumcheck is
-/// produced. `Compacted` carries the selection + compaction argument (|C| >= 1).
+/// A per-atom filter proof. `Identity` is the NO-SELECTION case (`spec.is_identity()`: no
+/// constant positions AND no same-row equalities, e.g. `t(?s,?p,?o)`): the result is every
+/// real row, so the kept columns ARE the base columns and no sumcheck is produced.
+/// `Compacted` carries the selection + compaction argument (any constant OR any equality —
+/// including a variable-predicate self-loop `t(?u,?w,?u)` whose only filter is `(S, O)`).
 #[derive(Clone, Debug)]
 pub enum AtomFilterProof {
+    /// The no-selection case (`spec.is_identity()`, e.g. `t(?s,?p,?o)`): the result is every
+    /// real row, so the kept columns ARE the base columns and no sumcheck is produced.
     Identity,
+    /// The selection case (>= 1 constant OR >= 1 equality): selection + compaction argument.
     Compacted(FullFilterProof),
 }
 
@@ -524,7 +567,7 @@ fn selection_claims(spec: &AtomFilterSpec, beta_c: ArkFr) -> (SumcheckClaim, Sum
 /// The IsZero SELECTION shape (claims A, B only) over `[S, P, O, sel, w]`, with
 /// `χ_n` the single chi bound. This is the selector sub-proof, UNCHANGED by the
 /// LogUp-GKR migration; the compaction multiset link is now a separate GKR fraction
-/// tree ([`filter_link_instance`]), not fused C/D/E claims in this sumcheck.
+/// tree (`filter_link_instance`), not fused C/D/E claims in this sumcheck.
 fn atom_selection_shape(
     spec: &AtomFilterSpec,
     num_vars: usize,
@@ -778,7 +821,7 @@ pub(crate) fn atom_kept_columns(
     real_rows: usize,
 ) -> io::Result<(Vec<Vec<ArkFr>>, usize)> {
     spec.validate()?;
-    if spec.constants.is_empty() {
+    if spec.is_identity() {
         let cols = spec
             .kept
             .iter()
@@ -1017,7 +1060,7 @@ pub fn prove_atom_filter_with_context(
     transcript: &mut Transcript254,
 ) -> io::Result<(AtomFilterProof, Vec<ArkGT>, usize)> {
     spec.validate()?;
-    if spec.constants.is_empty() {
+    if spec.is_identity() {
         let com_kept = spec
             .kept
             .iter()
@@ -1157,8 +1200,14 @@ pub fn verify_atom_filter(
     spec.validate()?;
     match proof {
         AtomFilterProof::Identity => {
-            if !spec.constants.is_empty() {
-                return Err(invalid("identity atom proof for a non-empty constant set"));
+            // An Identity proof asserts "result == every real row"; it is only sound when the
+            // atom applies NO selection at all. A non-empty constant set OR any intra-atom
+            // equality (a self-loop's `(S, O)`) requires the compacted selection path, so a
+            // claimed Identity here is a fail-closed reject rather than a leaked full scan.
+            if !spec.is_identity() {
+                return Err(invalid(
+                    "identity atom proof for a non-empty constant/equality set",
+                ));
             }
             let expected: Vec<ArkGT> = spec
                 .kept
@@ -1173,8 +1222,10 @@ pub fn verify_atom_filter(
             Ok(())
         }
         AtomFilterProof::Compacted(inner) => {
-            if spec.constants.is_empty() {
-                return Err(invalid("compacted atom proof for an empty constant set"));
+            if spec.is_identity() {
+                return Err(invalid(
+                    "compacted atom proof for an empty constant/equality set",
+                ));
             }
             verify_compacted(
                 spec, real_rows, com_s, com_p, com_o, com_kept, output_len, inner, transcript,
@@ -1272,8 +1323,11 @@ const SO_LABEL_BETA_C: &[u8] = b"pow/selection-only/const-beta";
 /// `Com(sel)` is returned separately (the authoritative equality-selection column).
 #[derive(Clone, Debug)]
 pub struct SelectionOnlyProof {
+    /// Batched sumcheck over selection claims A and B (no compaction).
     pub sumcheck: SumcheckProof,
+    /// Batched Dory opening of `[S, P, O, sel, w]` at the sumcheck point `r`.
     pub opening: ColumnOpening,
+    /// Commitment to the pseudo-inverse witness column `w`.
     pub w_commitment: ArkGT,
 }
 
@@ -1431,7 +1485,9 @@ const PR_LABEL_DOMAIN: &[u8] = b"pow/bool-product/domain-v1";
 /// A boolean-product proof: the Identity sumcheck over `[a, b, sel]` and its opening.
 #[derive(Clone, Debug)]
 pub struct BooleanProductProof {
+    /// Identity sumcheck over `[a, b, sel]` proving `sel − a·b = 0` at every row.
     pub sumcheck: SumcheckProof,
+    /// Batched Dory opening of `[a, b, sel]` at the sumcheck point `r`.
     pub opening: ColumnOpening,
 }
 
@@ -1544,7 +1600,7 @@ pub fn verify_boolean_product(
 // `sel = equality_sel · range_sel` that is NOT the plain equality indicator, so this
 // entry runs ONLY the compaction link over an EXTERNAL, already-committed boolean
 // `sel` column plus the kept SOURCE columns. Post the LogUp-GKR migration the link is
-// the SAME block-disjoint fraction tree the full filter uses ([`filter_link_instance`]),
+// the SAME block-disjoint fraction tree the full filter uses (`filter_link_instance`),
 // with NO committed reciprocal columns (`cstar`/`dstar`) and no C/D/E sumcheck:
 //   * one GKR fraction-sum-zero proof of
 //     `Σ_i sel_i·(α − in_fold_i)⁻¹ − Σ_j [j < m]·(α − out_fold_j)⁻¹ = 0`
@@ -1570,7 +1626,7 @@ const CO_LABEL_ALPHA: &[u8] = b"pow/compaction-only/logup-alpha";
 
 /// A compaction-only proof (LogUp-GKR): the block-disjoint fraction-sum-zero proof for
 /// `Σ_i sel_i·(α − in_fold_i)⁻¹ − Σ_j [j < m]·(α − out_fold_j)⁻¹ = 0` (the SAME link
-/// [`filter_link_instance`] the full filter emits), the evaluations of the length-`domain`
+/// `filter_link_instance` the full filter emits), the evaluations of the length-`domain`
 /// link columns `[sources.., kept_out.., sel]` at the low `num_vars` bits of the GKR leaf
 /// point, and one batched Dory opening binding them. NO reciprocal (`cstar`/`dstar`) column
 /// is committed. The kept OUTPUT commitments are returned separately (the authoritative
@@ -1582,6 +1638,7 @@ pub struct CompactionOnlyProof {
     /// Evaluations of `[sources.., kept_out.., sel]` at `r_low` (the low `num_vars` bits
     /// of the GKR leaf point), bound to their commitments by `link_opening`.
     pub link_col_evals: Vec<ArkFr>,
+    /// Batched Dory opening authenticating `link_col_evals` at the leaf point.
     pub link_opening: ColumnOpening,
 }
 
@@ -2076,6 +2133,60 @@ mod tests {
         let (m, commitments) = atom_honest(&spec, &s, &p, &o, 4).unwrap();
         assert_eq!(m, 2);
         assert_eq!(commitments.len(), 1);
+    }
+
+    /// Regression for the variable-predicate self-loop `t(?u, ?w, ?u)`: the spec has NO
+    /// constant (the predicate is a KEPT variable) and its ONLY filter is the same-row
+    /// equality `(S, O)`. This MUST reduce to the `s == o` rows. Gating the Identity
+    /// fast-path on `constants` alone returned EVERY row (the fuzzer's wrong-but-verifying
+    /// answer); `is_identity()` now also requires an empty `equalities`, so this routes
+    /// through the compacted selection path.
+    #[test]
+    fn atom_filter_equality_without_constant_filters_to_self_loops() {
+        let s = col16(&[1, 2, 3, 1]);
+        let p = col16(&[10, 20, 30, 40]);
+        let o = col16(&[1, 9, 3, 8]);
+        let spec = AtomFilterSpec {
+            constants: vec![],
+            kept: vec![Position::S, Position::P],
+            equalities: vec![(Position::S, Position::O)],
+        };
+        // Rows 0 (s=1,o=1) and 2 (s=3,o=3) are self-loops; rows 1,3 are not.
+        let (m, commitments) = atom_honest(&spec, &s, &p, &o, 4).unwrap();
+        assert_eq!(m, 2);
+        assert_eq!(commitments.len(), 2); // kept S and P
+    }
+
+    /// Adversarial: a prover that ships an `Identity` proof (claiming "the result is every
+    /// row") for a spec that carries an equality must be REJECTED — Identity is only sound
+    /// when the atom applies no selection at all. This forges the base (unfiltered) kept
+    /// commitments and `output_len == real_rows`, which the pre-fix verifier accepted.
+    #[test]
+    fn identity_proof_for_an_equality_spec_is_rejected() {
+        let s = col16(&[1, 2, 3, 1]);
+        let p = col16(&[10, 20, 30, 40]);
+        let o = col16(&[1, 9, 3, 8]);
+        let spec = AtomFilterSpec {
+            constants: vec![],
+            kept: vec![Position::S, Position::P],
+            equalities: vec![(Position::S, Position::O)],
+        };
+        let (com_s, com_p, com_o) = (commit(&s), commit(&p), commit(&o));
+        // The base (unfiltered) kept commitments are exactly what an Identity proof claims.
+        let com_kept = vec![com_s, com_p];
+        let mut vt = transcript();
+        assert!(verify_atom_filter(
+            &spec,
+            4,
+            &com_s,
+            &com_p,
+            &com_o,
+            &com_kept,
+            4,
+            &AtomFilterProof::Identity,
+            &mut vt,
+        )
+        .is_err());
     }
 
     // Prove+verify a compacted atom filter with an EXPLICIT sel + kept_out (malicious
