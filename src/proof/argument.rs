@@ -10,6 +10,12 @@
 //!
 //! Scope (Phase 2a): sumcheck + Dory glue only. No filter/join/dictionary/LogUp.
 //!
+//! For the shared conceptual model behind the terms used here —
+//! [commitment](crate::proof::primer), [sumcheck](crate::proof::primer),
+//! [MLE](crate::proof::primer), [Dory](crate::proof::primer), and
+//! [the Fiat–Shamir transcript invariant](crate::proof::primer) — see the
+//! developer primer. The reader's guide below is a self-contained recap.
+//!
 //! # Reader's guide (no cryptography assumed)
 //! Every other gadget in this directory ultimately reduces the statement it wants to
 //! prove — "this output relation is exactly the matching rows", "these two columns are
@@ -54,7 +60,7 @@
 //! LSB-first variable/bit mapping (see its `multilinear_lagrange_basis`): flat
 //! index `i` has bit `j` controlled by evaluation variable `j`. Because a column
 //! is laid out as `2^nu` rows x `2^sigma` columns at flat index
-//! `row*2^sigma + col` (see [`super::commitment::matrix_dims`]), the first
+//! `row*2^sigma + col` (see `super::commitment::matrix_dims`), the first
 //! `sigma` variables of the point are the column bits and the last `nu` are the
 //! row bits. Our sumcheck binds variables LSB-first (round `t` binds bit `t`), so
 //! the challenge vector `r = (r_0, .., r_{k-1})` we hand to Dory is exactly the
@@ -104,6 +110,9 @@ pub enum ProverSetupTier {
 }
 
 impl ProverSetupTier {
+    /// The `log2` of the largest column length this tier's public parameters
+    /// support (20, 22, or 24). Selects which precomputed generator vector a
+    /// Blitzar-accelerated context preprocesses.
     pub const fn log_domain(self) -> usize {
         match self {
             Self::Log20 => 20,
@@ -348,7 +357,12 @@ const LABEL_DOMAIN: &[u8] = b"pow/sumcheck/domain";
 const LABEL_SHAPE: &[u8] = b"pow/sumcheck/shape";
 const LABEL_ZEROCHECK: &[u8] = b"pow/sumcheck/zerocheck-point";
 const LABEL_RHO: &[u8] = b"pow/sumcheck/batch-rho";
+/// Transcript label under which each sumcheck round's univariate coefficients
+/// are absorbed. `pub(crate)` so gadgets that hand-roll their own round loop
+/// stay byte-identical to this engine's absorptions.
 pub(crate) const LABEL_ROUND_POLY: &[u8] = b"pow/sumcheck/round-poly";
+/// Transcript label for the per-round sumcheck challenge drawn AFTER the round
+/// polynomial is absorbed. `pub(crate)` for the same cross-gadget consistency.
 pub(crate) const LABEL_ROUND_CHALLENGE: &[u8] = b"pow/sumcheck/round-challenge";
 const LABEL_DORY_GAMMA: &[u8] = b"pow/dory/batch-gamma";
 // Fiat-Shamir binding of the batched-opening challenge `gamma` to the exact

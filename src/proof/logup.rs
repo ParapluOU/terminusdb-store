@@ -8,11 +8,17 @@
 //! reconcile link (the last, masked/signed one) included — so the committed-reciprocal gadget
 //! is fully retired. What remains is the one arithmetic helper that outlived it:
 //!
-//!   * [`pseudo_inverse`] — Montgomery's trick batch inverse (nonzero entries inverted, zeros
+//!   * `pseudo_inverse` — Montgomery's trick batch inverse (nonzero entries inverted, zeros
 //!     passed through) — still used by the `filter` IsZero selector witness.
 //!
 //! Clean-room from the log-derivative math (cf. p3-lookup, MIT/Apache); no COSL code was
 //! consulted or copied.
+//!
+//! For a developer: the LogUp lookup argument this file once implemented is described in the
+//! primer's [LogUp / LogUp-GKR](crate::proof::primer) section (§7); the LIVE version — the same
+//! multiset / rational-sum identity, proved through a GKR fraction tree with no committed
+//! reciprocal column — is [`super::logup_gkr`]. All that survives here is the
+//! `pseudo_inverse` helper, a batch modular inverse the `filter` IsZero selector still uses.
 
 use dory_pcs::backends::arkworks::ArkFr;
 use dory_pcs::primitives::arithmetic::Field;

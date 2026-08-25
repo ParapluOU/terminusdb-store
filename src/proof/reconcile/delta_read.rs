@@ -90,10 +90,10 @@ pub struct DeltaReadProof {
     pub bgp: PresentBgpProof,
     /// E2b: UNCOMMITTED prover-shipped Merkle resolution witness for a TERM-LESS delta artifact.
     /// One [`DictOpening`] per DISTINCT resolved result id, re-verified per id against the
-    /// root-bound `nv_merkle_root` at resolve time ([`ChainDictResolver::resolve_nv_id`]). `None`
+    /// root-bound `nv_merkle_root` at resolve time (`ChainDictResolver::resolve_nv_id`). `None`
     /// on the prover default and on term-bearing artifacts (whose resolver rebuilds from the clear
     /// catalogs); the term-less producer attaches it via [`attach_termless_delta_openings`]. NEVER
-    /// folded into `commitment_root`/`resolution_root` — bound solely by [`verify_opening`], so a
+    /// folded into `commitment_root`/`resolution_root` — bound solely by `verify_opening`, so a
     /// forged opening is rejected and a missing one fails closed. C4: this witness IS now wire-
     /// serialized (it rides the `Option<ResolutionOpenings>` `Wire` impl in `DeltaReadProof::encode`),
     /// so it survives the byte boundary; it stays an UNCOMMITTED witness, re-verified per id at
@@ -304,10 +304,10 @@ pub fn prove_delta_read(
 /// delta-read kept result column is a combined-dict node/value id (predicates are constants,
 /// matched in committed hash space — there is NO catalog dict-membership step to open, unlike the
 /// base path's constant openings), so this opens ONLY node/value ids: it maps each column value via
-/// [`canonical_dictionary_id`], drops the reserved null id 0, and routes each distinct id to its
-/// introducing layer via [`build_resolution_openings`] over the term-bearing prover views (the
-/// prover still holds the full catalogs). Mirrors [`build_termless_bgp_openings`]. The witness is
-/// re-verified per id at the verifier by [`verify_opening`] against the root-bound `nv_merkle_root`
+/// `canonical_dictionary_id`, drops the reserved null id 0, and routes each distinct id to its
+/// introducing layer via `build_resolution_openings` over the term-bearing prover views (the
+/// prover still holds the full catalogs). Mirrors `build_termless_bgp_openings`. The witness is
+/// re-verified per id at the verifier by `verify_opening` against the root-bound `nv_merkle_root`
 /// (a forged opening is rejected, a missing one fails closed) and is NEVER folded into
 /// `commitment_root`/`resolution_root`.
 pub fn build_termless_delta_openings(
@@ -333,7 +333,7 @@ pub fn build_termless_delta_openings(
 /// E2b (producer): attach the term-less resolution witness to a proven [`DeltaReadProof`], so it
 /// can ship alongside a TERM-LESS delta artifact. `result_columns` are the prover's
 /// [`PresentReadResult::columns`] returned by [`prove_delta_read`]. Mirrors
-/// [`attach_termless_bgp_openings`]. Over-inclusion is safe (the verifier only looks up the ids it
+/// `attach_termless_bgp_openings`. Over-inclusion is safe (the verifier only looks up the ids it
 /// needs, each independently checked); under-inclusion fails closed. A term-bearing verifier
 /// ignores the witness entirely (it rebuilds from the clear catalogs).
 pub fn attach_termless_delta_openings(

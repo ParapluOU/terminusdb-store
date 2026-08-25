@@ -4,6 +4,18 @@
 //! column is also the complete sort key, every value is a nonnullable Store ID resolving
 //! to one fixed-width order-preserving datatype, the output is an exact full-row
 //! permutation, and the authenticated dictionary value column is strictly ascending.
+//!
+//! For a developer: this [gadget](crate::proof::primer) proves an `ORDER BY` answer is
+//! the input's rows in the right order — nothing dropped, duplicated, or invented, and
+//! genuinely sorted. Two audited pieces do the work and neither alone suffices: a
+//! [permutation](crate::proof::primer) proof ([`super::permutation`]) forces the output
+//! to be a row-multiset copy of the input, and a nondecreasing [sort](crate::proof::primer)
+//! proof forces it to be ordered. Because ids are not themselves value-ordered, the sort
+//! key is the id's dictionary VALUE, authenticated against the root-bound dictionary by a
+//! [LogUp](crate::proof::primer) lookup (primer §7) before the sort runs. The datatype
+//! restriction and float exclusion are [fidelity](crate::proof::primer) guards (primer
+//! §11), not soundness ones. See [the primer](crate::proof::primer) for
+//! [commitments](crate::proof::primer) (§3) and [prove → verify](crate::proof::primer) (§10).
 
 use std::io;
 
@@ -46,7 +58,9 @@ const ORDER_BITS: usize = 64;
 /// both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderDirection {
+    /// Sort smallest-first.
     Ascending,
+    /// Sort largest-first (proved by sorting `MAX - value` ascending).
     Descending,
 }
 
@@ -56,19 +70,33 @@ pub enum OrderDirection {
 /// filter, and the nondecreasing-order proof over the (possibly complemented) sort key.
 #[derive(Clone, Debug)]
 pub struct ExactScalarOrderProof {
+    /// Output is a full-row permutation of the input (same rows, same multiplicities).
     pub permutation: RelationPermutationProof,
+    /// Relocation of the sorted output id column into the common lookup domain.
     pub relocate_output_id: RelocationProof,
+    /// Relocation of the dictionary id column into the common lookup domain.
     pub relocate_dict_id: RelocationProof,
+    /// Relocation of the dictionary value column into the common lookup domain.
     pub relocate_dict_value: RelocationProof,
+    /// Relocation of the dictionary datatype column into the common lookup domain.
     pub relocate_dict_datatype: RelocationProof,
+    /// Commitment to the sorted output id column at the common domain `d`.
     pub com_output_id_at_d: ArkGT,
+    /// Commitment to the dictionary id column at the common domain `d`.
     pub com_dict_id_at_d: ArkGT,
+    /// Commitment to the dictionary value column at the common domain `d`.
     pub com_dict_value_at_d: ArkGT,
+    /// Commitment to the dictionary datatype column at the common domain `d`.
     pub com_dict_datatype_at_d: ArkGT,
+    /// Authenticates each output id's `(value, datatype)` against the root-bound dictionary.
     pub lookup: DictLookupProof,
+    /// Filter proof that every real row's datatype equals the planned sort datatype.
     pub datatype_filter: FilterProof,
+    /// Commitment to the datatype filter's selection column.
     pub datatype_selection_commitment: ArkGT,
+    /// Commitment to the datatype filter's pseudo-inverse witness column.
     pub datatype_inverse_commitment: ArkGT,
+    /// Nondecreasing-order proof over the (possibly complemented) authenticated value key.
     pub sorted: SortedProof,
     /// Merkle-dict I2b step 3 (value↔term consistency, TERM-LESS order). The real object
     /// ids of the SORTED output rows (`oid[i]` = the id at sorted row `i`, length = the
@@ -77,20 +105,27 @@ pub struct ExactScalarOrderProof {
     /// sort-key value/datatype to real terms; the verifier ignores these). On a TERM-LESS
     /// artifact the verifier recommits `oid` to `com_output_id_at_d` (binding the sort key's
     /// object-id column) and rederives `lookup.com_v_val`/`lookup.com_v_dt` from the Merkle-
-    /// authenticated opened terms ([`verify_dict_value_terms`]). UNCOMMITTED — never folded
+    /// authenticated opened terms (`verify_dict_value_terms`). UNCOMMITTED — never folded
     /// into `commitment_root`/`resolution_root`; a missing opening (or recommit mismatch)
     /// fails closed.
     pub oid: Vec<u64>,
+    /// One positional Merkle opening per distinct `oid` (node/value namespace) on a
+    /// TERM-LESS artifact; `None` on a TERM-BEARING one. Consumed alongside `oid`.
     pub value_openings: Option<ResolutionOpenings>,
 }
 
 /// Prover result: the proof plus the ordered output relation (the single id column, its
 /// commitment, the `log_domain`, and the real row count `n`).
 pub struct ExactScalarOrderResult {
+    /// The order proof to hand to [`verify_exact_scalar_order`].
     pub proof: ExactScalarOrderProof,
+    /// Commitment(s) to the ordered output relation (the single id column).
     pub commitments: Vec<ArkGT>,
+    /// The ordered output column data, padded to `2^log_domain`.
     pub columns: Vec<Vec<ArkFr>>,
+    /// `log2` of the output padding domain.
     pub log_domain: usize,
+    /// The real output row count.
     pub n: usize,
 }
 
@@ -540,7 +575,7 @@ pub fn verify_exact_scalar_order(
 /// against the node/value tree, populating `proof.value_openings` IN PLACE.
 ///
 /// UNCOMMITTED witness (never folded into `commitment_root`/`resolution_root`): at verify,
-/// [`verify_dict_value_terms`] recommits `oid` to `com_output_id_at_d` (binding the sort-key
+/// `verify_dict_value_terms` recommits `oid` to `com_output_id_at_d` (binding the sort-key
 /// object column) and rederives the sort key value/datatype from the opened terms, failing closed
 /// on any mismatch or missing opening. BASE/ROLLUP single-layer ONLY (delta order stays
 /// fail-closed).

@@ -80,7 +80,7 @@ pub struct PresentScalarOrderProof {
     pub sorted: SortedProof,
     /// C2a value↔term witness for a TERM-LESS order: the SORTED output id column's real ids
     /// (`oid[i]` = the id at sorted row `i`) plus one Merkle opening per DISTINCT id, re-verified
-    /// against the root-bound `nv_merkle_root` by [`verify_dict_value_terms_chain`]. EMPTY / `None`
+    /// against the root-bound `nv_merkle_root` by `verify_dict_value_terms_chain`. EMPTY / `None`
     /// on a TERM-BEARING artifact (the catalog re-MSM ties the sort key to real terms). UNCOMMITTED —
     /// never folded into `commitment_root`/`resolution_root`; a missing opening (or recommit
     /// mismatch) fails closed. Also serves the ordered result column's RESOLUTION (same id set).
@@ -430,7 +430,7 @@ pub fn prove_read_order_bgp(
 /// result resolves+verifies over a TERM-LESS artifact. `ordered_ids` is the prover's ORDERED output
 /// id column (`PresentReadResult::columns[0]`). Records them as `oid` and opens each DISTINCT id
 /// against the node/value tree. A term-bearing verifier ignores both fields; leaving them unset
-/// keeps a term-less order fail-closed. Mirrors [`build_termless_order_openings`].
+/// keeps a term-less order fail-closed. Mirrors `build_termless_order_openings`.
 pub fn attach_termless_present_order_openings(
     proof: &mut PresentScalarOrderProof,
     layers: &[&LayerCommitment],

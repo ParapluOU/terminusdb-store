@@ -209,8 +209,8 @@ pub enum RelationProofPlanKind {
     /// [`crate::proof::commitment::database_root`] before either is trusted as an anchor.
     ///
     /// This node is TOP-LEVEL ONLY: it is proven/verified through the dedicated two-layer entries
-    /// [`RecursiveRelationEnvelope::prove_cross_root`] / [`RecursiveRelationEnvelope::verify_cross_root`];
-    /// the single-layer [`RecursiveRelationEnvelope::prove_bounded`] recursion rejects it closed
+    /// `RecursiveRelationEnvelope::prove_cross_root` / `RecursiveRelationEnvelope::verify_cross_root`;
+    /// the single-layer `RecursiveRelationEnvelope::prove_bounded` recursion rejects it closed
     /// (it has only one layer), so every EXISTING single-root plan is byte-identical. `left` is
     /// specialized to a SINGLE key column (the class set, `left_key_col == 0`, delivering nothing to
     /// the output); the output schema is `right`'s columns MINUS `right_key_col` (instance namespace).
@@ -595,6 +595,15 @@ pub(super) fn validate_equality_plan(
     }
 }
 
+/// Resolve a public (variable-blind) [`RelationEqualityPlan`] into the concrete
+/// [`RelationEqualityConstraint`] the equality gadget checks, using `source`'s OWN authenticated
+/// dictionary view (never the proof).
+///
+/// A `ColumnConstant` constant term is looked up in the layer's node/value catalog to its
+/// dictionary id — an ABSENT constant resolves to a fresh out-of-range id, so it can never match a
+/// stored row. `Columns` passes the two column indices through unchanged; `Constants` collapses to
+/// a zero/one flag by comparing the two public constants directly. This is the verifier-side bridge
+/// from the query's public constants to field-element ids, resolved against the trusted root.
 pub fn resolve_relation_equality_constraint(
     source: &impl VerifierLayer,
     constraint: &RelationEqualityPlan,
@@ -633,7 +642,7 @@ pub fn resolve_relation_equality_constraint(
 /// Structural validation for a tuple-disequality plan. The child must be non-ground and
 /// every referenced column must be a nonnullable node/value column (edges are compared
 /// on their node/value ids); a constant node reference must be a node IRI. Rejects
-/// closed everything else, mirroring [`validate_equality_plan`]'s discipline.
+/// closed everything else, mirroring `validate_equality_plan`'s discipline.
 pub(super) fn validate_tuple_disequality_plan(
     pairs: &[TupleDisequalityPairPlan],
     descriptors: &[ResultColumnDescriptor],
@@ -1452,6 +1461,11 @@ impl RelationProofPlan {
         }
     }
 
+    /// Derive this plan's output schema — the per-column [`ResultColumnDescriptor`]s and whether the
+    /// result is ground (a single unit row, `true`) — by a depth- and node-bounded walk of the
+    /// operator tree. The verifier calls this to learn the shape the delivered rows MUST have before
+    /// checking any proof node; a plan deeper than [`MAX_RELATION_PROOF_DEPTH`] or with more than
+    /// [`MAX_RELATION_PROOF_NODES`] nodes rejects closed.
     pub fn result_shape(&self) -> io::Result<(Vec<ResultColumnDescriptor>, bool)> {
         let mut nodes = 0;
         self.shape_bounded(1, &mut nodes)

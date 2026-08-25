@@ -39,6 +39,11 @@
 //!
 //! Public paths are unchanged: everything re-exported below is still reachable at
 //! `terminus_store::proof::commitment::*`, exactly as when this was one inline module.
+//!
+//! This module is the [layer-commitment model](crate::proof::primer) (primer §9)
+//! made concrete. For what a [commitment](crate::proof::primer) and the
+//! [`commitment_root`/`resolution_root`](crate::proof::primer) anchors are, read
+//! the developer primer first.
 
 use super::*;
 use sha2::{Digest, Sha256};
@@ -81,6 +86,10 @@ const COMMITMENT_MAGIC: &[u8; 8] = b"TSPCW0\0\0";
 // are NOT folded into `commitment_root` (the root DOMAIN and STRUCTURE are unchanged, so a
 // layer's `commitment_root` stays BYTE-IDENTICAL to v5). The bump exists only so a pre-I1 v5
 // file — which lacks the two roots in its body — cannot be read under the new layout.
+/// On-disk format tag for a full prover-side [`LayerCommitment`] sidecar. Decoding
+/// rejects any other value, so an older-layout file cannot be misread. See the
+/// version-history comment above for what each bump changed and why bumps do NOT
+/// perturb `commitment_root`.
 pub const COMMITMENT_FORMAT_VERSION: u32 = 6;
 const VERIFIER_COMMITMENT_MAGIC: &[u8; 8] = b"TSPCV0\0\0";
 // Bumped in lockstep (1 → 2): a verifier commitment derived from a v4 prover file
@@ -96,11 +105,16 @@ const VERIFIER_COMMITMENT_MAGIC: &[u8; 8] = b"TSPCV0\0\0";
 // is unchanged and the flag is NOT folded into it, so a layer's `commitment_root` stays
 // BYTE-IDENTICAL across term-bearing and term-less; the bump exists so a pre-S1 v3 file
 // (which lacks the flag byte) cannot be read under the new layout.
+/// On-disk format tag for the compact verifier-only [`VerifierCommitment`]
+/// artifact. Bumped in lockstep with the prover format; decoding rejects any
+/// other value. See the version-history comment above for each bump.
 pub const VERIFIER_COMMITMENT_FORMAT_VERSION: u32 = 4;
 
 /// Number of committed columns per layer: additions (S,P,O) then removals
 /// (S,P,O), in that fixed order.
 pub const COLUMN_COUNT: usize = 6;
+/// Number of committed columns for a base/rollup layer's materialized head view:
+/// the complete subject/predicate/object id columns (S,P,O).
 pub const MATERIALIZED_COLUMN_COUNT: usize = 3;
 
 /// Largest deterministic Dory domain needed by any structurally admissible

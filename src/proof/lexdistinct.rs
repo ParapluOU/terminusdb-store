@@ -18,16 +18,16 @@
 //! THE SIX STEPS (all over `[0, n)` unless noted; every piece reuses an audited gadget
 //! or the audited sumcheck engine — NO new sumcheck engine, NO in-circuit hash):
 //!   1. LIMB DECOMPOSITION + RANGE. Commit `hi`, `lo`; prove each `< 2^127` by a
-//!      127-bit booleanity ([`super::sort::booleanity_claim`]) + recomposition claim.
+//!      127-bit booleanity (`super::sort::booleanity_claim`) + recomposition claim.
 //!   2. LINEAR TIE. `Com(S) == 2^127·Com(hi) + Com(lo)` — one homomorphic GT equality,
 //!      binding the limbs to the committed column (no sumcheck).
-//!   3. `hi` NONDECREASING over `[0, n-1)`, via [`super::sort::prove_nondecreasing_bits`]
+//!   3. `hi` NONDECREASING over `[0, n-1)`, via `super::sort::prove_nondecreasing_bits`
 //!      at 127 bits. This ALSO commits+binds `hi_shift[i] = hi[i+1]` (its `u_shift`).
 //!   4. EQUALITY FLAG `e[i] = [hi[i] == hi[i+1]]` over `[0, n-1)`, via the IsZero
 //!      argument (pseudo-inverse `w_e`), COMPLETE both directions.
 //!   5. MASKED STRICT-`lo`. `w5[i] := e[i]·(lo_shift[i] - lo[i] - 1) ∈ [0, 2^127)` over
 //!      `[0, n-1)`. `lo_shift[i] = lo[i+1]` is bound by a successor lookup
-//!      ([`super::sort::prove_successor_lookup_with_context`]). When `hi` ties (`e=1`)
+//!      (`super::sort::prove_successor_lookup_with_context`). When `hi` ties (`e=1`)
 //!      this forces `lo` to strictly increase; when `hi` differs (`e=0`) it is `0`.
 //!   6. ⚠️ CANONICAL `<p` CHECK (LOAD-BEARING; Risk #1). `2×127 = 254 > log2(p)`, so a
 //!      value in the lower ~⅓ of the field admits a SECOND in-range split `(hi',lo')`
@@ -51,6 +51,14 @@
 //! STANDALONE. This is the I4-a gadget only: it takes the ALREADY-SORTED committed
 //! column and proves strict lex order. The permutation (that `S` is the real hashes
 //! rearranged) is I4-b; combined-column formation is I4-c; re-mint wiring is I4-d/e.
+//!
+//! For a developer: this is a lexicographic (multi-limb) distinctness [gadget](crate::proof::primer)
+//! — the full-field cousin of [`sort`](super::sort). It batches range/IsZero checks into ONE
+//! [sumcheck](crate::proof::primer) (§5) and reuses two audited [`sort`](super::sort) sub-proofs (a
+//! nondecreasing-bits proof and a successor [LogUp](crate::proof::primer) lookup, §7). All
+//! challenges (`tau`, the zero-check point, `rho`) are Fiat–Shamir, drawn after every column is
+//! committed ([the transcript invariant](crate::proof::primer), §8). See also
+//! [gadgets](crate::proof::primer) (§6).
 
 use std::io;
 
@@ -469,16 +477,23 @@ fn bind_statement(transcript: &mut Transcript254, n: usize, com_s: &ArkGT, p_hi:
 /// `[com_hi, com_lo, hi_shift, com_lo_shift, aux.., bits..]`.
 #[derive(Clone, Debug)]
 pub struct LexDistinctProof {
+    /// Commitment to the high 127-bit limb column `hi`.
     pub com_hi: ArkGT,
+    /// Commitment to the low 127-bit limb column `lo`.
     pub com_lo: ArkGT,
+    /// Commitment to the one-step shift `lo_shift[i] = lo[i+1]`.
     pub com_lo_shift: ArkGT,
+    /// Step 3: `hi` is nondecreasing (also commits + binds `hi_shift` as its `u_shift`).
     pub hi_nondec: SortedProof,
+    /// Step 5 support: the successor lookup binding `lo_shift[i] = lo[i+1]`.
     pub lo_succ: SuccessorProof,
     /// `[Com(e), Com(w_e), Com(g), Com(w_g), Com(w5), Com(t1), Com(t2)]`.
     pub aux_commitments: Vec<ArkGT>,
     /// `Com` of the 5×127 contiguous bit columns (hi, lo, w5, t1, t2).
     pub bit_commitments: Vec<ArkGT>,
+    /// The batched main sumcheck carrying steps 1+4+5+6.
     pub sumcheck: SumcheckProof,
+    /// Batched Dory opening of every main-sumcheck column at the sumcheck's final point.
     pub opening: ColumnOpening,
 }
 

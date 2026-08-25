@@ -1,5 +1,13 @@
 //! Nondecreasing lexicographic ordering for two or three authenticated 64-bit key columns.
 //!
+//! A [gadget](crate::proof::primer) (primer §6) that proves the ordering half of a
+//! multi-column `ORDER BY`. It reduces multi-key lexicographic order to a single
+//! nondecreasing-range check by packing the keys into one number, so the whole proof is
+//! just [`super::sort`]'s bit-range sumcheck run once. See [the developer
+//! primer](crate::proof::primer) for [commitments](crate::proof::primer) and their
+//! homomorphism (§3), the [MLE/sumcheck](crate::proof::primer) workhorse (§5), and where
+//! this sits in [prove → verify](crate::proof::primer) (§10).
+//!
 //! WHAT IT PROVES: given 2 or 3 committed key columns (each a 64-bit id) with a per-key
 //! sort DIRECTION (ascending/descending), the real rows `[0, n)` are already sorted
 //! lexicographically — row `i` is `<=` row `i+1` under the requested column priority and
@@ -11,8 +19,9 @@
 //! "smaller packed value" always means "earlier in the requested order". Proving the
 //! packed column is nondecreasing (via [`super::sort`]'s bit-range gadget over `64*k`
 //! bits) is exactly proving lexicographic order of the originals. The packed column's
-//! commitment is rebuilt homomorphically from the individual key commitments and the
-//! public real-row mask, so it cannot be a different column than the committed keys.
+//! commitment is rebuilt homomorphically (primer §3) from the individual key commitments
+//! and the public real-row mask, so it cannot be a different column than the committed
+//! keys.
 //!
 //! WHERE: the ordering half of exact multi-key `OrderBy` — [`super::multiorder`] pairs
 //! this with a permutation proof (rows are the same multiset) to get a full ORDER BY.

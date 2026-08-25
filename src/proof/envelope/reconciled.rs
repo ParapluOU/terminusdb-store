@@ -27,7 +27,7 @@
 //! reconcile-once, many-reads surface — the expensive `O(chain)` reconciliation runs once; each
 //! leaf is `O(present)`.
 //!
-//! [`resolve_combined_node_id`] resolves a constant IRI (`rdf:nil`, a closure seed) to its
+//! `resolve_combined_node_id` resolves a constant IRI (`rdf:nil`, a closure seed) to its
 //! combined-dict id over the chain catalogs, failing CLOSED on absence — the chain analogue of the
 //! materialized `resolve_node_id_or_absent`.
 //!
@@ -35,7 +35,7 @@
 //!
 //! [`prove_reconciled_transitive_closure`] mirrors the materialized `prove_transitive_closure`, but
 //! the edge relation is a FOUNDATION-A predicate-constant edge read over `present` and the seed is
-//! resolved via [`resolve_combined_node_id`]. The round/fixpoint machinery is the SHARED
+//! resolved via `resolve_combined_node_id`. The round/fixpoint machinery is the SHARED
 //! `prove_closure_rounds` / `verify_closure_rounds` (source-agnostic: it consumes only
 //! `edge_witness` + accumulator commitments), so nothing about the semi-naive unroll, the
 //! monotonicity checks, or the empty-delta fixpoint changes. This is needed by 6c (`rdf:rest`) AND
@@ -232,7 +232,7 @@ pub(crate) fn resolve_combined_node_id(views: &[VerifierCommitmentRef<'_>], iri:
 
 /// Resolve a node IRI to its COMBINED-dict id (C3), safe over a TERM-LESS reconcile view.
 ///
-/// THE SOUNDNESS RISK term-less: [`resolve_combined_node_id`] SCANS the clear catalog, which a
+/// THE SOUNDNESS RISK term-less: `resolve_combined_node_id` SCANS the clear catalog, which a
 /// term-less view drops — the scan reads EMPTY and fail-OPENS to the impossible-id sentinel a
 /// prover could steer (a wrong-but-real closure SEED certifies the WRONG closure). So this NEVER
 /// scans a term-less chain; it demands a prover-shipped [`DictOpening`] carrying the claimed id and
@@ -241,7 +241,7 @@ pub(crate) fn resolve_combined_node_id(views: &[VerifierCommitmentRef<'_>], iri:
 /// that view's root-bound `nv_merkle_root`, then the opened term MUST hash to
 /// `hash_object(Node(iri))`. A wrong id / substituted term / MISSING opening fails closed.
 ///
-/// * ALL views term-bearing → delegate to the audited [`resolve_combined_node_id`] scan (each
+/// * ALL views term-bearing → delegate to the audited `resolve_combined_node_id` scan (each
 ///   catalog is root-bound by the reconciliation's per-layer `validate()`) — backward compatible.
 /// * ANY view term-less → require `opening` (fail-closed on `None`), belt-hash it, return its
 ///   claimed id. A constant genuinely ABSENT from the dict cannot produce an authenticating opening
@@ -271,7 +271,7 @@ pub(crate) fn resolve_combined_node_id_termless(
 
 /// Resolve reconciled transitive-closure output node-ids back to their IRIs
 /// ([`CanonicalObject`]s) over the whole chain's root-authenticated catalogs — the exact INVERSE of
-/// [`resolve_combined_node_id`], used by ReadDocument 6e (a reconciled `sys:inherits` ancestor
+/// `resolve_combined_node_id`, used by ReadDocument 6e (a reconciled `sys:inherits` ancestor
 /// closure over a DELTA schema head delivers combined-dict ids, which the compiler must render as
 /// class IRIs to drive the per-ancestor frame reads).
 ///
@@ -307,7 +307,7 @@ pub fn resolve_reconciled_node_ids(
 /// reachable `ids` are ALREADY authenticated by the closure verify, so this is a pure id→term
 /// render: it binds them to their own accumulator-shaped commitment (`closure_set_commit`, exactly
 /// the padding the closure threaded) and routes each id through the audited chain Merkle resolver
-/// ([`resolve_node_value_id_column`]). A TERM-LESS routed view opens from the prover-shipped
+/// (`resolve_node_value_id_column`). A TERM-LESS routed view opens from the prover-shipped
 /// `openings` (fail-closed on a missing/forged one, each re-verified by `verify_opening` against the
 /// root-bound `nv_merkle_root`); a term-bearing chain passes `None` and rebuilds from catalogs.
 pub fn resolve_reconciled_node_ids_from_views(
@@ -434,7 +434,7 @@ pub fn prove_reconciled_transitive_closure(
 
 /// C3c (producer): attach the UNCOMMITTED term-less opening witnesses to a proven
 /// [`ReconciledClosureProof`], so it can ship alongside a TERM-LESS reconciled artifact. Mints the
-/// SEED [`DictOpening`] (routed to its introducing layer via [`build_resolution_openings`] for the
+/// SEED [`DictOpening`] (routed to its introducing layer via `build_resolution_openings` for the
 /// single resolved seed id) plus the REACHABLE-id [`ResolutionOpenings`] (for the output render).
 /// `reachable_ids` are the closure's proven reachable set (the second return of
 /// [`prove_reconciled_transitive_closure`]). Mirrors
@@ -488,10 +488,10 @@ pub fn verify_reconciled_transitive_closure(
 /// Views-based analogue of [`verify_reconciled_transitive_closure`] (split like
 /// [`verify_read_bgp_from_views`](crate::proof::reconcile::verify_read_bgp_from_views)): a TERM-LESS
 /// head view (`LayerCommitment::verifier_commitment_termless`, term-bearing elsewhere) can be
-/// passed. The round/fixpoint machinery ([`verify_closure_rounds`]) is commitment-only, so it is
+/// passed. The round/fixpoint machinery (`verify_closure_rounds`) is commitment-only, so it is
 /// term-less-safe unchanged; the two term-sensitive reads go term-less:
-/// [`verify_reconciled_leaf_from_views`] (plain conjunctive edge atom, no range ⇒ C1/E3-sound) and
-/// the SEED resolution via [`resolve_combined_node_id_termless`] (belt-hashed against
+/// `verify_reconciled_leaf_from_views` (plain conjunctive edge atom, no range ⇒ C1/E3-sound) and
+/// the SEED resolution via `resolve_combined_node_id_termless` (belt-hashed against
 /// `proof.seed_opening`, fail-closed on a missing/forged opening — the seed constant must be present
 /// and CORRECT, or the wrong closure would be certified).
 pub fn verify_reconciled_transitive_closure_from_views(

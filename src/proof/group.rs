@@ -7,6 +7,14 @@
 //! that the chosen id occurs in its subgroup.  Finally the subgroup value-id
 //! column is dictionary-authenticated and compared against the chosen value; the
 //! resulting range-selection commitment must be the whole real-row prefix.
+//!
+//! For a developer: this is the group-by (with per-group min/max) [gadget](crate::proof::primer).
+//! It adds no new cryptography — it COMPOSES the audited [`equality`](super::equality) gadget
+//! (subgroup partition + membership), the [`relocate`](super::relocate) domain tie, and the
+//! [`range`](super::range) selection (which the extremum must dominate). It also reads dictionary
+//! values, so it is anchored to the layer commitment / dictionary model (primer §9) and it
+//! deliberately rejects float datatypes on a fidelity ground (IEEE total order ≠ WOQL numeric
+//! order; primer §11 on soundness vs fidelity). See also [gadgets](crate::proof::primer) (§6).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -43,7 +51,9 @@ const DOMAIN: &[u8] = b"parture/proof-of-woql/group-extrema/v0";
 /// (`Max`). Selects the range operator used to prove the chosen id dominates its group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupExtremaKind {
+    /// Prove the group's minimum value (the chosen id is `<=` every group value, via `RangeOp::Ge`).
     Min,
+    /// Prove the group's maximum value (the chosen id is `>=` every group value, via `RangeOp::Le`).
     Max,
 }
 
@@ -65,28 +75,44 @@ impl GroupExtremaKind {
 /// dominates (min/max) the whole subgroup.
 #[derive(Clone, Debug)]
 pub struct GroupExtremaEntryProof {
+    /// Equality proof carving the exact subgroup where the key column equals this row's key.
     pub group: RelationEqualityProof,
+    /// Commitments to the carved subgroup's columns.
     pub group_commitments: Vec<ArkGT>,
+    /// The subgroup's real row count.
     pub group_len: usize,
+    /// Equality proof that the chosen extremum id occurs in the subgroup's value column.
     pub membership: RelationEqualityProof,
+    /// Commitments to the membership-filtered columns.
     pub membership_commitments: Vec<ArkGT>,
+    /// The membership-filtered row count (must be nonzero).
     pub membership_len: usize,
+    /// Relocate the subgroup value column to the common domain `2^d`.
     pub relocate_value: RelocationProof,
+    /// Relocate the dictionary id column to `2^d`.
     pub relocate_dict_id: RelocationProof,
+    /// Relocate the dictionary order-preserving value column to `2^d`.
     pub relocate_dict_value: RelocationProof,
+    /// Relocate the dictionary datatype column to `2^d`.
     pub relocate_dict_datatype: RelocationProof,
+    /// Commitment to the subgroup value column at domain `2^d`.
     pub com_value_at_d: ArkGT,
+    /// Commitment to the dictionary id column at domain `2^d`.
     pub com_dict_id_at_d: ArkGT,
+    /// Commitment to the dictionary value column at domain `2^d`.
     pub com_dict_value_at_d: ArkGT,
+    /// Commitment to the dictionary datatype column at domain `2^d`.
     pub com_dict_datatype_at_d: ArkGT,
+    /// The range selection proving the chosen value dominates (min/max) the whole subgroup.
     pub range: ObjectRangeProof,
+    /// Commitment to the range-selection column; must equal the whole real-row prefix of the subgroup.
     pub com_range_selection: ArkGT,
     /// Merkle-dict I2b step 3 (value↔term consistency, TERM-LESS group). The real object ids of
     /// this group's VALUE column (`oid[i]` = the id at compacted row `i`, length = `group_len`,
     /// in input/compaction order), which `com_value_at_d` commits and `range.lookup` gathers
     /// `(v_val, v_dt)` from. EMPTY on a TERM-BEARING artifact. On a TERM-LESS artifact the verifier
     /// recommits `oid` to `com_value_at_d` and rederives `range.lookup.com_v_val`/`com_v_dt` from
-    /// the Merkle-authenticated opened terms ([`verify_dict_value_terms`]) — the SAME columns the
+    /// the Merkle-authenticated opened terms (`verify_dict_value_terms`) — the SAME columns the
     /// Min/Max range selection consumes. UNCOMMITTED; a missing opening / recommit mismatch fails
     /// closed.
     pub oid: Vec<u64>,
@@ -105,10 +131,15 @@ pub struct GroupExtremaProof {
 /// Prover result: the proof plus the output relation `(key, extremum-id)` — its columns,
 /// their commitments, the output `log_domain`, and the group count `n`.
 pub struct GroupExtremaResult {
+    /// The group-extrema proof.
     pub proof: GroupExtremaProof,
+    /// The output `(key, extremum-id)` columns, zero-padded to `2^log_domain`.
     pub columns: Vec<Vec<ArkFr>>,
+    /// Dory commitments to `columns`.
     pub commitments: Vec<ArkGT>,
+    /// The output columns' power-of-two log-domain.
     pub log_domain: usize,
+    /// The number of output groups (real rows).
     pub n: usize,
 }
 

@@ -1,5 +1,14 @@
 //! Exact complete-row lexicographic order for two or three numeric Store-ID columns.
 //!
+//! For a developer: the multi-column sibling of [`super::order`] — a full `ORDER BY`
+//! over a 2- or 3-column relation. Same shape: a [permutation](crate::proof::primer)
+//! proof forces same-rows and a [sort](crate::proof::primer) proof forces sorted-order,
+//! and neither alone is enough. The only difference is the sort key spans several
+//! columns, so [`super::lexsort`] packs them into one number and the sort runs once. See
+//! [the primer](crate::proof::primer) for [commitments](crate::proof::primer) (§3),
+//! [gadgets](crate::proof::primer) (§6), and [prove → verify](crate::proof::primer) (§10);
+//! the float exclusion below is a [fidelity](crate::proof::primer) guard (§11).
+//!
 //! WHAT IT PROVES: this is a full `ORDER BY` over a 2- or 3-column relation of Store ids.
 //! Given a committed input relation and a claimed output relation, it certifies that the
 //! output is (a) an exact full-row PERMUTATION of the input — same rows, same
@@ -45,14 +54,16 @@ use super::{invalid, CanonicalDatatype, CanonicalObject};
 /// lexicographic-order subproof over the resolved value columns.
 #[derive(Clone, Debug)]
 pub struct ExactMultiOrderProof {
+    /// Output is a full-row permutation of the input (same rows, same multiplicities).
     pub permutation: RelationPermutationProof,
+    /// The resolved key-value columns are nondecreasing in the requested lexicographic order.
     pub lexicographic: LexicographicSortedProof,
     /// Merkle-dict I2b step 3 (value↔term consistency, TERM-LESS multi-key order). One
     /// positional Merkle opening per DISTINCT id touched across ALL key columns (node/value
     /// namespace). `None` on a TERM-BEARING artifact (the catalog re-MSM ties each key's
     /// value/datatype to real terms). On a TERM-LESS artifact the verifier rederives each key
     /// column's sort values from these openings and ties them to the root-bound output-id
-    /// commitments per column ([`verify_dict_value_terms`]); the per-column `oid` vector is the
+    /// commitments per column (`verify_dict_value_terms`); the per-column `oid` vector is the
     /// shipped `result_columns[k]` (already bound to `result_commitments[k]`), so no separate
     /// `oid` field is needed. UNCOMMITTED — a missing opening (or recommit mismatch) fails closed.
     pub value_openings: Option<ResolutionOpenings>,
@@ -61,8 +72,16 @@ pub struct ExactMultiOrderProof {
 /// Prover result: the proof plus the sorted output relation (its id columns, their
 /// commitments, the shared power-of-two `log_domain`, and the real row count `n`).
 pub struct ExactMultiOrderResult {
-    pub proof: ExactMultiOrderProof, pub commitments: Vec<ArkGT>,
-    pub columns: Vec<Vec<ArkFr>>, pub log_domain: usize, pub n: usize,
+    /// The order proof to hand to [`verify_exact_multi_order`].
+    pub proof: ExactMultiOrderProof,
+    /// Commitments to the sorted output id columns.
+    pub commitments: Vec<ArkGT>,
+    /// The sorted output id columns, padded to `2^log_domain`.
+    pub columns: Vec<Vec<ArkFr>>,
+    /// `log2` of the shared output padding domain.
+    pub log_domain: usize,
+    /// The real output row count.
+    pub n: usize,
 }
 
 fn validate_shape(arity: usize, datatypes: &[CanonicalDatatype], key_indices: &[usize], directions: &[OrderDirection]) -> io::Result<()> {
@@ -106,7 +125,7 @@ fn resolve_values(source: &impl VerifierLayer, columns: &[Vec<ArkFr>], n: usize,
 
 /// Merkle-dict I2b step 3 (TERM-LESS value↔term resolve). For each key column, decode its sort
 /// values from the Merkle-authenticated terms at the shipped output ids (`output_columns[k]`) and
-/// tie them to the root-bound `output_commitments[k]` via the audited [`verify_dict_value_terms`].
+/// tie them to the root-bound `output_commitments[k]` via the audited `verify_dict_value_terms`.
 ///
 /// The per-column `oid` is the shipped `output_columns[k]` itself (already bound to
 /// `output_commitments[k]` by the enclosing envelope's `verify_result_columns`); the tie re-forces

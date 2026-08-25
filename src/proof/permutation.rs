@@ -34,6 +34,13 @@
 //! holds iff the `beta`-fingerprint multiset of the real output rows equals that of the
 //! real input rows, i.e. iff the output is an exact full-row permutation (duplicates and
 //! tuple correlation included).
+//!
+//! For a developer: this is the permutation-argument [gadget](crate::proof::primer) — it proves
+//! two column orderings hold the same row multiset (and nothing about ordering). The multiset
+//! equality is the [LogUp](crate::proof::primer) rational-sum identity `Σ 1/(alpha - in_fold) -
+//! Σ 1/(alpha - out_fold) = 0`, batched through a [LogUp-GKR](crate::proof::primer) fraction tree
+//! (§7). `beta`/`alpha` are Fiat–Shamir, drawn after both sides are bound ([the transcript
+//! invariant](crate::proof::primer), §8). See also [gadgets](crate::proof::primer) (§6).
 
 use std::io;
 
@@ -70,18 +77,26 @@ fn f1() -> ArkFr {
 /// exists anymore.
 #[derive(Clone, Debug)]
 pub struct RelationPermutationProof {
+    /// The GKR fraction-sum-zero proof for `Sum 1/(alpha - in_fold) - Sum 1/(alpha - out_fold) = 0`.
     pub gkr: GkrFractionProof,
+    /// Claimed evaluations of the `2*arity` committed data columns (input then output) at `r_low`.
     pub col_evals: Vec<ArkFr>,
+    /// One batched Dory opening binding `col_evals` to the committed columns at `r_low`.
     pub opening: ColumnOpening,
 }
 
 /// Prover result: the proof plus the reordered output relation (its columns, their
 /// commitments, the shared `log_domain`, and the real row count `n`).
 pub struct RelationPermutationResult {
+    /// The permutation proof.
     pub proof: RelationPermutationProof,
+    /// Dory commitments to the reordered output columns.
     pub commitments: Vec<ArkGT>,
+    /// The reordered output columns (zero-padded to `2^log_domain`).
     pub columns: Vec<Vec<ArkFr>>,
+    /// The shared power-of-two log-domain (equal to the input's).
     pub log_domain: usize,
+    /// The real row count (equal to the input's).
     pub n: usize,
 }
 

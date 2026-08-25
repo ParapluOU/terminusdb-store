@@ -47,6 +47,9 @@ pub fn prove_layer_bgp_with_result(
     prove_layer_bgp_with_result_and_context(&StoreProverContext::cpu(), layer, plan)
 }
 
+/// The k-atom BGP prover core: [`prove_layer_bgp_with_result`] with a caller-supplied prover
+/// context (for GPU/Blitzar MSM offload). [`prove_layer_bgp`] and [`prove_layer_bgp_with_result`]
+/// are the CPU-context wrappers over this.
 pub fn prove_layer_bgp_with_result_and_context(
     context: &StoreProverContext<'_>,
     layer: &LayerCommitment,
@@ -336,7 +339,7 @@ pub fn prove_layer_bgp_with_result_and_context(
 
 /// Merkle-dict I2b S5: attach the UNCOMMITTED term-less resolution witness to a freshly proven
 /// base/rollup BGP result, so it can ship alongside a TERM-LESS artifact
-/// ([`VerifierCommitment::verifier_commitment_termless`]). The prover still holds the full
+/// (`VerifierCommitment::verifier_commitment_termless`). The prover still holds the full
 /// term-bearing catalog, so it rebuilds the id-indexed dictionary trees and opens:
 ///   * every DISTINCT matched-constant id (predicate IRI + subject/object constants) — the S4
 ///     belt-hash witness tying each authenticated constant to its real `resolution_root`-bound
@@ -371,12 +374,12 @@ pub fn attach_termless_bgp_openings(
 
 /// Merkle-dict I2b step 3 (producer): mint the TERM-LESS value↔term witness for every ranged
 /// atom of a proven base/rollup BGP. For each atom whose proof carries a [`RangeAtomSubproof`],
-/// re-derive the atom's source object column (the SAME [`source_layer_columns`] the prover ranged
+/// re-derive the atom's source object column (the SAME `source_layer_columns` the prover ranged
 /// over), record its real object ids as `oid`, and open each DISTINCT id against the node/value
-/// tree ([`build_resolution_openings`]). Populates `sub.oid` + `sub.value_openings` IN PLACE.
+/// tree (`build_resolution_openings`). Populates `sub.oid` + `sub.value_openings` IN PLACE.
 ///
 /// The witness is UNCOMMITTED (never folded into `commitment_root`/`resolution_root`): at verify,
-/// [`verify_dict_value_terms`](super::result) recommits `oid` to `com_object_at_d` (binding the
+/// `verify_dict_value_terms` recommits `oid` to `com_object_at_d` (binding the
 /// touched set) and rederives value/datatype from the opened terms, failing closed on any mismatch
 /// or missing opening. Over-inclusion is safe (the recommit pins the exact column); a term-bearing
 /// verifier ignores the witness. BASE/ROLLUP single-layer ONLY (delta range stays fail-closed).

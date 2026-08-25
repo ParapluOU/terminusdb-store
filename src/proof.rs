@@ -8,6 +8,13 @@
 //! The per-layer sidecar payload itself lives in [`commitment`], which replaces
 //! the abandoned SHA-256 Merkle scheme with a homomorphic column-commitment
 //! scheme ("Proof-of-WOQL").
+//!
+//! This is the crate's proof root: it declares the whole `proof` module tree and
+//! owns the on-disk framing, but the actual cryptography lives in the submodules.
+//! If a doc here (or in any submodule) uses a term like *commitment*, *sumcheck*,
+//! *gadget*, *Fiat–Shamir*, or *layer root* and it is unfamiliar, read
+//! [the developer primer](crate::proof::primer) first — every submodule links back
+//! to it rather than re-explaining the crypto.
 
 use std::cmp::Ordering;
 use std::convert::{TryFrom, TryInto};
@@ -28,7 +35,13 @@ const PERSISTED_TABLE_COUNT: usize = 5;
 // structural consistency, not as a contradictory lower deployment ceiling.
 const MAX_DECODED_RECORDS: usize = MAX_RECORDS * PERSISTED_TABLE_COUNT;
 const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
+/// Hard ceiling on the ENCODED size of one persisted proof-layer sidecar file.
+/// Decoding refuses to read (and encoding refuses to produce) anything larger,
+/// so a hostile or corrupt file cannot force an unbounded read.
 pub const MAX_PROOF_LAYER_BYTES: usize = 256 * 1024 * 1024;
+/// Hard ceiling on the estimated RETAINED heap a single decoded sidecar may
+/// occupy. Charged incrementally while decoding (before each allocation), so a
+/// compact-but-explosive encoding fails closed before it can exhaust memory.
 pub const MAX_DECODED_PROOF_BYTES: usize = 512 * 1024 * 1024;
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -42,6 +55,11 @@ fn validate_field_len(len: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// Scheme-independent enumeration of every literal datatype the proof pipeline
+/// can carry, decoupled from the Store's own `tdb_succinct::Datatype`. The `u8`
+/// discriminant is the stable on-disk tag: it is written into serialized records
+/// and folded into the committed DATATYPE column, so variants are only ever
+/// APPENDED (never reordered or removed) to keep old commitment roots valid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum CanonicalDatatype {
@@ -97,6 +115,8 @@ pub enum CanonicalDatatype {
 }
 
 impl CanonicalDatatype {
+    /// Map a Store `Datatype` onto its stable canonical tag. Total (every Store
+    /// datatype has a counterpart), so no proof-side datatype is ever lost.
     pub fn from_store(value: Datatype) -> Self {
         match value {
             Datatype::String => Self::String,
@@ -209,9 +229,17 @@ impl TryFrom<u8> for CanonicalDatatype {
     }
 }
 
+/// A triple's object in the scheme-independent proof model: either a graph
+/// `Node` (an IRI, carried as raw bytes) or a typed literal `Value` (a
+/// `CanonicalDatatype` plus its lexical bytes). This is what the dictionary
+/// hashes, the order-preserving VALUE encoding, and the Merkle leaves all
+/// decompose; the `Ord` derive gives the canonical ordering the `Value`/dict
+/// indices sort by.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CanonicalObject {
+    /// A graph node / IRI, stored as its raw UTF-8 bytes.
     Node(Vec<u8>),
+    /// A typed literal: its datatype tag plus the lexical form's bytes.
     Value {
         datatype: CanonicalDatatype,
         lexical: Vec<u8>,
@@ -231,6 +259,10 @@ impl CanonicalObject {
     }
 }
 
+/// A whole triple in the canonical proof model: subject and predicate IRIs as
+/// raw bytes, plus a [`CanonicalObject`]. These self-contained bytes travel with
+/// each [`ProofRecord`] so the verifier never needs a Store dictionary to read
+/// the logical term.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CanonicalTriple {
     pub subject: Vec<u8>,
@@ -250,6 +282,9 @@ pub struct ProofRecord {
 }
 
 impl CanonicalTriple {
+    /// Build a triple whose object is a graph `Node` (IRI), from raw byte
+    /// operands. Convenience for the common node-object case (mostly tests and
+    /// predicate rows); typed-literal objects go through [`CanonicalObject`].
     pub fn node(
         subject: impl Into<Vec<u8>>,
         predicate: impl Into<Vec<u8>>,
@@ -307,6 +342,13 @@ impl CanonicalTriple {
     }
 }
 
+/// The deterministic sort orders a record table can be projected into. Each
+/// variant names a total order over [`ProofRecord`]s (see `triple_cmp`): the
+/// three native triple indices (`Spo`/`Pos`/`Osp`) mirror the Store's own index
+/// orders, `Value` orders by the object term (for range/order gadgets), and the
+/// three `*Dictionary` variants order by a term + its id (for dictionary
+/// commitments). Choosing a canonical order per index is what makes two honest
+/// provers commit byte-identical columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum ProofIndex {
@@ -550,6 +592,7 @@ pub(crate) struct ProofConstructionBudget {
 }
 
 impl ProofConstructionBudget {
+    /// Start a fresh admission budget at zero charged bytes.
     pub(crate) fn new() -> Self {
         Self { bytes: 0 }
     }
@@ -558,6 +601,9 @@ impl ProofConstructionBudget {
         checked_heap_add(&mut self.bytes, bytes)
     }
 
+    /// Charge the estimated retained heap of one triple record (element table
+    /// growth plus its owned field bytes) against the cap, failing closed if the
+    /// running total would exceed [`MAX_DECODED_PROOF_BYTES`].
     pub(crate) fn record(&mut self, record: &ProofRecord) -> io::Result<()> {
         validate_field_len(record.triple.subject.len())?;
         validate_field_len(record.triple.predicate.len())?;
@@ -583,6 +629,8 @@ impl ProofConstructionBudget {
         )
     }
 
+    /// Charge one node/value dictionary catalog entry (an object term plus its
+    /// id) against the cap.
     pub(crate) fn node_value(&mut self, object: &CanonicalObject) -> io::Result<()> {
         let dynamic = match object {
             CanonicalObject::Node(value) => value.len(),
@@ -597,6 +645,8 @@ impl ProofConstructionBudget {
         )
     }
 
+    /// Charge one predicate dictionary catalog entry (a predicate term plus its
+    /// id) against the cap.
     pub(crate) fn predicate(&mut self, predicate: &[u8]) -> io::Result<()> {
         validate_field_len(predicate.len())?;
         self.reserve(
@@ -807,6 +857,9 @@ pub use commitment::{
     VerifierLayer,
 };
 
+/// Conceptual reference for the whole proof subsystem — read this first.
+/// Doc-only; other modules intra-doc-link here instead of re-explaining the crypto.
+pub mod primer;
 pub mod anti;
 pub mod argument;
 pub mod bgp;

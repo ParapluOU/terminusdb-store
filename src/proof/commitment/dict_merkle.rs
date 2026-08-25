@@ -33,6 +33,11 @@
 //! roots are a deterministic function of the already-committed catalog (recomputed and checked
 //! against the root-bound catalog by `validate`), so trusting `commitment_root` transitively
 //! trusts them through the wrapper.
+//!
+//! The `nv_merkle_root`/`pred_merkle_root` this builds are the dictionary-Merkle
+//! half of the [layer-commitment model's](crate::proof::primer)
+//! [`resolution_root`](crate::proof::primer) (primer §9): they authenticate the
+//! id → term resolution that turns a proved id back into a readable IRI/literal.
 
 use super::*;
 
@@ -222,6 +227,8 @@ impl DictMerkleTree {
         })
     }
 
+    /// The single top-level hash of the tree — the dictionary Merkle root that
+    /// `resolution_root` binds and that `verify_opening` authenticates against.
     pub(crate) fn root(&self) -> ProofHash {
         // `build_levels` always yields a nonempty top row of exactly one hash.
         self.levels.last().and_then(|row| row.first()).copied().unwrap()
@@ -336,7 +343,7 @@ pub(super) fn predicate_merkle_root(
 /// Merkle-dict I2b S5: this is now a PUBLIC (but UNCOMMITTED) proof-wire witness — a term-less
 /// [`LayerBgpProof`](crate::proof::query::LayerBgpProof) ships one per distinct matched-constant /
 /// resolved-result id. It is never folded into `commitment_root`/`resolution_root`; every consumer
-/// re-runs [`verify_opening`] against the trusted root, so a forged/absent opening fails closed.
+/// re-runs `verify_opening` against the trusted root, so a forged/absent opening fails closed.
 #[derive(Clone, Debug)]
 pub struct DictOpening {
     pub id: u64,
@@ -401,9 +408,9 @@ pub(crate) fn verify_opening(
 /// positional [`DictOpening`] per DISTINCT resolved id — node/value and predicate ids kept in
 /// separate namespaces — and term-less resolution verifies each against the root-bound
 /// `nv_merkle_root`/`pred_merkle_root` (β re-anchor), taking the term from the opening's OWN
-/// authenticated `term_bytes` ([`object_from_leaf_parts`]). This is EXACTLY analogous to the
+/// authenticated `term_bytes` (`object_from_leaf_parts`). This is EXACTLY analogous to the
 /// I2a filter-path `id_hints`: a proof-side witness, NEVER folded into
-/// `commitment_root`/`resolution_root`, bound solely by [`verify_opening`] (which re-forces the
+/// `commitment_root`/`resolution_root`, bound solely by `verify_opening` (which re-forces the
 /// interval `(parent,count]` + the structural position `id-parent-1` against the trusted root,
 /// so a fabricated tree or a wrong-id opening cannot authenticate). A MISSING opening is an
 /// `Err` (fail-closed), never a silent empty result.
@@ -415,7 +422,7 @@ pub struct ResolutionOpenings {
 
 impl ResolutionOpenings {
     /// The shipped opening for a node/value id, or `Err` (fail-closed) if the prover shipped
-    /// none. The caller still runs [`verify_opening`] against the root-bound root, so a present
+    /// none. The caller still runs `verify_opening` against the root-bound root, so a present
     /// but WRONG opening is rejected there; this only turns a MISSING opening into an error
     /// rather than an empty resolution.
     pub(crate) fn node_value_opening(&self, id: u64) -> io::Result<&DictOpening> {
@@ -433,7 +440,7 @@ impl ResolutionOpenings {
 
     /// Insert a node/value opening (keyed by its own id). Prover/wire constructor. Merkle-dict
     /// I2b S5: un-gated — the shipping term-less producer now mints openings (bound at verify by
-    /// [`verify_opening`], never committed).
+    /// `verify_opening`, never committed).
     pub(crate) fn insert_node_value(&mut self, opening: DictOpening) {
         self.node_value.insert(opening.id, opening);
     }
@@ -456,7 +463,7 @@ impl ResolutionOpenings {
 
     /// Merkle-dict I2b S5 (wire): reconstruct from decoded opening lists, each keyed by its own
     /// `id`. A duplicate id in either list is malformed (rejected). This is pure PARSING — it
-    /// confers NO trust; every opening is re-checked against the trusted root by [`verify_opening`]
+    /// confers NO trust; every opening is re-checked against the trusted root by `verify_opening`
     /// at consume time, and a MISSING opening fails closed there.
     pub(crate) fn from_wire(
         node_value: Vec<DictOpening>,

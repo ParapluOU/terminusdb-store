@@ -2,6 +2,19 @@
 //! completeness gadgets under ONE shared transcript against ONE set of committed
 //! columns. Clean-room composition; no COSL code.
 //!
+//! For a developer: this module proves a two-atom self-join answer is *exactly* the
+//! join — every genuine matching pair present, nothing forged or duplicated. It does
+//! not invent new cryptography; it wires five audited [gadgets](crate::proof::primer)
+//! ([`super::pairs`], [`super::sort`], two [`super::membership`], and [`super::count`])
+//! onto one Fiat–Shamir [transcript](crate::proof::primer) so their challenges all
+//! depend on the whole committed instance (per [the transcript
+//! invariant](crate::proof::primer), primer §8). The logic: the pairs are distinct
+//! valid matches, and a counting identity forces their number to equal the total, so a
+//! size-`m_J` set of distinct valid pairs drawn from a size-`m_J` universe is the whole
+//! universe. See [the primer](crate::proof::primer) for
+//! [commitments](crate::proof::primer) (§3) and [prove → verify](crate::proof::primer)
+//! (§10).
+//!
 //! A 2-atom self-join `t(?x, P, ?y), t(?y, P, ?z)` reduces (after the Q1 filter by
 //! `P`) to self-joining a relation `F = (Sf, Of)` on `Of == Sf` (the shared
 //! variable `y`), producing `(X, Y, Z)`. This module proves the claimed output is
@@ -86,25 +99,40 @@ fn padded(column: &[ArkFr], n: usize) -> Vec<ArkFr> {
 /// proofs; the SAME `u`/`w_l`/`w_r` feed distinctness, membership, and count.
 #[derive(Clone, Debug)]
 pub struct SelfJoinCommitments {
+    /// Commitment to the F relation's subject column `Sf`.
     pub sf: ArkGT,
+    /// Commitment to the F relation's object column `Of`.
     pub of: ArkGT,
+    /// Commitment to output column `X` (= `Sf[rho_l]`).
     pub x: ArkGT,
+    /// Commitment to output column `Y` (the shared join key, `= Of[rho_l] = Sf[rho_r]`).
     pub y: ArkGT,
+    /// Commitment to output column `Z` (= `Of[rho_r]`).
     pub z: ArkGT,
+    /// Commitment to the LEFT index-pointer column `rho_l` (into F).
     pub rho_l: ArkGT,
+    /// Commitment to the RIGHT index-pointer column `rho_r` (into F).
     pub rho_r: ArkGT,
+    /// Commitment to the join-key universe `U` (sorted distinct union of `Of` and `Sf`).
     pub u: ArkGT,
+    /// Commitment to the LEFT per-key multiplicity column `w_L`.
     pub w_l: ArkGT,
+    /// Commitment to the RIGHT per-key multiplicity column `w_R`.
     pub w_r: ArkGT,
 }
 
 /// A full sound+complete self-join proof: the five composed sub-proofs.
 #[derive(Clone, Debug)]
 pub struct SelfJoinCompleteProof {
+    /// The output is a set of distinct genuine key-matching F-pairs ([`super::pairs`]).
     pub pairs: PairsProof,
+    /// The key universe `U` is strictly increasing, hence distinct ([`super::sort`]).
     pub sorted_u: SortedProof,
+    /// `Of` is the multiset image of `U` under `w_L` ([`super::membership`]).
     pub membership_l: MembershipProof,
+    /// `Sf` is the multiset image of `U` under `w_R` ([`super::membership`]).
     pub membership_r: MembershipProof,
+    /// `Sum_i w_L[i]*w_R[i] = m_J`: the pair count equals the output size ([`super::count`]).
     pub count: CountProof,
 }
 

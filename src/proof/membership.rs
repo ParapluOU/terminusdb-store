@@ -6,6 +6,15 @@
 //! in `U`, and `w[i] = #{ a : Of_a = U[i] }`. This is completeness claim (i);
 //! claim (ii) is the symmetric `Sf/U/w_R` with fresh challenges.
 //!
+//! For a developer: this [gadget](crate::proof::primer) answers "is every value of
+//! one committed column present in another, and how many times?" — a *multiset*
+//! question, so it is discharged by a [lookup/LogUp](crate::proof::primer) argument
+//! (primer §7) rather than row-by-row [sumcheck](crate::proof::primer). `alpha` is a
+//! Fiat–Shamir challenge drawn only after the data is committed ([the transcript
+//! invariant](crate::proof::primer), primer §8). See [the primer](crate::proof::primer)
+//! for [commitments](crate::proof::primer) (§3) and [prove → verify](crate::proof::primer)
+//! (§10); the join gadgets build on this to certify complete joins.
+//!
 //! # The gadget (LogUp-GKR, block-disjoint two-side layout + GAP-1 auxiliary Identity)
 //! The log-derivative identity pinning `w[i]` to the true count of `U[i]` in `Of` is
 //! ```text
@@ -108,10 +117,16 @@ fn f1() -> ArkFr {
 /// `com_w` on the shared transcript). NO reciprocal (`rec_u`/`rec_of`) column exists.
 #[derive(Clone, Debug)]
 pub struct MembershipProof {
+    /// GKR fraction-tree proof of `Sum_{i<n_U} w/(alpha - U) - Sum_{a<n_F} 1/(alpha - Of) = 0`.
     pub gkr: GkrFractionProof,
+    /// Claimed evaluations of the three DATA columns `[U, Of, w]` at `r_low`.
     pub col_evals: Vec<ArkFr>,
+    /// One batched Dory opening authenticating `col_evals` at `r_low`.
     pub opening: ColumnOpening,
+    /// Sumcheck for the GAP-1 auxiliary Identity `(1 - chi_{n_U})*w = 0`
+    /// (forces `w` to vanish on the universe padding tail).
     pub id_sumcheck: SumcheckProof,
+    /// Opening of the SAME committed `w` column the identity sumcheck consumed.
     pub id_opening: ColumnOpening,
 }
 
@@ -411,7 +426,11 @@ pub(crate) fn prove_membership_with_mult_with_witness_and_context(
     })
 }
 
-/// Verify a membership-with-multiplicity proof.
+/// Verify a membership-with-multiplicity proof against the committed columns
+/// `com_u`/`com_of`/`com_w` and the public real lengths `n_u`/`n_of`. Confirms the
+/// fraction tree's root is zero (so `Of` is exactly the multiset image of `U` under
+/// `w`) and the GAP-1 identity holds; fails closed if any opening, leaf tie, or the
+/// tail-mask identity does not check.
 pub fn verify_membership_with_mult(
     com_u: &ArkGT,
     com_of: &ArkGT,

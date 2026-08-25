@@ -5,14 +5,14 @@
 //! RE-DERIVE the output column itself and compare. That is the "verifier-recompute" pattern,
 //! and this module is where those recomputations live:
 //!
-//! * generated-decimal row filters ([`generated_u64_filtered_columns`] /
-//!   [`generated_i64_filtered_columns`]) — keep the child rows whose generated value satisfies
+//! * generated-decimal row filters (`generated_u64_filtered_columns` /
+//!   `generated_i64_filtered_columns`) — keep the child rows whose generated value satisfies
 //!   the comparison;
 //! * grouped and whole-collection aggregates — `GROUP BY` / `findall`-style sum, count and
 //!   min/max over fixed-width integral Store values (`derived_group_*`, `derived_collection_*`,
 //!   `derived_cardinality_column`).
 //!
-//! [`GroupSumValue`] carries a signed/unsigned accumulator wide enough (i128) that no
+//! `GroupSumValue` carries a signed/unsigned accumulator wide enough (i128) that no
 //! intermediate overflow is possible within the envelope's row cap, while still requiring the
 //! final result to fit its declared generated domain. Floating types are refused here as
 //! defense-in-depth, because their total-order encoding places NaN differently from Prolog's

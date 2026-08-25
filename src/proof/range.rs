@@ -1,5 +1,19 @@
 //! Standalone numeric sign/range selection gadget (Phase 7.4, CP-B1).
 //!
+//! For a developer: this [gadget](crate::proof::primer) proves a `WHERE value < c`
+//! (or `<=`, `>`, `>=`) selection is faithful — the committed boolean `sel` marks
+//! EXACTLY the real rows satisfying the comparison. A field has no native "less than",
+//! so the trick is to form a guaranteed-non-negative offset difference and read its
+//! sign from a bit decomposition: the [sumcheck](crate::proof::primer) (primer §5)
+//! proves the committed bit columns are 0/1 and recompose to the difference, and the
+//! top bit is the answer. The later parts of this module ([`DictLookupProof`],
+//! [`ObjectRangeProof`]) first authenticate a triple object's numeric value against the
+//! root-bound dictionary via a [LogUp](crate::proof::primer) lookup (primer §7), then
+//! run the range on that authenticated value. See [the primer](crate::proof::primer)
+//! for [commitments](crate::proof::primer) (§3), the [transcript
+//! invariant](crate::proof::primer) (§8), and the [soundness-vs-fidelity
+//! distinction](crate::proof::primer) (§11) that drives the datatype-homogeneity guards.
+//!
 //! Given a committed value column `V` (`N = 2^k` rows, `n` of them real, the rest
 //! padding), a PUBLIC constant `c`, a bit-width `B`, and an operator
 //! `op ∈ {<, <=, >, >=}`, this gadget proves that a committed boolean selection
@@ -61,7 +75,7 @@
 //! order-preserving integers of ≤ 8 bytes (`< 2^64`), so choosing `B ≥ 64` on an
 //! honest root-anchored layer guarantees it. `c ∈ [0, 2^B)` IS checked (public).
 //! We also require `2^{B+1} ≤ r`, i.e. `B ≤ 252` on BN254 (`r ≈ 2^253.6`).
-//! [`out_of_range_v_breaks_the_sign_precondition`] demonstrates the bound is
+//! `out_of_range_v_breaks_the_sign_precondition` demonstrates the bound is
 //! load-bearing.
 //!
 //! The object-range composition below authenticates the dictionary lookup and
@@ -172,8 +186,11 @@ impl RangeOp {
 /// and passed back into the verifier (the authoritative output-column commitment).
 #[derive(Clone, Debug)]
 pub struct RangeSelectProof {
+    /// Batched sumcheck over the booleanity + recomposition + sign→sel claims.
     pub sumcheck: SumcheckProof,
+    /// Batched Dory opening of `[V, b_0..b_B, sel]` at the sumcheck point `r`.
     pub opening: ColumnOpening,
+    /// Commitments to the `B+1` bit columns of the offset difference.
     pub bit_commitments: Vec<ArkGT>,
 }
 
@@ -601,16 +618,22 @@ const LOOKUP_ALPHA: &[u8] = b"pow/obj-lookup/reciprocal-alpha";
 /// `v_val`, datatype-mask on `v_dt`) reuses as their committed inputs.
 #[derive(Clone, Debug)]
 pub struct DictLookupProof {
+    /// GKR fraction-tree proof of `Σ_{j<n_dict} w/(α − d) − Σ_{i<real_n} 1/(α − q) = 0`.
     pub gkr: GkrFractionProof,
     /// Evaluations of `[obj_id, v_val, v_dt, dict_id, dict_value, dict_datatype, w]` at
     /// `r_low`, bound to their commitments by `opening`.
     pub col_evals: Vec<ArkFr>,
+    /// One batched Dory opening authenticating `col_evals` at `r_low`.
     pub opening: ColumnOpening,
     /// GAP-1 auxiliary Identity `(1 − χ_{n_dict})·w = 0` sumcheck + its `w` opening.
     pub id_sumcheck: SumcheckProof,
+    /// Opening of the SAME committed `w` column the identity sumcheck consumed.
     pub id_opening: ColumnOpening,
+    /// Commitment to the authenticated per-row object VALUE column `v_val` (reused by the range gadget).
     pub com_v_val: ArkGT,
+    /// Commitment to the authenticated per-row object DATATYPE column `v_dt` (reused by the datatype mask).
     pub com_v_dt: ArkGT,
+    /// Commitment to the per-dict-row multiplicity column `w`.
     pub com_w: ArkGT,
 }
 
@@ -1058,7 +1081,9 @@ const CB_COL_SEL: usize = 2;
 /// degree 3) plus its batched opening of `[dt_match, range_sel, sel]`.
 #[derive(Clone, Debug)]
 pub struct ObjectRangeCombineProof {
+    /// Identity sumcheck proving `sel − dt_match·range_sel = 0` at every row.
     pub sumcheck: SumcheckProof,
+    /// Batched Dory opening of `[dt_match, range_sel, sel]` at the sumcheck point.
     pub opening: ColumnOpening,
 }
 
@@ -1068,12 +1093,19 @@ pub struct ObjectRangeCombineProof {
 /// output-column commitment, passed back into the verifier).
 #[derive(Clone, Debug)]
 pub struct ObjectRangeProof {
+    /// Authenticates each object's value/datatype against the root-bound dictionary.
     pub lookup: DictLookupProof,
+    /// Filter proof pinning the datatype-match indicator `[datatype == T]`.
     pub datatype: FilterProof,
+    /// Commitment to the datatype-match indicator column `dt_match`.
     pub com_dt_match: ArkGT,
+    /// Commitment to the datatype filter's pseudo-inverse witness column.
     pub com_dt_w: ArkGT,
+    /// Range proof over the authenticated value column `v_val`.
     pub range: RangeSelectProof,
+    /// Commitment to the range indicator column `range_sel`.
     pub com_range_sel: ArkGT,
+    /// Proof that `sel = dt_match ⊙ range_sel` (the combined object-range selection).
     pub combine: ObjectRangeCombineProof,
 }
 

@@ -397,7 +397,7 @@ pub(super) fn date_lexical_to_op_i64(lexical: &[u8]) -> io::Result<i64> {
 ///
 /// `Date`/`DateTime` are the sole EXCEPTION: they are order-preserving but their
 /// native lexical is NOT the OP encoding, so they are special-cased below —
-/// decoded to a chronological i64 key and re-encoded via [`op_offset_binary_i64`].
+/// decoded to a chronological i64 key and re-encoded via `op_offset_binary_i64`.
 /// This is `pub` so the woql2 compiler can compute a range constant's OP value
 /// through this EXACT function (single source of truth: the compiler's `c` is then
 /// byte-identical to the committed dict value column by construction).

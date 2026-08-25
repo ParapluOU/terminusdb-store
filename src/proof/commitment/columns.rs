@@ -9,6 +9,10 @@
 //! deterministic: the same tables always produce the same commitments, so any node can
 //! recompute and check them. It also holds [`reject_nan_catalog`], the guard that keeps IEEE
 //! NaNs out of a catalog before its total-order encoding is (mis)used as comparison order.
+//!
+//! A [Dory column commitment](crate::proof::primer) (primer §3–§4) is the short,
+//! binding fingerprint each function here produces; the same tables always yield
+//! the same commitment.
 
 use super::*;
 
@@ -42,6 +46,10 @@ pub(super) fn commit_record_id_column_with_context(
     context.commit_column(&coefficients)
 }
 
+/// Commit an already-built, power-of-two-padded field column via Dory. An empty
+/// column gets the canonical empty commitment (GT identity). Used for the
+/// dictionary hash/id/value/datatype columns, which are assembled as field
+/// vectors rather than selected from record ids.
 pub(super) fn commit_owned_field_column_with_context(
     context: &crate::proof::argument::StoreProverContext<'_>,
     coefficients: Vec<ArkFr>,
@@ -70,6 +78,9 @@ pub(super) fn commit_delta_columns(
     )
 }
 
+/// [`commit_delta_columns`] with explicitly selected prover arithmetic (e.g. a
+/// Blitzar-accelerated context). Arithmetic-only: the resulting commitments are
+/// identical regardless of context.
 pub(super) fn commit_delta_columns_with_context(
     context: &crate::proof::argument::StoreProverContext<'_>,
     additions: &[ProofRecord],
@@ -85,6 +96,8 @@ pub(super) fn commit_delta_columns_with_context(
     ])
 }
 
+/// Build the three materialized-head column commitments (S,P,O) for a
+/// base/rollup layer, from its complete logical triple set (pre-sorted SPO).
 pub(super) fn commit_materialized_columns(
     records: &[ProofRecord],
 ) -> io::Result<[ArkGT; MATERIALIZED_COLUMN_COUNT]> {
@@ -93,6 +106,8 @@ pub(super) fn commit_materialized_columns(
     )
 }
 
+/// [`commit_materialized_columns`] with explicitly selected prover arithmetic
+/// (arithmetic-only; identical commitments).
 pub(super) fn commit_materialized_columns_with_context(
     context: &crate::proof::argument::StoreProverContext<'_>,
     records: &[ProofRecord],
@@ -140,6 +155,8 @@ pub(super) fn commit_predicate_dictionary(
     )
 }
 
+/// [`commit_predicate_dictionary`] with explicitly selected prover arithmetic
+/// (arithmetic-only; identical commitments).
 pub(super) fn commit_predicate_dictionary_with_context(
     context: &crate::proof::argument::StoreProverContext<'_>,
     predicate_catalog: &[ProofRecord],
@@ -199,6 +216,8 @@ pub(super) fn commit_node_value_dictionary(
     )
 }
 
+/// [`commit_node_value_dictionary`] with explicitly selected prover arithmetic
+/// (arithmetic-only; identical commitments).
 pub(super) fn commit_node_value_dictionary_with_context(
     context: &crate::proof::argument::StoreProverContext<'_>,
     node_value_catalog: &[ProofRecord],
@@ -353,6 +372,8 @@ pub(super) fn commit_node_value_dict_range(
     )
 }
 
+/// [`commit_node_value_dict_range`] with explicitly selected prover arithmetic
+/// (arithmetic-only; identical commitments).
 pub(super) fn commit_node_value_dict_range_with_context(
     context: &crate::proof::argument::StoreProverContext<'_>,
     node_value_catalog: &[ProofRecord],

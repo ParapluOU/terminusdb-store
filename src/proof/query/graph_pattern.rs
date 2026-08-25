@@ -52,6 +52,9 @@ pub fn prove_layer_graph_pattern2(
     prove_layer_graph_pattern2_with_context(&StoreProverContext::cpu(), layer, predicate_term)
 }
 
+/// [`prove_layer_graph_pattern2`] with a caller-supplied prover context (for GPU/Blitzar MSM
+/// offload). Reads the materialized head view; see [`prove_layer_graph_pattern2_with_source`]
+/// for delta sources.
 pub fn prove_layer_graph_pattern2_with_context(
     context: &StoreProverContext<'_>,
     layer: &LayerCommitment,

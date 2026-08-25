@@ -10,15 +10,15 @@
 //! This file is only the facade: it re-exports the public API and wires the pieces together.
 //! The work is split by concern across submodules, from smallest building block to full query:
 //!
-//! * [`column_source`] — which committed columns a query reads (materialized head vs the
+//! * `column_source` — which committed columns a query reads (materialized head vs the
 //!   layer's own additions/removals delta), plus the shared selection/anchoring gates.
-//! * [`filter_query`] — Q1: a single triple pattern by predicate IRI, `t(?s, <P>, ?o)`.
-//! * [`graph_pattern`] — Q2: a 2-atom "friend-of-a-friend" self-join, `t(?x,<P>,?y),t(?y,<P>,?z)`.
-//! * [`plan`] — the public plan/atom/proof/result TYPES, plan validation, and the
+//! * `filter_query` — Q1: a single triple pattern by predicate IRI, `t(?s, <P>, ?o)`.
+//! * `graph_pattern` — Q2: a 2-atom "friend-of-a-friend" self-join, `t(?x,<P>,?y),t(?y,<P>,?z)`.
+//! * `plan` — the public plan/atom/proof/result TYPES, plan validation, and the
 //!   Fiat–Shamir statement binding that pins a plan into the proof's challenges.
-//! * [`result`] — turning proven Store-id result columns back into IRIs / typed literals.
-//! * [`range_atom`] — adding a numeric value-range test (`?a < c`) to one atom.
-//! * [`layer_bgp`] — Q_k: the general k-atom conjunctive BGP prove/verify entry points.
+//! * `result` — turning proven Store-id result columns back into IRIs / typed literals.
+//! * `range_atom` — adding a numeric value-range test (`?a < c`) to one atom.
+//! * `layer_bgp` — Q_k: the general k-atom conjunctive BGP prove/verify entry points.
 //!
 //! Public paths are unchanged: everything re-exported below is still reachable at
 //! `terminus_store::proof::query::*`, exactly as when this was a single file.

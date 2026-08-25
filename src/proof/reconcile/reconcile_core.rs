@@ -215,7 +215,7 @@ pub fn prove_reconcile_with_context(
 }
 
 /// Prover-side authenticated `present` relation (hash columns at 2^K) plus bookkeeping.
-/// Returned by [`prove_reconcile_core`] so a read query can be proved over `present` on the
+/// Returned by `prove_reconcile_core` so a read query can be proved over `present` on the
 /// SAME transcript — that shared transcript is what binds the BGP to the
 /// reconciliation-authenticated relation.
 pub struct ReconcileArtifacts {
@@ -584,7 +584,7 @@ pub fn verify_reconcile(
 }
 
 /// Verifier-side authenticated `present` handle (its column commitments at 2^K + counts),
-/// returned by [`verify_reconcile_core`] so a read query can be verified over it on the SAME
+/// returned by `verify_reconcile_core` so a read query can be verified over it on the SAME
 /// transcript.
 pub struct ReconcileVerified {
     pub com_present_s: ArkGT,

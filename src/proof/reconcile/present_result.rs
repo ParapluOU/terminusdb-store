@@ -372,7 +372,7 @@ impl<'a> ChainDictResolver<'a> {
 
 /// Merkle-dict I2b step 3 (CROSS-LAYER, C2a): the value↔term consistency verifier for a numeric
 /// object-value RANGE over a TERM-LESS delta / reconciled `present`. The chain analogue of
-/// [`verify_dict_value_terms`](crate::proof::query::result::verify_dict_value_terms): the object
+/// `verify_dict_value_terms`: the object
 /// ids of a delta / reconciled range span LAYERS, so step (3)'s per-id resolution drives the
 /// audited [`ChainDictResolver`] (which ROUTES each id to its introducing view and opens it
 /// term-less against that view's root-bound `nv_merkle_root`, fail-closed on a missing/forged
@@ -709,7 +709,7 @@ pub(crate) fn resolve_node_value_id_column(
 /// term-less view the combined-dict hash columns are prover-chosen, so a catalog SCAN reads empty
 /// and would fail-OPEN to a garbage id a prover could steer (the closure seed → a wrong-but-real
 /// id). Instead this drives the audited [`ChainDictResolver`], which routes `id` to its layer and
-/// re-forces the interval + structural position under [`verify_opening`], then requires
+/// re-forces the interval + structural position under `verify_opening`, then requires
 /// `hash_object(opened) == hash_object(expected)`. A wrong id, a substituted term, or a missing
 /// opening fails closed. If a routed view is itself term-bearing the resolver rebuilds+opens its
 /// tree and the shipped opening is redundant (still belt-checked). Returns unit on success.

@@ -28,7 +28,7 @@
 //!    certificate: no cell can be dropped (the BGP is complete + root-authenticated) or injected.
 //! 2. **(B/C) Edge relations** — the authenticated 2-column relations `t(?s,sys:index,?o)`,
 //!    `t(?s,sys:value,?o)`, and `t(?s,rdf:type,?o)`.
-//! 3. **(D/E/F) Functional binds** — [`super::list_walk::prove_edge_bind`] joins each cell to its ONE
+//! 3. **(D/E/F) Functional binds** — `super::list_walk::prove_edge_bind` joins each cell to its ONE
 //!    `sys:index`, its ONE `sys:value`, and its ONE `rdf:type`, pinning the join count to `n` (so a cell
 //!    with 0 or ≥2 of any of them breaks the count and rejects) and positionally relocating each read
 //!    object back onto the cell column. This delivers, aligned cell-for-cell: the index id, the value
@@ -58,7 +58,7 @@
 //! encode `nonNegativeInteger` (it maps to the `0` sentinel in [`crate::proof::commitment`]'s
 //! `node_value_op_value`), so a `nonNegativeInteger` value cannot be recovered from committed data at
 //! all. The composite therefore authenticates the index under the order-preserving fixed-width unsigned
-//! datatype [`INDEX_DATATYPE`] (`UInt64`), whose committed order-preserving value IS the raw integer.
+//! datatype `INDEX_DATATYPE` (`UInt64`), whose committed order-preserving value IS the raw integer.
 //! The compiler mirror / frame integration (a separate follow-on) maps the schema's declared index type
 //! onto this store-level convention.
 //!
@@ -1039,7 +1039,7 @@ fn reconciled_array_walk_digest(subject: &CanonicalObject, predicate: &[u8]) -> 
 }
 
 /// Every sub-proof of one reconciled ordered `sys:Array` walk. Compared to the materialized
-/// [`OrderedArrayWalkProof`], the four child ENVELOPES are replaced by ONE [`ReconcileProof`] + the
+/// `OrderedArrayWalkProof`, the four child ENVELOPES are replaced by ONE [`ReconcileProof`] + the
 /// per-leaf [`PresentBgpProof`]s; the density certificate carries the [`CombinedRangeDictProof`]
 /// authenticating each `sys:index` id over the chain (in place of the materialized single-layer dict);
 /// and EVERY gluing-gadget field is byte-identical to the materialized proof.
@@ -1124,14 +1124,14 @@ pub struct OrderedArrayWalkReconciledProof {
     /// catalog scan). Same in-memory-only discipline as `value_openings`.
     pub sys_array_opening: Option<DictOpening>,
     /// C3b (the C2a value re-pin witness): the per-cell `sys:index` id column — the SAME column the
-    /// density lookup's `com_index_at_d` / `com_obj_id` commits. [`verify_dict_value_terms_chain`]
+    /// density lookup's `com_index_at_d` / `com_obj_id` commits. `verify_dict_value_terms_chain`
     /// recommits it to `com_index_at_d` and opens each DISTINCT id's TERM cross-layer to re-derive the
     /// order-preserving VALUE/DATATYPE, pinning the density order key to the real terms (the array
     /// REORDER forge a term-less head opens). Populated at prove from the density index column (the
     /// prover already holds it); the opening set is minted separately.
     pub index_oid: Vec<u64>,
     /// C3b: the prover-shipped, UNCOMMITTED Merkle openings over the DISTINCT [`Self::index_oid`] ids,
-    /// used by [`verify_dict_value_terms_chain`] to open each index literal's term over a TERM-LESS
+    /// used by `verify_dict_value_terms_chain` to open each index literal's term over a TERM-LESS
     /// head. `None` on the term-bearing path (its committed value/datatype are catalog-tied by each
     /// view's `validate()` re-MSM); leaving it unset keeps a term-less density fail-closed. Same
     /// in-memory-only discipline as `value_openings`.
@@ -1150,7 +1150,7 @@ pub fn prove_ordered_array_walk_reconciled(
     prove_ordered_array_walk_reconciled_impl(layers, subject, predicate, None)
 }
 
-/// Test-only forging entry mirroring [`prove_ordered_array_walk_forged`]: prove with a CALLER-CHOSEN
+/// Test-only forging entry mirroring `prove_ordered_array_walk_forged`: prove with a CALLER-CHOSEN
 /// density permutation row order, to confirm a broken order/density is rejected by the density
 /// permutation-to-identity at verify (a wrong order makes the routed index column differ from the
 /// public identity `[0,n-1]`; a non-permutation of `[0,n)` is rejected at prove by the gadget).
@@ -1341,11 +1341,11 @@ struct DensityReconciledProve {
     out_col: Vec<ArkFr>,
     /// C3b: the per-cell `sys:index` ids the lookup authenticated (the SAME real prefix
     /// `com_index_at_d` commits) — the value re-pin witness carried into the proof for the term-less
-    /// density tie ([`verify_dict_value_terms_chain`]).
+    /// density tie (`verify_dict_value_terms_chain`).
     index_oid: Vec<u64>,
 }
 
-/// Prove the reconciled density+order certificate. IDENTICAL to the materialized [`prove_density_order`]
+/// Prove the reconciled density+order certificate. IDENTICAL to the materialized `prove_density_order`
 /// except the authenticated dictionary is the COMBINED `(id, value, datatype)` range dict over the
 /// whole chain (in place of a single layer's dict) — so a cell's `sys:index` id, wherever it was minted,
 /// authenticates to its true order-preserving value + datatype. Authenticates each index id, forces the
@@ -1542,12 +1542,12 @@ pub fn verify_ordered_array_walk_reconciled(
 /// term-less remote verifier. The walk STRUCTURE is id-space (the cell/index/value/type leaves
 /// deliver combined-dict id columns; every functional bind / equality / density permutation consumes
 /// committed id columns), so it is term-less-safe unchanged; the term-sensitive reads go term-less:
-/// [`verify_reconciled_leaf_from_views`] for the four `present` leaves (plain conjunctive atoms, no
-/// range ⇒ C1/E3-sound), the `sys:Array` class resolution via [`resolve_combined_node_id_termless`]
+/// `verify_reconciled_leaf_from_views` for the four `present` leaves (plain conjunctive atoms, no
+/// range ⇒ C1/E3-sound), the `sys:Array` class resolution via `resolve_combined_node_id_termless`
 /// (belt-hashed against `proof.sys_array_opening`, fail-closed on a missing/forged opening — the id
 /// keys the `rdf:type == sys:Array` equality), the delivered-value render via
-/// [`resolve_node_value_id_column`] threading `proof.value_openings`, AND — THE C3b CRUX — the density
-/// value re-pin (`verify_dict_value_terms_chain`, inside [`verify_density_order_reconciled`]) that
+/// `resolve_node_value_id_column` threading `proof.value_openings`, AND — THE C3b CRUX — the density
+/// value re-pin (`verify_dict_value_terms_chain`, inside `verify_density_order_reconciled`) that
 /// ties each authenticated `sys:index` id to its Merkle-opened order-preserving value/datatype (the
 /// committed range-dict value column is UNAUTHENTICATED on a term-less view, so without the re-pin a
 /// forged value would certify a verifying array REORDER).
@@ -1692,7 +1692,7 @@ pub fn decode_and_verify_ordered_array_walk_reconciled(
 /// Verify the reconciled density+order certificate. Re-verifies the combined range dict against the
 /// root-bound per-layer branches, each relocation, the authenticated dict lookup, the datatype filter,
 /// and the permutation whose OUTPUT index column the verifier reconstructs as the public identity
-/// `[0..n-1]` (the density certificate). Mirrors [`prove_density_order_reconciled`] step for step.
+/// `[0..n-1]` (the density certificate). Mirrors `prove_density_order_reconciled` step for step.
 #[allow(clippy::too_many_arguments)]
 fn verify_density_order_reconciled(
     views: &[crate::proof::VerifierCommitmentRef<'_>],
@@ -1811,7 +1811,7 @@ fn verify_density_order_reconciled(
 ///   * `value_openings` — the delivered-value [`ResolutionOpenings`] (for the ordered value render,
 ///     mirroring [`super::list_walk::attach_termless_list_walk_openings`]'s element openings);
 ///   * `sys_array_opening` — the `sys:Array` class [`DictOpening`] (routed to its introducing layer
-///     via [`build_resolution_openings`] for the single resolved id; belt-hashed at verify, its id
+///     via `build_resolution_openings` for the single resolved id; belt-hashed at verify, its id
 ///     keys the `rdf:type == sys:Array` equality);
 ///   * `index_oid` + `index_value_openings` — the C2a value re-pin witness (the per-cell `sys:index`
 ///     id column + Merkle openings over its DISTINCT ids), built by

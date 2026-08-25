@@ -19,6 +19,15 @@
 //!
 //! Each `_with_keys` entry accepts one scalar key column or two injectively packed key
 //! columns; the plain entries are the single-scalar-key special case.
+//!
+//! For a developer: these are the anti-/outer-join and negation [gadgets](crate::proof::primer).
+//! None introduces new cryptography — each COMPOSES audited gadgets: the complete binary
+//! [`join2`](super::join2) (whose per-left match multiplicity is itself a [LogUp](crate::proof::primer)
+//! argument, §7), the [`filter`](super::filter) IsZero indicator (a [sumcheck](crate::proof::primer),
+//! §5), exact compaction, the [`relocate`](super::relocate) domain tie, and — for the outer join —
+//! the [`union`](super::union) bag union. All challenges are Fiat–Shamir, drawn after the input
+//! commitments are bound ([the transcript invariant](crate::proof::primer), §8). See also
+//! [gadgets](crate::proof::primer) (§6).
 
 use std::io;
 
@@ -214,14 +223,23 @@ fn multiplicities(rho: &[ArkFr], left_rows: usize, join_rows: usize, size: usize
 /// surviving (unmatched) left rows.
 #[derive(Clone, Debug)]
 pub struct LeftAntiJoinProof {
+    /// Relocations tying each left input column into the binary-join domain.
     pub left_relocations: Vec<RelocationProof>,
+    /// Relocations tying each right input column into the binary-join domain.
     pub right_relocations: Vec<RelocationProof>,
+    /// The commitments the binary join consumes/produces (key + per-side other columns).
     pub join_commitments: BinaryJoinCommitments,
+    /// The complete binary join, authenticating each left row's match multiplicity.
     pub join: BinaryJoinProof,
+    /// The number of join output rows (public; threaded by the verifier, never read from the proof).
     pub join_len: usize,
+    /// The IsZero filter pinning the keep-selection to `match-count == 0` (the unmatched left rows).
     pub zero: FilterProof,
+    /// Commitment to the boolean keep-selection column the IsZero filter authenticates.
     pub zero_selection_commitment: ArkGT,
+    /// Commitment to the IsZero pseudo-inverse witness column.
     pub zero_inverse_commitment: ArkGT,
+    /// The compaction that emits the surviving (unmatched) left rows densely.
     pub compaction: CompactionOnlyProof,
 }
 
@@ -229,13 +247,19 @@ pub struct LeftAntiJoinProof {
 /// commitments, domain, and count). Also carries the COMPLETE matched inner-join relation
 /// (retained so the inner/outer wrappers can build on it without re-proving the join).
 pub struct LeftAntiJoinResult {
+    /// The left anti-join proof.
     pub proof: LeftAntiJoinProof,
+    /// Dory commitments to the unmatched-left output columns.
     pub commitments: Vec<ArkGT>,
+    /// The unmatched-left output columns (zero-padded to `2^log_domain`).
     pub columns: Vec<Vec<ArkFr>>,
+    /// The output columns' power-of-two log-domain (the binary-join domain).
     pub log_domain: usize,
+    /// The unmatched-left row count.
     pub n: usize,
     /// Complete matched inner-join relation in schema `[left.., right-only..]`.
     pub matched_commitments: Vec<ArkGT>,
+    /// The matched inner-join relation's columns (same schema as `matched_commitments`).
     pub matched_columns: Vec<Vec<ArkFr>>,
 }
 
@@ -245,18 +269,26 @@ pub struct LeftAntiJoinResult {
 /// the public matched projection.
 #[derive(Clone, Debug)]
 pub struct InnerJoinProof {
+    /// The anti-join proof, replayed to authenticate the complete binary join underneath.
     pub anti: LeftAntiJoinProof,
+    /// Commitments to the anti-join's unmatched-left output (retained so the anti argument can be replayed).
     pub unmatched_left_commitments: Vec<ArkGT>,
+    /// The anti-join's unmatched-left row count.
     pub unmatched_len: usize,
 }
 
 /// Prover result: the inner-join proof plus the matched output relation (schema
 /// `[left.., right-only..]`), its commitments, domain, and matched row count `n`.
 pub struct InnerJoinResult {
+    /// The inner-join proof.
     pub proof: InnerJoinProof,
+    /// Dory commitments to the matched output columns (schema `[left.., right-only..]`).
     pub commitments: Vec<ArkGT>,
+    /// The matched output columns (zero-padded to `2^log_domain`).
     pub columns: Vec<Vec<ArkFr>>,
+    /// The output columns' power-of-two log-domain.
     pub log_domain: usize,
+    /// The matched (join output) row count.
     pub n: usize,
 }
 
@@ -265,19 +297,28 @@ pub struct InnerJoinResult {
 /// rows together with the null-padded unmatched-left rows into the outer result.
 #[derive(Clone, Debug)]
 pub struct LeftOuterJoinProof {
+    /// The anti-join proof (authenticates both the matched inner relation and the unmatched-left rows).
     pub anti: LeftAntiJoinProof,
+    /// Commitments to the unmatched-left rows (the null-extension branch's left columns).
     pub unmatched_left_commitments: Vec<ArkGT>,
+    /// The unmatched-left row count.
     pub unmatched_len: usize,
+    /// The bag-union proof stitching the matched rows together with the null-padded unmatched-left rows.
     pub union: BagUnionProof,
 }
 
 /// Prover result: the left-outer-join proof plus the outer output relation (matched rows
 /// followed by null-extended unmatched-left rows), its commitments, domain, and count `n`.
 pub struct LeftOuterJoinResult {
+    /// The left-outer-join proof.
     pub proof: LeftOuterJoinProof,
+    /// Dory commitments to the outer output columns (matched rows then null-extended unmatched-left rows).
     pub commitments: Vec<ArkGT>,
+    /// The outer output columns (zero-padded to `2^log_domain`).
     pub columns: Vec<Vec<ArkFr>>,
+    /// The output columns' power-of-two log-domain.
     pub log_domain: usize,
+    /// The outer output row count.
     pub n: usize,
 }
 

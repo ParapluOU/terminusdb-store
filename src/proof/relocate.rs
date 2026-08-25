@@ -27,6 +27,17 @@
 //! nonzero padding within either domain) fails with overwhelming probability. This
 //! also forces the two real prefixes to agree POSITIONALLY, so `Sf`/`Of` keep the
 //! filter's row order (which the self-join's `rho` index pointers reference).
+//!
+//! For a developer: this is the "same column, two hypercube sizes" [gadget](crate::proof::primer).
+//! It proves nothing about the *data* beyond "these two commitments are the same padded column";
+//! it runs no [sumcheck](crate::proof::primer) of its own, just two Dory openings at one
+//! Fiat–Shamir point and a scalar check. Every column here has a power-of-two length `>= 2`
+//! (log-domain `>= 1`): that is the [MLE](crate::proof::primer) hypercube requirement — a
+//! `2^k`-vector is indexed by the corners of `{0,1}^k`, so it needs at least one variable to open
+//! at, and a length-1 column (`k = 0`) has none (see the private `domain_log` helper). See [the
+//! primer](crate::proof::primer) for [commitments and their homomorphism](crate::proof::primer)
+//! (§3), [MLE + sumcheck](crate::proof::primer) (§5), and the [Fiat–Shamir
+//! transcript](crate::proof::primer) (§8).
 
 use std::io;
 
@@ -52,12 +63,24 @@ fn f1() -> ArkFr {
 /// A cross-domain relocation proof: the two claimed evals and their Dory openings.
 #[derive(Clone, Debug)]
 pub struct RelocationProof {
+    /// `MLE_source(r[0..a])`: the source column's multilinear extension at the low `a`
+    /// coordinates of the shared challenge point `r`.
     pub source_eval: ArkFr,
+    /// `MLE_target(r[0..b])`: the target column's multilinear extension at the low `b`
+    /// coordinates of `r`.
     pub target_eval: ArkFr,
+    /// Dory opening binding `source_eval` to `com_source` (so the prover cannot misreport it).
     pub source_opening: ColumnOpening,
+    /// Dory opening binding `target_eval` to `com_target`.
     pub target_opening: ColumnOpening,
 }
 
+/// The log-domain `k` of a committed column of length `len = 2^k`. Requires a
+/// power-of-two length that is at least 2 (so `k >= 1`): a Dory-committed column is the
+/// multilinear extension over the boolean hypercube `{0,1}^k`, so it needs at least one
+/// variable to open at — a length-1 column (`k == 0`) has no hypercube variable. Columns
+/// are always zero-padded up to the next power of two, hence the power-of-two shape. See
+/// the primer's [MLE + sumcheck](crate::proof::primer) section (§5).
 fn domain_log(len: usize) -> io::Result<usize> {
     if !len.is_power_of_two() || len < 2 {
         return Err(invalid(

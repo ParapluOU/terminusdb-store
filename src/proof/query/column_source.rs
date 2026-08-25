@@ -39,13 +39,16 @@ pub(super) fn materialized_layer_columns(
 /// materialized nor swap additions↔removals: (a) it is carried in [`LayerBgpPlan`], which the
 /// verifier reconstructs from its OWN trusted compiled query (the envelope anti-substitution
 /// property) and therefore fixes independently; and (b) it is domain-separated in the
-/// Fiat–Shamir transcript (see [`bind_layer_bgp_statement`]). The `Materialized` tag emits NO
+/// Fiat–Shamir transcript (see `bind_layer_bgp_statement`). The `Materialized` tag emits NO
 /// extra transcript bytes, so pre-existing materialized proofs are byte-identical.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ColumnSource {
+    /// The complete logical head view (the default; the only behavior before delta reads).
     #[default]
     Materialized,
+    /// The layer's own ADDITIONS delta file (backs WOQL `AddedTriple` — "this commit, no deeper").
     Additions,
+    /// The layer's own REMOVALS delta file (backs WOQL `DeletedTriple`).
     Removals,
 }
 

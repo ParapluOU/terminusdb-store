@@ -223,7 +223,7 @@ pub(crate) fn resolve_node_value_id_via_merkle(
 ///      `Com(ov) == com_v_val`, `Com(dt) == com_v_dt`.
 /// All three group-equalities holding ⇒ `v_val`/`v_dt` are `OP-encode(Merkle term)` at every
 /// real row (padding self-annihilates at `0`). FAIL-CLOSED: a missing/tampered opening
-/// ([`verify_opening`] Err), a substituted `oid` (`Com(oid) ≠ com_obj_id`), or a forged
+/// (`verify_opening` Err), a substituted `oid` (`Com(oid) ≠ com_obj_id`), or a forged
 /// `dict_value`/`dict_datatype` (recommit mismatch) all reject.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_dict_value_terms(
@@ -542,6 +542,9 @@ fn resolve_result_values_impl(
         .collect()
 }
 
+/// The per-column descriptors for a plan's result schema: each column's Store id namespace
+/// (from [`result_id_namespaces`]) marked non-nullable. The non-nullable default matches the
+/// plain BGP result shape; a query that can bind a column to `Null` builds descriptors directly.
 pub fn result_column_descriptors(
     plan: &LayerBgpPlan,
 ) -> io::Result<Vec<ResultColumnDescriptor>> {

@@ -249,7 +249,7 @@ pub enum RecursiveRelationProof {
     /// Authenticated ordered `rdf:List` walk (ReadDocument increment 1). All sub-proofs — the four
     /// authenticated child relations (anchor, closure, `rdf:rest` edges, `rdf:first` edges) and the
     /// gluing gadgets (strip-nil anti-join, walk permutation, rest/first inner-joins + relocations,
-    /// the positional successor) — live in [`super::list_walk::OrderedListWalkProof`]. The delivered
+    /// the positional successor) — live in `super::list_walk::OrderedListWalkProof`. The delivered
     /// result of THIS envelope is the ordered element column. See
     /// [`RelationProofPlanKind::OrderedListWalk`].
     OrderedListWalk(Box<super::list_walk::OrderedListWalkProof>),
@@ -257,7 +257,7 @@ pub enum RecursiveRelationProof {
     /// the four authenticated child relations (cell set, `sys:index`/`sys:value`/`rdf:type` edges) and
     /// the gluing gadgets (three functional edge-binds, the `sys:Array` equality filter, the dictionary
     /// value/datatype lookup, the datatype-completeness filter, and the density+order permutation) —
-    /// live in [`super::array_walk::OrderedArrayWalkProof`]. The delivered result of THIS envelope is
+    /// live in `super::array_walk::OrderedArrayWalkProof`. The delivered result of THIS envelope is
     /// the value-in-index-order column. See [`RelationProofPlanKind::OrderedArrayWalk`].
     OrderedArrayWalk(Box<super::array_walk::OrderedArrayWalkProof>),
 }
@@ -504,7 +504,7 @@ pub(super) fn closure_distinct_witness(distinct: &RelationDistinctResult) -> Rel
 }
 
 /// The seed + rounds + fixpoint of a bounded semi-naive transitive closure — the SOURCE-AGNOSTIC
-/// heart of [`RecursiveRelationEnvelope::prove_transitive_closure`], factored out so a reconciled
+/// heart of `RecursiveRelationEnvelope::prove_transitive_closure`, factored out so a reconciled
 /// (delta-stack) closure can reuse the EXACT round/fixpoint machinery over a `present`-sourced edge.
 ///
 /// It consumes ONLY the already-committed `edge_witness` (the E relation columns/commitments) and
@@ -658,7 +658,7 @@ pub(super) fn prove_closure_rounds(
     })
 }
 
-/// The verifier mirror of [`prove_closure_rounds`]: replay the seed + rounds + fixpoint over an
+/// The verifier mirror of `prove_closure_rounds`: replay the seed + rounds + fixpoint over an
 /// already-authenticated `edge_commit` + resolved `seed_id`, reconstructing each accumulator
 /// commitment from the PUBLIC row sets and re-running the audited operator verifiers on the same
 /// `(root, digest, step, role)` transcripts. Returns the reachable node-id set. Source-agnostic —
@@ -898,7 +898,7 @@ pub(super) fn closure_pairs_seed_input(edge: &RelationWitness, inverted: bool) -
 }
 
 /// The direction-projected 2-column base commitment for the ALL-PAIRS seed (verifier side); mirrors
-/// [`closure_pairs_seed_input`] over the authenticated edge commitment.
+/// `closure_pairs_seed_input` over the authenticated edge commitment.
 pub(super) fn closure_pairs_seed_input_commit(edge: &RelationCommit, inverted: bool) -> io::Result<RelationCommit> {
     if edge.commitments.len() != 2 {
         return Err(invalid("all-pairs closure edge must be a [subject, object] relation"));
@@ -950,7 +950,7 @@ pub(super) fn closure_pairs_rows(pairs: &[(u64, u64)]) -> Vec<Vec<u64>> {
 }
 
 /// The seed + rounds + fixpoint of a bounded ALL-PAIRS semi-naive transitive closure. Mirrors
-/// [`prove_closure_rounds`] but every relation is 2-column and PLUS-only (no reflexive seed).
+/// `prove_closure_rounds` but every relation is 2-column and PLUS-only (no reflexive seed).
 pub(super) struct ClosurePairsRoundsWitness {
     pub seed: TransitiveClosurePairsSeed,
     pub accumulator: RelationWitness,
@@ -1059,7 +1059,7 @@ pub(super) fn prove_closure_pairs_rounds(
     })
 }
 
-/// The verifier mirror of [`prove_closure_pairs_rounds`].
+/// The verifier mirror of `prove_closure_pairs_rounds`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn verify_closure_pairs_rounds(
     edge_commit: &RelationCommit,
@@ -1356,6 +1356,9 @@ impl RecursiveRelationEnvelope {
         Self::prove_cross_root_with_context(&StoreProverContext::cpu(), instance, schema, plan)
     }
 
+    /// Context-taking form of [`RecursiveRelationEnvelope::prove_cross_root`] (routes its MSMs through
+    /// `context`, e.g. for GPU offload). Identical bytes and identical proof to the CPU convenience;
+    /// see that method for the full two-root soundness argument.
     pub fn prove_cross_root_with_context(
         context: &StoreProverContext<'_>,
         instance: &LayerCommitment,
@@ -1385,12 +1388,10 @@ impl RecursiveRelationEnvelope {
         }
         let x_col = 1 - right_key_col;
 
-        let instance_root = instance.state.commitment_root;
-        let schema_root = schema.state.commitment_root;
         // β re-anchor: the cross-root anchor bound into the transcript (and checked by the verifier's
-        // `validate_database_root`) now combines each graph's `resolution_root`, matching the verifier.
-        // `instance_root`/`schema_root` (commitment roots) are still used below for the per-child
-        // identity/relocation binding (Option P), so keep them.
+        // `validate_database_root`) combines each graph's `resolution_root`, matching the verifier.
+        // The prover binds each child against its own `layer`/`schema` view directly below (via
+        // `resolution_root()`), so the per-graph `commitment_root`s are not needed as locals here.
         let db_root = crate::proof::commitment::database_root(
             &instance.resolution_root(),
             &schema.resolution_root(),
@@ -3157,7 +3158,7 @@ impl RecursiveRelationEnvelope {
     }
 
     /// Verify a bounded ALL-PAIRS semi-naive transitive closure and return the reachable `(src, dst)`
-    /// set the delivered relation must equal. Mirrors [`Self::verify_transitive_closure`] over 2 columns.
+    /// set the delivered relation must equal. Mirrors `Self::verify_transitive_closure` over 2 columns.
     #[allow(clippy::too_many_arguments)]
     fn verify_transitive_closure_pairs(
         &self,
@@ -3188,6 +3189,13 @@ impl RecursiveRelationEnvelope {
         )
     }
 
+    /// SINGLE-ROOT ENTRY — verify this whole operator-tree envelope against ONE trusted
+    /// `expected_root` and the verifier's OWN independently compiled `plan`. Reconstructs the
+    /// expected result shape from the plan (anti-substitution: the plan comes from the caller's
+    /// query, never from the proof), then walks the delivered proof tree bottom-up under a shared
+    /// depth/node budget, checking every node's identity against columns opened relative to the root.
+    /// Rejects closed (returns `Err`) on the first mismatch; `Ok(())` means the delivered result is
+    /// sound. (Two-root `CrossRootHashJoin` plans go through [`RecursiveRelationEnvelope::verify_cross_root`] instead.)
     pub fn verify(
         &self,
         layer: &impl VerifierLayer,
@@ -3717,6 +3725,12 @@ impl RecursiveRelationEnvelope {
         })
     }
 
+    /// Frame this recursive relation envelope for shipping as BYTES:
+    /// `RECURSIVE_MAGIC` ‖ `RECURSIVE_VERSION` ‖ node-bounded body ‖ SHA-256 checksum. The body is
+    /// serialized under the same depth/node budget the decoder enforces. Serialization does NOT
+    /// change verification: the decoded envelope re-verifies via [`RecursiveRelationEnvelope::verify`]
+    /// (or [`RecursiveRelationEnvelope::verify_cross_root`]) against the trusted root and the
+    /// verifier's OWN plan.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(RECURSIVE_MAGIC);
@@ -3731,6 +3745,10 @@ impl RecursiveRelationEnvelope {
         Ok(out)
     }
 
+    /// Decode a framed recursive relation envelope. This is ONLY parsing under the strict
+    /// size / global-item / depth / node budgets — it performs NO trust checks; the decoded envelope
+    /// must still be handed to [`RecursiveRelationEnvelope::verify`] (or
+    /// [`RecursiveRelationEnvelope::verify_cross_root`]) against a trusted root before any result is believed.
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() < RECURSIVE_MAGIC.len() + 4 + CHECKSUM_BYTES
             || bytes.len() > MAX_QUERY_ENVELOPE_BYTES

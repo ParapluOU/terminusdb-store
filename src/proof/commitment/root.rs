@@ -8,9 +8,22 @@
 //! changes the root — so binding a proof to the root binds it to the entire committed layer.
 //! [`database_root`] combines an instance root with a schema root into one database-level
 //! anchor, and [`validate_database_root`] checks that combination.
+//!
+//! This is the concrete `commitment_root` of the [layer-commitment
+//! model](crate::proof::primer) (primer §9) — the single 32-byte value a
+//! verifier trusts per layer.
 
 use super::*;
 
+/// Fold a layer's committed parts into its single `commitment_root` digest.
+///
+/// Hashes, in a FIXED domain-separated order, the authenticated state (parent
+/// root + counts) followed by every column / dictionary / range Dory commitment.
+/// A delta layer (`parent_state_root == Some`) omits the materialized head view
+/// and uses a distinct domain (see the inline note), so its bound set can never
+/// collide with a base layer's. The order and domain are load-bearing: they are
+/// what makes the root bind the whole layer, and changing either would invalidate
+/// every existing anchor — hence any edit here is a wire-format break.
 pub(super) fn compute_commitment_root_from_parts(
     state: &CommitmentState,
     column_commitments: &[ArkGT; COLUMN_COUNT],

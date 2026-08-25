@@ -39,6 +39,14 @@
 //! fraction sum is zero iff the `beta`-fingerprint multiset of the output real rows equals
 //! the disjoint union of the branches' real-row multisets, i.e. iff the output is the exact
 //! bag union (duplicates and tuple correlation included).
+//!
+//! For a developer: this is the multiset (bag) union [gadget](crate::proof::primer) — the store
+//! side of WOQL `Or`. "Output = disjoint union of the branches" is proved as one
+//! [LogUp](crate::proof::primer) rational-sum identity `Σ_branch Σ 1/(alpha - branch_fold) - Σ
+//! 1/(alpha - out_fold) = 0`, batched through a [LogUp-GKR](crate::proof::primer) fraction tree
+//! (§7); branches are first tied to one domain with the [relocation gadget](super::relocate).
+//! `beta`/`alpha` are Fiat–Shamir, drawn after all commitments are bound ([the transcript
+//! invariant](crate::proof::primer), §8). See also [gadgets](crate::proof::primer) (§6).
 
 use std::io;
 
@@ -128,16 +136,22 @@ pub struct BagUnionProof {
     /// Evaluations of the `(N+1)·arity` committed columns (branch columns in branch order,
     /// then the output columns) at `r_low` (the low `log_domain` bits of the GKR leaf point).
     pub col_evals: Vec<ArkFr>,
+    /// One batched Dory opening binding `col_evals` to those committed columns at `r_low`.
     pub opening: ColumnOpening,
 }
 
 /// Prover-side exact union result. Rows are emitted by branch order, while verification
 /// intentionally authenticates bag equality and therefore permits result reordering.
 pub struct BagUnionResult {
+    /// The bag-union proof.
     pub proof: BagUnionProof,
+    /// Dory commitments to the output columns.
     pub commitments: Vec<ArkGT>,
+    /// The concatenated output columns (all branches' real rows, zero-padded to `2^log_domain`).
     pub columns: Vec<Vec<ArkFr>>,
+    /// The output columns' power-of-two log-domain.
     pub log_domain: usize,
+    /// The output row count (the sum of the branch real lengths).
     pub n: usize,
 }
 

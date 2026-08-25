@@ -206,7 +206,7 @@ fn closure_plan(digest: ProofHash, head: &CanonicalObject) -> RelationProofPlan 
 /// when absent — so an absent constant fails CLOSED downstream rather than matching anything. Both
 /// prover and verifier resolve identically.
 ///
-/// Also used by the sibling [`super::array_walk`] composite (the `rdf:type`/`sys:Array` membership
+/// Also used by the sibling `super::array_walk` composite (the `rdf:type`/`sys:Array` membership
 /// resolution), which is why it is `pub(super)`.
 pub(super) fn resolve_node_id_or_absent(view: &crate::proof::VerifierCommitmentRef<'_>, iri: &[u8]) -> u64 {
     let target = CanonicalObject::Node(iri.to_vec());
@@ -218,7 +218,7 @@ pub(super) fn resolve_node_id_or_absent(view: &crate::proof::VerifierCommitmentR
 }
 
 /// Decode an authenticated node/value store id from its canonical field image. Shared with the
-/// sibling [`super::array_walk`] composite (hence `pub(super)`).
+/// sibling `super::array_walk` composite (hence `pub(super)`).
 pub(super) fn field_id(field: ArkFr) -> io::Result<u64> {
     generated_decimal_u64_value(field)
 }
@@ -594,7 +594,7 @@ fn prove_ordered_list_walk_impl(
 }
 
 /// The intermediate sub-proofs of ONE functional-edge binding (rest or first, or — for the sibling
-/// [`super::array_walk`] composite — `sys:index`/`sys:value`/`rdf:type`). `pub(super)` so the array
+/// `super::array_walk` composite — `sys:index`/`sys:value`/`rdf:type`). `pub(super)` so the array
 /// walk can reuse the exact same functional-edge machinery.
 pub(super) struct EdgeBind {
     pub(super) join: InnerJoinProof,
@@ -614,7 +614,7 @@ pub(super) struct EdgeBind {
 /// `sys:value`, and `rdf:type` functional binds (the design's steps D/E/F).
 ///
 /// This materialized-envelope wrapper simply extracts the edge relation's witness and delegates to
-/// the source-agnostic [`prove_edge_bind_witness`]; the reconciled list walk (6c-ii) calls that core
+/// the source-agnostic `prove_edge_bind_witness`; the reconciled list walk (6c-ii) calls that core
 /// directly with a `present`-sourced leaf witness, so BOTH paths run byte-identical edge-bind logic.
 pub(super) fn prove_edge_bind(
     context: &StoreProverContext<'_>,
@@ -633,7 +633,7 @@ pub(super) fn prove_edge_bind(
     )
 }
 
-/// The SOURCE-AGNOSTIC functional-edge bind: identical to [`prove_edge_bind`] but consuming the edge
+/// The SOURCE-AGNOSTIC functional-edge bind: identical to `prove_edge_bind` but consuming the edge
 /// relation as an already-committed [`RelationWitness`] (never a `RecursiveRelationEnvelope`), so a
 /// reconciled `present`-sourced edge leaf glues in byte-identically to a materialized BGP edge child.
 /// `pub(super)` so both the materialized wrapper and the reconciled list walk call it.
@@ -761,7 +761,7 @@ fn role_tag(role: &[u8], suffix: &[u8]) -> Vec<u8> {
     tag
 }
 
-/// Zero-pad a real column up to `2^log_domain`. Shared with the sibling [`super::array_walk`]
+/// Zero-pad a real column up to `2^log_domain`. Shared with the sibling `super::array_walk`
 /// composite (hence `pub(super)`).
 pub(super) fn pad_to(column: &[ArkFr], log_domain: usize) -> Vec<ArkFr> {
     let mut out = column.to_vec();
@@ -1083,7 +1083,7 @@ fn reconciled_list_walk_digest(subject: &CanonicalObject, predicate: &[u8]) -> i
 }
 
 /// Every sub-proof of one reconciled ordered `rdf:List` walk. Compared to the materialized
-/// [`OrderedListWalkProof`], the four child ENVELOPES are replaced by ONE [`ReconcileProof`] + the
+/// `OrderedListWalkProof`, the four child ENVELOPES are replaced by ONE [`ReconcileProof`] + the
 /// per-leaf [`PresentBgpProof`]s + the closure's seed/rounds/fixpoint; the head-id binding
 /// (`anchor_opening` + public `head_id`) is added; and EVERY gluing-gadget field is byte-identical.
 #[derive(Clone, Debug)]
@@ -1161,7 +1161,7 @@ pub struct OrderedListWalkReconciledProof {
 }
 
 /// The `[subject, object]` id columns of a proven 2-column edge relation delivered as a
-/// [`RelationWitness`] (the reconciled analogue of [`edge_columns`], used only to order the walk on
+/// [`RelationWitness`] (the reconciled analogue of `edge_columns`, used only to order the walk on
 /// the prover side).
 fn witness_edge_columns(edge: &RelationWitness) -> io::Result<(Vec<u64>, Vec<u64>)> {
     if edge.columns.len() != 2 {
@@ -1191,7 +1191,7 @@ pub fn prove_ordered_list_walk_reconciled(
     prove_ordered_list_walk_reconciled_impl(layers, subject, predicate, None)
 }
 
-/// Test-only forging entry mirroring [`prove_ordered_list_walk_forged`]: prove with a CALLER-CHOSEN
+/// Test-only forging entry mirroring `prove_ordered_list_walk_forged`: prove with a CALLER-CHOSEN
 /// chain order, to confirm each forgery is rejected at the right gadget over `present` (a reordered
 /// but valid permutation-order rejects at the SUCCESSOR; a wrong-cells order rejects at the PERMUTATION).
 #[cfg(test)]
@@ -1435,11 +1435,11 @@ pub fn verify_ordered_list_walk_reconciled(
 /// anchor/rest/first leaves deliver combined-dict id columns; the closure rounds / LeftAnti /
 /// permutation / InnerJoin / successor / terminator all consume committed id columns), so it is
 /// term-less-safe unchanged; the three term-sensitive reads go term-less:
-/// [`verify_reconciled_leaf_from_views`] for the three `present` leaves (plain conjunctive atoms, no
-/// range ⇒ C1/E3-sound), the `rdf:nil` resolution via [`resolve_combined_node_id_termless`]
+/// `verify_reconciled_leaf_from_views` for the three `present` leaves (plain conjunctive atoms, no
+/// range ⇒ C1/E3-sound), the `rdf:nil` resolution via `resolve_combined_node_id_termless`
 /// (belt-hashed against `proof.nil_opening`, fail-closed on a missing/forged opening — the nil id
 /// keys the terminator equality, the strip and the cons-cell count pin), and the delivered-element
-/// render via [`resolve_node_value_id_column`] threading `proof.element_openings`.
+/// render via `resolve_node_value_id_column` threading `proof.element_openings`.
 pub fn verify_ordered_list_walk_reconciled_from_views(
     views: &[crate::proof::VerifierCommitmentRef<'_>],
     trusted_head_root: ProofHash,
@@ -1658,7 +1658,7 @@ pub fn decode_and_verify_ordered_list_walk_reconciled(
 /// C3a (producer): attach the UNCOMMITTED term-less opening witnesses to a proven
 /// [`OrderedListWalkReconciledProof`], so it can ship alongside a TERM-LESS reconciled artifact.
 /// Mints the delivered-element [`ResolutionOpenings`] (for the ordered element render) plus the
-/// `rdf:nil` [`DictOpening`] (routed to its introducing layer via [`build_resolution_openings`] for
+/// `rdf:nil` [`DictOpening`] (routed to its introducing layer via `build_resolution_openings` for
 /// the single resolved nil id). `element_ids` are the walk's delivered element column
 /// ([`OrderedListWalkReconciledProof::element_ids`], the second return of
 /// [`prove_ordered_list_walk_reconciled`] resolved to ids); `nil_id` is the resolved combined-dict

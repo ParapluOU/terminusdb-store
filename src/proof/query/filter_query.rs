@@ -57,6 +57,8 @@ pub fn prove_layer_filter(
     prove_layer_filter_with_context(&StoreProverContext::cpu(), layer, predicate_term)
 }
 
+/// [`prove_layer_filter`] with a caller-supplied prover context (for GPU/Blitzar MSM offload).
+/// Reads the materialized head view; see [`prove_layer_filter_with_source`] for delta sources.
 pub fn prove_layer_filter_with_context(
     context: &StoreProverContext<'_>,
     layer: &LayerCommitment,

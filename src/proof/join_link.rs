@@ -1,8 +1,18 @@
-//! Shared keyed-join LINK gadget (LogUp-GKR). The self-join (`proof::pairs`) and the
-//! binary join (`proof::join2`) each tie their claimed output rows to source relation
-//! rows with TWO near-identical masked multiset links (LEFT + RIGHT). This module
-//! factors the single-link prove/verify both files reuse (four links total: `l`/`r` ×
-//! `pairs`/`join2`), each with its OWN `alpha`/`beta` (the two links are NOT fused).
+//! Shared keyed-join LINK [gadget](crate::proof::primer) ([LogUp-GKR](crate::proof::primer),
+//! primer §7). The self-join (`proof::pairs`) and the binary join (`proof::join2`) each tie
+//! their claimed output rows to source relation rows with TWO near-identical masked multiset
+//! links (LEFT + RIGHT). This module factors the single-link prove/verify both files reuse
+//! (four links total: `l`/`r` × `pairs`/`join2`), each with its OWN `alpha`/`beta` (the two
+//! links are NOT fused).
+//!
+//! In plain terms: a link proves "every claimed output row copies the values of some real
+//! source row, and the per-source-row fan-out multiplicity is exactly right" — a *multiset*
+//! statement, so it uses a [lookup/LogUp argument](crate::proof::primer) (primer §7) rather
+//! than row-by-row sumcheck. `alpha`/`beta` are Fiat–Shamir challenges; per [the transcript
+//! invariant](crate::proof::primer) (primer §8) they are drawn only AFTER every data column
+//! is committed. See [the primer](crate::proof::primer) for [commitments](crate::proof::primer)
+//! (§3), [Dory openings](crate::proof::primer) (§4), and where links sit in
+//! [prove → verify](crate::proof::primer) (§10).
 //!
 //! # The link (migrated from committed reciprocals to a block-disjoint GKR tree)
 //! One link proves the reciprocal-era log-derivative identity (`masked_multiset_link_claim`
@@ -104,12 +114,18 @@ fn f1() -> ArkFr {
 /// column exists.
 #[derive(Clone, Debug)]
 pub struct JoinLinkProof {
+    /// The GKR fraction-tree proof discharging the block-disjoint rational-sum identity
+    /// `Sum chi_{m_j}/(alpha - cand_fold) - Sum mult/(alpha - src_fold) = 0`.
     pub gkr: GkrFractionProof,
     /// Evaluations of the committed columns `[src_0..src_{s-1}, mult, cand_0..cand_{c-1}]`
     /// (`c = s + 1`; the public index ramp is NOT here — it is verifier-reconstructed).
     pub col_evals: Vec<ArkFr>,
+    /// The single batched Dory opening authenticating `col_evals` at the tree's leaf point.
     pub opening: ColumnOpening,
+    /// Sumcheck for the co-running GAP-1 auxiliary Identity `(1 - chi_{n_src})*mult = 0`
+    /// (forces the multiplicity to vanish on the source padding tail).
     pub id_sumcheck: SumcheckProof,
+    /// Opening of the SAME committed `mult` column that the identity sumcheck consumed.
     pub id_opening: ColumnOpening,
 }
 

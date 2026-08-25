@@ -10,9 +10,15 @@
 //! carries the `impl LayerCommitment` build/validate/encode/decode logic and the
 //! GT-commitment (de)serialization helpers. The actual root arithmetic that ties all these
 //! commitments together lives next door in [`super::root`].
+//!
+//! These types ARE the [layer-commitment model](crate::proof::primer) (primer §9)
+//! in memory. See the primer for what a [commitment](crate::proof::primer) and the
+//! [`commitment_root`/`resolution_root`](crate::proof::primer) anchors mean.
 
 use super::*;
 
+/// Compress one GT commitment to its canonical byte form. This is the exact
+/// byte encoding the `commitment_root` hasher folds in, so it must stay stable.
 pub(super) fn serialize_commitment(commitment: &ArkGT) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     commitment
@@ -21,6 +27,7 @@ pub(super) fn serialize_commitment(commitment: &ArkGT) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Inverse of [`serialize_commitment`]: parse a compressed GT commitment.
 pub(super) fn deserialize_commitment(bytes: &[u8]) -> io::Result<ArkGT> {
     ArkGT::deserialize_compressed(bytes)
         .map_err(|error| invalid(format!("commitment deserialization failed: {error}")))
@@ -46,6 +53,9 @@ pub struct CommitmentState {
 }
 
 impl CommitmentState {
+    /// Check the summary's internal invariants: dictionary counts never shrink
+    /// below their parent counts, and a root layer (no parent root) starts both
+    /// parent counts at zero. Fails closed on any violation.
     pub fn validate(&self) -> io::Result<()> {
         if self.parent_node_value_count > self.node_value_count
             || self.parent_predicate_count > self.predicate_count
@@ -267,6 +277,14 @@ impl<T: VerifierLayer + ?Sized> VerifierLayer for std::sync::Arc<T> {
 }
 
 impl VerifierCommitmentRef<'_> {
+    /// The verifier-side authentication of one layer view. For a term-bearing
+    /// view: re-derive the dictionary catalogs, re-commit them and re-hash the
+    /// two Merkle roots, and confirm every recomputed commitment matches what is
+    /// carried. For a term-less view: confirm the catalogs really are absent. In
+    /// BOTH cases finish by recomputing `commitment_root` from the carried
+    /// commitments + counts and checking it equals `state.commitment_root`. Any
+    /// mismatch is an error — this is the gate that makes a carried root
+    /// trustworthy.
     pub fn validate(self) -> io::Result<()> {
         self.state.validate()?;
         if self.terms_present {
@@ -351,6 +369,10 @@ impl VerifierCommitmentRef<'_> {
         )
     }
 
+    /// Recompute `commitment_root` from the carried commitments and counts alone
+    /// (no catalog needed), via `super::root::compute_commitment_root_from_parts`.
+    /// [`Self::validate`] checks this against the stored root; it is also the
+    /// catalog-free path a term-less view relies on.
     pub fn recomputed_commitment_root(self) -> io::Result<ProofHash> {
         compute_commitment_root_from_parts(
             self.state,
@@ -698,6 +720,13 @@ impl LayerCommitment {
             .saturating_add(table_bytes(&self.node_value_catalog))
     }
 
+    /// Full self-consistency check of a prover-side sidecar. Confirms the record
+    /// tables are within limits, strictly SPO-ordered, and have ids inside the
+    /// dictionary counts; that additions/removals/materialized carry no duplicates
+    /// or conflicts; that the catalogs are complete; that EVERY Dory commitment and
+    /// both Merkle roots recompute from the clear tables; and finally that the
+    /// recomputed `commitment_root` equals the stored one. Fails closed on the
+    /// first violation — a sidecar that passes this is internally trustworthy.
     pub fn validate(&self) -> io::Result<()> {
         self.state.validate()?;
         // COMMITMENT DIET (Wave 0): a delta layer's materialized columns are NOT bound
@@ -817,6 +846,9 @@ impl LayerCommitment {
         Ok(())
     }
 
+    /// Serialize the sidecar to its self-describing on-disk framing (magic +
+    /// version + body + `commitment_root` + checksum). Calls [`Self::validate`]
+    /// first, so only an internally consistent sidecar is ever written.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
         let expected = self.encoded_len()?;
@@ -830,6 +862,12 @@ impl LayerCommitment {
         Ok(out)
     }
 
+    /// Parse an encoded sidecar back into a `LayerCommitment`, checking the file
+    /// checksum, magic, and format version, then running the full
+    /// [`Self::validate`] before returning — so a decoded layer is always
+    /// internally consistent (or the call fails). Resource limits are enforced
+    /// incrementally while reading, so a hostile file cannot force an unbounded
+    /// allocation.
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() < COMMITMENT_MAGIC.len() + 4 + 32 + 32
             || bytes.len() > MAX_PROOF_LAYER_BYTES
@@ -1015,6 +1053,8 @@ impl LayerCommitment {
         )
     }
 
+    /// Test-only: re-encode this layer in the pre-I1 v3 on-disk layout, so the
+    /// migration decoder (`super::legacy`) can be exercised against a v3 file.
     #[cfg(test)]
     pub(crate) fn encode_legacy_v3_for_test(
         &self,
@@ -1186,6 +1226,9 @@ impl LayerCommitment {
         Ok(out)
     }
 
+    /// Predict the exact encoded byte length, bounded by
+    /// [`MAX_PROOF_LAYER_BYTES`] at each step. [`Self::encode`] asserts the
+    /// produced buffer matches this, catching any framing drift.
     pub(super) fn encoded_len(&self) -> io::Result<usize> {
         let state_bytes = 1usize
             .checked_add(if self.state.parent_state_root.is_some() {
@@ -1321,6 +1364,10 @@ impl VerifierCommitment {
         Ok(())
     }
 
+    /// Recompute this artifact's `commitment_root` from its carried commitments
+    /// and counts (no catalog needed) — the catalog-free root check that also
+    /// works for a term-less artifact. Mirrors
+    /// [`VerifierCommitmentRef::recomputed_commitment_root`].
     pub fn recomputed_commitment_root(&self) -> io::Result<ProofHash> {
         compute_commitment_root_from_parts(
             &self.state,
@@ -1332,6 +1379,11 @@ impl VerifierCommitment {
         )
     }
 
+    /// Serialize the compact verifier artifact to its on-disk framing. Calls
+    /// [`Self::validate`] first. The `terms_present` flag byte selects whether the
+    /// two clear catalog blocks are written (term-bearing) or dropped (term-less,
+    /// O(1) in dictionary size); either way the same commitments and Merkle roots
+    /// are written, so both encode the same `commitment_root`.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
         let mut out = Vec::new();
@@ -1384,6 +1436,9 @@ impl VerifierCommitment {
         Ok(out)
     }
 
+    /// Parse a compact verifier artifact, checking checksum/magic/version and the
+    /// `terms_present` framing, then running the full [`Self::validate`] before
+    /// returning — so a decoded artifact is always internally consistent.
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         // + 1 for the I2b S1 `terms_present` flag byte after the version.
         if bytes.len() < VERIFIER_COMMITMENT_MAGIC.len() + 4 + 1 + 64

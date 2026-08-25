@@ -13,6 +13,9 @@ use super::*;
 
 // -- Combined dictionary (bag union of every contributing layer's dict, or direct) --
 
+/// The prover-side result of building the combined `(hash, id)` dictionary: the `CombinedDictProof`
+/// plus the two combined columns and their commitments relocated to the working domain (`*_at_k`),
+/// and the combined real length `n`. The group-hash and reconcile-link steps read these columns.
 pub(super) struct CombinedDictBuilt {
     pub(super) proof: CombinedDictProof,
     pub(super) hash_at_k: Vec<ArkFr>,
@@ -22,6 +25,12 @@ pub(super) struct CombinedDictBuilt {
     pub(super) n: usize,
 }
 
+/// Build and prove the combined `(hash, id)` node/value (or predicate) dictionary across the
+/// chain: bag-union every contributing layer's incremental dict (`>= 2` branches) — or take the
+/// single branch's root-bound dict directly — then relocate the two columns to the `working_log`
+/// domain (each tie authenticated against its root-bound source). Returns the proof plus the
+/// relocated columns/commitments the later group-hash and reconcile-link steps consume. Fails
+/// closed if no layer contributes a dict.
 pub(super) fn prove_combined_dict(
     context: &StoreProverContext<'_>,
     branches: &[RelationWitness],
@@ -76,6 +85,10 @@ pub(super) fn prove_combined_dict(
     })
 }
 
+/// Verify a combined `(hash, id)` dictionary proof, mirroring `prove_combined_dict`'s transcript
+/// order: the bag-union (`>= 2` branches) or the single-layer direct root-bound binding, that the
+/// combined real length equals the head count `expected_n`, and the two relocations to the working
+/// domain. Fails closed on a shape/length mismatch or a missing/unexpected bag-union proof.
 pub(super) fn verify_combined_dict(
     branches: &[RelationCommit],
     expected_n: usize,
@@ -169,6 +182,11 @@ pub struct CombinedRangeDictProof {
     pub com_datatype_at_k: ArkGT,
 }
 
+/// Build and prove the combined `(id, value, datatype)` node/value RANGE dictionary across the
+/// chain: bag-union every contributing layer's incremental range dict (`>= 2` branches) — or the
+/// single branch's root-bound range dict — then relocate the three columns to the `working_log`
+/// domain. The present-BGP range gadget and the scalar-order sort key authenticate each object id's
+/// order-preserving value/datatype against these columns. Structurally parallels `prove_combined_dict`.
 pub(crate) fn prove_combined_range_dict(
     context: &StoreProverContext<'_>,
     branches: &[RelationWitness],
@@ -245,6 +263,10 @@ pub(crate) fn prove_combined_range_dict(
     })
 }
 
+/// Verify a combined `(id, value, datatype)` range dictionary proof, mirroring
+/// `prove_combined_range_dict`: the bag-union (`>= 2` branches) or single-layer direct binding, the
+/// combined length against `expected_n`, and the three relocations to the working domain. Fails
+/// closed on a shape/length mismatch or a missing/unexpected bag-union proof.
 pub(crate) fn verify_combined_range_dict(
     branches: &[RelationCommit],
     expected_n: usize,

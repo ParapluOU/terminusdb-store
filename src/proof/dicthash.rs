@@ -72,6 +72,10 @@
 //! bound to the ROOT-COMMITTED `node_value_dict_commitments` via
 //! [`super::relocate::verify_column_relocation`]. So `v_hash` is authenticated against that
 //! one root — never a prover-chosen dictionary.
+//!
+//! See the developer primer for the shared concepts this builds on:
+//! [LogUp](crate::proof::primer), [commitment](crate::proof::primer), and
+//! [the layer-commitment / resolution-root model](crate::proof::primer).
 
 use std::io;
 

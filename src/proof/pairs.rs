@@ -6,6 +6,17 @@
 //! matrix). Read `sort_merge_join_exec.rs` / `membership_check.rs` closely;
 //! reimplemented here on our primitives. No COSL code.
 //!
+//! For a developer: this [gadget](crate::proof::primer) proves that a claimed
+//! self-join output is exactly the set of distinct row-pairs whose join keys match —
+//! no forged pair, no duplicate, no dropped pair. It combines two multiset
+//! [lookup/LogUp](crate::proof::primer) links (each output row's endpoints really are
+//! source rows — see [`super::join_link`]) with a strict-increase
+//! [sort](crate::proof::primer) proof on a combined index (the pairs are distinct).
+//! `proof::join` then adds the counting argument that turns "distinct valid pairs"
+//! into "ALL valid pairs". See [the primer](crate::proof::primer) for
+//! [commitments](crate::proof::primer) (§3), [LogUp](crate::proof::primer) (§7), and
+//! [prove → verify](crate::proof::primer) (§10).
+//!
 //! Given `F = (Sf, Of)` (n_F rows) and a claimed self-join output `(X, Y, Z)` with
 //! committed INDEX-POINTER columns `rho_l, rho_r` (each in `[0, n_F)`), `m_J` real
 //! rows, prove the output is a SET of DISTINCT genuine key-matching
@@ -19,7 +30,7 @@
 //!    equal it.
 //! 2. RIGHT index-augmented membership: `(Y[k], Z[k], rho_r[k])` in
 //!    `{ (Sf_b, Of_b, idx_b) }`. The SHARED committed `Y` column links the two
-//!    (Y = Of[rho_l] = Sf[rho_r]), so each output row is a valid key-match.
+//!    (`Y = Of[rho_l] = Sf[rho_r]`), so each output row is a valid key-match.
 //! 3. COMBINED-INDEX strict monotonicity: `i_eval[k] = C*rho_l[k] + rho_r[k]` is
 //!    STRICTLY INCREASING over the `m_J` real rows (via 2c-2a
 //!    `prove_strictly_sorted`). `C = next_pow2(n_F) >= n_F`, so with `rho_r < n_F
@@ -66,10 +77,18 @@ fn f0() -> ArkFr {
 /// and the batched membership sumcheck are GONE.
 #[derive(Clone, Debug)]
 pub struct PairsProof {
+    /// Commitment to the LEFT source-multiplicity column (fan-out of each F-row into
+    /// the output via `rho_l`); consumed by `link_l`.
     pub mult_l_in_commitment: ArkGT,
+    /// Commitment to the RIGHT source-multiplicity column (fan-out via `rho_r`);
+    /// consumed by `link_r`.
     pub mult_r_in_commitment: ArkGT,
+    /// LEFT keyed-join link: ties each output `(X, Y)` to the F-row `rho_l` points at.
     pub link_l: JoinLinkProof,
+    /// RIGHT keyed-join link: ties each output `(Y, Z)` to the F-row `rho_r` points at.
     pub link_r: JoinLinkProof,
+    /// Strict-monotonicity proof on the combined index `C*rho_l + rho_r`, forcing all
+    /// output pairs distinct.
     pub sorted: SortedProof,
 }
 

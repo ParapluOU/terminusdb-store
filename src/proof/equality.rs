@@ -5,6 +5,13 @@
 //! or non-null columns of a committed input relation.  It proves the exact equality
 //! indicator with the existing IsZero argument, then densely compacts every input
 //! column with the existing LogUp compaction argument.
+//!
+//! For a developer: this is the equality-constraint [gadget](crate::proof::primer). It composes
+//! two audited [`filter`](super::filter) pieces — an IsZero indicator (a [sumcheck](crate::proof::primer),
+//! §5) pinning a boolean keep-selection to "column − target == 0", and a [LogUp](crate::proof::primer)
+//! compaction (§7) that emits exactly the selected rows densely. All challenges are Fiat–Shamir,
+//! drawn after the input commitments are bound ([the transcript invariant](crate::proof::primer),
+//! §8). See also [gadgets](crate::proof::primer) (§6).
 
 use std::io;
 
@@ -28,8 +35,11 @@ const EQUALITY_DOMAIN: &[u8] = b"parture/proof-of-woql/relation-equality/v0";
 /// row). Only these relationally-safe (already-bound) forms are supported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelationEqualityConstraint {
+    /// Column `column` equals the public constant `value` (keep rows where they match).
     ColumnConstant { column: usize, value: ArkFr },
+    /// Columns `left` and `right` are equal within the same row.
     Columns { left: usize, right: usize },
+    /// Two public constants — a pure gate that keeps every row (`left == right`) or no row.
     Constants { left: ArkFr, right: ArkFr },
 }
 
@@ -38,19 +48,28 @@ pub enum RelationEqualityConstraint {
 /// emits the selected rows densely.
 #[derive(Clone, Debug)]
 pub struct RelationEqualityProof {
+    /// The IsZero indicator pinning the keep-selection to the exact equality (column − target == 0).
     pub indicator: FilterProof,
+    /// Commitment to the boolean keep-selection column the indicator authenticates.
     pub selection_commitment: ArkGT,
+    /// Commitment to the pseudo-inverse witness column the IsZero argument uses.
     pub inverse_commitment: ArkGT,
+    /// The LogUp compaction that emits the selected rows densely as the output relation.
     pub compaction: CompactionOnlyProof,
 }
 
 /// Prover result: the proof plus the filtered output relation (surviving rows only) — its
 /// columns, their commitments, the shared `log_domain`, and the kept row count `n`.
 pub struct RelationEqualityResult {
+    /// The relation-equality proof.
     pub proof: RelationEqualityProof,
+    /// Dory commitments to the filtered output columns.
     pub commitments: Vec<ArkGT>,
+    /// The filtered output columns (surviving rows densely, zero-padded to `2^log_domain`).
     pub columns: Vec<Vec<ArkFr>>,
+    /// The output columns' power-of-two log-domain (equal to the input's).
     pub log_domain: usize,
+    /// The kept row count.
     pub n: usize,
 }
 

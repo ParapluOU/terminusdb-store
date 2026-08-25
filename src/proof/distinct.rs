@@ -6,6 +6,13 @@
 //! tuples define disjoint equality classes, these checks prove no input class was
 //! omitted and no output tuple was duplicated or invented. This statement deliberately
 //! does not authenticate SWI-Prolog's first-occurrence output order.
+//!
+//! For a developer: this is the set-distinct / dedup [gadget](crate::proof::primer). It adds no
+//! new cryptography — each output tuple's equality class is carved by the audited
+//! [equality gadget](super::equality) (an IsZero indicator + LogUp compaction), and distinctness
+//! is argued combinatorially: disjoint nonempty classes whose sizes sum to the input row count
+//! exactly cover the input. See the primer for [gadgets](crate::proof::primer) (§6) and the
+//! [LogUp](crate::proof::primer) compaction it leans on (§7).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -28,8 +35,13 @@ const DOMAIN: &[u8] = b"parture/proof-of-woql/relation-distinct/v0";
 /// out that tuple's equality class of the input, with each stage's commitments and length.
 #[derive(Clone, Debug)]
 pub struct RelationDistinctEntryProof {
+    /// One equality-filter proof per key column: each stage restricts the running relation to
+    /// the rows whose key column equals this tuple's value, so the chain carves the tuple's
+    /// exact equality class of the input.
     pub filters: Vec<RelationEqualityProof>,
+    /// Per stage, the output column commitments the corresponding `filters` entry produced.
     pub commitments: Vec<Vec<ArkGT>>,
+    /// Per stage, the surviving (real) row count — the shrinking class cardinality.
     pub lengths: Vec<usize>,
 }
 
@@ -42,10 +54,15 @@ pub struct RelationDistinctProof {
 /// Prover result: the proof plus the distinct output relation (its key columns, their
 /// commitments, the output `log_domain`, and the distinct-tuple count `n`).
 pub struct RelationDistinctResult {
+    /// The distinct-projection proof.
     pub proof: RelationDistinctProof,
+    /// The distinct output key columns, zero-padded to `2^log_domain`.
     pub columns: Vec<Vec<ArkFr>>,
+    /// Dory commitments to `columns`.
     pub commitments: Vec<ArkGT>,
+    /// The output columns' power-of-two log-domain.
     pub log_domain: usize,
+    /// The number of distinct output tuples (real rows).
     pub n: usize,
 }
 

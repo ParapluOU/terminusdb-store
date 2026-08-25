@@ -47,6 +47,11 @@
 //! (RHS is a single simple pole with residue 1, so the residue-at-infinity forces
 //! `Sum mult = 1`). `beta` fingerprints `(hash, id)`, so it binds the PAIR, not
 //! hash-or-id alone. Clean-room from the log-derivative identity; no COSL code.
+//!
+//! Background for the vocabulary here — [LogUp](crate::proof::primer),
+//! [commitment](crate::proof::primer), [sumcheck](crate::proof::primer), and the
+//! [absorb-before-challenge invariant](crate::proof::primer) that governs the
+//! `beta`/`alpha` draws below — is in the developer primer.
 
 use std::io;
 

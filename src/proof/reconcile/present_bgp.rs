@@ -96,7 +96,7 @@ pub struct PresentSecondRange {
 }
 
 /// The DATATYPE-HOMOGENEITY guard for a `present` ranged atom (fail-closed fidelity). Same as
-/// the base path's [`RangeDatatypeGuardProof`], minus the relocation: `present`'s object column
+/// the base path's `RangeDatatypeGuardProof`, minus the relocation: `present`'s object column
 /// and equality selection already share the working domain, so `(1 − dt_match)` feeds the
 /// `equality_sel ⊙ (1 − dt_match) == 0` product directly. A datatype-heterogeneous compared
 /// column reject-closes (we refuse rather than under-report TerminusDB's cross-datatype
@@ -176,14 +176,14 @@ pub struct PresentBgpProof {
     /// re-verified per id against the root-bound `nv_merkle_root` at resolve time. `None` on the
     /// prover default and on term-bearing artifacts (whose resolver rebuilds from the clear
     /// catalogs); the term-less producer attaches it via [`attach_termless_reconcile_openings`].
-    /// NEVER folded into `commitment_root`/`resolution_root` — bound solely by [`verify_opening`],
+    /// NEVER folded into `commitment_root`/`resolution_root` — bound solely by `verify_opening`,
     /// so a forged opening is rejected and a missing one fails closed. C4: this witness IS now
     /// wire-serialized as part of `DeltaReadProof::encode` (it rides the `Option<ResolutionOpenings>`
     /// `Wire` impl), so it survives the byte boundary; it stays an UNCOMMITTED witness, re-verified
     /// per id at resolve time. Mirrors [`DeltaReadProof::openings`].
     pub openings: Option<ResolutionOpenings>,
     /// C2a: UNCOMMITTED prover-shipped REAL present object-id column (the same `present_id_o`
-    /// prefix `auth_o.com_id` commits), used by [`verify_dict_value_terms_chain`] to recommit the
+    /// prefix `auth_o.com_id` commits), used by `verify_dict_value_terms_chain` to recommit the
     /// touched object column and pin it to `auth_o.com_id` when a numeric object-value RANGE is
     /// verified over a TERM-LESS delta / reconciled view. Empty on the prover default and on
     /// term-bearing artifacts; the term-less producer attaches it via
@@ -1092,10 +1092,10 @@ pub fn prove_read_bgp(
 /// TERM-LESS head view. Every BGP kept result column is a combined-dict node/value id (predicates
 /// are constants, matched in committed hash space — there is NO catalog dict-membership step to
 /// open), so this opens ONLY node/value ids: it maps each column value via
-/// [`canonical_dictionary_id`], drops the reserved null id 0, and routes each distinct id to its
-/// introducing layer via [`build_resolution_openings`] over the term-bearing prover views (the
+/// `canonical_dictionary_id`, drops the reserved null id 0, and routes each distinct id to its
+/// introducing layer via `build_resolution_openings` over the term-bearing prover views (the
 /// prover still holds the full catalogs). BODY-IDENTICAL to [`build_termless_delta_openings`]. The
-/// witness is re-verified per id at the verifier by [`verify_opening`] against the root-bound
+/// witness is re-verified per id at the verifier by `verify_opening` against the root-bound
 /// `nv_merkle_root` (a forged opening is rejected, a missing one fails closed) and is NEVER folded
 /// into `commitment_root`/`resolution_root`.
 pub fn build_termless_reconcile_openings(
@@ -1139,13 +1139,13 @@ pub fn attach_termless_reconcile_openings(
 /// path the head group's object ids; on the reconcile path the reconciled present's object ids, in
 /// reconcile order). It records those ids as `oid` (for the verifier's `Com(oid) == auth_o.com_id`
 /// recommit), drops the reserved null id 0 for the opening set, and routes each DISTINCT id to its
-/// introducing layer via [`build_resolution_openings`] over the term-bearing prover views (empty
+/// introducing layer via `build_resolution_openings` over the term-bearing prover views (empty
 /// predicate list — a range reads only node/value terms). Mirrors [`build_termless_delta_openings`]
 /// / [`build_termless_reconcile_openings`], except it opens the PRESENT OBJECT column (not the
 /// result columns) — the column the range gadget authenticated `(value, datatype)` against.
 ///
 /// The witness is UNCOMMITTED (never folded into `commitment_root` / `resolution_root`): at verify,
-/// [`verify_dict_value_terms_chain`] recommits `oid` to `auth_o.com_id` (binding the touched set)
+/// `verify_dict_value_terms_chain` recommits `oid` to `auth_o.com_id` (binding the touched set)
 /// and re-derives value/datatype from the chain-opened terms, failing closed on any recommit
 /// mismatch or missing/forged opening. Over-inclusion is safe (the recommit pins the exact column);
 /// a term-bearing verifier ignores the witness.

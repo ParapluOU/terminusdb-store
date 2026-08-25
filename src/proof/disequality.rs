@@ -64,8 +64,17 @@
 //!   The 3-column fold GENERALIZES the 2-column one (equal concrete predicate ⇒ γ² term vanishes;
 //!   differing concrete predicate ⇒ γ² term forces `Δ != 0`), so both reduce to the same
 //!   IsZero+compaction machinery with only the fold arity changing.
-//! * Its OWN transcript domain tag ([`TDQ_DOMAIN`]) so a disequality proof can never
+//! * Its OWN transcript domain tag (`TDQ_DOMAIN`) so a disequality proof can never
 //!   be replayed as an equality (or any other) selection.
+//!
+//! For a developer: this is the packed-tuple disequality [gadget](crate::proof::primer) (drop the
+//! rows where a full triple `(subject, predicate, object)` coincides). It adds no new
+//! cryptography — the fingerprint difference `Δ` is a linear fold of committed columns, the
+//! per-row indicator is the audited [`filter`](super::filter) IsZero
+//! ([sumcheck](crate::proof::primer), §5), and the keep-complement is emitted by the audited
+//! [`filter`](super::filter) LogUp compaction (§7). The fold challenge `γ` is Fiat–Shamir, drawn
+//! after the columns are bound ([the transcript invariant](crate::proof::primer), §8). See also
+//! [gadgets](crate::proof::primer) (§6).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -91,7 +100,9 @@ const TDQ_DOMAIN: &[u8] = b"parture/proof-of-woql/tuple-disequality/v0";
 /// constant node id (an endpoint IRI resolved through the trusted layer dictionary).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisequalityNode {
+    /// A committed input column (this position varies per row).
     Column(usize),
+    /// A public constant node id (an endpoint IRI resolved through the trusted layer dictionary).
     Constant(ArkFr),
 }
 
@@ -129,11 +140,17 @@ pub struct DisequalityPair {
 /// authenticates it against `com_keep`).
 #[derive(Clone, Debug)]
 pub struct TupleDisequalityStageProof {
+    /// The IsZero indicator pinning `sel = [Δ == 0 ∧ i < n]` over the RLC-fold predicate.
     pub indicator: FilterProof,
+    /// Commitment to the reuse-selection column `sel`.
     pub selection_commitment: ArkGT,
+    /// Commitment to the IsZero pseudo-inverse witness column.
     pub inverse_commitment: ArkGT,
+    /// The keep-complement (`keep = χ_n − sel`) compaction that drops the edge-reuse rows.
     pub compaction: CompactionOnlyProof,
+    /// This stage's compacted output column commitments (an intermediate relation).
     pub output_commitments: Vec<ArkGT>,
+    /// The surviving (real) row count after this stage.
     pub output_len: usize,
 }
 
@@ -146,10 +163,15 @@ pub struct TupleDisequalityProof {
 /// Prover result: the final compacted relation (all columns retained, only real rows
 /// dropped) plus the proof.
 pub struct TupleDisequalityResult {
+    /// The complete tuple-disequality proof (one stage per hop-pair).
     pub proof: TupleDisequalityProof,
+    /// Dory commitments to the final surviving relation's columns.
     pub commitments: Vec<ArkGT>,
+    /// The final surviving relation's columns (all columns retained; only real rows dropped).
     pub columns: Vec<Vec<ArkFr>>,
+    /// The relation's power-of-two log-domain (unchanged across stages).
     pub log_domain: usize,
+    /// The surviving row count after all stages.
     pub n: usize,
 }
 

@@ -1,5 +1,17 @@
 //! General k-atom conjunctive BGP as a LEFT-DEEP binary-join chain (Phase 7.6).
 //!
+//! For a developer: a basic graph pattern (BGP) is the "WHERE these triples all hold and
+//! share variables" core of a query; its answer is the natural join of the per-atom
+//! relations. This module proves a whole `k`-atom BGP by folding a chain of audited
+//! two-relation joins ([`super::join2`]) — join `R_1` with `R_2`, then that result with
+//! `R_3`, and so on. It adds NO new [sumcheck](crate::proof::primer)/join math; its only
+//! novel job is the two "continuity" checks that stitch the stages together soundly
+//! (each stage's inputs are the relocated commitments of the previous stage's outputs
+//! via [`super::relocate`], and intermediate real-lengths are pinned public values, not
+//! prover-chosen). See [the primer](crate::proof::primer) for
+//! [commitments](crate::proof::primer) and their homomorphism (§3), [gadgets](crate::proof::primer)
+//! (§6), and [prove → verify](crate::proof::primer) (§10).
+//!
 //! A conjunctive basic graph pattern is a set of atoms `A_1..A_k`; the answer is the
 //! natural join over shared variables. Planned left-deep: `T_1 = R_1`; for `i = 2..k`,
 //! `T_i = T_{i-1} ⋈_K R_i` on the one- or two-variable key `K` shared between the
@@ -121,8 +133,11 @@ fn split_key(cols: &[Vec<ArkFr>], key: usize) -> (&[ArkFr], Vec<&[ArkFr]>) {
 /// `2^log_domain`), the log-domain, and the real row count.
 #[derive(Clone, Debug)]
 pub struct RelationCommit {
+    /// One Dory commitment per column, each at domain `2^log_domain`.
     pub commitments: Vec<ArkGT>,
+    /// `log2` of the power-of-two padding domain.
     pub log_domain: usize,
+    /// The real row count (the padding prefix `[0, n)` carries genuine rows).
     pub n: usize,
 }
 
@@ -130,9 +145,13 @@ pub struct RelationCommit {
 /// `2^log_domain`, zero-padded beyond `n`) plus the matching per-column commitments.
 #[derive(Clone)]
 pub struct RelationWitness {
+    /// The padded column data (each length `2^log_domain`, zero beyond `n`).
     pub columns: Vec<Vec<ArkFr>>,
+    /// Per-column Dory commitments matching `columns`.
     pub commitments: Vec<ArkGT>,
+    /// `log2` of the power-of-two padding domain.
     pub log_domain: usize,
+    /// The real row count.
     pub n: usize,
 }
 
@@ -192,7 +211,10 @@ impl RelationWitness {
 /// s_other_out..]`, so `acc_key` indexes into that evolving list at each step.
 #[derive(Clone, Debug)]
 pub struct JoinStep {
+    /// The join-key column index in the accumulator's evolving schema (`usize::MAX` for
+    /// a Cartesian product; see [`JoinStep::cross_product`]).
     pub acc_key: usize,
+    /// The join-key column index in the fresh relation being joined in this step.
     pub rel_key: usize,
     /// Further `(accumulator, relation)` column pairs that form a composite natural-join
     /// key with `acc_key == rel_key`. Empty preserves the original scalar-key path.
@@ -233,23 +255,31 @@ pub struct BgpStageProof {
     pub rel_relocations: Vec<RelocationProof>,
     /// Every input+output column committed at `binary_join_domain(n_r,n_s,m_j,n_u)`.
     pub commitments: BinaryJoinCommitments,
+    /// This stage's complete two-relation join proof.
     pub join: BinaryJoinProof,
+    /// This stage's proven output length (the next stage's pinned accumulator length).
     pub m_j: usize,
 }
 
 /// A full left-deep chain proof: one stage per join step (`k - 1` of them).
 #[derive(Clone, Debug)]
 pub struct BgpChainProof {
+    /// One [`BgpStageProof`] per join step, in left-deep chain order.
     pub stages: Vec<BgpStageProof>,
 }
 
 /// Prover-side output of a BGP chain, including the authenticated result column values.
 /// `columns` are padded to `2^log_domain`; only the prefix `[0, n)` is query output.
 pub struct BgpChainResult {
+    /// The chain proof to hand to [`verify_bgp_chain`].
     pub proof: BgpChainProof,
+    /// The final result column commitments (in `[r_other_out.., key, s_other_out..]` order).
     pub commitments: Vec<ArkGT>,
+    /// The final result columns, padded to `2^log_domain`.
     pub columns: Vec<Vec<ArkFr>>,
+    /// `log2` of the final result domain.
     pub log_domain: usize,
+    /// The final result row count (query output is the prefix `[0, n)`).
     pub n: usize,
 }
 

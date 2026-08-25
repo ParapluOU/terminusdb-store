@@ -21,7 +21,7 @@
 //!   2. the audited [`super::filter::prove_compaction_only`]: the delivered `(x_kept, h_kept)` is
 //!      EXACTLY the `sel`-compaction of the instance rows `(x, h)` — so every kept row is a REAL
 //!      instance row with its own `x` and hash;
-//!   3. the audited [`super::membership::prove_membership_with_mult_in_domain_with_context`]:
+//!   3. the audited `super::membership::prove_membership_with_mult_in_domain_with_context`:
 //!      `h_kept` is a sub-multiset of the closure hash set `U` — so every kept hash is in the closure.
 //!
 //! SOUNDNESS: (2)+(3) give that every delivered `x` is a real instance row whose class-hash is a
@@ -37,6 +37,13 @@
 //! per-element equality. The honest prover keeps every member (so the e2e answer is complete); a
 //! cryptographic no-drop guarantee is a documented follow-up (per-closure-element equality-filter +
 //! union). This matches the coordinator's membership specification.
+//!
+//! For a developer: this is the semi-join [gadget](crate::proof::primer) (kept rows ⊆ matching
+//! rows). The reconciliation is a [LogUp](crate::proof::primer) set-membership check (§7) — a
+//! field-native lookup argument, not a sort — composed with a booleanity/mask
+//! [sumcheck](crate::proof::primer) (§5) and the audited [`filter`](super::filter) compaction. All
+//! challenges are Fiat–Shamir, drawn after the columns are bound ([the transcript
+//! invariant](crate::proof::primer), §8). See also [gadgets](crate::proof::primer) (§6).
 
 use std::io;
 
@@ -71,7 +78,10 @@ const SEL_LABEL_DOMAIN: &[u8] = b"pow/semijoin/sel-mask/domain-v1";
 /// holds. Two Identity claims over the single `sel` column.
 #[derive(Clone, Debug)]
 pub struct SelMaskProof {
+    /// The two-Identity-claim sumcheck (booleanity `sel*sel - sel = 0` and padding mask
+    /// `sel*(1 - chi_n) = 0`) over the single `sel` column.
     pub sumcheck: SumcheckProof,
+    /// Dory opening of `sel` at the sumcheck's final point.
     pub opening: ColumnOpening,
 }
 
@@ -154,12 +164,19 @@ fn verify_sel_mask(
 /// to the kept `(x, h)` prefix, and the membership of the kept hashes in the closure set.
 #[derive(Clone, Debug)]
 pub struct HashSemiJoinProof {
+    /// The keep-selection booleanity + `chi_n` mask proof (`sel` is boolean and zero on padding).
     pub sel_mask: SelMaskProof,
+    /// Commitment to the keep-selection column `sel`.
     pub com_sel: ArkGT,
+    /// The compaction of the instance rows `(x, h)` down to the kept prefix `(x_kept, h_kept)`.
     pub compaction: CompactionOnlyProof,
+    /// Commitment to the delivered `?x` column (the kept instance ids).
     pub com_x_kept: ArkGT,
+    /// Commitment to the kept class-hash column.
     pub com_h_kept: ArkGT,
+    /// Commitment to the LogUp multiplicity column `w` (per closure hash, how often it is kept).
     pub com_w: ArkGT,
+    /// The LogUp proof that every kept hash is a member of the closure set.
     pub membership: MembershipProof,
 }
 

@@ -4,6 +4,18 @@
 //! math (the design mirrors Proof-of-SQL's production shift/range gadgets, but is
 //! implemented from our primitives; no COSL code transcribed).
 //!
+//! For a developer: this [gadget](crate::proof::primer) certifies "this committed
+//! column is sorted (and therefore its values are distinct)". Distinctness is what
+//! lets the join gadgets treat a key column as a set. It combines a
+//! [sumcheck](crate::proof::primer) (primer §5) proving each adjacent gap
+//! decomposes into 64 committed bits in `[1, 2^64)` — a positive difference, hence a
+//! strict increase, with the wide field ruling out wraparound — and a
+//! [LogUp](crate::proof::primer) (primer §7) "shift" link binding `U_shift[i]` to
+//! `U[i+1]`. Challenges are Fiat–Shamir, drawn after the data is committed ([the
+//! transcript invariant](crate::proof::primer), primer §8). See [the
+//! primer](crate::proof::primer) for [commitments](crate::proof::primer) (§3) and
+//! [prove → verify](crate::proof::primer) (§10).
+//!
 //! Two pieces, batched into one sumcheck:
 //!
 //! 1. SHIFT (index-augmented LogUp lookup): commit `U_shift` intended as the
@@ -121,9 +133,14 @@ fn pow2(j: usize) -> ArkFr {
 ///     committed anywhere.
 #[derive(Clone, Debug)]
 pub struct SortedProof {
+    /// The RANGE sumcheck: booleanity of the gap bits plus their recomposition to the
+    /// consecutive difference.
     pub sumcheck: SumcheckProof,
+    /// Batched Dory opening of `[U, U_shift, bit_0..]` at the RANGE sumcheck's point.
     pub opening: ColumnOpening,
+    /// Commitment to the one-step shift column `U_shift` (`U_shift[i] = U[i+1]`).
     pub u_shift_commitment: ArkGT,
+    /// Commitment to the shift-link multiplicity column `mult_c`.
     pub mult_c_commitment: ArkGT,
     /// GKR fraction tree for the shift LogUp
     /// `Σ [i<n-1]·(α−d_fold)⁻¹ − Σ mult_c·(α−c_fold)⁻¹ = 0`.
@@ -131,7 +148,9 @@ pub struct SortedProof {
     /// Evaluations of `[U, U_shift, mult_c]` at `r_low` (the low `k` bits of the GKR
     /// leaf point), bound to their commitments by `link_opening`.
     pub link_col_evals: Vec<ArkFr>,
+    /// Batched Dory opening authenticating `link_col_evals` at the leaf point.
     pub link_opening: ColumnOpening,
+    /// Commitments to the gap's bit columns `bit_0..` (one per bit of the difference).
     pub bit_commitments: Vec<ArkGT>,
 }
 
@@ -690,6 +709,7 @@ const LABEL_SUCC_ALPHA: &[u8] = b"pow/successor/reciprocal-alpha";
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct SuccessorProof {
+    /// Commitment to the shift-link multiplicity column `mult` (honest mask `1` on `[1, n)`).
     pub mult_commitment: ArkGT,
     /// GKR fraction tree for the shift LogUp
     /// `Σ [i<n-1]·(α−d_fold)⁻¹ − Σ mult·(α−c_fold)⁻¹ = 0` (the exact reciprocal-era link).
@@ -697,6 +717,7 @@ pub struct SuccessorProof {
     /// Evaluations of `[base, next, mult]` at `r_low` (the low `k` bits of the GKR leaf
     /// point), bound to their commitments by `link_opening`.
     pub link_col_evals: Vec<ArkFr>,
+    /// Batched Dory opening authenticating `link_col_evals` at the leaf point.
     pub link_opening: ColumnOpening,
 }
 

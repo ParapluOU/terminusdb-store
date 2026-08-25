@@ -21,6 +21,13 @@
 //! identity happily verifies the wrong `m_J`. Distinctness (Phase 2c-2a, via
 //! `prove_strictly_sorted`) is therefore a HARD prerequisite that 2c-2e composes
 //! upstream to collapse duplicates and forbid the split.
+//!
+//! For a developer: this is the count-aggregate [gadget](crate::proof::primer). The whole thing
+//! is one [sumcheck](crate::proof::primer) (a ZeroSum with a public target) discharged by one
+//! batched Dory opening — see the primer's [MLE + sumcheck](crate::proof::primer) (§5) and
+//! [gadgets](crate::proof::primer) (§6). The `chi` mask challenge and sumcheck challenges are
+//! Fiat–Shamir, drawn after `w_L`/`w_R` are bound ([the transcript
+//! invariant](crate::proof::primer), §8).
 
 use std::io;
 
@@ -54,7 +61,10 @@ fn f1() -> ArkFr {
 /// of `w_L, w_R` (both commitments are external inputs).
 #[derive(Clone, Debug)]
 pub struct CountProof {
+    /// The single ZeroSum sumcheck proving `Sum_i chi_{n_U}[i]*w_L[i]*w_R[i] = m_J`.
     pub sumcheck: SumcheckProof,
+    /// Batched Dory opening of `w_L, w_R` at the sumcheck's final point (binds the
+    /// sumcheck's claimed column evaluations to the input commitments).
     pub opening: ColumnOpening,
 }
 

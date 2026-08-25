@@ -5,9 +5,9 @@
 //! envelope's `verify`).
 //!
 //! Key pieces:
-//! * [`Wire`] — a tiny put/get trait implemented for every leaf type that appears in an
+//! * `Wire` — a tiny put/get trait implemented for every leaf type that appears in an
 //!   envelope (primitives, the arkworks field/group elements, and each operator sub-proof).
-//! * [`Reader`] — a cursor over the input with two hard budgets: a byte length it can never
+//! * `Reader` — a cursor over the input with two hard budgets: a byte length it can never
 //!   read past, and a GLOBAL decoded-item counter (`claim_items`) shared across all nested
 //!   vectors, so an attacker cannot force tens of millions of tiny allocations from a small,
 //!   individually valid input.
@@ -123,18 +123,32 @@ use crate::proof::reconcile::{
     ReconcileProof, ReconciledGroupReadProof, ReconciledOrderReadProof, ReconciledReadBgpProof,
     RemintProof,
 };
+/// 12-byte magic tag opening the framed byte image of the base query-proof envelope
+/// (`LayerBgpEnvelope`). Each envelope/proof shape below has its OWN distinct `*_MAGIC` tag so a
+/// decoder can tell the formats apart (and reject a foreign one) before parsing any body.
+///
+/// WIRE-FORMAT INVARIANT — these bytes are permanent. Never change the value of an existing
+/// `*_MAGIC` (below): doing so rejects every previously emitted proof of that shape. A NEW proof
+/// shape gets a NEW magic; an existing shape whose byte layout changes bumps its `*_VERSION`
+/// instead (see [`VERSION`]).
 pub(super) const MAGIC: &[u8; 12] = b"TDBWQPROOF\0\0";
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const UNION_MAGIC: &[u8; 12] = b"TDBWQUNION\0\0";
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const ANTI_MAGIC: &[u8; 12] = b"TDBWQANTI\0\0\0";
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const OUTER_MAGIC: &[u8; 12] = b"TDBWQOUTER\0\0";
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const RECURSIVE_MAGIC: &[u8; 12] = b"TDBWQTREE\0\0\0";
 // C4: the delta-read plain-BGP proof family gets its OWN independent wire format (its bytes are
 // `DeltaReadProof`, NOT a `LayerBgpEnvelope`), so it carries a fresh MAGIC/VERSION and never
 // touches the envelope `VERSION`/`UNION`/`ANTI`/`OUTER`/`RECURSIVE` constants above.
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const DELTA_READ_MAGIC: &[u8; 12] = b"TDBWQDLTA\0\0\0";
 // C4-slice-2: the reconciled MATERIALIZED-present plain-BGP READ (a `ReconciledReadBgpProof` =
 // `ReconcileProof` + `PresentBgpProof`) gets its OWN independent wire format, distinct from the
 // delta-read (`DELTA_READ_*`) format and every envelope format above. Pure addition.
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const RECONCILE_READ_MAGIC: &[u8; 12] = b"TDBWQRCON\0\0\0";
 // C4 GROUP byte-in: the reconciled `GroupBy`-aggregate read (a `ReconciledGroupReadProof` =
 // `ReconcileProof` + `PresentBgpProof` + the delivered child result columns) gets its OWN
@@ -142,19 +156,24 @@ pub(super) const RECONCILE_READ_MAGIC: &[u8; 12] = b"TDBWQRCON\0\0\0";
 // delta-read (`DELTA_READ_*`), and every envelope format. Pure addition — no existing format is
 // touched. The child columns cross the wire (they are root-authenticated at verify); the GroupSpec
 // does NOT (it is the verifier's own re-lowered query — anti-substitution).
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const GROUP_READ_MAGIC: &[u8; 12] = b"TDBWQGRUP\0\0\0";
 // C4 ORDER byte-in: the reconciled single-column numeric `OrderBy` read (a `ReconciledOrderReadProof`
 // = `ReconcileProof` + `PresentBgpProof` + `PresentScalarOrderProof` + the delivered ordered column +
 // the `OrderReadSpec` witness) gets its OWN independent framed wire format, disjoint from every other.
 // Pure addition — no existing format is touched. The ordered column + order proof cross the wire
 // (root-authenticated at verify); the order direction/datatype are the verifier's re-lowered query.
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const ORDER_READ_MAGIC: &[u8; 12] = b"TDBWQORDR\0\0\0";
 // C4-slice-3: each of the three reconciled WALK/CLOSURE proofs is a SELF-CONTAINED shippable
 // container (it carries its own `reconcile` + leaves + walk-structure sub-proofs), so each gets its
 // OWN independent wire format — a fresh DISTINCT 12-byte magic, disjoint from every format above and
 // from each other. Pure additions: no existing MAGIC/VERSION/golden is touched.
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const CLOSURE_READ_MAGIC: &[u8; 12] = b"TDBWQCLOS\0\0\0";
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const LIST_WALK_READ_MAGIC: &[u8; 12] = b"TDBWQLIST\0\0\0";
+/// Framing magic for this proof shape — a permanent wire-format constant; never change these bytes (see [`MAGIC`]).
 pub(super) const ARRAY_WALK_READ_MAGIC: &[u8; 12] = b"TDBWQARRY\0\0\0";
 
 /// Canonical hidden column for a zero-column relation: one on every real row and zero
@@ -222,6 +241,13 @@ pub(super) fn ground_unit_column(n: usize, log_domain: usize) -> Vec<ArkFr> {
 // carries an empty vector + `None` (a length prefix + one option tag); a term-less range atom
 // ships the object-id vector + per-distinct value openings. Any BGP proof containing a ranged
 // atom shifts, so the format version bumps.
+/// Wire-format version of the base query-proof envelope body (framed after [`MAGIC`]). A decoder
+/// accepts ONLY this exact value and rejects anything else.
+///
+/// WIRE-FORMAT INVARIANT — bump this by one whenever the encoded byte layout of a
+/// `LayerBgpEnvelope` changes (any field added / removed / reordered anywhere in the embedded
+/// proof tree). The running log above records why each past bump happened; never re-use or rewind
+/// a version number. Each sibling `*_VERSION` below follows the same rule for its own shape.
 pub(super) const VERSION: u32 = 13;
 // v10: LogUp-GKR bag-union (`Or`) migration (Inc 4) — `BagUnionProof` dropped its `N+1`
 // committed reciprocal GT commitments (`reciprocal_commitments`) and the masked multiset-link
@@ -237,16 +263,19 @@ pub(super) const VERSION: u32 = 13;
 // which gained the optional `openings` field, so every branch's proof bytes shift (lockstep).
 // v12: Merkle-dict I2b step 3 — the union branches embed a `LayerBgpProof` whose `RangeAtomSubproof`
 // gained the term-less value↔term witness; lockstep bump.
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const UNION_VERSION: u32 = 12;
 // v12: Merkle-dict I2b S5 — the anti sides are `LayerBgpEnvelope`s embedding a `LayerBgpProof`
 // (added `openings`); lockstep bump.
 // v13: Merkle-dict I2b step 3 — the anti sides embed a `LayerBgpProof` whose `RangeAtomSubproof`
 // gained the term-less value↔term witness; lockstep bump.
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const ANTI_VERSION: u32 = 13;
 // v10: Merkle-dict I2b S5 — the outer sides are `LayerBgpEnvelope`s embedding a `LayerBgpProof`
 // (added `openings`); lockstep bump.
 // v11: Merkle-dict I2b step 3 — the outer sides embed a `LayerBgpProof` whose `RangeAtomSubproof`
 // gained the term-less value↔term witness; lockstep bump.
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const OUTER_VERSION: u32 = 11;
 // v21 generalizes grouped extrema to zero through two canonical node keys.
 // v22 adds the bounded transitive-closure (`star`/`plus`) composite node.
@@ -307,34 +336,47 @@ pub(super) const OUTER_VERSION: u32 = 11;
 // vectors + `None` (length prefixes + one option tag), so every recursive envelope with an
 // order/group node shifts. Order/group appear ONLY under `RecursiveRelationProof` (the standalone
 // UNION/ANTI/OUTER envelopes embed only `LayerBgpEnvelope` branches), so ONLY this version bumps.
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const RECURSIVE_VERSION: u32 = 36;
 // C4: initial version of the independent delta-read plain-BGP wire format (see `DELTA_READ_MAGIC`).
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const DELTA_READ_VERSION: u32 = 1;
 // C4-slice-2: initial version of the independent reconciled materialized-present read wire format
 // (see `RECONCILE_READ_MAGIC`).
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const RECONCILE_READ_VERSION: u32 = 1;
 // C4 GROUP byte-in: initial version of the independent reconciled group-aggregate read wire format
 // (see `GROUP_READ_MAGIC`).
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const GROUP_READ_VERSION: u32 = 1;
 // C4 ORDER byte-in: initial version of the independent reconciled order read wire format (see
 // `ORDER_READ_MAGIC`).
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const ORDER_READ_VERSION: u32 = 1;
 // C4-slice-3: initial version of each independent reconciled WALK/CLOSURE read wire format (see the
 // `CLOSURE_READ_MAGIC` / `LIST_WALK_READ_MAGIC` / `ARRAY_WALK_READ_MAGIC` constants).
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const CLOSURE_READ_VERSION: u32 = 1;
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const LIST_WALK_READ_VERSION: u32 = 1;
+/// Wire-format version of this shape's framed body (accepted exactly). Bump on any byte-layout change; never rewind or re-use — see [`VERSION`].
 pub(super) const ARRAY_WALK_READ_VERSION: u32 = 1;
 pub(super) const CHECKSUM_BYTES: usize = 32;
 pub(super) const MAX_ITEMS: usize = 4_000_000;
 pub(super) const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 /// Hard cap for an untrusted portable query-proof envelope.
 pub const MAX_QUERY_ENVELOPE_BYTES: usize = 256 * 1024 * 1024;
-// Keep this conservative: decoding a node includes large cryptographic proof values on
-// the stack, so a much larger syntactic limit could exhaust ordinary verifier threads
-// before the guard is reached.
+/// Hard cap on the DEPTH (operator-tree nesting) of a decoded relation proof.
+///
+/// Keep this conservative: decoding a node includes large cryptographic proof values on
+/// the stack, so a much larger syntactic limit could exhaust ordinary verifier threads
+/// before the guard is reached.
 pub const MAX_RELATION_PROOF_DEPTH: usize = 64;
+/// Hard cap on the total NUMBER of nodes in a decoded relation-proof operator tree.
+/// A decoded tree exceeding either this or [`MAX_RELATION_PROOF_DEPTH`] is rejected while
+/// parsing (a resource guard on untrusted input, independent of the crypto checks).
 pub const MAX_RELATION_PROOF_NODES: usize = 4096;
-/// The maximum number of bounded semi-naive closure ROUNDS a [`RelationProofPlanKind::TransitiveClosure`]
+/// The maximum number of bounded semi-naive closure ROUNDS a `RelationProofPlanKind::TransitiveClosure`
 /// proof may carry. `K` is prover-chosen (the depth at which the frontier stops growing), NOT declared
 /// in the plan; soundness rests entirely on the empty-delta fixpoint, so this bound is purely a COST
 /// guard against an unbounded (or pathologically deep) unroll. A closure whose reachable frontier from
@@ -2044,7 +2086,7 @@ impl OrderedArrayWalkReconciledProof {
     }
 }
 
-/// Encode then decode a [`DictProof`] through the envelope [`Wire`] framing, so the
+/// Encode then decode a [`DictProof`] through the envelope `Wire` framing, so the
 /// migrated GKR proof shape can be asserted to survive serialization and re-verify.
 #[cfg(test)]
 pub(crate) fn wire_roundtrip_dict_proof(proof: &DictProof) -> io::Result<DictProof> {

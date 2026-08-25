@@ -4,6 +4,17 @@
 //! audited masked LogUp links (source AND universe masked) and the combined-index
 //! monotonicity.
 //!
+//! For a developer: this proves a natural-join answer is the *complete* join of two
+//! committed relations — every matching `(R-row, S-row)` present, none forged or
+//! duplicated. Like [`super::join`] it composes audited [gadgets](crate::proof::primer)
+//! (two [`super::join_link`] [LogUp](crate::proof::primer) links + a [`super::sort`]
+//! strict-increase + two [`super::membership`] + a [`super::count`]) on one Fiat–Shamir
+//! [transcript](crate::proof::primer). The #1 soundness subtlety is the combined-index
+//! radix `C` used to pack `(rho_l, rho_r)` injectively — see the note on
+//! `combined_index_radix`. See [the primer](crate::proof::primer) for
+//! [commitments](crate::proof::primer) (§3), [LogUp](crate::proof::primer) (§7), and
+//! [prove → verify](crate::proof::primer) (§10).
+//!
 //! Model. `R` has `n_R` rows `(r_key[a], r_other_0[a], ..)`; `S` has `n_S` rows
 //! `(s_key[b], s_other_0[b], ..)`. The join output, for every `(a, b)` with
 //! `r_key[a] == s_key[b]`, is `(r_other[a].., key, s_other[b]..)` with index pointers
@@ -100,31 +111,54 @@ fn source_multiplicities(rho: &[ArkFr], real: usize, m_j: usize, n: usize) -> Ve
 /// The padded data columns of a binary join, all length `N`.
 #[derive(Clone)]
 pub struct JoinColumns {
+    /// R's join-key column.
     pub r_key: Vec<ArkFr>,
+    /// R's non-key payload columns.
     pub r_other: Vec<Vec<ArkFr>>,
+    /// S's join-key column.
     pub s_key: Vec<ArkFr>,
+    /// S's non-key payload columns.
     pub s_other: Vec<Vec<ArkFr>>,
+    /// Output projection of R's payload (one row per matched pair).
     pub r_other_out: Vec<Vec<ArkFr>>,
+    /// Output shared join-key column.
     pub key: Vec<ArkFr>,
+    /// Output projection of S's payload (one row per matched pair).
     pub s_other_out: Vec<Vec<ArkFr>>,
+    /// LEFT index pointers (each output row's source R-row index).
     pub rho_l: Vec<ArkFr>,
+    /// RIGHT index pointers (each output row's source S-row index).
     pub rho_r: Vec<ArkFr>,
 }
 
 /// The per-column commitments of a binary join (all committed at the shared domain).
+/// Fields mirror [`JoinColumns`] one-for-one, plus the key universe and its
+/// multiplicity columns.
 #[derive(Clone, Debug)]
 pub struct BinaryJoinCommitments {
+    /// Commitment to R's join-key column.
     pub r_key: ArkGT,
+    /// Commitments to R's payload columns.
     pub r_other: Vec<ArkGT>,
+    /// Commitment to S's join-key column.
     pub s_key: ArkGT,
+    /// Commitments to S's payload columns.
     pub s_other: Vec<ArkGT>,
+    /// Commitments to the output projection of R's payload.
     pub r_other_out: Vec<ArkGT>,
+    /// Commitment to the output shared join-key column.
     pub key: ArkGT,
+    /// Commitments to the output projection of S's payload.
     pub s_other_out: Vec<ArkGT>,
+    /// Commitment to the LEFT index-pointer column.
     pub rho_l: ArkGT,
+    /// Commitment to the RIGHT index-pointer column.
     pub rho_r: ArkGT,
+    /// Commitment to the join-key universe `U` (sorted distinct union of `r_key`, `s_key`).
     pub u: ArkGT,
+    /// Commitment to the LEFT per-key multiplicity column `w_L`.
     pub w_l: ArkGT,
+    /// Commitment to the RIGHT per-key multiplicity column `w_R`.
     pub w_r: ArkGT,
 }
 
@@ -137,10 +171,15 @@ pub struct BinaryJoinCommitments {
 /// sumcheck are GONE.
 #[derive(Clone, Debug)]
 pub struct BinaryPairsProof {
+    /// Commitment to the LEFT source-multiplicity column (fan-out of each R-row via `rho_l`).
     pub mult_l_commitment: ArkGT,
+    /// Commitment to the RIGHT source-multiplicity column (fan-out of each S-row via `rho_r`).
     pub mult_r_commitment: ArkGT,
+    /// LEFT keyed-join link: each output row's `(r_other_out.., key)` copies an R-row.
     pub link_l: JoinLinkProof,
+    /// RIGHT keyed-join link: each output row's `(key, s_other_out..)` copies an S-row.
     pub link_r: JoinLinkProof,
+    /// Strict-monotonicity proof on the combined index `C*rho_l + rho_r` (pairs distinct).
     pub sorted: SortedProof,
 }
 
@@ -351,15 +390,25 @@ fn multiplicity_in(u: &[ArkFr], col: &[ArkFr]) -> Vec<ArkFr> {
 /// duplicate key in `u`'s padding tail `[n_u, domain)` (that attack must be rejected).
 #[derive(Clone)]
 pub struct BinaryJoinWitness {
+    /// Output projection of R's payload columns.
     pub r_other_out: Vec<Vec<ArkFr>>,
+    /// Output shared join-key column.
     pub key: Vec<ArkFr>,
+    /// Output projection of S's payload columns.
     pub s_other_out: Vec<Vec<ArkFr>>,
+    /// LEFT index pointers (source R-row per output row).
     pub rho_l: Vec<ArkFr>,
+    /// RIGHT index pointers (source S-row per output row).
     pub rho_r: Vec<ArkFr>,
+    /// The join-key universe (sorted distinct union of `r_key` and `s_key`).
     pub u: Vec<ArkFr>,
+    /// LEFT per-key multiplicity `w_L[i] = #{ a : r_key[a] == u[i] }`.
     pub w_l: Vec<ArkFr>,
+    /// RIGHT per-key multiplicity `w_R[i] = #{ b : s_key[b] == u[i] }`.
     pub w_r: Vec<ArkFr>,
+    /// Claimed distinct-key count (the chi real length; see the type doc).
     pub n_u: usize,
+    /// Output row count (number of matched pairs).
     pub m_j: usize,
 }
 
@@ -461,11 +510,17 @@ pub fn binary_join_commitments_with_context(
 /// A full sound+complete binary-join proof.
 #[derive(Clone, Debug)]
 pub struct BinaryJoinProof {
+    /// The output is a set of distinct genuine key-matching `(R, S)` pairs.
     pub pairs: BinaryPairsProof,
+    /// The key universe `U` is strictly increasing, hence distinct.
     pub sorted_u: SortedProof,
+    /// `r_key` is the multiset image of `U` under `w_L`.
     pub membership_l: MembershipProof,
+    /// `s_key` is the multiset image of `U` under `w_R`.
     pub membership_r: MembershipProof,
+    /// `Sum_i w_L[i]*w_R[i] = m_J`: the pair count equals the output size.
     pub count: CountProof,
+    /// The distinct-key count bound into the count/membership chi masks.
     pub n_u: usize,
 }
 

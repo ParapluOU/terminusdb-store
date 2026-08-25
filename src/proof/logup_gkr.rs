@@ -105,6 +105,13 @@
 //! "Improving logarithmic derivative lookups using GKR", and the layered-circuit
 //! sumcheck of Goldwasser–Kalai–Rothblum); no COSL-licensed code was consulted or
 //! copied. This module reuses only the crate's own sumcheck engine helpers.
+//!
+//! For a developer: this module IS the [LogUp / LogUp-GKR](crate::proof::primer) machinery the
+//! primer describes in §7 — the multiset / lookup argument that joins, dictionary membership, set
+//! union, permutation, and delta reconciliation all reduce to. Every per-layer reduction is a
+//! [sumcheck](crate::proof::primer) (§5), and all challenges are Fiat–Shamir, so a consumer MUST
+//! bind its column commitments (and draw `alpha`/`beta`) before calling — [the transcript
+//! invariant](crate::proof::primer) (§8).
 
 use std::io;
 
@@ -165,9 +172,13 @@ pub fn eq_at_index(pos: usize, point: &[ArkFr]) -> ArkFr {
 pub struct GkrLayerProof {
     /// `ℓ` round polynomials for the reduction at layer `ℓ` (empty at the root).
     pub round_polys: Vec<Vec<ArkFr>>,
+    /// Claimed `p_{ℓ+1}(ρ', 0)` — the numerator's low child at the sumcheck's final point.
     pub child_p_left: ArkFr,
+    /// Claimed `p_{ℓ+1}(ρ', 1)` — the numerator's high child.
     pub child_p_right: ArkFr,
+    /// Claimed `q_{ℓ+1}(ρ', 0)` — the denominator's low child.
     pub child_q_left: ArkFr,
+    /// Claimed `q_{ℓ+1}(ρ', 1)` — the denominator's high child.
     pub child_q_right: ArkFr,
 }
 
@@ -175,8 +186,11 @@ pub struct GkrLayerProof {
 /// tree layer (`layers[ℓ]` is the reduction from layer `ℓ` to layer `ℓ+1`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GkrFractionProof {
+    /// The root numerator `P = Σ_i p_i·Π_{j≠i} q_j`; the whole statement is `P = 0`.
     pub root_p: ArkFr,
+    /// The root denominator `Q = Π_i q_i` (nonzero whp; a zero here is a degenerate/forged proof).
     pub root_q: ArkFr,
+    /// One reduction per tree layer (`layers[ℓ]` reduces layer `ℓ` to layer `ℓ+1`).
     pub layers: Vec<GkrLayerProof>,
 }
 
@@ -396,8 +410,8 @@ pub fn verify_fraction_tree(
 // ---------------------------------------------------------------------------
 
 /// A single leaf-value source. Each has a MATCHED PAIR of evaluations: the value at
-/// a hypercube index (prover side, [`Src::eval_index`]) and the MLE of that source
-/// vector at a point (verifier side, [`Src::eval_mle`]). Because leaves are linear
+/// a hypercube index (prover side, the private `eval_index`) and the MLE of that source
+/// vector at a point (verifier side, the private `eval_mle`). Because leaves are linear
 /// combinations of these, the two agree exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Src {
@@ -450,7 +464,9 @@ impl Src {
 /// One term `coeff · src` of a leaf linear form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LinearTerm {
+    /// The constant coefficient multiplying `src`.
     pub coeff: ArkFr,
+    /// The leaf-value source (committed column or public indicator).
     pub src: Src,
 }
 
@@ -460,7 +476,9 @@ pub struct LinearTerm {
 /// reconstruction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinearForm {
+    /// The additive constant of the leaf form.
     pub constant: ArkFr,
+    /// The `coeff · src` terms summed on top of `constant`.
     pub terms: Vec<LinearTerm>,
 }
 
@@ -511,9 +529,13 @@ impl LinearForm {
 ///   fold columns are zero outside its own block).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FractionInstance {
+    /// Leaf variable count `K` (so `2^K` leaves).
     pub num_vars: usize,
+    /// Number of committed columns the leaf forms reference.
     pub num_cols: usize,
+    /// The numerator leaf form `p_leaf`.
     pub p_form: LinearForm,
+    /// The denominator leaf form `q_leaf`.
     pub q_form: LinearForm,
 }
 
