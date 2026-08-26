@@ -196,7 +196,7 @@ pub use present_join::{
     prove_read_two_atom_join, verify_read_two_atom_join, PresentIdAuth, PresentJoinProof,
 };
 pub use present_result::{
-    verify_and_resolve_single_atom, verify_and_resolve_two_atom_join, ResolveKind,
+    verify_and_resolve_single_atom, verify_and_resolve_two_atom_join, ResolveKind, ValueRenderBelt,
 };
 pub use present_bgp::{
     attach_termless_present_range_openings, attach_termless_reconcile_openings,

@@ -316,7 +316,9 @@ pub fn resolve_reconciled_node_ids_from_views(
     openings: Option<&ResolutionOpenings>,
 ) -> io::Result<Vec<CanonicalObject>> {
     let commit = super::recursive::closure_set_commit(ids)?;
-    resolve_node_value_id_column(views, ids, commit.commitments[0], commit.log_domain, openings)
+    // No fully-term-less RENDER belt here (closure ids are already authenticated by the closure
+    // verify; a non-head term-less id stays fail-closed).
+    resolve_node_value_id_column(views, ids, commit.commitments[0], commit.log_domain, openings, None)
 }
 
 // ===========================================================================

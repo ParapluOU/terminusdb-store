@@ -565,6 +565,8 @@ pub fn verify_and_resolve_order_bgp_from_views(
         &kinds,
         None,
         order.value_openings.as_ref(),
+        // No fully-term-less RENDER belt on the order path (walk-only).
+        None,
     )
 }
 

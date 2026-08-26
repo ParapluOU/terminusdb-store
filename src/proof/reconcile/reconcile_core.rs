@@ -50,9 +50,10 @@ pub struct CombinedDictProof {
 pub struct ReconcileProof {
     pub combined_nv: CombinedDictProof,
     pub combined_pred: CombinedDictProof,
-    /// I4 no-re-mint: full-field distinctness of the two combined dict-hash columns (no canonical
-    /// term re-minted at two ids across the chain), proved over the root-bound `Com(dict_hash)`
-    /// columns — the committed-data replacement for the old clear-catalog guard.
+    /// I4 no-re-mint / no-re-use: full-field distinctness of the two combined dict-HASH columns (no
+    /// canonical term re-minted at two ids) AND the two combined dict-ID columns (no dict id re-used
+    /// by two rows), proved over the root-bound `Com(dict_hash)` / `Com(dict_id)` columns — the
+    /// committed-data replacement for the old clear-catalog guard.
     pub(crate) remint: RemintProof,
     pub working_log: usize,
     /// Committed groups (each layer's additions then removals, in chain order).

@@ -100,9 +100,10 @@ use super::wire::{invalid, Reader, Wire};
 
 use crate::proof::reconcile::{
     build_termless_present_range_openings, prove_combined_range_dict, prove_reconcile_core,
-    range_dict_branch_commits, range_dict_branches, resolve_node_value_id_column,
-    verify_combined_range_dict, verify_dict_value_terms_chain, verify_reconcile_core,
-    CombinedRangeDictProof, PresentBgpProof, ReconcileProof,
+    prove_value_render_belt, range_dict_branch_commits, range_dict_branches,
+    resolve_node_value_id_column, verify_combined_range_dict, verify_dict_value_terms_chain,
+    verify_reconcile_core, verify_value_render_belt, CombinedRangeDictProof, PresentBgpProof,
+    ReconcileProof, ValueRenderBelt,
 };
 
 use crate::proof::argument::{commit_column, StoreProverContext, Transcript254};
@@ -1136,6 +1137,15 @@ pub struct OrderedArrayWalkReconciledProof {
     /// view's `validate()` re-MSM); leaving it unset keeps a term-less density fail-closed. Same
     /// in-memory-only discipline as `value_openings`.
     pub index_value_openings: Option<ResolutionOpenings>,
+
+    /// C4 (fully-term-less RENDER belt): a root-bound `id → hash` certificate over the delivered
+    /// [`Self::value_ids`], so a walk whose head AND ancestors are ALL term-less can still resolve
+    /// each value id to its real term (its `hash_object` is authenticated against the
+    /// reconciliation's combined dict, then belt-checked against the Merkle-opened term). `None` on
+    /// the term-bearing / term-less-HEAD path (the belt is redundant there, and its absence keeps a
+    /// non-head term-less id fail-closed). Minted by [`attach_termless_array_walk_openings`]; same
+    /// in-memory/uncommitted discipline as `value_openings` — it rides the `Option<…>` `Wire` impl.
+    pub value_belt: Option<ValueRenderBelt>,
 }
 
 /// Prove the ordered `sys:value` sequence of the `sys:Array` at `(subject, predicate)` over the
@@ -1259,7 +1269,7 @@ fn prove_ordered_array_walk_reconciled_impl(
         .map(|f| field_id(*f))
         .collect::<io::Result<Vec<_>>>()?;
     let elements =
-        resolve_node_value_id_column(&views, &value_ids, density.com_out, density.common_log_domain, None)?;
+        resolve_node_value_id_column(&views, &value_ids, density.com_out, density.common_log_domain, None, None)?;
 
     let proof = OrderedArrayWalkReconciledProof {
         reconcile,
@@ -1314,6 +1324,9 @@ fn prove_ordered_array_walk_reconciled_impl(
         sys_array_opening: None,
         index_oid: density.index_oid,
         index_value_openings: None,
+        // Pure prove keeps the belt absent (term-bearing / term-less-HEAD need no belt); the
+        // fully-term-less producer attaches it via `attach_termless_array_walk_openings`.
+        value_belt: None,
     };
     Ok((proof, elements))
 }
@@ -1649,12 +1662,34 @@ pub fn verify_ordered_array_walk_reconciled_from_views(
     if proof.value_ids.len() != n {
         return Err(invalid("reconciled ordered-array-walk value id count mismatch"));
     }
+    // C4: a FULLY term-less chain (head AND ancestors term-less) ships a root-bound id→hash RENDER
+    // belt; verify it on the same fresh walk-bound transcript the producer used and thread the
+    // authenticated per-row hashes, so each ancestor-minted value id opens to a term matching its
+    // belt hash (`resolve_nv_id`'s mandatory belt-hash). `None` ⇒ a non-head term-less id stays
+    // fail-closed, byte-identically to before the belt.
+    let value_belt_hashes = match &proof.value_belt {
+        Some(belt) => {
+            let mut t = aw_transcript(&root, &digest, b"value-render-belt");
+            Some(verify_value_render_belt(
+                views,
+                &proof.reconcile,
+                proof.com_out,
+                n,
+                proof.common_log_domain,
+                verified.working_log,
+                belt,
+                &mut t,
+            )?)
+        }
+        None => None,
+    };
     resolve_node_value_id_column(
         views,
         &proof.value_ids,
         proof.com_out,
         proof.common_log_domain,
         proof.value_openings.as_ref(),
+        value_belt_hashes.as_deref(),
     )
 }
 
@@ -1830,10 +1865,13 @@ fn verify_density_order_reconciled(
 pub fn attach_termless_array_walk_openings(
     proof: &mut OrderedArrayWalkReconciledProof,
     layers: &[&LayerCommitment],
+    subject: &CanonicalObject,
+    predicate: &[u8],
     value_ids: &[u64],
     sys_array_id: u64,
     index_ids: &[u64],
 ) -> io::Result<()> {
+    let context = StoreProverContext::cpu();
     let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
         layers.iter().map(|l| l.verifier_view()).collect();
     // Delivered ordered values: rebuild each id-indexed tree, then open it.
@@ -1847,5 +1885,27 @@ pub fn attach_termless_array_walk_openings(
     let (oid, index_openings) = build_termless_present_range_openings(layers, &index_column)?;
     proof.index_oid = oid;
     proof.index_value_openings = Some(index_openings);
+
+    // C4 fully-term-less RENDER belt over the delivered value ids: a root-bound `id → hash` lookup
+    // (against the reconciliation's combined dict) so a chain whose head AND ancestors are ALL
+    // term-less can still resolve each value id's real term. Built on the SAME fresh walk-bound
+    // transcript the verifier reconstructs (anti-substitution: bound to `(root, digest)` + `com_out`).
+    let root = layers
+        .last()
+        .ok_or_else(|| invalid("reconciled ordered-array-walk needs a head layer"))?
+        .state
+        .commitment_root;
+    let digest = reconciled_array_walk_digest(subject, predicate)?;
+    let mut t = aw_transcript(&root, &digest, b"value-render-belt");
+    let belt = prove_value_render_belt(
+        &context,
+        layers,
+        proof.reconcile.working_log,
+        proof.com_out,
+        proof.common_log_domain,
+        value_ids,
+        &mut t,
+    )?;
+    proof.value_belt = Some(belt);
     Ok(())
 }

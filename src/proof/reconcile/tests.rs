@@ -1906,6 +1906,70 @@ fn full_field_column_distinct_single_row_trivial() {
     verify_column_distinct_fullfield(com, 1, log, &proof, &mut vt).unwrap();
 }
 
+/// Soundness — combined-dict ID RE-USE (the value-render belt's dependency): the combined
+/// `(id, hash)` dictionary the reconcile/delta belt resolves ids against must have BOTH columns
+/// all-distinct. `remint` used to prove ONLY the HASH column distinct, leaving a hole: a malicious
+/// head could present a combined dict with two rows sharing one id but distinct hashes —
+/// `(5, hash(ex:A))` and `(5, hash(ex:Evil))` — so all HASHES pass the hash-side no-re-mint proof,
+/// and then the belt's `id → hash` lookup could match a delivered id `5` to the FORGED `ex:Evil`
+/// row. `prove_remint`/`verify_remint` now prove the ID column distinct too, so such a dict is
+/// UNPROVABLE (fail-closed). This mirrors `full_field_column_distinct_rejects_duplicate` at the
+/// `remint` integration point over a real `CombinedDictBuilt`.
+#[test]
+fn remint_rejects_reused_combined_dict_id() {
+    let ctx = StoreProverContext::cpu();
+    let working_log = 3usize; // domain 8
+
+    // Build a single-branch combined dict from its (hash, id) columns — the honest single-layer
+    // `prove_combined_dict` path (multi-layer bag-union produces the same combined columns).
+    let build = |hashes: &[ArkFr], ids: &[ArkFr]| -> CombinedDictBuilt {
+        let n = hashes.len();
+        let branch = RelationWitness::commit(vec![hashes.to_vec(), ids.to_vec()], n).unwrap();
+        let mut t = Transcript254::new(b"remint-id-build");
+        prove_combined_dict(&ctx, std::slice::from_ref(&branch), working_log, &mut t).unwrap()
+    };
+
+    // Near-p distinct HASH values (the shape a real combined hash column takes); the honest and
+    // malicious node/value dicts share these hashes and differ ONLY in the id column.
+    let nv_hashes = [ark(1) - ark(9), ark(1) - ark(2)];
+    let pred = build(&[ark(10), ark(20)], &[ark(1), ark(2)]);
+
+    // Positive control: distinct ids prove + verify (the fix keeps honest stacks provable).
+    let nv_ok = build(&nv_hashes, &[ark(5), ark(6)]);
+    let mut pt = Transcript254::new(b"remint-id");
+    let proof = prove_remint(&ctx, &nv_ok, &pred, working_log, &mut pt).unwrap();
+    let mut vt = Transcript254::new(b"remint-id");
+    verify_remint(&nv_ok.proof, &pred.proof, working_log, &proof, &mut vt).unwrap();
+
+    // The malicious dict: id 5 RE-USED across two rows (distinct hashes). Its HASH column alone is
+    // still all-distinct, so the retired hash-only guard would have passed — this is exactly the
+    // hole the id-side check closes.
+    let nv_bad = build(&nv_hashes, &[ark(5), ark(5)]);
+    let mut ht = Transcript254::new(b"remint-id-hash-only");
+    assert!(
+        prove_column_distinct_fullfield(
+            &ctx, &nv_bad.hash_at_k, nv_bad.com_hash_at_k, nv_bad.n, working_log, &mut ht,
+        )
+        .is_ok(),
+        "the malicious dict's HASH column is distinct — a hash-only remint would have accepted it"
+    );
+
+    // The fix: with the id-side distinctness now inside `remint`, the re-used id has a zero adjacent
+    // gap after sorting, so NO valid remint proof exists — either the prover cannot build it or the
+    // verifier rejects it (same fail-closed idiom as the underlying full-field distinct gadget).
+    let mut bt = Transcript254::new(b"remint-id");
+    match prove_remint(&ctx, &nv_bad, &pred, working_log, &mut bt) {
+        Err(_) => {}
+        Ok(bad_proof) => {
+            let mut bvt = Transcript254::new(b"remint-id");
+            assert!(
+                verify_remint(&nv_bad.proof, &pred.proof, working_log, &bad_proof, &mut bvt).is_err(),
+                "verify_remint must reject a combined dict whose id column re-uses an id"
+            );
+        }
+    }
+}
+
 #[test]
 fn tampered_present_distinct_rejects() {
     let layers = bgp_stack();
@@ -3111,7 +3175,7 @@ fn termless_nonhead_readable_nodevalueid_forgery_is_rejected() {
     // THE FIX: the readable `NodeValueId` path fails CLOSED over the non-head term-less view
     // (was resolving ex:EVIL-FORGED).
     assert!(
-        resolve_node_value_id_column(&forged_views, &[victim_id], com, 1, Some(&forged_openings))
+        resolve_node_value_id_column(&forged_views, &[victim_id], com, 1, Some(&forged_openings), None)
             .is_err(),
         "readable NodeValueId over a NON-HEAD term-less view must fail closed (audit forgery)"
     );
@@ -3130,7 +3194,7 @@ fn termless_nonhead_readable_nodevalueid_forgery_is_rejected() {
 
     // Positive control 1: an honest term-bearing chain resolves the TRUE term (readable path OK).
     let honest_resolved =
-        resolve_node_value_id_column(&views, &[victim_id], com, 1, None).unwrap();
+        resolve_node_value_id_column(&views, &[victim_id], com, 1, None, None).unwrap();
     assert_eq!(
         honest_resolved,
         vec![honest_term.clone()],
@@ -3153,7 +3217,7 @@ fn termless_nonhead_readable_nodevalueid_forgery_is_rejected() {
     head_tl_views[3] = tl_head;
     let com_head = commit_col(&[ark(head_id), ark(0)]);
     let head_resolved =
-        resolve_node_value_id_column(&head_tl_views, &[head_id], com_head, 1, Some(&head_openings))
+        resolve_node_value_id_column(&head_tl_views, &[head_id], com_head, 1, Some(&head_openings), None)
             .unwrap();
     assert_eq!(
         head_resolved,

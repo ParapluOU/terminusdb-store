@@ -69,8 +69,9 @@ use super::reconciled::{
 use super::wire::{invalid, Reader, Wire};
 
 use crate::proof::reconcile::{
-    prove_reconcile_core, resolve_node_value_id_column, verify_reconcile_core, PresentBgpProof,
-    ReconcileProof,
+    prove_reconcile_core, prove_value_render_belt, resolve_node_value_id_column,
+    verify_reconcile_core, verify_value_render_belt, PresentBgpProof, ReconcileProof,
+    ValueRenderBelt,
 };
 
 use crate::proof::anti::{
@@ -1158,6 +1159,15 @@ pub struct OrderedListWalkReconciledProof {
     /// on the term-bearing path (nil is resolved by the audited catalog scan). Same in-memory-only
     /// discipline as `element_openings`.
     pub nil_opening: Option<DictOpening>,
+
+    /// C4 (fully-term-less RENDER belt): a root-bound `id → hash` certificate over the delivered
+    /// [`Self::element_ids`], so a walk whose head AND ancestors are ALL term-less can still resolve
+    /// each element id to its real term (its `hash_object` is authenticated against the
+    /// reconciliation's combined dict, then belt-checked against the Merkle-opened term). `None` on
+    /// the term-bearing / term-less-HEAD path (redundant there; its absence keeps a non-head
+    /// term-less id fail-closed). Minted by [`attach_termless_list_walk_openings`]; same
+    /// in-memory/uncommitted discipline as `element_openings` — it rides the `Option<…>` `Wire` impl.
+    pub value_belt: Option<ValueRenderBelt>,
 }
 
 /// The `[subject, object]` id columns of a proven 2-column edge relation delivered as a
@@ -1365,7 +1375,7 @@ fn prove_ordered_list_walk_reconciled_impl(
         .iter()
         .map(|f| field_id(*f))
         .collect::<io::Result<Vec<_>>>()?;
-    let elements = resolve_node_value_id_column(&views, &element_ids, com_elements, cons_log_domain, None)?;
+    let elements = resolve_node_value_id_column(&views, &element_ids, com_elements, cons_log_domain, None, None)?;
 
     let proof = OrderedListWalkReconciledProof {
         reconcile,
@@ -1405,6 +1415,9 @@ fn prove_ordered_list_walk_reconciled_impl(
         // `attach_termless_list_walk_openings`; a term-bearing verifier ignores them.
         element_openings: None,
         nil_opening: None,
+        // Pure prove keeps the belt absent (term-bearing / term-less-HEAD need no belt); the
+        // fully-term-less producer attaches it via `attach_termless_list_walk_openings`.
+        value_belt: None,
     };
     Ok((proof, elements))
 }
@@ -1615,12 +1628,33 @@ pub fn verify_ordered_list_walk_reconciled_from_views(
     if proof.element_ids.len() != proof.cons_len {
         return Err(invalid("reconciled ordered-list-walk element id count mismatch"));
     }
+    // C4: a FULLY term-less chain (head AND ancestors term-less) ships a root-bound id→hash RENDER
+    // belt; verify it on the same fresh walk-bound transcript the producer used and thread the
+    // authenticated per-row hashes, so each ancestor-minted element id opens to a term matching its
+    // belt hash. `None` ⇒ a non-head term-less id stays fail-closed, byte-identically to before.
+    let element_belt_hashes = match &proof.value_belt {
+        Some(belt) => {
+            let mut t = lw_transcript(&root, &digest, b"value-render-belt");
+            Some(verify_value_render_belt(
+                views,
+                &proof.reconcile,
+                proof.com_elements,
+                proof.cons_len,
+                proof.cons_log_domain,
+                verified.working_log,
+                belt,
+                &mut t,
+            )?)
+        }
+        None => None,
+    };
     resolve_node_value_id_column(
         views,
         &proof.element_ids,
         proof.com_elements,
         proof.cons_log_domain,
         proof.element_openings.as_ref(),
+        element_belt_hashes.as_deref(),
     )
 }
 
@@ -1673,9 +1707,12 @@ pub fn decode_and_verify_ordered_list_walk_reconciled(
 pub fn attach_termless_list_walk_openings(
     proof: &mut OrderedListWalkReconciledProof,
     layers: &[&LayerCommitment],
+    subject: &CanonicalObject,
+    predicate: &[u8],
     element_ids: &[u64],
     nil_id: u64,
 ) -> io::Result<()> {
+    let context = StoreProverContext::cpu();
     let views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
         layers.iter().map(|l| l.verifier_view()).collect();
     // The prover holds term-bearing catalogs: rebuild each element's id-indexed tree, then open it.
@@ -1683,5 +1720,27 @@ pub fn attach_termless_list_walk_openings(
     // The single rdf:nil opening (routed to its introducing layer, opened positionally).
     let nil_openings = build_resolution_openings(&views, &[nil_id], &[])?;
     proof.nil_opening = Some(nil_openings.node_value_opening(nil_id)?.clone());
+
+    // C4 fully-term-less RENDER belt over the delivered element ids: a root-bound `id → hash` lookup
+    // (against the reconciliation's combined dict) so a chain whose head AND ancestors are ALL
+    // term-less can still resolve each element id's real term. Built on the SAME fresh walk-bound
+    // transcript the verifier reconstructs (anti-substitution: bound to `(root, digest)` + `com_elements`).
+    let root = layers
+        .last()
+        .ok_or_else(|| invalid("reconciled ordered-list-walk needs a head layer"))?
+        .state
+        .commitment_root;
+    let digest = reconciled_list_walk_digest(subject, predicate)?;
+    let mut t = lw_transcript(&root, &digest, b"value-render-belt");
+    let belt = prove_value_render_belt(
+        &context,
+        layers,
+        proof.reconcile.working_log,
+        proof.com_elements,
+        proof.cons_log_domain,
+        element_ids,
+        &mut t,
+    )?;
+    proof.value_belt = Some(belt);
     Ok(())
 }

@@ -4273,8 +4273,10 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
             lref.iter().map(|l| l.verifier_view()).collect();
         let nil_id = super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
         let element_ids = proof.element_ids.clone();
-        super::list_walk::attach_termless_list_walk_openings(&mut proof, &lref, &element_ids, nil_id)
-            .unwrap();
+        super::list_walk::attach_termless_list_walk_openings(
+            &mut proof, &lref, &subj, pbytes, &element_ids, nil_id,
+        )
+        .unwrap();
 
         // Term-bearing baseline (the `layers` wrapper: catalog scan + catalog render).
         let bearing_elements = super::list_walk::verify_ordered_list_walk_reconciled(
@@ -4317,8 +4319,10 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let nil_id = super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
         let c_id = super::reconciled::resolve_combined_node_id(&bearing_views, iri("c").as_bytes());
         let element_ids = proof.element_ids.clone();
-        super::list_walk::attach_termless_list_walk_openings(&mut proof, &lref, &element_ids, nil_id)
-            .unwrap();
+        super::list_walk::attach_termless_list_walk_openings(
+            &mut proof, &lref, &subj, pbytes, &element_ids, nil_id,
+        )
+        .unwrap();
 
         let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
         let termless_views = termless_head_views(&lref, &head_termless);
@@ -4388,8 +4392,10 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let nil_id = super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
         let a_id = super::reconciled::resolve_combined_node_id(&bearing_views, iri("a").as_bytes());
         let element_ids = proof.element_ids.clone();
-        super::list_walk::attach_termless_list_walk_openings(&mut proof, &lref, &element_ids, nil_id)
-            .unwrap();
+        super::list_walk::attach_termless_list_walk_openings(
+            &mut proof, &lref, &subj, pbytes, &element_ids, nil_id,
+        )
+        .unwrap();
 
         let head_termless = lref.last().unwrap().verifier_commitment_termless().unwrap();
         let termless_views = termless_head_views(&lref, &head_termless);
@@ -4454,7 +4460,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
                 .and_then(|(mut proof, _)| {
                     let element_ids = proof.element_ids.clone();
                     super::list_walk::attach_termless_list_walk_openings(
-                        &mut proof, &lref, &element_ids, nil_id,
+                        &mut proof, &lref, &subj, pbytes, &element_ids, nil_id,
                     )?;
                     super::list_walk::verify_ordered_list_walk_reconciled_from_views(
                         &termless_views, head_root, &subj, pbytes, &proof,
@@ -4518,8 +4524,10 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
             lref.iter().map(|l| l.verifier_view()).collect();
         let nil_id = super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
         let element_ids = proof.element_ids.clone();
-        super::list_walk::attach_termless_list_walk_openings(&mut proof, &lref, &element_ids, nil_id)
-            .unwrap();
+        super::list_walk::attach_termless_list_walk_openings(
+            &mut proof, &lref, &subj, pbytes, &element_ids, nil_id,
+        )
+        .unwrap();
 
         // Term-bearing baseline.
         let bearing_elements = super::list_walk::verify_ordered_list_walk_reconciled(
@@ -4922,7 +4930,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let value_ids = proof.value_ids.clone();
         let index_ids = proof.index_oid.clone();
         super::array_walk::attach_termless_array_walk_openings(
-            &mut proof, &lref, &value_ids, sys_array_id, &index_ids,
+            &mut proof, &lref, &subj, p.as_bytes(), &value_ids, sys_array_id, &index_ids,
         )
         .unwrap();
 
@@ -4974,7 +4982,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let value_ids = proof.value_ids.clone();
         let index_ids = proof.index_oid.clone();
         super::array_walk::attach_termless_array_walk_openings(
-            &mut proof, &lref, &value_ids, sys_array_id, &index_ids,
+            &mut proof, &lref, &subj, p.as_bytes(), &value_ids, sys_array_id, &index_ids,
         )
         .unwrap();
 
@@ -5038,7 +5046,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let value_ids = proof.value_ids.clone();
         let index_ids = proof.index_oid.clone();
         super::array_walk::attach_termless_array_walk_openings(
-            &mut proof, &lref, &value_ids, sys_array_id, &index_ids,
+            &mut proof, &lref, &subj, p.as_bytes(), &value_ids, sys_array_id, &index_ids,
         )
         .unwrap();
 
@@ -5109,7 +5117,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let value_ids = proof.value_ids.clone();
         let index_ids = proof.index_oid.clone();
         super::array_walk::attach_termless_array_walk_openings(
-            &mut proof, &lref, &value_ids, sys_array_id, &index_ids,
+            &mut proof, &lref, &subj, p.as_bytes(), &value_ids, sys_array_id, &index_ids,
         )
         .unwrap();
 
@@ -5215,7 +5223,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
                 let value_ids = proof.value_ids.clone();
                 let index_ids = proof.index_oid.clone();
                 super::array_walk::attach_termless_array_walk_openings(
-                    &mut proof, &lref, &value_ids, sys_array_id, &index_ids,
+                    &mut proof, &lref, &subj, p.as_bytes(), &value_ids, sys_array_id, &index_ids,
                 )?;
                 super::array_walk::verify_ordered_array_walk_reconciled_from_views(
                     &termless_views, head_root, &subj, p.as_bytes(), &proof,
@@ -5448,8 +5456,10 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let nil_id =
             super::reconciled::resolve_combined_node_id(&bearing_views, rdf_nil().as_bytes());
         let element_ids = proof.element_ids.clone();
-        super::list_walk::attach_termless_list_walk_openings(&mut proof, lref, &element_ids, nil_id)
-            .unwrap();
+        super::list_walk::attach_termless_list_walk_openings(
+            &mut proof, lref, subj, pbytes, &element_ids, nil_id,
+        )
+        .unwrap();
         proof
     }
 
@@ -5592,7 +5602,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         let value_ids = proof.value_ids.clone();
         let index_ids = proof.index_oid.clone();
         super::array_walk::attach_termless_array_walk_openings(
-            &mut proof, lref, &value_ids, sys_array_id, &index_ids,
+            &mut proof, lref, subj, pbytes, &value_ids, sys_array_id, &index_ids,
         )
         .unwrap();
         proof
@@ -5706,4 +5716,123 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
     #[test]
     fn c4_array_walk_byte_in_matches_in_memory_and_rejects_substitution() {
         big_stack(assert_c4_array_walk_byte_in);
+    }
+
+    // ---- C4 fully-term-less value-render BELT — soundness negatives -------------------------
+    //
+    // The belt lets a FULLY term-less array walk (head AND ancestors term-less) resolve its
+    // ancestor-minted value ids. These negatives pin its additivity + soundness: without it a
+    // fully-term-less walk stays fail-closed, and every way of tampering it (its hashes, its
+    // authenticated lookup, a forged delivered term, or lifting it from a different walk) rejects.
+    fn assert_c4_array_walk_value_belt_negatives() {
+        let (stack, subj, pred) = array_walk_wire_fixture();
+        let lref = arc_refs(&stack);
+        let pbytes = pred.as_bytes();
+        let head_root = lref.last().unwrap().resolution_root();
+        let proof = prove_attach_array_walk(&lref, &subj, pbytes);
+
+        // FULLY term-less views: EVERY layer (head and ancestors) drops its clear catalogs — the
+        // exact chain shape the render belt exists for.
+        let tl_owned: Vec<VerifierCommitment> = lref
+            .iter()
+            .map(|l| l.verifier_commitment_termless().unwrap())
+            .collect();
+        let tl_views: Vec<crate::proof::VerifierCommitmentRef<'_>> =
+            tl_owned.iter().map(|c| c.verifier_view()).collect();
+
+        // POSITIVE control: with the honest belt the fully-term-less walk resolves the true order.
+        let ok = super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+            &tl_views, head_root, &subj, pbytes, &proof,
+        )
+        .unwrap();
+        assert_eq!(object_iris(&ok), vec![iri("x"), iri("y"), iri("z")]);
+        assert!(proof.value_belt.is_some(), "the term-less producer must attach the belt");
+
+        // (a) belt ABSENT on a fully-term-less chain → the ancestor-minted (x, y) value ids route to
+        // NON-HEAD term-less views and hit the D5 fail-close (byte-identical to before the belt).
+        {
+            let mut p = proof.clone();
+            p.value_belt = None;
+            assert!(
+                super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                    &tl_views, head_root, &subj, pbytes, &p,
+                )
+                .is_err(),
+                "(a) fully term-less walk with NO render belt must fail closed"
+            );
+        }
+
+        // (b) FORGED delivered-value term: substitute a WRONG term at a value id's opening. On the
+        // root-bound tree `verify_opening` rejects the substituted leaf; the belt-hash is the
+        // additional backstop when a NON-HEAD term-less root is prover-forged (that pure case is
+        // unit-tested at `resolve_nv_id` in `reconcile::tests`, the gadget the belt reuses).
+        {
+            let mut p = proof.clone();
+            let mut op = p.value_openings.clone().unwrap();
+            let vid = p.value_ids[0];
+            let mut tampered = op.node_value_opening(vid).unwrap().clone();
+            tampered.term_bytes = iri("EVIL-FORGED").into_bytes();
+            op.insert_node_value(tampered);
+            p.value_openings = Some(op);
+            assert!(
+                super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                    &tl_views, head_root, &subj, pbytes, &p,
+                )
+                .is_err(),
+                "(b) a forged delivered-value term must be rejected"
+            );
+        }
+
+        // (c) TAMPERED belt value_hashes → the recommit no longer opens the authenticated lookup.
+        {
+            let mut p = proof.clone();
+            let belt = p.value_belt.as_mut().unwrap();
+            belt.value_hashes[0] = belt.value_hashes[0] + ArkFr::one();
+            assert!(
+                super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                    &tl_views, head_root, &subj, pbytes, &p,
+                )
+                .is_err(),
+                "(c) tampered belt value_hashes must reject at the recommit"
+            );
+        }
+
+        // (d) TAMPERED belt lookup → the authenticated id→hash lookup (its committed-column opening
+        // tie) rejects, so `com_v_hash` can no longer be trusted to be the true per-row hash.
+        {
+            let mut p = proof.clone();
+            let belt = p.value_belt.as_mut().unwrap();
+            belt.lookup.col_evals[0] = belt.lookup.col_evals[0] + ArkFr::one();
+            assert!(
+                super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                    &tl_views, head_root, &subj, pbytes, &p,
+                )
+                .is_err(),
+                "(d) a tampered belt lookup must reject"
+            );
+        }
+
+        // (e) belt LIFTED from a DIFFERENT walk (a list walk under a different subject/predicate):
+        // its transcript + `com_out` bindings are foreign, so splicing it in rejects (belt-log /
+        // relocation / transcript mismatch).
+        {
+            let (lstack, lsubj, lpred) = list_walk_wire_fixture();
+            let llref = arc_refs(&lstack);
+            let lproof = prove_attach_list_walk(&llref, &lsubj, lpred.as_bytes());
+            assert!(lproof.value_belt.is_some());
+            let mut p = proof.clone();
+            p.value_belt = lproof.value_belt.clone();
+            assert!(
+                super::array_walk::verify_ordered_array_walk_reconciled_from_views(
+                    &tl_views, head_root, &subj, pbytes, &p,
+                )
+                .is_err(),
+                "(e) a belt lifted from a different walk must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn c4_array_walk_value_belt_negatives() {
+        big_stack(assert_c4_array_walk_value_belt_negatives);
     }

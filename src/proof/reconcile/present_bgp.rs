@@ -295,28 +295,35 @@ pub(super) fn bgp_needs_range_dict(atoms: &[PresentBgpAtom]) -> bool {
 //       strict-sorted (adjacent gaps of near-modulus field elements exceed the 253-bit range
 //       the sort gadget bounds). A duplicated present row (a store that smuggled a duplicated
 //       addition into a bag) has a duplicated id-triple and is rejected.
-//   (2) combined-dict ID UNIQUENESS: the combined node/value dictionary assigns DISTINCT ids
-//       (no two dict rows share an id), so the id space present is joined in is well-formed
-//       (a store that reused/duplicated a dict id is rejected).
+//   (2) combined-dict ID UNIQUENESS: the combined node/value AND predicate dictionaries assign
+//       DISTINCT ids (no two dict rows share an id), so the `id → hash` lookup every group-hash /
+//       BGP step performs is a FUNCTION and the id space present is joined in is well-formed. This
+//       is PROVED over COMMITTED data by `prove_remint` / `verify_remint` (the id side, below) —
+//       NOT by (1)'s bounded strict-sort — so a store that reused/duplicated a dict id is rejected
+//       on the fully term-less path too.
 //
-// Both reuse the audited FULL-FIELD permutation ([`crate::proof::permutation`]) + BOUNDED strict-sort
-// ([`crate::proof::sort`]) as a distinctness argument: commit the sorted column U, prove U is a
-// permutation of the key column (reciprocal LogUp, field-native, no ordering cap), then prove
-// U STRICTLY increases (each adjacent gap in `[1, 2^bits)`, forcing all entries distinct).
-// The key columns are the reconciliation-authenticated id commitments (bound to the trusted
-// head root); the whole argument runs on the shared reconcile/BGP transcript.
+// Assertion (1) reuses the audited FULL-FIELD permutation ([`crate::proof::permutation`]) + BOUNDED
+// strict-sort ([`crate::proof::sort`]) as a distinctness argument over the packed id-triple key:
+// commit the sorted column U, prove U is a permutation of the key column (reciprocal LogUp,
+// field-native, no ordering cap), then prove U STRICTLY increases (each adjacent gap in
+// `[1, 2^bits)`, forcing all entries distinct). The key columns are the reconciliation-authenticated
+// id commitments (bound to the trusted head root); the whole argument runs on the shared
+// reconcile/BGP transcript.
 //
-// NO-RE-MINT (I4): full dictionary HASH-uniqueness (no term re-minted with two DIFFERENT ids —
-// a duplicate HASH sitting at two ids) is now PROVED over COMMITTED data by `prove_remint` /
-// `verify_remint` (below), run by both reconcile cores. Detecting a duplicate among 254-bit
-// canonical hashes needs a full-field distinctness primitive (limb-wise lexicographic strict
+// NO-RE-MINT / NO-RE-USE (I4): dictionary HASH-uniqueness (no term re-minted with two DIFFERENT ids
+// — a duplicate HASH sitting at two ids) AND dictionary ID-uniqueness (assertion (2): no id re-used
+// by two rows — a duplicate ID carrying two hashes) are both PROVED over COMMITTED data by
+// `prove_remint` / `verify_remint` (below), run by both reconcile cores. Detecting a duplicate among
+// 254-bit canonical hashes needs a full-field distinctness primitive (limb-wise lexicographic strict
 // sort) — I4-a's `prove_column_distinct_fullfield` — because the magnitude strict-sort caps keys
 // at 253 bits and `hash_object`/`hash_term` values sit near the ~254-bit field modulus, so their
-// sorted adjacent gaps overflow the range check on honest stacks. `prove_remint` runs that
-// full-field distinctness over each combined `Com(dict_hash)` column (the bag union of every
-// layer's root-bound dict-hash rows), so the old clear-catalog recompute guard is retired.
-// Assertion (2) closes duplicate/malformed IDS; hash collision-resistance (Blake2b-512) closes
-// distinct-terms-same-hash; the same-hash-two-distinct-ids case is now closed by `verify_remint`.
+// sorted adjacent gaps overflow the range check on honest stacks; the id columns reuse that SAME
+// full-field gadget (their exact mirror). `prove_remint` runs it over each combined `Com(dict_hash)`
+// AND `Com(dict_id)` column (the bag union of every layer's root-bound dict rows), so the old
+// clear-catalog recompute guard is retired. Assertion (2) — the id-side distinctness — closes
+// duplicate/malformed IDS; hash collision-resistance (Blake2b-512) closes distinct-terms-same-hash;
+// the same-hash-two-distinct-ids case is closed by the hash-side `verify_remint`; the
+// same-id-two-distinct-terms (id re-use) case is closed by its id-side.
 // ===========================================================================
 
 /// `2^w` as a field element (`w` is small — a dictionary-id bit-width, `<= 84`).
@@ -466,22 +473,35 @@ pub(super) fn verify_column_distinct_fullfield(
     verify_lex_strictly_sorted(&proof.com_sorted, n, &proof.lex, transcript)
 }
 
-/// The no-re-mint carrier: full-field distinctness proofs for the COMBINED node/value and
-/// predicate dictionary hash columns (each the bag union of every chain layer's root-bound
-/// `Com(dict_hash)`, relocated to the working domain). Distinctness of these committed columns
-/// ⇔ no canonical term is re-minted at two ids across the chain — the committed-data replacement
-/// for the old clear-catalog `assert_combined_catalog_hash_unique` (works term-less: a term-less
-/// view drops its clear catalog but RETAINS its dict commitments, so it still contributes to the
-/// combined column and is covered).
+/// The no-re-mint / no-re-use carrier: full-field distinctness proofs for the COMBINED node/value
+/// and predicate dictionary HASH columns AND their ID columns (each the bag union of every chain
+/// layer's root-bound `Com(dict_hash)` / `Com(dict_id)`, relocated to the working domain).
+///
+/// * HASH distinctness (`nv`, `pred`) ⇔ no canonical term is re-MINTED at two ids across the chain
+///   (the committed-data replacement for the old clear-catalog `assert_combined_catalog_hash_unique`).
+/// * ID distinctness (`nv_id`, `pred_id`) ⇔ no dict id is re-USED by two rows across the chain, so
+///   the `id → hash` lookup every group-hash / BGP step performs is a FUNCTION. Without it a
+///   malicious head could present two combined-dict rows sharing one id — e.g. `(5, hash(ex:A))`
+///   and `(5, hash(ex:Evil))`, all HASHES still distinct so `nv`/`pred` pass — and then resolve a
+///   delivered id `5` to the FORGED term `ex:Evil`. This is the id-side mirror of the hash proof.
+///
+/// Works term-less: a term-less view drops its clear catalog but RETAINS its dict commitments, so
+/// both the hash and id columns still contribute to the combined columns and are covered.
 #[derive(Clone, Debug)]
 pub(crate) struct RemintProof {
     pub nv: ColumnDistinctFullFieldProof,
     pub pred: ColumnDistinctFullFieldProof,
+    /// Full-field distinctness of the combined node/value dict ID column (`Com(dict_id)`), the id
+    /// side of the no-re-use guarantee (mirrors `nv` on the hash column).
+    pub nv_id: ColumnDistinctFullFieldProof,
+    /// Full-field distinctness of the combined predicate dict ID column (mirrors `pred`).
+    pub pred_id: ColumnDistinctFullFieldProof,
 }
 
-/// Prove the combined node/value + predicate dictionary hash columns are each all-distinct
-/// (no re-mint). Runs right after `prove_combined_dict` for both dicts, before any group-hash /
-/// BGP step trusts the term↔id bijection.
+/// Prove the combined node/value + predicate dictionary HASH columns are each all-distinct
+/// (no re-mint) AND their ID columns are each all-distinct (no re-use). Runs right after
+/// `prove_combined_dict` for both dicts, before any group-hash / BGP step trusts the term↔id
+/// bijection.
 pub(super) fn prove_remint(
     context: &StoreProverContext<'_>,
     combined_nv: &CombinedDictBuilt,
@@ -495,11 +515,24 @@ pub(super) fn prove_remint(
     let pred = prove_column_distinct_fullfield(
         context, &combined_pred.hash_at_k, combined_pred.com_hash_at_k, combined_pred.n, working_log, transcript,
     )?;
-    Ok(RemintProof { nv, pred })
+    // ID side (no re-use): each combined dict's ID column is all-distinct too — no dict id shared by
+    // two rows — proved over the SAME root-bound `Com(dict_id)` (`com_id_at_k`) the group-hash
+    // lookups resolve against. Exact mirror of the hash proofs above; runs AFTER them so honest
+    // hash-side transcript positions are unchanged (both sides append in this same order).
+    let nv_id = prove_column_distinct_fullfield(
+        context, &combined_nv.id_at_k, combined_nv.com_id_at_k, combined_nv.n, working_log, transcript,
+    )?;
+    let pred_id = prove_column_distinct_fullfield(
+        context, &combined_pred.id_at_k, combined_pred.com_id_at_k, combined_pred.n, working_log, transcript,
+    )?;
+    Ok(RemintProof { nv, pred, nv_id, pred_id })
 }
 
-/// Verify both combined-dict hash columns are all-distinct (no re-mint). Runs right after
-/// `verify_combined_dict` for both dicts, mirroring `prove_remint`'s transcript position.
+/// Verify both combined-dict HASH columns are all-distinct (no re-mint) AND both combined-dict ID
+/// columns are all-distinct (no re-use). Runs right after `verify_combined_dict` for both dicts,
+/// mirroring `prove_remint`'s transcript position. FAILS CLOSED if any of the four columns has a
+/// duplicate: the hash proofs bind to `com_hash_at_k`, the id proofs to `com_id_at_k`, both
+/// root-bound.
 pub(super) fn verify_remint(
     combined_nv: &CombinedDictProof,
     combined_pred: &CombinedDictProof,
@@ -508,7 +541,10 @@ pub(super) fn verify_remint(
     transcript: &mut Transcript254,
 ) -> io::Result<()> {
     verify_column_distinct_fullfield(combined_nv.com_hash_at_k, combined_nv.n, working_log, &proof.nv, transcript)?;
-    verify_column_distinct_fullfield(combined_pred.com_hash_at_k, combined_pred.n, working_log, &proof.pred, transcript)
+    verify_column_distinct_fullfield(combined_pred.com_hash_at_k, combined_pred.n, working_log, &proof.pred, transcript)?;
+    // ID side (no re-use), bound to the root-committed `Com(dict_id)` columns — same order as the prover.
+    verify_column_distinct_fullfield(combined_nv.com_id_at_k, combined_nv.n, working_log, &proof.nv_id, transcript)?;
+    verify_column_distinct_fullfield(combined_pred.com_id_at_k, combined_pred.n, working_log, &proof.pred_id, transcript)
 }
 
 /// The bounded canonical-triple key column `id_s + 2^w*id_p + 2^(2w)*id_o` for present (an
@@ -1275,6 +1311,8 @@ pub fn verify_and_resolve_bgp_from_views(
     resolve_result_columns(
         views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None,
         proof.openings.as_ref(),
+        // No fully-term-less RENDER belt on the BGP path (walk-only).
+        None,
     )
 }
 

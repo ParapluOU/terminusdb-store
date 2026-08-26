@@ -121,7 +121,7 @@ use crate::proof::reconcile::{
     PresentBgpProof, PresentIdAuth, PresentRangeDatatypeGuardProof, PresentRangeSubproof,
     GroupReadAgg, GroupReadSpec, OrderReadSpec, PresentScalarOrderProof, PresentSecondRange,
     ReconcileProof, ReconciledGroupReadProof, ReconciledOrderReadProof, ReconciledReadBgpProof,
-    RemintProof,
+    RemintProof, ValueRenderBelt,
 };
 /// 12-byte magic tag opening the framed byte image of the base query-proof envelope
 /// (`LayerBgpEnvelope`). Each envelope/proof shape below has its OWN distinct `*_MAGIC` tag so a
@@ -966,6 +966,21 @@ wire_struct!(HashLookupInnerProof {
     com_v_hash,
     com_w
 });
+// C4 fully-term-less value-render belt: the three relocations + their targets, the audited
+// `id → hash` inner lookup, and the real-prefix authenticated hash column. Every field is already
+// `Wire` (`RelocationProof`, `ArkGT`, `HashLookupInnerProof`, `Vec<ArkFr>`). It rides the walk
+// proofs as an `Option<ValueRenderBelt>` (length-tagged ⇒ byte-identity fixed point holds).
+wire_struct!(ValueRenderBelt {
+    belt_log,
+    reloc_ids,
+    com_ids_at_belt,
+    reloc_dict_id,
+    com_dict_id_at_belt,
+    reloc_dict_hash,
+    com_dict_hash_at_belt,
+    lookup,
+    value_hashes
+});
 wire_struct!(DictHashLookupProof {
     relocate_dict_hash,
     relocate_dict_id,
@@ -1394,8 +1409,12 @@ wire_struct!(CombinedDictProof {
 });
 // 8. Full-field (whole-`Fr`) distinctness of one committed column (I4-a via `LexDistinctProof`).
 wire_struct!(ColumnDistinctFullFieldProof { perm, com_sorted, lex });
-// 9. The no-re-mint carrier: full-field distinctness of the combined nv + predicate hash columns.
-wire_struct!(RemintProof { nv, pred });
+// 9. The no-re-mint / no-re-use carrier: full-field distinctness of the combined nv + predicate
+// HASH columns (`nv`, `pred`) AND their ID columns (`nv_id`, `pred_id`). The id fields are appended
+// after the hash fields (matching `prove_remint`'s field/transcript order); this grows the wire
+// format additively — the byte-identity round-trip goldens re-derive their bytes, so no golden
+// byte array changes.
+wire_struct!(RemintProof { nv, pred, nv_id, pred_id });
 // 10. A committed group's three authenticated canonical hash columns (S/O vs nv, P vs predicate).
 wire_struct!(CommittedGroupProof { s, o, p });
 // 11. A ranged atom's sub-proofs over `present`.
@@ -1922,7 +1941,8 @@ wire_struct!(OrderedListWalkReconciledProof {
     nested_join_out,
     element_ids,
     element_openings,
-    nil_opening
+    nil_opening,
+    value_belt
 });
 
 impl OrderedListWalkReconciledProof {
@@ -2029,7 +2049,8 @@ wire_struct!(OrderedArrayWalkReconciledProof {
     value_openings,
     sys_array_opening,
     index_oid,
-    index_value_openings
+    index_value_openings,
+    value_belt
 });
 
 impl OrderedArrayWalkReconciledProof {

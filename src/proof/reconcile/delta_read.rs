@@ -78,9 +78,10 @@ impl DeltaSource {
 pub struct DeltaReadProof {
     pub combined_nv: CombinedDictProof,
     pub combined_pred: CombinedDictProof,
-    /// I4 no-re-mint: full-field distinctness of the two combined dict-hash columns (no canonical
-    /// term re-minted at two ids across the chain), proved over the root-bound `Com(dict_hash)`
-    /// columns — the committed-data replacement for the old clear-catalog guard.
+    /// I4 no-re-mint / no-re-use: full-field distinctness of the two combined dict-HASH columns (no
+    /// canonical term re-minted at two ids) AND the two combined dict-ID columns (no dict id re-used
+    /// by two rows), proved over the root-bound `Com(dict_hash)` / `Com(dict_id)` columns — the
+    /// committed-data replacement for the old clear-catalog guard.
     pub(crate) remint: RemintProof,
     pub working_log: usize,
     /// The head group's S/O/P id→hash authentications (S,O vs the combined node/value dict, P vs
@@ -474,6 +475,8 @@ pub fn verify_and_resolve_delta_read_from_views(
     resolve_result_columns(
         views, claimed_columns, &result_coms, result_m, result_log_domain, &kinds, None,
         proof.openings.as_ref(),
+        // No fully-term-less RENDER belt on the delta-read path (walk-only).
+        None,
     )
 }
 

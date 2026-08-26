@@ -258,18 +258,30 @@ impl<'a> ChainDictResolver<'a> {
     /// ancestor-minted result ids; that is a cross-cutting proof-format change, out of scope for this
     /// localized soundness fix, so until then such a resolution fails closed rather than trust an
     /// unbound ancestor root.
-    fn resolve_nv_id_readable(&mut self, id: u64) -> io::Result<CanonicalObject> {
+    ///
+    /// C4 fully-term-less RENDER belt (ADDITIVE, never a bypass): when `belt_hash = Some(H)`, `H`
+    /// is a ROOT-BOUND `hash_object(term(id))` produced by [`verify_value_render_belt`] (an
+    /// authenticated `id → hash` lookup against the reconciliation's combined dict). It relaxes the
+    /// D5-FIX fail-close ONLY for a routed NON-HEAD term-less view, and is then handed to
+    /// [`resolve_nv_id`](Self::resolve_nv_id) as the MANDATORY belt-hash — the opened term must
+    /// satisfy `hash_object(term) == H`, so a forged non-head `nv_merkle_root` cannot launder a
+    /// wrong term through. With `belt_hash = None` this is BYTE-IDENTICAL to the pre-belt fail-close.
+    fn resolve_nv_id_readable(
+        &mut self,
+        id: u64,
+        belt_hash: Option<ArkFr>,
+    ) -> io::Result<CanonicalObject> {
         let i = self.nv_layer(id)?;
         let view = self.views[i];
         let is_head = i + 1 == self.views.len();
-        if !view.terms_present && !is_head {
+        if !view.terms_present && !is_head && belt_hash.is_none() {
             return Err(invalid(
                 "resolve: unbelted NodeValueId routed to a NON-HEAD term-less view whose \
                  nv_merkle_root is not root-bound; refusing to resolve an unauthenticated term \
                  (delta-reconcile term-less fix — fail-closed)",
             ));
         }
-        self.resolve_nv_id(id, None)
+        self.resolve_nv_id(id, belt_hash)
     }
 
     /// Route + open a predicate id to its authenticated IRI (as a `Node`, mirroring the legacy
@@ -348,10 +360,13 @@ impl<'a> ChainDictResolver<'a> {
         value: ArkFr,
         kind: ResolveKind,
         id_hint: Option<u64>,
+        belt_hash: Option<ArkFr>,
     ) -> io::Result<CanonicalObject> {
         match kind {
             ResolveKind::NodeValueId => {
-                self.resolve_nv_id_readable(canonical_dictionary_id(&value)?)
+                // `belt_hash` (the fully-term-less RENDER belt) applies ONLY here — the value IS the
+                // id, so there is no per-row authenticated present hash to belt against otherwise.
+                self.resolve_nv_id_readable(canonical_dictionary_id(&value)?, belt_hash)
             }
             ResolveKind::NodeValueHash => {
                 let id = id_hint.ok_or_else(|| {
@@ -484,6 +499,7 @@ pub(crate) fn verify_dict_value_terms_chain(
 /// cannot rebuild its tree). It is `None` on the ordinary delta path (all `LayerCommitment`
 /// views are term-bearing); every routed view is opened against its own root-bound Merkle root
 /// either way, so `openings` — like `id_hints` — is a proof-side witness, never committed.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_result_columns(
     views: &[VerifierCommitmentRef<'_>],
     claimed_columns: &[Vec<ArkFr>],
@@ -493,6 +509,7 @@ pub(super) fn resolve_result_columns(
     kinds: &[ResolveKind],
     id_hints: Option<&[Vec<u64>]>,
     openings: Option<&ResolutionOpenings>,
+    belt_hashes: Option<&[Vec<ArkFr>]>,
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
     if claimed_columns.len() != com_out.len() || claimed_columns.len() != kinds.len() {
         return Err(invalid("resolve: result column shape mismatch"));
@@ -500,6 +517,14 @@ pub(super) fn resolve_result_columns(
     if let Some(hints) = id_hints {
         if hints.len() != claimed_columns.len() {
             return Err(invalid("resolve: id-hint column count mismatch"));
+        }
+    }
+    // The C4 fully-term-less RENDER belt (one root-bound `hash_object(term(id))` per real row of a
+    // `NodeValueId` column). Aligned one column per result column; `None` on every non-walk caller
+    // (byte-identical to the pre-belt resolver).
+    if let Some(belt) = belt_hashes {
+        if belt.len() != claimed_columns.len() {
+            return Err(invalid("resolve: belt-hash column count mismatch"));
         }
     }
     // (1) Bind the claimed values to the authenticated result commitments.
@@ -536,9 +561,26 @@ pub(super) fn resolve_result_columns(
             }
             ResolveKind::NodeValueId => None,
         };
+        // Per-column RENDER belt (used only by the fully-term-less walk render path; every other
+        // caller passes `None`). One root-bound hash per real row, aligned to `col`.
+        let col_belt: Option<&Vec<ArkFr>> = match belt_hashes {
+            Some(belt) => {
+                let b = &belt[col_idx];
+                if b.len() != col.len() {
+                    return Err(invalid("resolve: belt-hash column length mismatch"));
+                }
+                Some(b)
+            }
+            None => None,
+        };
         let mut out = Vec::with_capacity(col.len());
         for (row, value) in col.iter().enumerate() {
-            out.push(resolver.resolve(*value, *kind, col_hints.map(|h| h[row]))?);
+            out.push(resolver.resolve(
+                *value,
+                *kind,
+                col_hints.map(|h| h[row]),
+                col_belt.map(|b| b[row]),
+            )?);
         }
         resolved.push(out);
     }
@@ -677,14 +719,23 @@ pub(crate) fn resolve_predicate_hash_via_catalog_scan(
 /// path (the resolver rebuilds each routed tree from the clear catalog and ignores it); either way
 /// each routed view is opened against its own root-bound Merkle root, so `openings` is a proof-side
 /// witness, never committed.
+///
+/// `belt_hashes`, when supplied (the C4 fully-term-less RENDER belt), is one root-bound
+/// `hash_object(term(ids[i]))` per delivered id (from [`verify_value_render_belt`]); it is threaded
+/// as the MANDATORY belt-hash so each id routed to a NON-HEAD term-less view opens to a term whose
+/// hash equals the authenticated belt hash. `None` on the term-bearing / term-less-HEAD path (a
+/// non-head term-less id stays fail-closed, byte-identically to before the belt).
 pub(crate) fn resolve_node_value_id_column(
     views: &[VerifierCommitmentRef<'_>],
     ids: &[u64],
     com: ArkGT,
     log_domain: usize,
     openings: Option<&ResolutionOpenings>,
+    belt_hashes: Option<&[ArkFr]>,
 ) -> io::Result<Vec<CanonicalObject>> {
     let column: Vec<ArkFr> = ids.iter().map(|id| ark(*id)).collect();
+    // Forward the single-column belt (if any) as a one-element per-column belt aligned to `ids`.
+    let belt_cols: Option<Vec<Vec<ArkFr>>> = belt_hashes.map(|b| vec![b.to_vec()]);
     let mut resolved = resolve_result_columns(
         views,
         &[column],
@@ -696,10 +747,211 @@ pub(crate) fn resolve_node_value_id_column(
         // Term-less routed views open from the prover-shipped `openings`; a term-bearing chain
         // passes `None` and the resolver rebuilds from the clear catalogs.
         openings,
+        belt_cols.as_deref(),
     )?;
     resolved
         .pop()
         .ok_or_else(|| invalid("resolve: empty node/value-id column"))
+}
+
+// ===========================================================================
+// C4 — the fully-term-less RENDER belt: a root-bound `id → hash` certificate that lets an ordered
+// array/list walk resolve its ANCESTOR-minted value ids even when EVERY layer view is term-less.
+//
+// The ordered-walk render (`resolve_node_value_id_column`) delivers value combined-dict ids that may
+// route to a NON-HEAD term-less view, whose `nv_merkle_root` is prover-controlled (never folded into
+// `commitment_root`, `resolution_root` unchecked) — so an unbelted open there is fail-closed (the D5
+// forgery). The belt closes the gap WITHOUT trusting that root: it proves a per-row hash column `H`
+// where `(v_i, H_i)` is a row of the ROOT-BOUND combined `(id, hash)` node/value dict
+// (`reconcile.combined_nv`), i.e. `H_i = hash_object(term(v_i))`. `H_i` is then the MANDATORY
+// belt-hash the render's `resolve_nv_id` checks against the Merkle-opened term — a forged term hashes
+// to something ≠ `H_i` and rejects (Blake2b 2nd-preimage resistance + no-re-mint distinctness). The
+// belt is STRICTLY ADDITIVE: absent it (or if any of its relocations/lookup/recommit fail) the walk
+// stays fail-closed. It reuses ONLY audited gadgets (`PresentIdAuth`'s `prove/verify_hash_lookup_inner`,
+// column relocation, the reconciliation's combined dict) — no new crypto.
+// ===========================================================================
+
+/// The fully-term-less value-render belt (§C4): binds the walk's delivered value-id column to a
+/// root-bound `id → hash` lookup against the reconciliation's combined node/value dict, yielding one
+/// authenticated `hash_object(term(id))` per real row. Every field is `Wire` (the walk proof carries
+/// it as an `Option`). See [`prove_value_render_belt`] / [`verify_value_render_belt`].
+#[derive(Clone, Debug)]
+pub struct ValueRenderBelt {
+    /// The belt working domain `2^belt_log = 2^max(L, working_log)` (`L` = the walk's value-id column
+    /// domain, `working_log` = the reconciliation domain). Verifier-recomputed; a mismatch rejects.
+    pub belt_log: usize,
+    /// Relocation binding the walk's `com_out` value-id column (at `L`) up to the belt domain.
+    pub reloc_ids: RelocationProof,
+    pub com_ids_at_belt: ArkGT,
+    /// Relocation binding the root-bound combined-dict id column (`reconcile.combined_nv.com_id_at_k`,
+    /// at `working_log`) up to the belt domain.
+    pub reloc_dict_id: RelocationProof,
+    pub com_dict_id_at_belt: ArkGT,
+    /// Relocation binding the root-bound combined-dict hash column (`reconcile.combined_nv.com_hash_at_k`)
+    /// up to the belt domain.
+    pub reloc_dict_hash: RelocationProof,
+    pub com_dict_hash_at_belt: ArkGT,
+    /// The audited `id → hash` inner lookup: its `com_v_hash` commits the TRUE per-row dict hash of
+    /// each delivered value id.
+    pub lookup: HashLookupInnerProof,
+    /// The real-prefix authenticated hashes `H_i = hash_object(term(v_i))`; recommitted (padded to
+    /// `2^belt_log`) it MUST equal `lookup.com_v_hash`. Returned by the verifier as the render belt.
+    pub value_hashes: Vec<ArkFr>,
+}
+
+/// PRODUCER (C4): build a [`ValueRenderBelt`] for a fully-term-less ordered walk, on the caller's
+/// fresh walk-bound transcript (`aw_transcript`/`lw_transcript` with tag `b"value-render-belt"`).
+/// `com_out` is the walk's delivered value-id commitment (at `domain_log = L`); `value_ids` its real
+/// delivered ids (`real_n = value_ids.len()`); `working_log` the reconciliation working domain. The
+/// combined `(hash, id)` dict columns are REBUILT here (deterministic bag union, identical to
+/// `prove_reconcile_core`) so the belt relocations bind against the SAME root-bound
+/// `reconcile.combined_nv` commitments the verifier reads — a THROWAWAY transcript carries the rebuild
+/// (its proof material is discarded; only the transcript-independent columns/commitments are used).
+pub(crate) fn prove_value_render_belt(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    working_log: usize,
+    com_out: ArkGT,
+    domain_log: usize,
+    value_ids: &[u64],
+    transcript: &mut Transcript254,
+) -> io::Result<ValueRenderBelt> {
+    let n = value_ids.len();
+    let belt_log = domain_log.max(working_log);
+    let head_nv = layers
+        .last()
+        .ok_or_else(|| invalid("value-render belt: empty layer chain"))?
+        .state
+        .node_value_count as usize;
+
+    // Rebuild the combined `(hash, id)` node/value dict at `working_log` — byte-for-byte the bag union
+    // `prove_reconcile_core` builds (deterministic concatenation of each layer's incremental dict), so
+    // `combined.com_{id,hash}_at_k` equal `reconcile.combined_nv.com_{id,hash}_at_k`. On a throwaway
+    // transcript: the verifier never replays this rebuild (it reuses the reconcile commitments).
+    let mut nv_branches = Vec::new();
+    for layer in layers {
+        if !layer.node_value_catalog.is_empty() {
+            let (h, id) = layer.node_value_dictionary_columns()?;
+            let dn = layer.node_value_catalog.len();
+            nv_branches.push(RelationWitness {
+                columns: vec![h, id],
+                commitments: vec![
+                    layer.node_value_dict_commitments.0,
+                    layer.node_value_dict_commitments.1,
+                ],
+                log_domain: dict_log(dn)?,
+                n: dn,
+            });
+        }
+    }
+    let mut throwaway = Transcript254::new(b"pow/value-render-belt/dict-rebuild");
+    let combined = prove_combined_dict(context, &nv_branches, working_log, &mut throwaway)?;
+
+    // (2) The delivered value-id column at `L` (== `com_out`), relocated up to the belt domain.
+    let ids_data: Vec<ArkFr> = value_ids.iter().map(|v| ark(*v)).collect();
+    let ids_at_l = pad_to(&ids_data, domain_log);
+    let ids_at_belt = pad_to(&ids_at_l, belt_log);
+    let com_ids_at_belt = context.commit_column(&ids_at_belt)?;
+    let reloc_ids = prove_column_relocation_with_context(
+        context, &ids_at_l, &com_out, &ids_at_belt, &com_ids_at_belt, transcript,
+    )?;
+
+    // (3) The root-bound combined-dict `(id, hash)` columns, relocated up to the belt domain.
+    let dict_id_at_belt = pad_to(&combined.id_at_k, belt_log);
+    let dict_hash_at_belt = pad_to(&combined.hash_at_k, belt_log);
+    let com_dict_id_at_belt = context.commit_column(&dict_id_at_belt)?;
+    let com_dict_hash_at_belt = context.commit_column(&dict_hash_at_belt)?;
+    let reloc_dict_id = prove_column_relocation_with_context(
+        context, &combined.id_at_k, &combined.com_id_at_k, &dict_id_at_belt, &com_dict_id_at_belt, transcript,
+    )?;
+    let reloc_dict_hash = prove_column_relocation_with_context(
+        context, &combined.hash_at_k, &combined.com_hash_at_k, &dict_hash_at_belt, &com_dict_hash_at_belt, transcript,
+    )?;
+
+    // (4) The audited `id → hash` inner lookup over the delivered ids (real_n = n, n_dict = head count).
+    let lookup = prove_hash_lookup_inner(
+        context, &ids_at_belt, &com_ids_at_belt, &dict_id_at_belt, &dict_hash_at_belt,
+        &com_dict_id_at_belt, &com_dict_hash_at_belt, n, head_nv, transcript,
+    )?;
+    // (5) The real-prefix hash column (honest witness; padding rows are zero and recommit as zero).
+    let full_hashes = honest_hash_lookup(&ids_at_belt, &dict_id_at_belt, &dict_hash_at_belt, n, head_nv).0;
+    let value_hashes = full_hashes[..n].to_vec();
+
+    Ok(ValueRenderBelt {
+        belt_log,
+        reloc_ids,
+        com_ids_at_belt,
+        reloc_dict_id,
+        com_dict_id_at_belt,
+        reloc_dict_hash,
+        com_dict_hash_at_belt,
+        lookup,
+        value_hashes,
+    })
+}
+
+/// VERIFIER (C4): re-verify a [`ValueRenderBelt`] on the caller's fresh walk-bound transcript and
+/// return the `n` root-bound render hashes `H_i = hash_object(term(v_i))`. `com_out` is the walk's
+/// value-id commitment (at `domain_log = L`), `n` its real row count, `working_log` the
+/// reconciliation domain. Steps: (1) `belt_log == max(L, working_log)`; (2) bind the belt id column to
+/// `com_out`; (3) bind the belt dict columns to the ROOT-BOUND `reconcile.combined_nv`; (4) the
+/// authenticated inner lookup with `n_dict` VERIFIER-DERIVED from the head `node_value_count` (never
+/// prover-chosen); (5) recommit `value_hashes` (padded to `2^belt_log`) equals `lookup.com_v_hash`.
+/// Any failure rejects, leaving the walk render fail-closed. The caller (`verify_reconcile_core`) has
+/// already re-verified `combined_nv` against the root-bound per-layer branches before this runs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_value_render_belt(
+    views: &[VerifierCommitmentRef<'_>],
+    reconcile: &ReconcileProof,
+    com_out: ArkGT,
+    n: usize,
+    domain_log: usize,
+    working_log: usize,
+    belt: &ValueRenderBelt,
+    transcript: &mut Transcript254,
+) -> io::Result<Vec<ArkFr>> {
+    let belt_log = domain_log.max(working_log);
+    if belt.belt_log != belt_log {
+        return Err(invalid(
+            "value-render belt: belt_log does not equal max(value-column log, reconcile working log)",
+        ));
+    }
+    // (2) The belt id column IS the walk's delivered value-id column (bound to `com_out`).
+    verify_column_relocation(
+        &com_out, domain_log, &belt.com_ids_at_belt, belt_log, &belt.reloc_ids, transcript,
+    )?;
+    // (3) The belt dict columns ARE the reconciliation's root-bound combined `(id, hash)` dict.
+    verify_column_relocation(
+        &reconcile.combined_nv.com_id_at_k, working_log, &belt.com_dict_id_at_belt, belt_log,
+        &belt.reloc_dict_id, transcript,
+    )?;
+    verify_column_relocation(
+        &reconcile.combined_nv.com_hash_at_k, working_log, &belt.com_dict_hash_at_belt, belt_log,
+        &belt.reloc_dict_hash, transcript,
+    )?;
+    // (4) Authenticated `id → hash`: `n_dict` is the head node/value count (VERIFIER-DERIVED — the
+    // combined dict has exactly `head_nv` real rows; a prover-chosen `n_dict` cannot mask a pole).
+    let head_nv = views
+        .last()
+        .ok_or_else(|| invalid("value-render belt: empty view chain"))?
+        .state
+        .node_value_count as usize;
+    verify_hash_lookup_inner(
+        &belt.com_ids_at_belt, &belt.com_dict_id_at_belt, &belt.com_dict_hash_at_belt, n, head_nv,
+        &belt.lookup, transcript,
+    )?;
+    // (5) The delivered `value_hashes` (real prefix) recommit to the authenticated lookup output.
+    if belt.value_hashes.len() != n {
+        return Err(invalid("value-render belt: value_hashes length does not match the row count"));
+    }
+    let mut padded = belt.value_hashes.clone();
+    padded.resize(1usize << belt_log, f0());
+    if commit_column(&padded)? != belt.lookup.com_v_hash {
+        return Err(invalid(
+            "value-render belt: recommitted value hashes do not open the authenticated id→hash lookup",
+        ));
+    }
+    Ok(belt.value_hashes.clone())
 }
 
 /// C3 (term-less reconciled CONSTANT resolution): route+open a prover-CLAIMED node/value `id`
@@ -776,6 +1028,8 @@ pub fn verify_and_resolve_single_atom(
         // Delta path resolves over full term-bearing `LayerCommitment` views (term-less is
         // base/rollup-only and is fail-closed upstream at `present_bgp.rs` require_terms_present).
         None,
+        // No RENDER belt on the single-atom path (hash-kind columns already belt each id-hint).
+        None,
     )
 }
 
@@ -797,6 +1051,6 @@ pub fn verify_and_resolve_two_atom_join(
     let out_len = verify_present_join(reconcile, &verified, head_nv, const_p, const_q, join, &mut transcript)?;
     // Join output [id_x, id_y, id_z] are all node/value combined-dict ids (no id-hints needed).
     let kinds = [ResolveKind::NodeValueId, ResolveKind::NodeValueId, ResolveKind::NodeValueId];
-    resolve_result_columns(&views, claimed_columns, &join.com_join_out, out_len, join.join_log, &kinds, None, None)
+    resolve_result_columns(&views, claimed_columns, &join.com_join_out, out_len, join.join_log, &kinds, None, None, None)
 }
 
