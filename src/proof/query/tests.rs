@@ -3570,3 +3570,55 @@
         // Term-bearing still verifies (the witness is irrelevant there).
         verify_bearing(&lc, &plan, &result).unwrap();
     }
+
+    /// PROVE-PATH PARITY (materialized single-layer BGP). Extends
+    /// `caller_owned_blitzar_context_preserves_commitments_and_proof_bytes` (which only covers
+    /// `commit_column`/`prove_column_openings`) UP to the threaded materialized prove entrypoint
+    /// `prove_layer_bgp_with_result_and_context`: a caller-owned `blitzar` context and the `cpu()`
+    /// default must produce BYTE-IDENTICAL Dory column commitments (the dominant O(n) MSM output).
+    /// Gated on a Blitzar backend; the coordinator runs it under `--features blitzar-cpu` (the same
+    /// code path as GPU, executed on CPU).
+    #[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+    #[test]
+    fn materialized_bgp_prove_path_blitzar_matches_cpu_bytes() {
+        use crate::proof::argument::{BlitzarRuntimeConfig, ProverSetupTier, StoreProverContext};
+        use ark_serialize::CanonicalSerialize;
+
+        let lc = build_layer(&[("a", "knows", "b"), ("b", "knows", "c")]);
+        let plan = LayerBgpPlan {
+            source: ColumnSource::Materialized,
+            atoms: vec![atom(KNOWS)],
+            joins: Vec::new(),
+        };
+
+        let runtime = StoreProverContext::initialize_blitzar(BlitzarRuntimeConfig {
+            num_precomputed_generators: 0,
+        });
+        let accelerated = StoreProverContext::blitzar(&runtime, ProverSetupTier::Log20).unwrap();
+        let cpu = StoreProverContext::cpu();
+
+        let cpu_result = prove_layer_bgp_with_result_and_context(&cpu, &lc, &plan).unwrap();
+        let acc_result =
+            prove_layer_bgp_with_result_and_context(&accelerated, &lc, &plan).unwrap();
+
+        // The dominant O(n) MSM outputs — the Dory column commitments — must be bit-identical, and
+        // so must the delivered result shape.
+        assert_eq!(cpu_result.result_commitments, acc_result.result_commitments);
+        assert_eq!(cpu_result.result_len, acc_result.result_len);
+        assert_eq!(cpu_result.result_columns, acc_result.result_columns);
+
+        let mut cpu_bytes = Vec::new();
+        cpu_result
+            .result_commitments
+            .serialize_compressed(&mut cpu_bytes)
+            .unwrap();
+        let mut acc_bytes = Vec::new();
+        acc_result
+            .result_commitments
+            .serialize_compressed(&mut acc_bytes)
+            .unwrap();
+        assert_eq!(
+            cpu_bytes, acc_bytes,
+            "blitzar vs cpu materialized commitment bytes must be identical"
+        );
+    }

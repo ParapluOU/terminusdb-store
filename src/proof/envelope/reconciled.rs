@@ -382,17 +382,35 @@ pub fn prove_reconciled_transitive_closure(
     seed_iri: &[u8],
     reflexive: bool,
 ) -> io::Result<(ReconciledClosureProof, Vec<u64>)> {
-    let context = StoreProverContext::cpu();
+    prove_reconciled_transitive_closure_with_context(
+        &StoreProverContext::cpu(),
+        layers,
+        edge_predicate,
+        seed_iri,
+        reflexive,
+    )
+}
+
+/// [`prove_reconciled_transitive_closure`] with a caller-supplied prover context (for GPU/Blitzar
+/// MSM offload). The context threads through the reconcile core, the edge leaf, and the closure
+/// rounds; identical bytes and proof to the CPU convenience.
+pub fn prove_reconciled_transitive_closure_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    edge_predicate: &[u8],
+    seed_iri: &[u8],
+    reflexive: bool,
+) -> io::Result<(ReconciledClosureProof, Vec<u64>)> {
     let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
 
     // Reconcile ONCE — the O(chain) work; threaded (by `artifacts`) to every leaf below.
-    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
+    let (reconcile, artifacts) = prove_reconcile_core(context, layers, &mut transcript)?;
 
     // FOUNDATION-A: the predicate-constant edge relation E = `t(?s, P, ?o)` over `present`, proven
     // on the SHARED reconciliation transcript (so E's committed columns are bound to the head root).
     let atom = predicate_edge_leaf_atom(edge_predicate);
     let (edge_leaf, edge_witness) =
-        prove_reconciled_leaf(&context, layers, &artifacts, atom, &mut transcript)?;
+        prove_reconciled_leaf(context, layers, &artifacts, atom, &mut transcript)?;
 
     // Seed resolution over the chain catalogs (fail-closed on absence).
     let views: Vec<VerifierCommitmentRef<'_>> = layers.iter().map(|l| l.verifier_view()).collect();
@@ -407,7 +425,7 @@ pub fn prove_reconciled_transitive_closure(
     let digest = reconciled_closure_digest(edge_predicate, seed_id, reflexive);
     let mut nodes = 0usize;
     let ClosureRoundsWitness { seed, rounds, fixpoint, reachable_ids, .. } = prove_closure_rounds(
-        &context,
+        context,
         &edge_witness,
         seed_id,
         root,

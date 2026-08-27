@@ -211,10 +211,25 @@ pub fn prove_read_single_atom(
     position: FilterPosition,
     constant_hash: ArkFr,
 ) -> io::Result<(ReconcileProof, PresentFilterProof, PresentReadResult)> {
-    let context = StoreProverContext::cpu();
+    prove_read_single_atom_with_context(
+        &StoreProverContext::cpu(),
+        layers,
+        position,
+        constant_hash,
+    )
+}
+
+/// [`prove_read_single_atom`] with a caller-supplied prover context (for GPU/Blitzar MSM offload).
+/// Identical bytes and proof to the CPU convenience.
+pub fn prove_read_single_atom_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    position: FilterPosition,
+    constant_hash: ArkFr,
+) -> io::Result<(ReconcileProof, PresentFilterProof, PresentReadResult)> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
-    let (filter, result) = prove_present_filter(&context, &artifacts, position, constant_hash, &mut transcript)?;
+    let (reconcile, artifacts) = prove_reconcile_core(context, layers, &mut transcript)?;
+    let (filter, result) = prove_present_filter(context, &artifacts, position, constant_hash, &mut transcript)?;
     Ok((reconcile, filter, result))
 }
 

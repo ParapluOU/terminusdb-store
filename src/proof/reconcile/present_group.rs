@@ -38,7 +38,20 @@ pub fn prove_read_group_count_bgp(
     atoms: &[PresentBgpAtom],
     joins: &[JoinStep],
 ) -> io::Result<(ReconcileProof, PresentBgpProof, PresentReadResult)> {
-    prove_read_bgp(layers, atoms, joins)
+    prove_read_group_count_bgp_with_context(&StoreProverContext::cpu(), layers, atoms, joins)
+}
+
+/// [`prove_read_group_count_bgp`] with a caller-supplied prover context (for GPU/Blitzar MSM
+/// offload). The aggregate is a verifier-recompute over the same store BGP bundle, so this simply
+/// threads the context into [`prove_read_bgp_with_context`]. Identical bytes and proof to the CPU
+/// convenience.
+pub fn prove_read_group_count_bgp_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+) -> io::Result<(ReconcileProof, PresentBgpProof, PresentReadResult)> {
+    prove_read_bgp_with_context(context, layers, atoms, joins)
 }
 
 /// Recompute the `GroupCount` output from the root-authenticated resolved child rows: group the
@@ -328,7 +341,19 @@ pub fn prove_read_group_sum_bgp(
     atoms: &[PresentBgpAtom],
     joins: &[JoinStep],
 ) -> io::Result<(ReconcileProof, PresentBgpProof, PresentReadResult)> {
-    prove_read_bgp(layers, atoms, joins)
+    prove_read_group_sum_bgp_with_context(&StoreProverContext::cpu(), layers, atoms, joins)
+}
+
+/// [`prove_read_group_sum_bgp`] with a caller-supplied prover context (for GPU/Blitzar MSM offload).
+/// Threads the context into [`prove_read_bgp_with_context`]; identical bytes and proof to the CPU
+/// convenience.
+pub fn prove_read_group_sum_bgp_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+) -> io::Result<(ReconcileProof, PresentBgpProof, PresentReadResult)> {
+    prove_read_bgp_with_context(context, layers, atoms, joins)
 }
 
 /// Verify + resolve a reconciled `GroupSum(BGP)` read against the trusted head root, then RECOMPUTE
@@ -468,7 +493,19 @@ pub fn prove_read_group_extrema_bgp(
     atoms: &[PresentBgpAtom],
     joins: &[JoinStep],
 ) -> io::Result<(ReconcileProof, PresentBgpProof, PresentReadResult)> {
-    prove_read_bgp(layers, atoms, joins)
+    prove_read_group_extrema_bgp_with_context(&StoreProverContext::cpu(), layers, atoms, joins)
+}
+
+/// [`prove_read_group_extrema_bgp`] with a caller-supplied prover context (for GPU/Blitzar MSM
+/// offload). Threads the context into [`prove_read_bgp_with_context`]; identical bytes and proof to
+/// the CPU convenience.
+pub fn prove_read_group_extrema_bgp_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+) -> io::Result<(ReconcileProof, PresentBgpProof, PresentReadResult)> {
+    prove_read_bgp_with_context(context, layers, atoms, joins)
 }
 
 /// Verify + resolve a reconciled `GroupBy + RangeMin/RangeMax(BGP)` read against the trusted head

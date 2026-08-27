@@ -1198,7 +1198,24 @@ pub fn prove_ordered_list_walk_reconciled(
     subject: &CanonicalObject,
     predicate: &[u8],
 ) -> io::Result<(OrderedListWalkReconciledProof, Vec<CanonicalObject>)> {
-    prove_ordered_list_walk_reconciled_impl(layers, subject, predicate, None)
+    prove_ordered_list_walk_reconciled_with_context(
+        &StoreProverContext::cpu(),
+        layers,
+        subject,
+        predicate,
+    )
+}
+
+/// [`prove_ordered_list_walk_reconciled`] with a caller-supplied prover context (for GPU/Blitzar MSM
+/// offload). The context threads through the reconcile core, every leaf, the closure rounds, and the
+/// permutation/successor/equality gadgets; identical bytes and proof to the CPU convenience.
+pub fn prove_ordered_list_walk_reconciled_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    subject: &CanonicalObject,
+    predicate: &[u8],
+) -> io::Result<(OrderedListWalkReconciledProof, Vec<CanonicalObject>)> {
+    prove_ordered_list_walk_reconciled_impl(context, layers, subject, predicate, None)
 }
 
 /// Test-only forging entry mirroring `prove_ordered_list_walk_forged`: prove with a CALLER-CHOSEN
@@ -1211,16 +1228,22 @@ pub fn prove_ordered_list_walk_reconciled_forged(
     predicate: &[u8],
     walk_override: Vec<u64>,
 ) -> io::Result<(OrderedListWalkReconciledProof, Vec<CanonicalObject>)> {
-    prove_ordered_list_walk_reconciled_impl(layers, subject, predicate, Some(walk_override))
+    prove_ordered_list_walk_reconciled_impl(
+        &StoreProverContext::cpu(),
+        layers,
+        subject,
+        predicate,
+        Some(walk_override),
+    )
 }
 
 fn prove_ordered_list_walk_reconciled_impl(
+    context: &StoreProverContext<'_>,
     layers: &[&LayerCommitment],
     subject: &CanonicalObject,
     predicate: &[u8],
     walk_override: Option<Vec<u64>>,
 ) -> io::Result<(OrderedListWalkReconciledProof, Vec<CanonicalObject>)> {
-    let context = StoreProverContext::cpu();
     let root = layers
         .last()
         .ok_or_else(|| invalid("reconciled ordered-list-walk needs a head layer"))?
@@ -1231,12 +1254,12 @@ fn prove_ordered_list_walk_reconciled_impl(
 
     // Reconcile ONCE, then read every leaf against the SHARED artifacts on the SHARED transcript.
     let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
-    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
+    let (reconcile, artifacts) = prove_reconcile_core(context, layers, &mut transcript)?;
 
     // (1) ANCHOR leaf t(S,P,?head): exactly one head cons cell.
     let anchor_atom = bound_subject_leaf_atom(subject, predicate);
     let (anchor_leaf, anchor_witness) =
-        prove_reconciled_leaf(&context, layers, &artifacts, anchor_atom, &mut transcript)?;
+        prove_reconciled_leaf(context, layers, &artifacts, anchor_atom, &mut transcript)?;
     if anchor_witness.n != 1 || anchor_witness.columns.len() != 1 {
         return Err(invalid("reconciled ordered-list-walk anchor must be exactly one head triple"));
     }
@@ -1245,10 +1268,10 @@ fn prove_ordered_list_walk_reconciled_impl(
     // (2) EDGE leaves t(?s,rdf:rest,?o) and t(?s,rdf:first,?o) (shared transcript, in this order).
     let rest_atom = predicate_edge_leaf_atom(RDF_REST);
     let (rest_edge_leaf, rest_edge_witness) =
-        prove_reconciled_leaf(&context, layers, &artifacts, rest_atom, &mut transcript)?;
+        prove_reconciled_leaf(context, layers, &artifacts, rest_atom, &mut transcript)?;
     let first_atom = predicate_edge_leaf_atom(RDF_FIRST);
     let (first_edge_leaf, first_edge_witness) =
-        prove_reconciled_leaf(&context, layers, &artifacts, first_atom, &mut transcript)?;
+        prove_reconciled_leaf(context, layers, &artifacts, first_atom, &mut transcript)?;
 
     // Bind the PUBLIC head id to the anchor leaf's authenticated commitment (position-0 opening on a
     // FRESH transcript — does not touch the shared reconciliation transcript).
@@ -1263,14 +1286,14 @@ fn prove_ordered_list_walk_reconciled_impl(
     let nil_id = resolve_combined_node_id(&views, RDF_NIL);
     let mut nodes = 0usize;
     let ClosureRoundsWitness { seed, accumulator, rounds, fixpoint, reachable_ids: _ } =
-        prove_closure_rounds(&context, &rest_edge_witness, head_id, root, closure_digest, true, false, &mut nodes)?;
+        prove_closure_rounds(context, &rest_edge_witness, head_id, root, closure_digest, true, false, &mut nodes)?;
 
     // (4) strip the rdf:nil terminator -> the cons-cell SET.
     let nil_witness =
-        RelationWitness::commit_with_context(&context, vec![vec![ArkFr::from_u64(nil_id)]], 1)?;
+        RelationWitness::commit_with_context(context, vec![vec![ArkFr::from_u64(nil_id)]], 1)?;
     let mut t_strip = lw_transcript(&root, &digest, b"strip-nil");
     let cons = prove_left_anti_join_with_keys_and_context(
-        &context, &accumulator, &nil_witness, &[(0, 0)], &mut t_strip,
+        context, &accumulator, &nil_witness, &[(0, 0)], &mut t_strip,
     )?;
     let cons_len = cons.n;
     let cons_log_domain = cons.log_domain;
@@ -1300,7 +1323,7 @@ fn prove_ordered_list_walk_reconciled_impl(
         n: cons_len,
     };
     let mut t_perm = lw_transcript(&root, &digest, b"walk-perm");
-    let walk = prove_relation_permutation_with_context(&context, &cons_witness, &row_order, &mut t_perm)?;
+    let walk = prove_relation_permutation_with_context(context, &cons_witness, &row_order, &mut t_perm)?;
     let com_walk = walk.commitments[0];
     let walk_col = walk.columns[0].clone();
     let c_witness = RelationWitness {
@@ -1317,14 +1340,14 @@ fn prove_ordered_list_walk_reconciled_impl(
 
     // (6) rest bind (functional successor per cell) + positional successor (the exact order).
     let (com_next, next_col, rest_bind) = prove_edge_bind_witness(
-        &context, &root, &digest, &c_witness, &walk_col, cons_len, cons_log_domain,
+        context, &root, &digest, &c_witness, &walk_col, cons_len, cons_log_domain,
         &rest_edge_witness, b"rest",
     )?;
     let mut t_succ = lw_transcript(&root, &digest, b"successor");
     let base = walk_col.clone();
     let next = pad_to(&next_col, cons_log_domain);
     let successor = prove_successor_lookup_with_context(
-        &context, &base, &next, cons_len, &com_walk, &com_next, &mut t_succ,
+        context, &base, &next, cons_len, &com_walk, &com_next, &mut t_succ,
     )?;
 
     // TERMINATOR: exactly one successor equals rdf:nil (a cycle has none -> count 0 -> reject).
@@ -1340,7 +1363,7 @@ fn prove_ordered_list_walk_reconciled_impl(
     };
     let mut t_term = lw_transcript(&root, &digest, b"terminator");
     let terminator =
-        prove_relation_equality_with_context(&context, &next_witness, &nil_constraint, &mut t_term)?;
+        prove_relation_equality_with_context(context, &next_witness, &nil_constraint, &mut t_term)?;
     if terminator.n != 1 {
         return Err(invalid(
             "reconciled ordered-list-walk chain does not terminate at exactly one rdf:nil (cycle or missing terminator)",
@@ -1349,7 +1372,7 @@ fn prove_ordered_list_walk_reconciled_impl(
 
     // (7) first bind (elements) -> the ordered element column E.
     let (com_elements, elem_col, first_bind) = prove_edge_bind_witness(
-        &context, &root, &digest, &c_witness, &walk_col, cons_len, cons_log_domain,
+        context, &root, &digest, &c_witness, &walk_col, cons_len, cons_log_domain,
         &first_edge_witness, b"first",
     )?;
 
@@ -1362,7 +1385,7 @@ fn prove_ordered_list_walk_reconciled_impl(
     };
     let mut t_nested = lw_transcript(&root, &digest, b"nested");
     let nested = prove_inner_join_with_keys_and_context(
-        &context, &e_witness, &first_edge_witness, &[(0, 0)], &mut t_nested,
+        context, &e_witness, &first_edge_witness, &[(0, 0)], &mut t_nested,
     )?;
     if nested.n != 0 {
         return Err(invalid(

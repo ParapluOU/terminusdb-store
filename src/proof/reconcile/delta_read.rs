@@ -295,9 +295,20 @@ pub fn prove_delta_read(
     atoms: &[PresentBgpAtom],
     joins: &[JoinStep],
 ) -> io::Result<(DeltaReadProof, PresentReadResult)> {
-    let context = StoreProverContext::cpu();
+    prove_delta_read_with_context(&StoreProverContext::cpu(), layers, source, atoms, joins)
+}
+
+/// [`prove_delta_read`] with a caller-supplied prover context (for GPU/Blitzar MSM offload).
+/// Identical bytes and proof to the CPU convenience.
+pub fn prove_delta_read_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    source: DeltaSource,
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+) -> io::Result<(DeltaReadProof, PresentReadResult)> {
     let mut transcript = Transcript254::new(DELTA_READ_TRANSCRIPT);
-    prove_delta_read_core(&context, layers, source, atoms, joins, &mut transcript)
+    prove_delta_read_core(context, layers, source, atoms, joins, &mut transcript)
 }
 
 /// E2b (producer): build the UNCOMMITTED term-less resolution witness for a proven delta-read, so

@@ -3976,3 +3976,46 @@ fn present_scalar_order_rejects_permuted_output() {
     )
     .is_err());
 }
+
+/// PROVE-PATH PARITY (reconciled delta-stack present BGP). The threaded reconciled entrypoint
+/// `prove_read_bgp_with_context` must produce a BYTE-IDENTICAL proof (reconcile + present-BGP,
+/// serialized wholesale via `ReconciledReadBgpProof::encode`) whether driven with a caller-owned
+/// `blitzar` context or the `cpu()` default. This locks the full reconciled prove path — the O(n)
+/// dictionary/column-commitment MSMs of `prove_reconcile_core` plus the permutation/sort/join
+/// opening MSMs of `prove_present_bgp` — not just the top-level commitments. Gated on a Blitzar
+/// backend; the coordinator runs it under `--features blitzar-cpu`.
+#[cfg(any(feature = "blitzar-cpu", feature = "blitzar-gpu"))]
+#[test]
+fn reconciled_read_bgp_prove_path_blitzar_matches_cpu_bytes() {
+    use crate::proof::argument::{BlitzarRuntimeConfig, ProverSetupTier};
+
+    let layers = bgp_stack();
+    let lref = refs(&layers);
+    let atoms = [
+        atom(var(), "http://ex/p1", var()),
+        atom(var(), "http://ex/p2", var()),
+        atom(var(), "http://ex/p3", var()),
+    ];
+    let joins = [scalar_join(1, 0), scalar_join(2, 0)];
+
+    let runtime = StoreProverContext::initialize_blitzar(BlitzarRuntimeConfig {
+        num_precomputed_generators: 0,
+    });
+    let accelerated = StoreProverContext::blitzar(&runtime, ProverSetupTier::Log20).unwrap();
+    let cpu = StoreProverContext::cpu();
+
+    let (rec_cpu, bgp_cpu, _) = prove_read_bgp_with_context(&cpu, &lref, &atoms, &joins).unwrap();
+    let (rec_acc, bgp_acc, _) =
+        prove_read_bgp_with_context(&accelerated, &lref, &atoms, &joins).unwrap();
+
+    let cpu_bytes = ReconciledReadBgpProof { reconcile: rec_cpu, bgp: bgp_cpu }
+        .encode()
+        .unwrap();
+    let acc_bytes = ReconciledReadBgpProof { reconcile: rec_acc, bgp: bgp_acc }
+        .encode()
+        .unwrap();
+    assert_eq!(
+        cpu_bytes, acc_bytes,
+        "blitzar vs cpu reconciled present-BGP proof bytes must be identical"
+    );
+}

@@ -1116,10 +1116,21 @@ pub fn prove_read_bgp(
     atoms: &[PresentBgpAtom],
     joins: &[JoinStep],
 ) -> io::Result<(ReconcileProof, PresentBgpProof, PresentReadResult)> {
-    let context = StoreProverContext::cpu();
+    prove_read_bgp_with_context(&StoreProverContext::cpu(), layers, atoms, joins)
+}
+
+/// [`prove_read_bgp`] with a caller-supplied prover context (for GPU/Blitzar MSM offload). The
+/// context threads to the reconcile + present-BGP MSMs; identical bytes and proof to the CPU
+/// convenience.
+pub fn prove_read_bgp_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+) -> io::Result<(ReconcileProof, PresentBgpProof, PresentReadResult)> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
-    let (bgp, result) = prove_present_bgp(&context, layers, &artifacts, atoms, joins, &mut transcript)?;
+    let (reconcile, artifacts) = prove_reconcile_core(context, layers, &mut transcript)?;
+    let (bgp, result) = prove_present_bgp(context, layers, &artifacts, atoms, joins, &mut transcript)?;
     Ok((reconcile, bgp, result))
 }
 

@@ -389,11 +389,30 @@ pub fn prove_read_order_bgp(
     datatype: CanonicalDatatype,
     direction: OrderDirection,
 ) -> io::Result<(ReconcileProof, PresentBgpProof, PresentScalarOrderProof, PresentReadResult)> {
-    let context = StoreProverContext::cpu();
+    prove_read_order_bgp_with_context(
+        &StoreProverContext::cpu(),
+        layers,
+        atoms,
+        joins,
+        datatype,
+        direction,
+    )
+}
+
+/// [`prove_read_order_bgp`] with a caller-supplied prover context (for GPU/Blitzar MSM offload).
+/// Identical bytes and proof to the CPU convenience.
+pub fn prove_read_order_bgp_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    atoms: &[PresentBgpAtom],
+    joins: &[JoinStep],
+    datatype: CanonicalDatatype,
+    direction: OrderDirection,
+) -> io::Result<(ReconcileProof, PresentBgpProof, PresentScalarOrderProof, PresentReadResult)> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
+    let (reconcile, artifacts) = prove_reconcile_core(context, layers, &mut transcript)?;
     let (bgp, bgp_result) =
-        prove_present_bgp(&context, layers, &artifacts, atoms, joins, &mut transcript)?;
+        prove_present_bgp(context, layers, &artifacts, atoms, joins, &mut transcript)?;
     // Full-key single-column numeric order: the BGP must expose exactly one column at the working
     // domain (a subset/multi-key or wider-arity order is reject-closed upstream and here).
     if bgp.result_arity != 1 {
@@ -420,7 +439,7 @@ pub fn prove_read_order_bgp(
         n,
     };
     let (order, ordered_col) = prove_present_scalar_order(
-        &context, layers, &artifacts, &input, head_nv, datatype, direction, &mut transcript,
+        context, layers, &artifacts, &input, head_nv, datatype, direction, &mut transcript,
     )?;
     let result = PresentReadResult { columns: vec![ordered_col], len: n, id_hints: Vec::new() };
     Ok((reconcile, bgp, order, result))

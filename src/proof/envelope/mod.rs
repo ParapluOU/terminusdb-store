@@ -119,7 +119,8 @@ pub use recursive::{
 // walk (6c-ii) and schema closure (6e), not a standalone public entry.
 pub use reconciled::{
     attach_termless_closure_openings, decode_and_verify_reconciled_transitive_closure,
-    prove_reconciled_transitive_closure, resolve_reconciled_node_ids,
+    prove_reconciled_transitive_closure, prove_reconciled_transitive_closure_with_context,
+    resolve_reconciled_node_ids,
     resolve_reconciled_node_ids_from_views, verify_reconciled_transitive_closure,
     verify_reconciled_transitive_closure_from_views, ReconciledClosureProof,
 };
@@ -129,7 +130,8 @@ pub use reconciled::{
 // 6c-i foundation; the materialized `OrderedListWalk` composite stays byte-identical (a PARALLEL entry).
 pub use list_walk::{
     attach_termless_list_walk_openings, decode_and_verify_ordered_list_walk_reconciled,
-    prove_ordered_list_walk_reconciled, verify_ordered_list_walk_reconciled,
+    prove_ordered_list_walk_reconciled, prove_ordered_list_walk_reconciled_with_context,
+    verify_ordered_list_walk_reconciled,
     verify_ordered_list_walk_reconciled_from_views, OrderedListWalkReconciledProof,
 };
 
@@ -140,7 +142,8 @@ pub use list_walk::{
 // composite stays byte-identical (a PARALLEL entry).
 pub use array_walk::{
     attach_termless_array_walk_openings, decode_and_verify_ordered_array_walk_reconciled,
-    prove_ordered_array_walk_reconciled, verify_ordered_array_walk_reconciled,
+    prove_ordered_array_walk_reconciled, prove_ordered_array_walk_reconciled_with_context,
+    verify_ordered_array_walk_reconciled,
     verify_ordered_array_walk_reconciled_from_views, OrderedArrayWalkReconciledProof,
 };
 

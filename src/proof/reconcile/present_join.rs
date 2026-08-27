@@ -174,10 +174,20 @@ pub fn prove_read_two_atom_join(
     const_p: ArkFr,
     const_q: ArkFr,
 ) -> io::Result<(ReconcileProof, PresentJoinProof, PresentReadResult)> {
-    let context = StoreProverContext::cpu();
+    prove_read_two_atom_join_with_context(&StoreProverContext::cpu(), layers, const_p, const_q)
+}
+
+/// [`prove_read_two_atom_join`] with a caller-supplied prover context (for GPU/Blitzar MSM offload).
+/// Identical bytes and proof to the CPU convenience.
+pub fn prove_read_two_atom_join_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    const_p: ArkFr,
+    const_q: ArkFr,
+) -> io::Result<(ReconcileProof, PresentJoinProof, PresentReadResult)> {
     let mut transcript = Transcript254::new(b"parture-delta-reconcile-envelope");
-    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
-    let (join, result) = prove_present_join(&context, &artifacts, const_p, const_q, &mut transcript)?;
+    let (reconcile, artifacts) = prove_reconcile_core(context, layers, &mut transcript)?;
+    let (join, result) = prove_present_join(context, &artifacts, const_p, const_q, &mut transcript)?;
     Ok((reconcile, join, result))
 }
 

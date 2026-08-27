@@ -189,11 +189,12 @@ pub use reconcile_core::{
 };
 pub use combined_dict::CombinedRangeDictProof;
 pub use present_filter::{
-    prove_read_single_atom, verify_read_single_atom, FilterPosition, PresentFilterProof,
-    PresentReadResult,
+    prove_read_single_atom, prove_read_single_atom_with_context, verify_read_single_atom,
+    FilterPosition, PresentFilterProof, PresentReadResult,
 };
 pub use present_join::{
-    prove_read_two_atom_join, verify_read_two_atom_join, PresentIdAuth, PresentJoinProof,
+    prove_read_two_atom_join, prove_read_two_atom_join_with_context, verify_read_two_atom_join,
+    PresentIdAuth, PresentJoinProof,
 };
 pub use present_result::{
     verify_and_resolve_single_atom, verify_and_resolve_two_atom_join, ResolveKind, ValueRenderBelt,
@@ -201,7 +202,7 @@ pub use present_result::{
 pub use present_bgp::{
     attach_termless_present_range_openings, attach_termless_reconcile_openings,
     build_termless_present_range_openings, build_termless_reconcile_openings,
-    decode_and_verify_read_bgp, prove_read_bgp, verify_and_resolve_bgp,
+    decode_and_verify_read_bgp, prove_read_bgp, prove_read_bgp_with_context, verify_and_resolve_bgp,
     verify_and_resolve_bgp_from_views, verify_read_bgp, verify_read_bgp_from_views,
     ColumnDistinctProof, PresentAtomFilter, PresentBgpAtom, PresentBgpAtomProof, PresentBgpProof,
     PresentRangeDatatypeGuardProof, PresentRangeSubproof, PresentSecondRange, PresentTerm,
@@ -209,19 +210,23 @@ pub use present_bgp::{
 };
 pub use delta_read::{
     attach_termless_delta_openings, build_termless_delta_openings, decode_and_verify_delta_read,
-    prove_delta_read, verify_and_resolve_delta_read, verify_and_resolve_delta_read_from_views,
+    prove_delta_read, prove_delta_read_with_context, verify_and_resolve_delta_read,
+    verify_and_resolve_delta_read_from_views,
     verify_delta_read, verify_delta_read_from_views, DeltaReadProof, DeltaSource,
 };
 pub use present_order::{
     attach_termless_order_openings, attach_termless_present_order_openings, decode_and_verify_order,
-    prove_read_order_bgp, verify_and_resolve_order_bgp, verify_and_resolve_order_bgp_from_views,
+    prove_read_order_bgp, prove_read_order_bgp_with_context, verify_and_resolve_order_bgp,
+    verify_and_resolve_order_bgp_from_views,
     verify_read_order_bgp, verify_read_order_bgp_from_views, OrderReadSpec, PresentScalarOrderProof,
     ReconciledOrderReadProof,
 };
 pub use present_group::{
     attach_termless_group_openings, decode_and_verify_group_count, decode_and_verify_group_extrema,
     decode_and_verify_group_sum,
-    prove_read_group_count_bgp, prove_read_group_extrema_bgp, prove_read_group_sum_bgp,
+    prove_read_group_count_bgp, prove_read_group_count_bgp_with_context,
+    prove_read_group_extrema_bgp, prove_read_group_extrema_bgp_with_context,
+    prove_read_group_sum_bgp, prove_read_group_sum_bgp_with_context,
     verify_and_resolve_group_count_bgp, verify_and_resolve_group_count_bgp_from_views,
     verify_and_resolve_group_extrema_bgp, verify_and_resolve_group_extrema_bgp_from_views,
     verify_and_resolve_group_sum_bgp, verify_and_resolve_group_sum_bgp_from_views, GroupCountEntry,

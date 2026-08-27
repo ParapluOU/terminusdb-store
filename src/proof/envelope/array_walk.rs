@@ -1157,7 +1157,24 @@ pub fn prove_ordered_array_walk_reconciled(
     subject: &CanonicalObject,
     predicate: &[u8],
 ) -> io::Result<(OrderedArrayWalkReconciledProof, Vec<CanonicalObject>)> {
-    prove_ordered_array_walk_reconciled_impl(layers, subject, predicate, None)
+    prove_ordered_array_walk_reconciled_with_context(
+        &StoreProverContext::cpu(),
+        layers,
+        subject,
+        predicate,
+    )
+}
+
+/// [`prove_ordered_array_walk_reconciled`] with a caller-supplied prover context (for GPU/Blitzar
+/// MSM offload). The context threads through the reconcile core, every leaf, the walk gadgets, and
+/// the density order; identical bytes and proof to the CPU convenience.
+pub fn prove_ordered_array_walk_reconciled_with_context(
+    context: &StoreProverContext<'_>,
+    layers: &[&LayerCommitment],
+    subject: &CanonicalObject,
+    predicate: &[u8],
+) -> io::Result<(OrderedArrayWalkReconciledProof, Vec<CanonicalObject>)> {
+    prove_ordered_array_walk_reconciled_impl(context, layers, subject, predicate, None)
 }
 
 /// Test-only forging entry mirroring `prove_ordered_array_walk_forged`: prove with a CALLER-CHOSEN
@@ -1171,16 +1188,22 @@ pub fn prove_ordered_array_walk_reconciled_forged(
     predicate: &[u8],
     row_order_override: Vec<usize>,
 ) -> io::Result<(OrderedArrayWalkReconciledProof, Vec<CanonicalObject>)> {
-    prove_ordered_array_walk_reconciled_impl(layers, subject, predicate, Some(row_order_override))
+    prove_ordered_array_walk_reconciled_impl(
+        &StoreProverContext::cpu(),
+        layers,
+        subject,
+        predicate,
+        Some(row_order_override),
+    )
 }
 
 fn prove_ordered_array_walk_reconciled_impl(
+    context: &StoreProverContext<'_>,
     layers: &[&LayerCommitment],
     subject: &CanonicalObject,
     predicate: &[u8],
     row_order_override: Option<Vec<usize>>,
 ) -> io::Result<(OrderedArrayWalkReconciledProof, Vec<CanonicalObject>)> {
-    let context = StoreProverContext::cpu();
     let root = layers
         .last()
         .ok_or_else(|| invalid("reconciled ordered-array-walk needs a head layer"))?
@@ -1192,12 +1215,12 @@ fn prove_ordered_array_walk_reconciled_impl(
 
     // Reconcile ONCE, then read every leaf against the SHARED artifacts on the SHARED transcript.
     let mut transcript = Transcript254::new(RECONCILE_TRANSCRIPT);
-    let (reconcile, artifacts) = prove_reconcile_core(&context, layers, &mut transcript)?;
+    let (reconcile, artifacts) = prove_reconcile_core(context, layers, &mut transcript)?;
 
     // (A) CELL SET leaf t(S,P,?cell): the COMPLETE cell set (every row kept), NOT a single head.
     let cells_atom = bound_subject_leaf_atom(subject, predicate);
     let (cells_leaf, c_witness) =
-        prove_reconciled_leaf(&context, layers, &artifacts, cells_atom, &mut transcript)?;
+        prove_reconciled_leaf(context, layers, &artifacts, cells_atom, &mut transcript)?;
     if c_witness.columns.len() != 1 {
         return Err(invalid("reconciled ordered-array-walk cell set must be a single node column"));
     }
@@ -1211,26 +1234,26 @@ fn prove_ordered_array_walk_reconciled_impl(
     // (B/C/type) EDGE leaves (shared transcript, in this order: index, value, type).
     let index_atom = predicate_edge_leaf_atom(SYS_INDEX);
     let (index_edge_leaf, index_edge_witness) =
-        prove_reconciled_leaf(&context, layers, &artifacts, index_atom, &mut transcript)?;
+        prove_reconciled_leaf(context, layers, &artifacts, index_atom, &mut transcript)?;
     let value_atom = predicate_edge_leaf_atom(SYS_VALUE);
     let (value_edge_leaf, value_edge_witness) =
-        prove_reconciled_leaf(&context, layers, &artifacts, value_atom, &mut transcript)?;
+        prove_reconciled_leaf(context, layers, &artifacts, value_atom, &mut transcript)?;
     let type_atom = predicate_edge_leaf_atom(RDF_TYPE);
     let (type_edge_leaf, type_edge_witness) =
-        prove_reconciled_leaf(&context, layers, &artifacts, type_atom, &mut transcript)?;
+        prove_reconciled_leaf(context, layers, &artifacts, type_atom, &mut transcript)?;
 
     // (D/E/F) functional binds — the SAME source-agnostic core the materialized array walk + the
     // reconciled list walk use (`prove_edge_bind_witness`), consuming the reconciled leaf witnesses.
     let (com_index, index_col, index_bind) = prove_edge_bind_witness(
-        &context, &root, &digest, &c_witness, &cells_col, n, cell_log_domain, &index_edge_witness,
+        context, &root, &digest, &c_witness, &cells_col, n, cell_log_domain, &index_edge_witness,
         b"index",
     )?;
     let (com_value, value_col, value_bind) = prove_edge_bind_witness(
-        &context, &root, &digest, &c_witness, &cells_col, n, cell_log_domain, &value_edge_witness,
+        context, &root, &digest, &c_witness, &cells_col, n, cell_log_domain, &value_edge_witness,
         b"value",
     )?;
     let (com_type, type_col, type_bind) = prove_edge_bind_witness(
-        &context, &root, &digest, &c_witness, &cells_col, n, cell_log_domain, &type_edge_witness,
+        context, &root, &digest, &c_witness, &cells_col, n, cell_log_domain, &type_edge_witness,
         b"type",
     )?;
 
@@ -1249,7 +1272,7 @@ fn prove_ordered_array_walk_reconciled_impl(
     };
     let mut t_type = aw_transcript(&root, &digest, b"type-membership");
     let type_eq =
-        prove_relation_equality_with_context(&context, &type_witness, &array_constraint, &mut t_type)?;
+        prove_relation_equality_with_context(context, &type_witness, &array_constraint, &mut t_type)?;
     if type_eq.n != n {
         return Err(invalid(
             "reconciled ordered-array-walk has a cell whose rdf:type is not sys:Array",
@@ -1258,7 +1281,7 @@ fn prove_ordered_array_walk_reconciled_impl(
 
     // (G) DENSITY + ORDER certificate over the COMBINED range dict (the 6d wrinkle).
     let density = prove_density_order_reconciled(
-        &context, layers, artifacts.working_log, &root, &digest, com_index, &index_col, com_value,
+        context, layers, artifacts.working_log, &root, &digest, com_index, &index_col, com_value,
         &value_col, n, cell_log_domain, row_order_override,
     )?;
 
