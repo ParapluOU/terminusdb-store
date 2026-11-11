@@ -103,6 +103,9 @@ page-addressable and still reconstructs every projection on a cold proof read.
 - Whole-chain operations (chain validation, migration, pack import validation)
   walk the original chain once, base first, without a depth cap.
 - Squash and squash-up-to create new authenticated history and new roots.
+  `StoreLayer::squash_deterministic` gives a base layer whose files and roots
+  are a pure function of the logical state, whatever the history;
+  `Store::squashed_roots` computes those roots without writing.
 - Base merge always regenerates authenticated state; legacy inputs must first be
   migrated explicitly.
 - `pf3` was a development-only format and was never shipped. There is no v3
