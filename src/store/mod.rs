@@ -1233,6 +1233,9 @@ pub fn open_directory_store<P: Into<PathBuf>>(path: P) -> Store {
 }
 
 #[cfg(test)]
+mod admission_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::{consts::FILENAMES, name_to_string};

@@ -109,6 +109,21 @@ pub trait ArchiveMetadataBackend: Clone + Send + Sync {
     ) -> io::Result<usize>;
     async fn get_rollup(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
     async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()>;
+    /// The rollup a layer is registered to, with the registration's version
+    /// line. Version 2 marks a rollup this store validated as resolving every
+    /// id of the original layer to the same term (see
+    /// [`crate::storage::layer::VALIDATED_ROLLUP_VERSION`]).
+    async fn get_rollup_record(&self, id: [u32; 5]) -> io::Result<Option<(u32, [u32; 5])>> {
+        Ok(self.get_rollup(id).await?.map(|rollup| (1, rollup)))
+    }
+    async fn set_rollup_record(
+        &self,
+        id: [u32; 5],
+        rollup: [u32; 5],
+        _version: u32,
+    ) -> io::Result<()> {
+        self.set_rollup(id, rollup).await
+    }
     async fn get_parent(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
 }
 
@@ -850,6 +865,10 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
     }
 
     async fn get_rollup(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        Ok(self.get_rollup_record(id).await?.map(|(_, rollup)| rollup))
+    }
+
+    async fn get_rollup_record(&self, id: [u32; 5]) -> io::Result<Option<(u32, [u32; 5])>> {
         if !self.layer_visible(id).await? {
             return Ok(None);
         }
@@ -869,13 +888,26 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
             return Ok(None);
         }
         let data = result?;
-        let name = data.lines().skip(1).next().expect(
+        let mut lines = data.lines();
+        let version = lines.next().and_then(|line| line.parse::<u32>().ok()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "rollup file has no version line")
+        })?;
+        let name = lines.next().expect(
             "Expected rollup file to have two lines but was unable to skip to the second line",
         );
-        Ok(Some(string_to_name(&name)?))
+        Ok(Some((version, string_to_name(&name)?)))
     }
 
     async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()> {
+        self.set_rollup_record(id, rollup, 1).await
+    }
+
+    async fn set_rollup_record(
+        &self,
+        id: [u32; 5],
+        rollup: [u32; 5],
+        version: u32,
+    ) -> io::Result<()> {
         if !self.layer_visible(id).await? {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -888,7 +920,7 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
 
         let path = self.path_for_rollup(id);
         let mut data = Vec::with_capacity(43);
-        data.extend_from_slice(b"1\n");
+        data.extend_from_slice(format!("{version}\n").as_bytes());
         data.extend_from_slice(name_to_string(rollup).as_bytes());
         data.extend_from_slice(b"\n");
         let mut file = fs::File::create(path).await?;
@@ -1370,6 +1402,26 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
     }
     async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()> {
         self.metadata_origin.set_rollup(id, rollup).await?;
+        #[cfg(feature = "rollup_metadata_experimental")]
+        {
+            self.rollup_cache.write().unwrap().insert(id, Some(rollup));
+        }
+        Ok(())
+    }
+
+    async fn get_rollup_record(&self, id: [u32; 5]) -> io::Result<Option<(u32, [u32; 5])>> {
+        self.metadata_origin.get_rollup_record(id).await
+    }
+
+    async fn set_rollup_record(
+        &self,
+        id: [u32; 5],
+        rollup: [u32; 5],
+        version: u32,
+    ) -> io::Result<()> {
+        self.metadata_origin
+            .set_rollup_record(id, rollup, version)
+            .await?;
         #[cfg(feature = "rollup_metadata_experimental")]
         {
             self.rollup_cache.write().unwrap().insert(id, Some(rollup));
@@ -1896,7 +1948,7 @@ impl<M: ArchiveMetadataBackend> FileLoad for ArchiveRollupFile<M> {
             .await?
             .is_some()
         {
-            Ok(std::mem::size_of::<[u32; 5]>() + 2)
+            Ok(self.map().await?.len())
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1912,10 +1964,10 @@ impl<M: ArchiveMetadataBackend> FileLoad for ArchiveRollupFile<M> {
     }
 
     async fn map(&self) -> io::Result<Bytes> {
-        let id = self.metadata_backend.get_rollup(self.layer_id).await?;
-        if let Some(id) = id {
+        let record = self.metadata_backend.get_rollup_record(self.layer_id).await?;
+        if let Some((version, id)) = record {
             let mut bytes = Vec::with_capacity(42);
-            bytes.extend_from_slice(b"1\n");
+            bytes.extend_from_slice(format!("{version}\n").as_bytes());
             bytes.extend_from_slice(name_to_string(id).as_bytes());
             Ok(bytes.into())
         } else {
@@ -1976,12 +2028,19 @@ impl<M: ArchiveMetadataBackend + Unpin> SyncableFile for ArchiveRollupFileWriter
     async fn sync_all(self) -> io::Result<()> {
         let rollup_string =
             String::from_utf8(self.data.to_vec()).expect("rollup id was not a string");
-        // first line of this string is going to be a version number. it should be discarded.
-        let line = rollup_string.lines().skip(1).next().unwrap();
+        // The first line is the registration's version, the second the rollup.
+        let mut lines = rollup_string.lines();
+        let version = lines
+            .next()
+            .and_then(|line| line.parse::<u32>().ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "rollup record has no version")
+            })?;
+        let line = lines.next().unwrap();
         let rollup_id = string_to_name(&line)?;
 
         self.metadata_backend
-            .set_rollup(self.layer_id, rollup_id)
+            .set_rollup_record(self.layer_id, rollup_id, version)
             .await
     }
 }

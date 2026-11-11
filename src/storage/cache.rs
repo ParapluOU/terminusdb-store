@@ -361,6 +361,32 @@ impl LayerStore for CachedLayerStore {
         self.inner.get_unrolled_layer(name).await
     }
 
+    async fn load_layer_over(
+        &self,
+        name: [u32; 5],
+        parent: Option<Arc<InternalLayer>>,
+    ) -> io::Result<Arc<InternalLayer>> {
+        self.inner.load_layer_over(name, parent).await
+    }
+
+    async fn unrolled_chain_names(&self, name: [u32; 5]) -> io::Result<Vec<[u32; 5]>> {
+        self.inner.unrolled_chain_names(name).await
+    }
+
+    async fn get_admission_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<InternalLayer>>> {
+        self.inner
+            .get_admission_layer_with_cache(name, self.cache.clone())
+            .await
+    }
+
+    async fn get_admission_layer_with_cache(
+        &self,
+        name: [u32; 5],
+        cache: Arc<dyn LayerCache>,
+    ) -> io::Result<Option<Arc<InternalLayer>>> {
+        self.inner.get_admission_layer_with_cache(name, cache).await
+    }
+
     async fn finalize_layer(&self, name: [u32; 5]) -> io::Result<()> {
         self.inner.finalize_layer(name).await
     }

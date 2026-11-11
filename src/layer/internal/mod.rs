@@ -55,6 +55,23 @@ impl InternalLayer {
         }
     }
 
+    /// Every rollup substitution in this loaded layer and its ancestry, as
+    /// (original layer, rollup layer) pairs, from the top down.
+    pub fn rollup_substitutions(&self) -> Vec<([u32; 5], [u32; 5])> {
+        let mut substitutions = Vec::new();
+        let mut current = self;
+        loop {
+            match current {
+                Base(_) => return substitutions,
+                Child(child) => current = &*child.parent,
+                Rollup(rollup) => {
+                    substitutions.push((rollup.original, rollup.internal.name()));
+                    current = &*rollup.internal;
+                }
+            }
+        }
+    }
+
     pub fn layer_stack_size(&self) -> usize {
         let mut count = 1;
         let mut l = self;

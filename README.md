@@ -90,7 +90,18 @@ page-addressable and still reconstructs every projection on a cold proof read.
 - Children require an intrinsically committed parent and fail closed otherwise.
 - Rollups are physical accelerators and retain the original unrolled proof
   identity. Each physical rollup also carries a commitment for its own native
-  representation and must never substitute remapped IDs during admission.
+  representation.
+- Admission of a new layer resolves its delta's ids against its own files over
+  the cached or rolled-up ancestry, so it costs O(delta) at any chain depth and
+  writes sidecars byte-identical to the unrolled chain's. A rollup stands in
+  for a layer during admission only once it is validated to resolve every id of
+  that layer to the same term with the same counts: rollups of proof-carrying
+  layers are validated when registered (record version 2); a rollup registered
+  otherwise (older code, by hand) is validated on first use, and admission
+  fails closed when it does not hold. Rollup records are local and never travel
+  in packs.
+- Whole-chain operations (chain validation, migration, pack import validation)
+  walk the original chain once, base first, without a depth cap.
 - Squash and squash-up-to create new authenticated history and new roots.
 - Base merge always regenerates authenticated state; legacy inputs must first be
   migrated explicitly.

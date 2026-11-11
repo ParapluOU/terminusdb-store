@@ -40,6 +40,20 @@ use async_trait::async_trait;
 
 pub const MAX_LAYER_CHAIN_DEPTH: usize = 1024;
 
+/// Version line of a rollup record written without id validation (also what
+/// older code wrote for every rollup).
+pub const PLAIN_ROLLUP_VERSION: u32 = 1;
+
+/// Version line of a rollup record whose rollup this store validated as
+/// resolving every id of the original layer to the same term, with the same
+/// node/value and predicate counts. Proof admission uses only such rollups.
+pub const VALIDATED_ROLLUP_VERSION: u32 = 2;
+
+/// Bound on nested lazy rollup validations (a validation loads the ancestry of
+/// the original and of the rollup, which may meet further unvalidated
+/// rollups). A rollup that leads back into itself exhausts it and fails.
+const MAX_ROLLUP_VALIDATION_NESTING: usize = 64;
+
 /// Result of an explicit proof-chain migration.
 ///
 /// `migrated` is derived inside the migration operation, so callers do not
@@ -180,10 +194,64 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     }
 
     /// Load the original physical layer chain without substituting a rollup.
-    /// Proof admission must resolve ids from the original delta files, not an
-    /// equivalent but potentially remapped rollup representation.
     async fn get_unrolled_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<InternalLayer>>> {
         self.get_layer(name).await
+    }
+
+    /// Load `name` from its own physical files: as a base layer when it has
+    /// no parent, otherwise as a child over `parent`, which must carry the
+    /// parent name recorded for `name`. A rollup of `name` is never used.
+    async fn load_layer_over(
+        &self,
+        _name: [u32; 5],
+        _parent: Option<Arc<InternalLayer>>,
+    ) -> io::Result<Arc<InternalLayer>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this layer store cannot load a layer over a given parent",
+        ))
+    }
+
+    /// Load `name` for proof admission: its own physical files over its
+    /// ancestry loaded as queries load it, from the cache or through rollups,
+    /// with one difference: a rollup is used only once this store has
+    /// validated that it resolves every id of the layer it stands for to the
+    /// same term and has the same counts (a version-2 rollup record). A rollup
+    /// registered without that validation, by older code or by hand, is
+    /// validated on first use, and admission fails when it does not hold.
+    async fn get_admission_layer_with_cache(
+        &self,
+        name: [u32; 5],
+        _cache: Arc<dyn LayerCache>,
+    ) -> io::Result<Option<Arc<InternalLayer>>> {
+        self.get_unrolled_layer(name).await
+    }
+
+    async fn get_admission_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<InternalLayer>>> {
+        self.get_admission_layer_with_cache(name, NOCACHE.clone())
+            .await
+    }
+
+    /// The names of the physical layer chain ending in `name`, base first.
+    /// Unbounded in depth, so explicit whole-chain operations work on chains of
+    /// any length; a cycle or a missing ancestor is an error.
+    async fn unrolled_chain_names(&self, name: [u32; 5]) -> io::Result<Vec<[u32; 5]>> {
+        let mut names = vec![name];
+        let mut seen = HashSet::from([name]);
+        let mut current = name;
+        while let Some(parent) = self.get_layer_parent_name(current).await? {
+            if !seen.insert(parent) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cycle in layer parent chain",
+                ));
+            }
+            names.try_reserve(1).map_err(io::Error::other)?;
+            names.push(parent);
+            current = parent;
+        }
+        names.reverse();
+        Ok(names)
     }
 
     async fn finalize_layer(&self, _name: [u32; 5]) -> io::Result<()> {
@@ -217,11 +285,32 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     /// Rebuild proof state from the complete native delta and the complete set of
     /// dictionary mappings introduced by this layer. This is an admission-time
     /// operation, never a proof-query operation.
+    ///
+    /// Ids are resolved against the admission load of the layer
+    /// ([`Self::get_admission_layer`]): the layer's own files over validated
+    /// rollups or cached ancestors, so the cost is the delta's, not the depth's.
     async fn rebuild_proof_layer(&self, name: [u32; 5]) -> io::Result<LayerCommitment> {
         let layer = self
-            .get_unrolled_layer(name)
+            .get_admission_layer(name)
             .await?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "layer not found"))?;
+        self.rebuild_proof_layer_from(name, layer).await
+    }
+
+    /// Rebuild proof state for `name` from a loaded `layer` that resolves the
+    /// same ids to the same terms as the original chain (its own files over an
+    /// equivalent ancestry).
+    async fn rebuild_proof_layer_from(
+        &self,
+        name: [u32; 5],
+        layer: Arc<InternalLayer>,
+    ) -> io::Result<LayerCommitment> {
+        if layer.name() != name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "proof rebuild was given another layer",
+            ));
+        }
         let parent_state_root = match layer.parent_name() {
             None => None,
             Some(parent) => Some(self.proof_layer(parent).await?.state.commitment_root),
@@ -367,6 +456,19 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         &self,
         name: [u32; 5],
     ) -> io::Result<CommitmentState> {
+        let layer = self
+            .get_admission_layer(name)
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "layer not found"))?;
+        self.validate_proof_layer_against_store_from(name, layer)
+            .await
+    }
+
+    async fn validate_proof_layer_against_store_from(
+        &self,
+        name: [u32; 5],
+        layer: Arc<InternalLayer>,
+    ) -> io::Result<CommitmentState> {
         let stored = self.proof_layer(name).await?;
         // Decoding has already independently checked that every stored table
         // reconstructs the root committed by this state. Retain only that
@@ -374,7 +476,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         // sized decoded commitments at once.
         let stored_state = stored.state.clone();
         drop(stored);
-        let rebuilt = self.rebuild_proof_layer(name).await?;
+        let rebuilt = self.rebuild_proof_layer_from(name, layer).await?;
         if rebuilt.state != stored_state {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -384,13 +486,23 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         Ok(stored_state)
     }
 
+    /// Validate every layer of the physical chain ending in `name`, base first,
+    /// against its own native files. One streaming pass over the original
+    /// chain (no rollups), loading each layer once over the one before it, so
+    /// the work is linear in the chain and its depth is unbounded.
     async fn validate_proof_chain_against_store(
         &self,
         name: [u32; 5],
     ) -> io::Result<CommitmentState> {
         let mut top = None;
-        for layer_name in self.retrieve_layer_stack_names(name).await? {
-            top = Some(self.validate_proof_layer_against_store(layer_name).await?);
+        let mut current: Option<Arc<InternalLayer>> = None;
+        for layer_name in self.unrolled_chain_names(name).await? {
+            let layer = self.load_layer_over(layer_name, current.take()).await?;
+            top = Some(
+                self.validate_proof_layer_against_store_from(layer_name, layer.clone())
+                    .await?,
+            );
+            current = Some(layer);
         }
         top.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty proof layer chain"))
     }
@@ -403,15 +515,21 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         let mut top = None;
         let mut legacy_parent_root = None;
         let mut migrated = false;
-        for layer_name in self.retrieve_layer_stack_names(name).await? {
+        let mut loaded: Option<Arc<InternalLayer>> = None;
+        for layer_name in self.unrolled_chain_names(name).await? {
+            let layer = self.load_layer_over(layer_name, loaded.take()).await?;
+            loaded = Some(layer.clone());
             let state = match self.proof_layer(layer_name).await {
                 Ok(current) => {
-                    let state = self.validate_proof_layer_against_store(layer_name).await?;
+                    let state = self
+                        .validate_proof_layer_against_store_from(layer_name, layer)
+                        .await?;
                     legacy_parent_root = Some(current.legacy_v3_root(legacy_parent_root)?);
                     state
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    let current = self.prepare_proof_layer(layer_name).await?;
+                    let current = self.rebuild_proof_layer_from(layer_name, layer).await?;
+                    self.write_proof_layer(layer_name, &current).await?;
                     migrated = true;
                     legacy_parent_root = Some(current.legacy_v3_root(legacy_parent_root)?);
                     current.state
@@ -430,7 +548,7 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
                             "legacy v3 proof parent root is discontinuous",
                         ));
                     }
-                    let current = self.rebuild_proof_layer(layer_name).await?;
+                    let current = self.rebuild_proof_layer_from(layer_name, layer).await?;
                     legacy.validate_against_v4(&current)?;
                     let reconstructed = current.legacy_v3_root(legacy_parent_root)?;
                     if reconstructed != legacy.commitment_root {
@@ -1136,12 +1254,25 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
 
     // TODO this should check if the rollup is better than what is there
     async fn write_rollup_file(&self, dir_name: [u32; 5], rollup_name: [u32; 5]) -> io::Result<()> {
+        self.write_rollup_file_with_version(dir_name, rollup_name, PLAIN_ROLLUP_VERSION)
+            .await
+    }
+
+    /// Register `rollup_name` for `dir_name` with the given record version:
+    /// [`PLAIN_ROLLUP_VERSION`], or [`VALIDATED_ROLLUP_VERSION`] once the
+    /// rollup was validated as preserving every id of `dir_name`.
+    async fn write_rollup_file_with_version(
+        &self,
+        dir_name: [u32; 5],
+        rollup_name: [u32; 5],
+        version: u32,
+    ) -> io::Result<()> {
         let rollup_string = name_to_string(rollup_name);
 
         let file = self.get_file(dir_name, FILENAMES.rollup).await?;
         let mut writer = file.open_write().await?;
 
-        let contents = format!("{}\n{}\n", 1, rollup_string);
+        let contents = format!("{}\n{}\n", version, rollup_string);
         writer.write_all(contents.as_bytes()).await?;
         writer.flush().await?;
         writer.sync_all().await?;
@@ -1172,6 +1303,29 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
         let layer_str = &lines[1];
 
         string_to_name(layer_str)
+    }
+
+    /// The rollup registered for `dir_name` with its record version, if any.
+    async fn read_rollup_record(&self, dir_name: [u32; 5]) -> io::Result<Option<(u32, [u32; 5])>> {
+        if !self.layer_has_rollup(dir_name).await? {
+            return Ok(None);
+        }
+        let file = self.get_file(dir_name, FILENAMES.rollup).await?;
+        let mut reader = file.open_read().await?;
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await?;
+        let text = String::from_utf8_lossy(&data);
+        let mut lines = text.lines();
+        let version = lines
+            .next()
+            .and_then(|line| line.trim().parse::<u32>().ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "rollup record has no version")
+            })?;
+        let rollup = lines.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "rollup record has no rollup")
+        })?;
+        Ok(Some((version, string_to_name(rollup.trim())?)))
     }
 
     async fn create_child_layer_files_with_cache(
@@ -2110,6 +2264,84 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         Ok(Some(layer))
     }
 
+    async fn load_layer_over(
+        &self,
+        name: [u32; 5],
+        parent: Option<Arc<InternalLayer>>,
+    ) -> io::Result<Arc<InternalLayer>> {
+        if !self.directory_exists(name).await? {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "layer not found"));
+        }
+        let recorded_parent = if self.layer_has_parent(name).await? {
+            Some(self.read_parent_file(name).await?)
+        } else {
+            None
+        };
+        match (recorded_parent, parent) {
+            (None, None) => {
+                let files = self.base_layer_files(name).await?;
+                Ok(Arc::new(BaseLayer::load_from_files(name, &files).await?.into()))
+            }
+            (Some(expected), Some(parent)) if parent.name() == expected => {
+                let files = self.child_layer_files(name).await?;
+                Ok(Arc::new(
+                    ChildLayer::load_from_files(name, parent, &files)
+                        .await?
+                        .into(),
+                ))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "layer loaded over a layer that is not its parent",
+            )),
+        }
+    }
+
+    async fn unrolled_chain_names(&self, name: [u32; 5]) -> io::Result<Vec<[u32; 5]>> {
+        // From the layers' own parent files, so layers still under
+        // construction (not yet visible) are walked too.
+        if !self.directory_exists(name).await? {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "layer not found"));
+        }
+        let mut names = vec![name];
+        let mut seen = HashSet::from([name]);
+        let mut current = name;
+        while let Some(parent) = physical_parent(self, current).await? {
+            if !self.directory_exists(parent).await? {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "parent layer is missing from layer chain",
+                ));
+            }
+            if !seen.insert(parent) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cycle in layer parent chain",
+                ));
+            }
+            names.try_reserve(1).map_err(io::Error::other)?;
+            names.push(parent);
+            current = parent;
+        }
+        names.reverse();
+        Ok(names)
+    }
+
+    async fn get_admission_layer_with_cache(
+        &self,
+        name: [u32; 5],
+        cache: Arc<dyn LayerCache>,
+    ) -> io::Result<Option<Arc<InternalLayer>>> {
+        if !self.directory_exists(name).await? {
+            return Ok(None);
+        }
+        let parent = match physical_parent(self, name).await? {
+            None => None,
+            Some(parent) => Some(admission_ancestor(self, parent, cache, 0).await?),
+        };
+        Ok(Some(self.load_layer_over(name, parent).await?))
+    }
+
     async fn finalize_layer(&self, name: [u32; 5]) -> io::Result<()> {
         self.finalize(name).await
     }
@@ -2475,6 +2707,13 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         if layer == rollup {
             // let's not create a loop
             Ok(())
+        } else if self.has_proof_layer(layer).await? {
+            // A proof-carrying layer's rollup stands in for it during proof
+            // admission, so it is registered only once it provably resolves
+            // every id of the layer the same way.
+            validate_rollup_preserves_ids(self, layer, rollup, NOCACHE.clone(), 0).await?;
+            self.write_rollup_file_with_version(layer, rollup, VALIDATED_ROLLUP_VERSION)
+                .await
         } else {
             self.write_rollup_file(layer, rollup).await
         }
@@ -3280,6 +3519,222 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         result.reverse();
         Ok(result)
     }
+}
+
+/// The parent recorded in a layer's own files. Unlike `layer_parent`, this
+/// works on a layer still under construction (an archive layer being admitted).
+async fn physical_parent<T: PersistentLayerStore>(
+    store: &T,
+    name: [u32; 5],
+) -> io::Result<Option<[u32; 5]>> {
+    if store.layer_has_parent(name).await? {
+        Ok(Some(store.read_parent_file(name).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+type IoFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<T>> + Send + 'a>>;
+
+/// One step of an admission load, from the head down: an original layer
+/// loaded from its own files, or a child rollup standing in for an original.
+enum AdmissionStep {
+    Original([u32; 5]),
+    ChildRollup { original: [u32; 5], rollup: [u32; 5] },
+}
+
+/// Whether every rollup inside an already loaded layer is registered, as a
+/// validated record, for the layer it stands in for.
+async fn rollups_validated<T: LayerStore + PersistentLayerStore>(
+    store: &T,
+    layer: &InternalLayer,
+) -> io::Result<bool> {
+    for (original, rollup) in layer.rollup_substitutions() {
+        if store.read_rollup_record(original).await? != Some((VALIDATED_ROLLUP_VERSION, rollup)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Load `name` as an ancestor for proof admission: equal to the original
+/// layer in every id it resolves and in its counts. The walk down stops at a
+/// cached layer built only from validated rollups, at a rollup (validated
+/// first if its record is not), or at the base; the layers above it are loaded
+/// from their own files. Its length is the distance to that anchor, so with a
+/// cached or rolled-up ancestry it is O(1), and it has no depth cap.
+fn admission_ancestor<'a, T: LayerStore + PersistentLayerStore>(
+    store: &'a T,
+    name: [u32; 5],
+    cache: Arc<dyn LayerCache>,
+    nesting: usize,
+) -> IoFuture<'a, Arc<InternalLayer>> {
+    Box::pin(async move {
+        let mut steps = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = name;
+        let mut anchor: Option<Arc<InternalLayer>> = None;
+        loop {
+            if !seen.insert(current) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cycle in layer or rollup chain",
+                ));
+            }
+            if let Some(layer) = cache.get_layer_from_cache(current) {
+                if rollups_validated(store, &layer).await? {
+                    anchor = Some(layer);
+                    break;
+                }
+            }
+            if store.layer_has_rollup(current).await? {
+                let rollup = store.read_rollup_file(current).await?;
+                ensure_rollup_validated(store, current, rollup, cache.clone(), nesting).await?;
+                match physical_parent(store, rollup).await? {
+                    None => {
+                        let inner = store.load_layer_over(rollup, None).await?;
+                        cache.cache_layer(inner.clone());
+                        let original_parent = physical_parent(store, current).await?;
+                        let layer: Arc<InternalLayer> = Arc::new(
+                            RollupLayer::from_base_layer(inner, current, original_parent).into(),
+                        );
+                        cache.cache_layer(layer.clone());
+                        anchor = Some(layer);
+                        break;
+                    }
+                    Some(upto) => {
+                        steps.try_reserve(1).map_err(io::Error::other)?;
+                        steps.push(AdmissionStep::ChildRollup {
+                            original: current,
+                            rollup,
+                        });
+                        current = upto;
+                        continue;
+                    }
+                }
+            }
+            steps.try_reserve(1).map_err(io::Error::other)?;
+            steps.push(AdmissionStep::Original(current));
+            match physical_parent(store, current).await? {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        let mut layer = anchor;
+        for step in steps.into_iter().rev() {
+            let loaded = match step {
+                AdmissionStep::Original(original) => {
+                    store.load_layer_over(original, layer.take()).await?
+                }
+                AdmissionStep::ChildRollup { original, rollup } => {
+                    let inner = store.load_layer_over(rollup, layer.take()).await?;
+                    cache.cache_layer(inner.clone());
+                    let original_parent = physical_parent(store, original).await?.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "child rollup stands in for a base layer",
+                        )
+                    })?;
+                    Arc::new(RollupLayer::from_child_layer(inner, original, original_parent).into())
+                }
+            };
+            cache.cache_layer(loaded.clone());
+            layer = Some(loaded);
+        }
+        layer.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty layer chain"))
+    })
+}
+
+/// Make sure the rollup registered for `original` is validated, validating
+/// it now (and recording that) when its record is a plain one.
+async fn ensure_rollup_validated<T: LayerStore + PersistentLayerStore>(
+    store: &T,
+    original: [u32; 5],
+    rollup: [u32; 5],
+    cache: Arc<dyn LayerCache>,
+    nesting: usize,
+) -> io::Result<()> {
+    if store.read_rollup_record(original).await? == Some((VALIDATED_ROLLUP_VERSION, rollup)) {
+        return Ok(());
+    }
+    validate_rollup_preserves_ids(store, original, rollup, cache, nesting).await?;
+    store
+        .write_rollup_file_with_version(original, rollup, VALIDATED_ROLLUP_VERSION)
+        .await
+}
+
+/// Check that `rollup` resolves every node/value and predicate id of
+/// `original` to the same term and has the same counts, comparing the
+/// original's own files over its admission ancestry with the rollup's own
+/// files over the rollup's admission ancestry. O(state); done once per rollup.
+fn validate_rollup_preserves_ids<'a, T: LayerStore + PersistentLayerStore>(
+    store: &'a T,
+    original: [u32; 5],
+    rollup: [u32; 5],
+    cache: Arc<dyn LayerCache>,
+    nesting: usize,
+) -> IoFuture<'a, ()> {
+    Box::pin(async move {
+        if nesting >= MAX_ROLLUP_VALIDATION_NESTING {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rollup validation nests too deep (a rollup that leads back into itself?)",
+            ));
+        }
+        if original == rollup {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a layer cannot be its own rollup",
+            ));
+        }
+        let reference_parent = match physical_parent(store, original).await? {
+            None => None,
+            Some(parent) => {
+                Some(admission_ancestor(store, parent, cache.clone(), nesting + 1).await?)
+            }
+        };
+        let reference = store.load_layer_over(original, reference_parent).await?;
+        let rolled_parent = match physical_parent(store, rollup).await? {
+            None => None,
+            Some(parent) => {
+                Some(admission_ancestor(store, parent, cache.clone(), nesting + 1).await?)
+            }
+        };
+        let rolled = store.load_layer_over(rollup, rolled_parent).await?;
+        tokio::task::spawn_blocking(move || layers_resolve_ids_alike(&*reference, &*rolled))
+            .await
+            .map_err(io::Error::other)?
+    })
+}
+
+/// Whether two layers resolve every id to the same term and have the same
+/// node/value and predicate counts.
+pub(crate) fn layers_resolve_ids_alike(reference: &dyn Layer, rolled: &dyn Layer) -> io::Result<()> {
+    let mismatch = |what: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("rollup does not preserve the original layer's {what}"),
+        ))
+    };
+    if reference.node_and_value_count() != rolled.node_and_value_count() {
+        return mismatch("node/value count");
+    }
+    if reference.predicate_count() != rolled.predicate_count() {
+        return mismatch("predicate count");
+    }
+    for id in 1..=reference.node_and_value_count() as u64 {
+        let expected = reference.id_object(id);
+        if expected.is_none() || expected != rolled.id_object(id) {
+            return mismatch("node/value ids");
+        }
+    }
+    for id in 1..=reference.predicate_count() as u64 {
+        let expected = reference.id_predicate(id);
+        if expected.is_none() || expected != rolled.id_predicate(id) {
+            return mismatch("predicate ids");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn file_triple_exists<F: FileLoad + FileStore>(
