@@ -199,6 +199,10 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     /// Persist a validated proof layer before the physical layer is exposed.
     async fn write_proof_layer(&self, name: [u32; 5], proof: &LayerCommitment) -> io::Result<()>;
 
+    /// Whether the layer carries a proof sidecar, without decoding it. A layer
+    /// written while proof state was off, or a system-graph layer, has none.
+    async fn has_proof_layer(&self, name: [u32; 5]) -> io::Result<bool>;
+
     /// Raw sidecar access and exact-byte CAS replacement are exposed solely for
     /// the explicit legacy migration boundary. Normal commit/read paths remain
     /// single-assignment and fail closed on unknown versions.
@@ -2114,6 +2118,10 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         self.abort_directory(name).await
     }
 
+    async fn has_proof_layer(&self, name: [u32; 5]) -> io::Result<bool> {
+        self.file_exists(name, FILENAMES.proof_state).await
+    }
+
     async fn proof_layer(&self, name: [u32; 5]) -> io::Result<Arc<LayerCommitment>> {
         if !self.file_exists(name, FILENAMES.proof_state).await? {
             return Err(io::Error::new(
@@ -2310,16 +2318,24 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             return Ok(layer.name());
         }
 
-        self.validate_proof_chain_against_store(layer.name())
-            .await?;
+        // A rollup carries proof state exactly when the layer it rolls up does.
+        let proved = self.has_proof_layer(layer.name()).await?;
+        if proved {
+            self.validate_proof_chain_against_store(layer.name())
+                .await?;
+        }
 
         // check if there's already an equivalent rollup
         if self.layer_has_rollup(layer.name()).await? {
             let rollup = self.read_rollup_file(layer.name()).await?;
             // the rollup is equivalent if it is a base layer
-            if !self.layer_has_parent(rollup).await? {
+            if !self.layer_has_parent(rollup).await?
+                && (!proved || self.has_proof_layer(rollup).await?)
+            {
                 // yup, equivalent. let's just return the rollup we know about.
-                self.validate_proof_chain_against_store(rollup).await?;
+                if proved {
+                    self.validate_proof_chain_against_store(rollup).await?;
+                }
                 return Ok(rollup);
             }
         }
@@ -2328,7 +2344,9 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let result = async {
             let files = self.base_layer_files(dir_name).await?;
             delta_rollup(&layer, files).await?;
-            self.prepare_proof_layer(dir_name).await?;
+            if proved {
+                self.prepare_proof_layer(dir_name).await?;
+            }
             self.finalize(dir_name).await?;
             Ok(dir_name)
         }
@@ -2355,17 +2373,25 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             return Ok(layer.name());
         }
 
-        self.validate_proof_chain_against_store(layer.name())
-            .await?;
+        // A rollup carries proof state exactly when the layer it rolls up does.
+        let proved = self.has_proof_layer(layer.name()).await?;
+        if proved {
+            self.validate_proof_chain_against_store(layer.name())
+                .await?;
+        }
 
         // check if there's already an equivalent rollup
         if self.layer_has_rollup(layer.name()).await? {
             let rollup = self.read_rollup_file(layer.name()).await?;
 
             // get rollup parent. if it is the same as upto, we're requesting something equivalent.
-            if upto == self.read_parent_file(rollup).await? {
+            if upto == self.read_parent_file(rollup).await?
+                && (!proved || self.has_proof_layer(rollup).await?)
+            {
                 // yup, equivalent. Let's just return the rollup we know about.
-                self.validate_proof_chain_against_store(rollup).await?;
+                if proved {
+                    self.validate_proof_chain_against_store(rollup).await?;
+                }
                 return Ok(rollup);
             }
         }
@@ -2375,7 +2401,9 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             .await?;
         let result = async {
             delta_rollup_upto(self, &layer, upto, child_layer_files).await?;
-            self.prepare_proof_layer(layer_dir).await?;
+            if proved {
+                self.prepare_proof_layer(layer_dir).await?;
+            }
             self.finalize(layer_dir).await?;
             Ok(layer_dir)
         }
@@ -2402,17 +2430,25 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             return Ok(layer.name());
         }
 
-        self.validate_proof_chain_against_store(layer.name())
-            .await?;
+        // A rollup carries proof state exactly when the layer it rolls up does.
+        let proved = self.has_proof_layer(layer.name()).await?;
+        if proved {
+            self.validate_proof_chain_against_store(layer.name())
+                .await?;
+        }
 
         // check if there's already an equivalent rollup
         if self.layer_has_rollup(layer.name()).await? {
             let rollup = self.read_rollup_file(layer.name()).await?;
 
             // get rollup parent. if it is the same as upto, we're requesting something equivalent.
-            if upto == self.read_parent_file(rollup).await? {
+            if upto == self.read_parent_file(rollup).await?
+                && (!proved || self.has_proof_layer(rollup).await?)
+            {
                 // yup, equivalent. Let's just return the rollup we know about.
-                self.validate_proof_chain_against_store(rollup).await?;
+                if proved {
+                    self.validate_proof_chain_against_store(rollup).await?;
+                }
                 return Ok(rollup);
             }
         }
@@ -2422,7 +2458,9 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             .await?;
         let result = async {
             imprecise_delta_rollup_upto(self, &layer, upto, child_layer_files).await?;
-            self.prepare_proof_layer(layer_dir).await?;
+            if proved {
+                self.prepare_proof_layer(layer_dir).await?;
+            }
             self.finalize(layer_dir).await?;
             Ok(layer_dir)
         }
@@ -2450,8 +2488,12 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         // sort the mapped triples, insert them
         // finalize
 
-        self.validate_proof_chain_against_store(layer.name())
-            .await?;
+        // A squash carries proof state exactly when the layer it squashes does.
+        let proved = self.has_proof_layer(layer.name()).await?;
+        if proved {
+            self.validate_proof_chain_against_store(layer.name())
+                .await?;
+        }
         let stack = layer.immediate_layers();
         let node_count: usize = stack
             .iter()
@@ -2571,7 +2613,9 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
 
             builder.add_id_triples(triples.into_iter()).await?;
             builder.finalize().await?;
-            self.prepare_proof_layer(layer_name).await?;
+            if proved {
+                self.prepare_proof_layer(layer_name).await?;
+            }
             self.finalize_layer(layer_name).await?;
             Ok::<(), io::Error>(())
         }
@@ -2585,8 +2629,12 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
     }
 
     async fn squash_upto(&self, layer: Arc<InternalLayer>, upto: [u32; 5]) -> io::Result<[u32; 5]> {
-        self.validate_proof_chain_against_store(layer.name())
-            .await?;
+        // A squash carries proof state exactly when the layer it squashes does.
+        let proved = self.has_proof_layer(layer.name()).await?;
+        if proved {
+            self.validate_proof_chain_against_store(layer.name())
+                .await?;
+        }
         let mut base_node_count = 0;
         let mut base_pred_count = 0;
         let mut base_value_count = 0;
@@ -2809,7 +2857,9 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             }
             builder.finalize().await?;
             self.write_parent_file(layer_name, upto).await?;
-            self.prepare_proof_layer(layer_name).await?;
+            if proved {
+                self.prepare_proof_layer(layer_name).await?;
+            }
             self.finalize_layer(layer_name).await?;
             Ok::<(), io::Error>(())
         }
@@ -2827,8 +2877,15 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         layers: &[[u32; 5]],
         temp_path: &Path,
     ) -> io::Result<[u32; 5]> {
+        // The merged base carries proof state exactly when every input does.
+        let mut proved = true;
         for layer in layers {
-            self.validate_proof_chain_against_store(*layer).await?;
+            proved &= self.has_proof_layer(*layer).await?;
+        }
+        if proved {
+            for layer in layers {
+                self.validate_proof_chain_against_store(*layer).await?;
+            }
         }
         let mut layer_files = Vec::with_capacity(layers.len());
         for layer in layers {
@@ -2848,7 +2905,9 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let finish = async {
             let output_layer_files = self.base_layer_files(output_name).await?;
             merge_base_layers(&layer_files, output_layer_files, temp_path).await?;
-            self.prepare_proof_layer(output_name).await?;
+            if proved {
+                self.prepare_proof_layer(output_name).await?;
+            }
             self.finalize(output_name).await?;
             Ok::<(), io::Error>(())
         }

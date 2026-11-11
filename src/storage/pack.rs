@@ -15,6 +15,7 @@ use super::cache::*;
 use super::consts::*;
 use super::file::*;
 use super::layer::*;
+use super::proof_mode::ProofStateMode;
 
 use crate::proof::ProofHash;
 use bytes::Bytes;
@@ -108,6 +109,21 @@ pub trait Packable {
         expected_roots: HashMap<[u32; 5], ProofHash>,
         limits: PackImportLimits,
     ) -> io::Result<()>;
+
+    /// Import under the importing store's proof-state mode. A layer that
+    /// arrives with a proof sidecar has it validated against its native delta
+    /// (and against its expected root, if one is supplied). A layer that
+    /// arrives without one has its proof state computed when `proof_state` is
+    /// on or an expected root is supplied for it, and is otherwise stored as is.
+    /// The other import methods import with proof state on.
+    async fn import_layers_with_proof_state(
+        &self,
+        pack: &[u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+        expected_roots: HashMap<[u32; 5], ProofHash>,
+        limits: PackImportLimits,
+        proof_state: ProofStateMode,
+    ) -> io::Result<()>;
 }
 
 #[async_trait]
@@ -138,6 +154,7 @@ impl<T: PersistentLayerStore> Packable for T {
             layer_ids,
             HashMap::new(),
             PackImportLimits::default(),
+            ProofStateMode::On,
         )
         .await
     }
@@ -154,6 +171,7 @@ impl<T: PersistentLayerStore> Packable for T {
             layer_ids,
             expected_roots,
             PackImportLimits::default(),
+            ProofStateMode::On,
         )
         .await
     }
@@ -165,7 +183,26 @@ impl<T: PersistentLayerStore> Packable for T {
         expected_roots: HashMap<[u32; 5], ProofHash>,
         limits: PackImportLimits,
     ) -> io::Result<()> {
-        import_pack(self, pack, layer_ids, expected_roots, limits).await
+        import_pack(
+            self,
+            pack,
+            layer_ids,
+            expected_roots,
+            limits,
+            ProofStateMode::On,
+        )
+        .await
+    }
+
+    async fn import_layers_with_proof_state(
+        &self,
+        pack: &[u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+        expected_roots: HashMap<[u32; 5], ProofHash>,
+        limits: PackImportLimits,
+        proof_state: ProofStateMode,
+    ) -> io::Result<()> {
+        import_pack(self, pack, layer_ids, expected_roots, limits, proof_state).await
     }
 }
 
@@ -671,6 +708,60 @@ async fn validate_staged_proof_without_panicking(
         })?
 }
 
+async fn rebuild_staged_proof_without_panicking(
+    staging: &PackValidationStore,
+    id: [u32; 5],
+) -> io::Result<crate::proof::LayerCommitment> {
+    std::panic::AssertUnwindSafe(staging.rebuild_proof_layer(id))
+        .catch_unwind()
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed imported native layer structure",
+            )
+        })?
+}
+
+/// Order the requested layers so that every requested parent precedes its
+/// requested children.
+fn parents_first(
+    layer_ids: &[[u32; 5]],
+    files: &HashMap<[u32; 5], HashMap<String, Bytes>>,
+) -> io::Result<Vec<[u32; 5]>> {
+    let mut parents = HashMap::with_capacity(layer_ids.len());
+    for id in layer_ids {
+        let files = files.get(id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "requested layer disappeared")
+        })?;
+        parents.insert(*id, parent_from_files(files)?);
+    }
+    let mut order = Vec::with_capacity(layer_ids.len());
+    let mut placed = HashSet::with_capacity(layer_ids.len());
+    for id in layer_ids {
+        let mut chain = Vec::new();
+        let mut current = Some(*id);
+        while let Some(layer) = current {
+            if placed.contains(&layer) || !parents.contains_key(&layer) {
+                break;
+            }
+            if chain.contains(&layer) || chain.len() > layer_ids.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cycle in imported layer ancestry",
+                ));
+            }
+            chain.push(layer);
+            current = parents[&layer];
+        }
+        for layer in chain.into_iter().rev() {
+            placed.insert(layer);
+            order.push(layer);
+        }
+    }
+    Ok(order)
+}
+
 async fn copy_layer_files<S: PersistentLayerStore>(
     store: &S,
     id: [u32; 5],
@@ -843,6 +934,29 @@ impl PackValidationStore {
         Ok(())
     }
 
+    fn insert_file(&self, id: [u32; 5], name: &str, bytes: Bytes) -> io::Result<()> {
+        let mut guard = self.layers.write().unwrap();
+        let files = guard.get_mut(&id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "pack validation layer not found")
+        })?;
+        if files.insert(name.to_owned(), bytes).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate pack validation structure",
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_file(&self, id: [u32; 5], name: &str) -> io::Result<()> {
+        let mut guard = self.layers.write().unwrap();
+        let files = guard.get_mut(&id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "pack validation layer not found")
+        })?;
+        files.remove(name);
+        Ok(())
+    }
+
     fn into_layers(self) -> io::Result<PackLayerFiles> {
         Arc::try_unwrap(self.layers)
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "pack validation handles remain"))?
@@ -920,6 +1034,7 @@ async fn import_pack<S: PersistentLayerStore>(
     layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     expected_roots: HashMap<[u32; 5], ProofHash>,
     limits: PackImportLimits,
+    proof_state: ProofStateMode,
 ) -> io::Result<()> {
     if pack.len() > limits.max_compressed_bytes {
         return Err(io::Error::new(
@@ -985,6 +1100,7 @@ async fn import_pack<S: PersistentLayerStore>(
         validate_layer_file_set(files)?;
     }
 
+    let order = parents_first(&layer_ids, &imported)?;
     let mut pending: Vec<_> = imported
         .values()
         .map(parent_from_files)
@@ -1026,21 +1142,56 @@ async fn import_pack<S: PersistentLayerStore>(
         staged_ids.insert(parent);
     }
 
-    for id in &layer_ids {
-        load_staged_layer_without_panicking(&staging, *id).await?;
-        if !v2 || !staging.file_exists(*id, FILENAMES.proof_state).await? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "legacy pack has no intrinsic layer commitment; migrate and re-export it",
-            ));
-        }
-        // Proof decoding has its own hard heap limit. Reserve that entire
-        // allowance against the aggregate pack peak before validation.
-        peak.set_transient(crate::proof::MAX_DECODED_PROOF_BYTES)?;
-        let validated = validate_staged_proof_without_panicking(&staging, *id).await?;
-        peak.set_transient(0)?;
-        if let Some(expected) = expected_roots.get(id) {
-            if &validated.commitment_root != expected {
+    if !v2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy pack has no pack manifest; re-export it",
+        ));
+    }
+    // Parents before children, so a layer whose proof state is computed here
+    // can build on its parent's, computed just before it.
+    for id in &order {
+        let id = *id;
+        load_staged_layer_without_panicking(&staging, id).await?;
+        let expected = expected_roots.get(&id);
+        let state = if staging.file_exists(id, FILENAMES.proof_state).await? {
+            let parent_unproven = match staging.get_layer_parent_name(id).await? {
+                Some(parent) => !staging.has_proof_layer(parent).await?,
+                None => false,
+            };
+            if parent_unproven && !proof_state.is_on() && expected.is_none() {
+                // A proof-state-off store keeps no proof state it cannot
+                // validate: this layer's ancestry was written without any.
+                staging.remove_file(id, FILENAMES.proof_state)?;
+                continue;
+            }
+            // Proof decoding has its own hard heap limit. Reserve that entire
+            // allowance against the aggregate pack peak before validation.
+            peak.set_transient(crate::proof::MAX_DECODED_PROOF_BYTES)?;
+            let validated = validate_staged_proof_without_panicking(&staging, id).await?;
+            peak.set_transient(0)?;
+            validated
+        } else if proof_state.is_on() || expected.is_some() {
+            // The layer was exported without proof state. Compute it from the
+            // native delta exactly as a local commit would.
+            peak.set_transient(crate::proof::MAX_DECODED_PROOF_BYTES)?;
+            let proof = rebuild_staged_proof_without_panicking(&staging, id).await?;
+            let state = proof.state.clone();
+            let bytes = tokio::task::spawn_blocking(move || proof.encode())
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))??;
+            peak.set_transient(0)?;
+            peak.retain(bytes.len().checked_add(PACK_ENTRY_HEAP_OVERHEAD).ok_or_else(
+                || io::Error::new(io::ErrorKind::InvalidData, "proof entry heap overflow"),
+            )?)?;
+            staging.insert_file(id, FILENAMES.proof_state, Bytes::from(bytes))?;
+            state
+        } else {
+            // A proof-state-off store keeps the layer as it arrived.
+            continue;
+        };
+        if let Some(expected) = expected {
+            if &state.commitment_root != expected {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "imported proof state does not match expected root",
@@ -1214,7 +1365,10 @@ async fn tar_append_layer<W: io::Write, S: PersistentLayerStore>(
     for f in &SHARED_REQUIRED_FILES {
         tar_append_file(store, tar, layer, &path, f, mtime, budget).await?;
     }
-    tar_append_file(
+    // The intrinsic commitment travels with the layer when the layer has one.
+    // A layer written without proof state (proof state off, or a system
+    // graph) is exported without it, like any other optional structure.
+    tar_append_file_if_exists(
         store,
         tar,
         layer,
@@ -1227,7 +1381,7 @@ async fn tar_append_layer<W: io::Write, S: PersistentLayerStore>(
     for f in &SHARED_OPTIONAL_FILES {
         if f == &FILENAMES.rollup || f == &FILENAMES.proof_state {
             // Rollups are local aliases; the intrinsic commitment was emitted
-            // above as a required portable layer component.
+            // above.
             continue;
         }
         tar_append_file_if_exists(store, tar, layer, &path, f, mtime, budget).await?;
@@ -1387,6 +1541,19 @@ impl Packable for CachedLayerStore {
     ) -> io::Result<()> {
         self.inner
             .import_layers_with_limits(pack, layer_ids, expected_roots, limits)
+            .await
+    }
+
+    async fn import_layers_with_proof_state(
+        &self,
+        pack: &[u8],
+        layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
+        expected_roots: HashMap<[u32; 5], ProofHash>,
+        limits: PackImportLimits,
+        proof_state: ProofStateMode,
+    ) -> io::Result<()> {
+        self.inner
+            .import_layers_with_proof_state(pack, layer_ids, expected_roots, limits, proof_state)
             .await
     }
 }
@@ -1562,7 +1729,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn pack_validates_intrinsically_and_rejects_legacy_format() {
+    async fn pack_validates_intrinsically_and_computes_missing_proof_state() {
         let source = open_memory_store();
         let builder = source.create_base_layer().await.unwrap();
         builder
@@ -1610,14 +1777,99 @@ mod tests {
             state.commitment_root
         );
 
+        // A layer exported without its sidecar has its proof state computed
+        // by a proofs-on importer, anchored to the producer's root.
         let proof_path = format!("{}/{}", name_to_string(id), FILENAMES.proof_state);
-        let legacy_pack = remove_pack_entry(&proof_pack, &proof_path);
+        let unproven_pack = remove_pack_entry(&proof_pack, &proof_path);
+        let computed = open_memory_store();
+        computed
+            .import_layers_with_expected_roots(
+                &unproven_pack,
+                Box::new(vec![id].into_iter()),
+                HashMap::from([(id, state.commitment_root)]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            computed
+                .get_layer_from_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .proof_commitment()
+                .await
+                .unwrap()
+                .state,
+            state
+        );
+
+        // A forged sidecar is still rejected however the importer is configured.
+        let forged = replace_pack_entry(&proof_pack, &proof_path, b"not a proof layer");
+        for mode in [ProofStateMode::On, ProofStateMode::Off] {
+            let target = open_memory_store().with_proof_state(mode);
+            assert!(target
+                .import_layers(&forged, Box::new(vec![id].into_iter()))
+                .await
+                .is_err());
+            assert!(target.get_layer_from_id(id).await.unwrap().is_none());
+        }
+
+        // A pack without the manifest is still a legacy pack.
+        let legacy_pack = remove_pack_entry(&proof_pack, PACK_MANIFEST_PATH);
         let legacy = open_memory_store();
         assert!(legacy
             .import_layers(&legacy_pack, Box::new(vec![id].into_iter()))
             .await
             .is_err());
         assert!(legacy.get_layer_from_id(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pack_child_sidecar_over_an_unproven_parent() {
+        let source = open_memory_store();
+        let base = source.create_base_layer().await.unwrap();
+        base.add_value_triple(ValueTriple::new_node("a", "p", "b"))
+            .unwrap();
+        let base = base.commit().await.unwrap();
+        let child = base.open_write().await.unwrap();
+        child
+            .add_value_triple(ValueTriple::new_node("b", "p", "c"))
+            .unwrap();
+        let child = child.commit().await.unwrap();
+        let root = child.proof_commitment().await.unwrap().state.commitment_root;
+        let ids = vec![base.name(), child.name()];
+        let pack = source
+            .export_layers(Box::new(ids.clone().into_iter()))
+            .await
+            .unwrap();
+        let base_proof = format!("{}/{}", name_to_string(base.name()), FILENAMES.proof_state);
+        let pack = remove_pack_entry(&pack, &base_proof);
+
+        // Proofs on: the parent's proof state is computed first, then the
+        // child's sidecar validates against it.
+        let on = open_memory_store();
+        on.import_layers_with_expected_roots(
+            &pack,
+            Box::new(ids.clone().into_iter()),
+            HashMap::from([(child.name(), root)]),
+        )
+        .await
+        .unwrap();
+        let head = on.get_layer_from_id(child.name()).await.unwrap().unwrap();
+        assert_eq!(head.proof_commitment().await.unwrap().state.commitment_root, root);
+
+        // Proofs off: the parent stays unproven, so the child's sidecar cannot
+        // be validated and is not kept.
+        let off = open_memory_store().with_proof_state(ProofStateMode::Off);
+        off.import_layers(&pack, Box::new(ids.clone().into_iter()))
+            .await
+            .unwrap();
+        let head = off.get_layer_from_id(child.name()).await.unwrap().unwrap();
+        assert_eq!(head.triples().count(), 2);
+        assert_eq!(
+            head.proof_commitment().await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

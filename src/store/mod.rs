@@ -13,7 +13,7 @@ use crate::storage::directory::{DirectoryLabelStore, DirectoryLayerStore};
 use crate::storage::memory::{MemoryLabelStore, MemoryLayerStore};
 use crate::storage::{
     CachedLayerStore, LabelStore, LayerStore, LockingHashMapLayerCache, PackImportLimits,
-    ProofMigrationOutcome,
+    ProofMigrationOutcome, ProofStateMode,
 };
 use tdb_succinct::TypedDictEntry;
 
@@ -29,6 +29,7 @@ pub struct Store {
     layer_store: Arc<dyn LayerStore>,
     lru_used_bytes_fn: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     lru_evict_fn: Option<Arc<dyn Fn(f64) + Send + Sync>>,
+    proof_state: ProofStateMode,
 }
 
 /// A wrapper over a SimpleLayerBuilder, providing a thread-safe sharable interface.
@@ -126,9 +127,24 @@ impl StoreLayerBuilder {
             .is_none()
     }
 
-    /// Commit the layer and its intrinsic authenticated commitment without
-    /// loading the resulting layer. Neither is published unless both succeed.
+    /// Commit the layer without loading the resulting layer. When the store's
+    /// proof state is on, the layer's intrinsic authenticated commitment is
+    /// written with it, and neither is published unless both succeed; when it
+    /// is off, the layer is written without one.
     pub async fn commit_no_load(&self) -> io::Result<()> {
+        self.commit_no_load_with_proof(self.store.proof_state.is_on())
+            .await
+    }
+
+    /// Commit the layer without loading it and without proof state, whatever
+    /// the store's mode. For graphs that are never proven, such as the system
+    /// graph: the layer has the shape of a legacy layer, which
+    /// `migrate_proof_chain` can still prepare later.
+    pub async fn commit_no_load_without_proof(&self) -> io::Result<()> {
+        self.commit_no_load_with_proof(false).await
+    }
+
+    async fn commit_no_load_with_proof(&self, prove: bool) -> io::Result<()> {
         let mut builder = None;
         {
             let mut guard = self
@@ -153,13 +169,20 @@ impl StoreLayerBuilder {
                     builder.commit_boxed().await.map_err(|error| {
                         io::Error::new(error.kind(), format!("write native layer: {error}"))
                     })?;
-                    self.store
-                        .layer_store
-                        .prepare_proof_layer(id)
-                        .await
-                        .map_err(|error| {
-                            io::Error::new(error.kind(), format!("prepare proof layer: {error}"))
-                        })?;
+                    if prove {
+                        // A child of a layer without proof state fails closed
+                        // here until that chain is migrated (migrate_proof_chain).
+                        self.store
+                            .layer_store
+                            .prepare_proof_layer(id)
+                            .await
+                            .map_err(|error| {
+                                io::Error::new(
+                                    error.kind(),
+                                    format!("prepare proof layer: {error}"),
+                                )
+                            })?;
+                    }
                     self.store
                         .layer_store
                         .finalize_layer(id)
@@ -212,10 +235,19 @@ impl StoreLayerBuilder {
 
     /// Commit the layer to storage.
     pub async fn commit(&self) -> io::Result<StoreLayer> {
-        let name = self.name;
         self.commit_no_load().await?;
+        self.load_committed().await
+    }
 
-        let layer = self.store.layer_store.get_layer(name).await?;
+    /// Commit the layer to storage without proof state, whatever the store's
+    /// mode. See [`Self::commit_no_load_without_proof`].
+    pub async fn commit_without_proof(&self) -> io::Result<StoreLayer> {
+        self.commit_no_load_without_proof().await?;
+        self.load_committed().await
+    }
+
+    async fn load_committed(&self) -> io::Result<StoreLayer> {
+        let layer = self.store.layer_store.get_layer(self.name).await?;
         Ok(StoreLayer::wrap(
             layer.expect("layer that was just created was not found in store"),
             self.store.clone(),
@@ -924,7 +956,19 @@ impl Store {
             layer_store: Arc::new(layer_store),
             lru_used_bytes_fn: None,
             lru_evict_fn: None,
+            proof_state: ProofStateMode::On,
         }
+    }
+
+    /// Choose whether commits and pack imports write proof state (default on).
+    pub fn with_proof_state(mut self, mode: ProofStateMode) -> Self {
+        self.proof_state = mode;
+        self
+    }
+
+    /// Whether commits and pack imports of this store write proof state.
+    pub fn proof_state(&self) -> ProofStateMode {
+        self.proof_state
     }
 
     /// Set a callback that returns the current LRU archive cache usage in bytes.
@@ -966,12 +1010,19 @@ impl Store {
     }
 
     /// Retrieve a layer with the given name from the layer store this Store was initialized with.
+    ///
+    /// A layer with a proof sidecar is returned only if the sidecar decodes. A
+    /// layer without one (written while proof state was off, a system-graph
+    /// layer, or a legacy layer) reads normally; only proof operations on it
+    /// fail closed until `migrate_proof_chain` prepares its proof state.
     pub async fn get_layer_from_id(&self, layer: [u32; 5]) -> io::Result<Option<StoreLayer>> {
         let stored = self.layer_store.get_layer(layer).await?;
         match stored {
             None => Ok(None),
             Some(stored) => {
-                self.layer_store.proof_layer(layer).await?;
+                if self.layer_store.has_proof_layer(layer).await? {
+                    self.layer_store.proof_layer(layer).await?;
+                }
                 Ok(Some(StoreLayer::wrap(stored, self.clone())))
             }
         }
@@ -1037,7 +1088,13 @@ impl Store {
         pack: &'a [u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<()> {
-        self.layer_store.import_layers(pack, layer_ids).await
+        self.import_layers_with_limits(
+            pack,
+            layer_ids,
+            std::collections::HashMap::new(),
+            PackImportLimits::default(),
+        )
+        .await
     }
 
     /// Import intrinsically committed layers, optionally anchored to supplied roots.
@@ -1047,9 +1104,13 @@ impl Store {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
     ) -> io::Result<()> {
-        self.layer_store
-            .import_layers_with_expected_roots(pack, layer_ids, expected_roots)
-            .await
+        self.import_layers_with_limits(
+            pack,
+            layer_ids,
+            expected_roots,
+            PackImportLimits::default(),
+        )
+        .await
     }
 
     /// Import with caller-selected parser and staging budgets.
@@ -1061,7 +1122,13 @@ impl Store {
         limits: crate::storage::pack::PackImportLimits,
     ) -> io::Result<()> {
         self.layer_store
-            .import_layers_with_limits(pack, layer_ids, expected_roots, limits)
+            .import_layers_with_proof_state(
+                pack,
+                layer_ids,
+                expected_roots,
+                limits,
+                self.proof_state,
+            )
             .await
     }
 
@@ -1366,6 +1433,240 @@ mod tests {
         assert!(store.get_layer_from_id(child_name).await.unwrap().is_none());
     }
 
+    /// The triples of `create_proof_stack`, committed under the store's mode.
+    async fn create_stack(store: &Store) -> (StoreLayer, StoreLayer) {
+        let builder = store.create_base_layer().await.unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node("a", "p", "one"))
+            .unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("a", "label", "alpha"))
+            .unwrap();
+        let base = builder.commit().await.unwrap();
+
+        let child = base.open_write().await.unwrap();
+        child
+            .remove_value_triple(ValueTriple::new_node("a", "p", "one"))
+            .unwrap();
+        child
+            .add_value_triple(ValueTriple::new_node("b", "p", "two"))
+            .unwrap();
+        let head = child.commit().await.unwrap();
+        (base, head)
+    }
+
+    fn assert_stack_reads(head: &StoreLayer) {
+        let mut triples: Vec<_> = head
+            .triples()
+            .map(|t| head.id_triple_to_string(&t).unwrap())
+            .collect();
+        triples.sort();
+        let mut expected = vec![
+            ValueTriple::new_string_value("a", "label", "alpha"),
+            ValueTriple::new_node("b", "p", "two"),
+        ];
+        expected.sort();
+        assert_eq!(triples, expected);
+        assert!(!head.value_triple_exists(&ValueTriple::new_node("a", "p", "one")));
+    }
+
+    #[tokio::test]
+    async fn proof_state_off_commits_without_sidecar_and_migrates_to_the_proven_state() {
+        let proven = open_memory_store();
+        assert_eq!(proven.proof_state(), ProofStateMode::On);
+        let (_, proven_head) = create_stack(&proven).await;
+        let proven_state = proven_head.proof_commitment().await.unwrap().state.clone();
+
+        let dir = tempdir().unwrap();
+        let store = open_archive_store(dir.path(), 16).with_proof_state(ProofStateMode::Off);
+        let (base, head) = create_stack(&store).await;
+        for layer in [&base, &head] {
+            assert!(!store.layer_store.has_proof_layer(layer.name()).await.unwrap());
+            assert_eq!(
+                layer.proof_commitment().await.unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+        }
+        assert_stack_reads(&head);
+        let name = head.name();
+        drop((base, head));
+        drop(store);
+
+        // Reopened with proof state on, the off-written chain still reads and
+        // migrates once to exactly the state a proofs-on commit produced.
+        let reopened = open_archive_store(dir.path(), 16);
+        let head = reopened.get_layer_from_id(name).await.unwrap().unwrap();
+        assert_stack_reads(&head);
+        let child = head.open_write().await.unwrap();
+        child
+            .add_value_triple(ValueTriple::new_node("c", "p", "three"))
+            .unwrap();
+        assert!(child.commit().await.is_err(), "unmigrated parent fails closed");
+        let migrated = head.migrate_proof_chain().await.unwrap();
+        assert_eq!(migrated, proven_state);
+        assert_eq!(head.proof_commitment().await.unwrap().state, proven_state);
+        let child = head.open_write().await.unwrap();
+        child
+            .add_value_triple(ValueTriple::new_node("c", "p", "three"))
+            .unwrap();
+        let next = child.commit().await.unwrap();
+        assert!(next.proof_commitment().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn commit_without_proof_writes_no_sidecar_in_a_proof_store() {
+        let store = open_memory_store();
+        let builder = store.create_base_layer().await.unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_node("system", "has", "db0"))
+            .unwrap();
+        let mut head = builder.commit_without_proof().await.unwrap();
+        // A system-graph chain longer than the unrolled-ancestry limit keeps
+        // committing, because no commit walks it to prepare proof state.
+        for i in 1..=(crate::storage::MAX_LAYER_CHAIN_DEPTH + 8) {
+            let builder = head.open_write().await.unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_node("system", "has", &format!("db{i}")))
+                .unwrap();
+            builder
+                .remove_value_triple(ValueTriple::new_node(
+                    "system",
+                    "has",
+                    &format!("db{}", i - 1),
+                ))
+                .unwrap();
+            head = builder.commit_without_proof().await.unwrap();
+        }
+        assert!(!store.layer_store.has_proof_layer(head.name()).await.unwrap());
+        let last = format!("db{}", crate::storage::MAX_LAYER_CHAIN_DEPTH + 8);
+        assert!(head.value_triple_exists(&ValueTriple::new_node("system", "has", &last)));
+        assert_eq!(head.triples().count(), 1);
+
+        // The same store still proves ordinary commits.
+        let (_, proven) = create_stack(&store).await;
+        assert!(store.layer_store.has_proof_layer(proven.name()).await.unwrap());
+        assert!(proven.proof_commitment().await.is_ok());
+
+        // Squashing and rolling up a proofless chain keep it proofless.
+        let squashed = head.squash().await.unwrap();
+        assert!(!store.layer_store.has_proof_layer(squashed.name()).await.unwrap());
+        assert_eq!(squashed.triples().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn pack_round_trips_with_and_without_proof_state() {
+        let proven = open_memory_store();
+        let (proven_base, proven_head) = create_stack(&proven).await;
+        let proven_ids = vec![proven_base.name(), proven_head.name()];
+        let proven_root = proven_head
+            .proof_commitment()
+            .await
+            .unwrap()
+            .state
+            .commitment_root;
+        let proven_pack = proven
+            .export_layers(Box::new(proven_ids.clone().into_iter()))
+            .await
+            .unwrap();
+
+        // With sidecar: validated and kept, by a proofs-on and a proofs-off store.
+        for mode in [ProofStateMode::On, ProofStateMode::Off] {
+            let target = open_memory_store().with_proof_state(mode);
+            target
+                .import_layers(&proven_pack, Box::new(proven_ids.clone().into_iter()))
+                .await
+                .unwrap();
+            let head = target
+                .get_layer_from_id(proven_head.name())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_stack_reads(&head);
+            assert_eq!(
+                head.proof_commitment().await.unwrap().state.commitment_root,
+                proven_root
+            );
+        }
+
+        // Without sidecar: exported from a proofs-off store.
+        let unproven = open_memory_store().with_proof_state(ProofStateMode::Off);
+        let (base, head) = create_stack(&unproven).await;
+        let ids = vec![base.name(), head.name()];
+        let pack = unproven
+            .export_layers(Box::new(ids.clone().into_iter()))
+            .await
+            .unwrap();
+
+        // Into a proofs-on store: proof state is computed, matching a proofs-on commit.
+        let target = open_memory_store();
+        target
+            .import_layers(&pack, Box::new(ids.clone().into_iter()))
+            .await
+            .unwrap();
+        let imported = target.get_layer_from_id(head.name()).await.unwrap().unwrap();
+        assert_stack_reads(&imported);
+        assert_eq!(
+            imported.proof_commitment().await.unwrap().state.commitment_root,
+            proven_root
+        );
+        // ...and that computed state is exported again and re-validated.
+        let repack = target
+            .export_layers(Box::new(ids.clone().into_iter()))
+            .await
+            .unwrap();
+        let again = open_memory_store();
+        again
+            .import_layers_with_expected_roots(
+                &repack,
+                Box::new(ids.clone().into_iter()),
+                std::collections::HashMap::from([(head.name(), proven_root)]),
+            )
+            .await
+            .unwrap();
+
+        // Into a proofs-on store with a wrong expected root: rejected, nothing published.
+        let anchored = open_memory_store();
+        assert!(anchored
+            .import_layers_with_expected_roots(
+                &pack,
+                Box::new(ids.clone().into_iter()),
+                std::collections::HashMap::from([(head.name(), [0x55; 32])]),
+            )
+            .await
+            .is_err());
+        assert!(anchored.get_layer_from_id(head.name()).await.unwrap().is_none());
+
+        // Into a proofs-off store: kept without proof state, and reads fine.
+        let off = open_memory_store().with_proof_state(ProofStateMode::Off);
+        off.import_layers(&pack, Box::new(ids.clone().into_iter()))
+            .await
+            .unwrap();
+        let kept = off.get_layer_from_id(head.name()).await.unwrap().unwrap();
+        assert_stack_reads(&kept);
+        for id in &ids {
+            assert!(!off.layer_store.has_proof_layer(*id).await.unwrap());
+        }
+        // An expected root still makes a proofs-off store compute and check it.
+        let off_anchored = open_memory_store().with_proof_state(ProofStateMode::Off);
+        off_anchored
+            .import_layers_with_expected_roots(
+                &pack,
+                Box::new(ids.clone().into_iter()),
+                std::collections::HashMap::from([(base.name(), {
+                    proven_base
+                        .proof_commitment()
+                        .await
+                        .unwrap()
+                        .state
+                        .commitment_root
+                })]),
+            )
+            .await
+            .unwrap();
+        assert!(off_anchored.layer_store.has_proof_layer(base.name()).await.unwrap());
+        assert!(!off_anchored.layer_store.has_proof_layer(head.name()).await.unwrap());
+    }
+
     #[tokio::test]
     async fn explicit_archive_migration_indexes_legacy_chain_once() {
         let dir = tempdir().unwrap();
@@ -1388,10 +1689,14 @@ mod tests {
         drop(store);
 
         let reopened = open_raw_archive_store(dir.path());
+        // A legacy layer reads normally; only its proof state is missing.
+        let legacy = reopened.get_layer_from_id(name).await.unwrap().unwrap();
+        assert_eq!(legacy.triples().count(), 2);
         assert_eq!(
-            reopened.get_layer_from_id(name).await.err().unwrap().kind(),
+            legacy.proof_commitment().await.unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+        drop(legacy);
         let migrated = reopened.migrate_proof_chain(name).await.unwrap();
         assert_eq!(reopened.migrate_proof_chain(name).await.unwrap(), migrated);
         let head = reopened.get_layer_from_id(name).await.unwrap().unwrap();

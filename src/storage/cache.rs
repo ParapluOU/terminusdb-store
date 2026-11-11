@@ -435,6 +435,10 @@ impl LayerStore for CachedLayerStore {
         self.inner.proof_state_bytes(name).await
     }
 
+    async fn has_proof_layer(&self, name: [u32; 5]) -> io::Result<bool> {
+        self.inner.has_proof_layer(name).await
+    }
+
     async fn replace_proof_state_bytes_if_matches(
         &self,
         name: [u32; 5],

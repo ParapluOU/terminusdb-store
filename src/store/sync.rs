@@ -15,7 +15,7 @@ use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, Value
 use std::sync::Arc;
 
 use crate::proof::{CommitmentState, LayerCommitment, ProofHash};
-use crate::storage::{PackImportLimits, ProofMigrationOutcome};
+use crate::storage::{PackImportLimits, ProofMigrationOutcome, ProofStateMode};
 use crate::store::{
     open_directory_store, open_memory_store, NamedGraph, Store, StoreLayer, StoreLayerBuilder,
 };
@@ -102,6 +102,12 @@ impl SyncStoreLayerBuilder {
         let inner = task_sync(self.inner.commit());
 
         inner.map(SyncStoreLayer::wrap)
+    }
+
+    /// Commit the layer to storage without proof state, whatever the store's
+    /// proof-state mode. For graphs that are never proven, such as the system graph.
+    pub fn commit_without_proof(&self) -> Result<SyncStoreLayer, io::Error> {
+        task_sync(self.inner.commit_without_proof()).map(SyncStoreLayer::wrap)
     }
 
     /// Apply all triples added and removed by a layer to this builder.
@@ -557,6 +563,18 @@ impl SyncStore {
         Self { inner }
     }
 
+    /// Choose whether commits and pack imports write proof state (default on).
+    pub fn with_proof_state(self, mode: ProofStateMode) -> Self {
+        Self {
+            inner: self.inner.with_proof_state(mode),
+        }
+    }
+
+    /// Whether commits and pack imports of this store write proof state.
+    pub fn proof_state(&self) -> ProofStateMode {
+        self.inner.proof_state()
+    }
+
     /// Create a new database with the given name.
     ///
     /// If the database already exists, this will return an error.
@@ -656,7 +674,7 @@ impl SyncStore {
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
     ) -> io::Result<()> {
-        task_sync(self.inner.layer_store.import_layers(pack, layer_ids))
+        task_sync(self.inner.import_layers(pack, layer_ids))
     }
 
     /// Import intrinsically committed layers, optionally anchored to supplied roots.
@@ -666,7 +684,7 @@ impl SyncStore {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
     ) -> io::Result<()> {
-        task_sync(self.inner.layer_store.import_layers_with_expected_roots(
+        task_sync(self.inner.import_layers_with_expected_roots(
             pack,
             layer_ids,
             expected_roots,
@@ -681,7 +699,7 @@ impl SyncStore {
         expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
         limits: crate::storage::pack::PackImportLimits,
     ) -> io::Result<()> {
-        task_sync(self.inner.layer_store.import_layers_with_limits(
+        task_sync(self.inner.import_layers_with_limits(
             pack,
             layer_ids,
             expected_roots,

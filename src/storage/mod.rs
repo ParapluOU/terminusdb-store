@@ -35,6 +35,7 @@ pub mod delta;
 mod locking;
 pub mod memory;
 pub mod pack;
+mod proof_mode;
 
 pub use cache::*;
 pub use delta::*;
@@ -42,3 +43,4 @@ pub use file::*;
 pub use label::*;
 pub use layer::*;
 pub use pack::*;
+pub use proof_mode::*;
