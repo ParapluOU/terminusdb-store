@@ -135,6 +135,37 @@ pub fn require_termless_plan(plan: &RelationProofPlan) -> io::Result<()> {
     walk(plan, 1)
 }
 
+/// The wire form of a single-layer relation proof over one base layer.
+///
+/// Both forms prove the SAME operator tree over the SAME layer, anchored to the SAME
+/// `resolution_root`; they differ only in how the verifier resolves ids to terms. The
+/// [`Self::TermBearing`] form verifies every statement the single-layer compiler proves; the
+/// [`Self::Termless`] form only statements [`require_termless_plan`] admits, and among those only
+/// when the witness needs no dictionary scan (an ABSENT constant needs a catalog nonmembership
+/// scan, which only the term-bearing form carries — a data-dependent fact no plan can predict).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SingleLayerEnvelopeForm {
+    /// [`TermlessRelationEnvelope`] verified against the O(1) TERM-LESS `VerifierCommitment`.
+    Termless,
+    /// [`RecursiveRelationEnvelope`] verified against the TERM-BEARING `VerifierCommitment`
+    /// (it carries the layer's dictionaries, so it grows with the catalog).
+    TermBearing,
+}
+
+/// The form an encoded single-layer envelope CLAIMS, read from its framing magic only. Parsing the
+/// magic confers no trust: it only selects which full verification runs (and which commitment
+/// kind that verification demands); the verifier's own plan still decides whether that form may
+/// answer the statement at all. Any other framing is rejected.
+pub fn single_layer_envelope_form(bytes: &[u8]) -> io::Result<SingleLayerEnvelopeForm> {
+    if bytes.starts_with(TERMLESS_TREE_MAGIC) {
+        Ok(SingleLayerEnvelopeForm::Termless)
+    } else if bytes.starts_with(RECURSIVE_MAGIC) {
+        Ok(SingleLayerEnvelopeForm::TermBearing)
+    } else {
+        Err(invalid("not a single-layer relation envelope (unknown framing magic)"))
+    }
+}
+
 /// The commitment gate shared by prover dry run and verifier: TERM-LESS, a BASE layer, internally
 /// consistent (`validate`), and anchored to the caller's trusted `resolution_root`. Returns the
 /// authenticated `commitment_root` the envelope's transcript is bound to.

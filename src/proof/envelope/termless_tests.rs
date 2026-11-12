@@ -5,7 +5,10 @@
 
 use super::plan::{RelationEqualityPlan, RelationProofPlan, RelationProofPlanKind};
 use super::recursive::RecursiveRelationEnvelope;
-use super::termless::{require_termless_plan, TermlessRelationEnvelope, TERMLESS_TREE_MAGIC, TERMLESS_TREE_VERSION};
+use super::termless::{
+    require_termless_plan, single_layer_envelope_form, SingleLayerEnvelopeForm, TermlessRelationEnvelope,
+    TERMLESS_TREE_MAGIC, TERMLESS_TREE_VERSION,
+};
 use super::wire::{plan_digest, Wire, CHECKSUM_BYTES};
 
 use sha2::{Digest, Sha256};
@@ -387,4 +390,18 @@ fn termless_plan_gate_rejects_value_reading_shapes() {
     assert!(require_termless_plan(&equality).is_err());
     assert!(require_termless_plan(&join_plan()).is_ok());
     assert!(require_termless_plan(&distinct_plan()).is_ok());
+}
+
+#[test]
+fn single_layer_form_follows_the_framing() {
+    // The claimed form is read from the framing magic; anything else is not an envelope.
+    big_stack("single-layer-form", || {
+        let f = fixture(layer_with("A_", 3), single_plan());
+        let termless = f.termless.encode().unwrap();
+        let bearing = f.term_bearing.encode().unwrap();
+        assert_eq!(single_layer_envelope_form(&termless).unwrap(), SingleLayerEnvelopeForm::Termless);
+        assert_eq!(single_layer_envelope_form(&bearing).unwrap(), SingleLayerEnvelopeForm::TermBearing);
+        assert!(single_layer_envelope_form(&termless[1..]).is_err());
+        assert!(single_layer_envelope_form(&[]).is_err());
+    });
 }
