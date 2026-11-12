@@ -216,7 +216,7 @@ impl<'a> ChainDictResolver<'a> {
                 view.state.parent_node_value_count,
                 view.state.node_value_count,
                 id,
-                opening,
+                &opening,
             )?
         };
         if let Some(hash) = expected_hash {
@@ -318,7 +318,7 @@ impl<'a> ChainDictResolver<'a> {
                 view.state.parent_predicate_count,
                 view.state.predicate_count,
                 id,
-                opening,
+                &opening,
             )?
         };
         if let Some(hash) = expected_hash {

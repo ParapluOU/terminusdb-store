@@ -225,6 +225,31 @@ pub trait VerifierLayer {
     fn terms_present(&self) -> bool {
         self.verifier_view().terms_present
     }
+
+    /// The term-less resolution witness that rides WITH this layer for one verification — the
+    /// single-layer term-less envelope's openings (see `TermlessRelationEnvelope`). `None` for every
+    /// ordinary layer (a sidecar, a verifier commitment, a view), so their resolution is unchanged.
+    /// A resolver consumes it only for a TERM-LESS view (a term-bearing view rebuilds its trees),
+    /// and re-verifies each opening against the root-bound Merkle root, so a carried witness never
+    /// adds trust — it only lets a term-less view resolve ids it could not resolve otherwise.
+    fn shipped_openings(&self) -> Option<&ResolutionOpenings> {
+        None
+    }
+}
+
+/// Pick the ONE resolution witness a consumer uses: the proof-embedded `own` openings or the
+/// layer-carried [`VerifierLayer::shipped_openings`]. Both present is malformed (two carriers for
+/// one statement) and fails closed rather than silently preferring either.
+pub(crate) fn effective_openings<'a>(
+    source: &'a (impl VerifierLayer + ?Sized),
+    own: Option<&'a ResolutionOpenings>,
+) -> io::Result<Option<&'a ResolutionOpenings>> {
+    match (own, source.shipped_openings()) {
+        (Some(_), Some(_)) => Err(invalid(
+            "term-less resolution witness supplied twice (proof-embedded and envelope-carried)",
+        )),
+        (own, shipped) => Ok(own.or(shipped)),
+    }
 }
 
 impl VerifierLayer for LayerCommitment {
@@ -273,6 +298,27 @@ impl VerifierLayer for VerifierCommitmentRef<'_> {
 impl<T: VerifierLayer + ?Sized> VerifierLayer for std::sync::Arc<T> {
     fn verifier_view(&self) -> VerifierCommitmentRef<'_> {
         (**self).verifier_view()
+    }
+    fn shipped_openings(&self) -> Option<&ResolutionOpenings> {
+        (**self).shipped_openings()
+    }
+}
+
+/// A TERM-LESS verifier commitment paired with the resolution witness shipped beside it — the
+/// layer the single-layer term-less envelope verifies against. Its view is exactly the
+/// commitment's (no catalogs); the openings are only reachable through
+/// [`VerifierLayer::shipped_openings`].
+pub(crate) struct TermlessWithOpenings<'a> {
+    pub(crate) commitment: &'a VerifierCommitment,
+    pub(crate) openings: &'a ResolutionOpenings,
+}
+
+impl VerifierLayer for TermlessWithOpenings<'_> {
+    fn verifier_view(&self) -> VerifierCommitmentRef<'_> {
+        self.commitment.verifier_view()
+    }
+    fn shipped_openings(&self) -> Option<&ResolutionOpenings> {
+        Some(self.openings)
     }
 }
 

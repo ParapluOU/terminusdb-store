@@ -418,6 +418,58 @@ pub(crate) fn verify_opening(
 pub struct ResolutionOpenings {
     node_value: std::collections::BTreeMap<u64, DictOpening>,
     predicate: std::collections::BTreeMap<u64, DictOpening>,
+    /// Which ids a verifier actually looked up (node/value, predicate). Pure bookkeeping — it
+    /// never influences a lookup's result. The single-layer term-less envelope uses it to reject a
+    /// carrier that ships an opening the verifier never consumed (an EXACT witness, no padding).
+    consumed: ConsumedIds,
+    /// PROVER-ONLY lazy opener over the term-bearing trees (see [`ResolutionOpenings::oracle`]).
+    /// Never decoded from bytes and never encoded (the wire `put` rejects it), so a verifier's
+    /// openings are always exactly the shipped maps.
+    oracle: Option<std::sync::Arc<OpeningOracle>>,
+}
+
+/// The ids a verifier consumed from a [`ResolutionOpenings`]. A `Mutex` (not a `RefCell`) so a
+/// shared `&ResolutionOpenings` stays `Sync` for the parallel verifier paths.
+#[derive(Debug, Default)]
+struct ConsumedIds(std::sync::Mutex<(std::collections::BTreeSet<u64>, std::collections::BTreeSet<u64>)>);
+
+impl Clone for ConsumedIds {
+    fn clone(&self) -> Self {
+        Self(std::sync::Mutex::new(self.snapshot()))
+    }
+}
+
+impl ConsumedIds {
+    fn snapshot(&self) -> (std::collections::BTreeSet<u64>, std::collections::BTreeSet<u64>) {
+        match self.0.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+    fn record(&self, predicate: bool, id: u64) {
+        let mut guard = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if predicate {
+            guard.1.insert(id);
+        } else {
+            guard.0.insert(id);
+        }
+    }
+}
+
+/// The prover's term-bearing dictionary trees, opened on demand while a dry-run verifier walks
+/// a term-less proof — so the shipped witness is exactly the ids that verifier consumes.
+struct OpeningOracle {
+    node_value: DictMerkleTree,
+    predicate: DictMerkleTree,
+}
+
+impl std::fmt::Debug for OpeningOracle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpeningOracle")
+    }
 }
 
 impl ResolutionOpenings {
@@ -425,17 +477,119 @@ impl ResolutionOpenings {
     /// none. The caller still runs `verify_opening` against the root-bound root, so a present
     /// but WRONG opening is rejected there; this only turns a MISSING opening into an error
     /// rather than an empty resolution.
-    pub(crate) fn node_value_opening(&self, id: u64) -> io::Result<&DictOpening> {
-        self.node_value.get(&id).ok_or_else(|| {
-            invalid("term-less resolution: prover shipped no node/value Merkle opening for this id")
-        })
+    pub(crate) fn node_value_opening(
+        &self,
+        id: u64,
+    ) -> io::Result<std::borrow::Cow<'_, DictOpening>> {
+        let opening = match (self.node_value.get(&id), &self.oracle) {
+            (Some(opening), _) => std::borrow::Cow::Borrowed(opening),
+            (None, Some(oracle)) => std::borrow::Cow::Owned(oracle.node_value.open(id)?),
+            (None, None) => {
+                return Err(invalid(
+                    "term-less resolution: prover shipped no node/value Merkle opening for this id",
+                ))
+            }
+        };
+        self.consumed.record(false, id);
+        Ok(opening)
     }
 
     /// The shipped opening for a predicate id, or `Err` (fail-closed) if the prover shipped none.
-    pub(crate) fn predicate_opening(&self, id: u64) -> io::Result<&DictOpening> {
-        self.predicate.get(&id).ok_or_else(|| {
-            invalid("term-less resolution: prover shipped no predicate Merkle opening for this id")
+    pub(crate) fn predicate_opening(
+        &self,
+        id: u64,
+    ) -> io::Result<std::borrow::Cow<'_, DictOpening>> {
+        let opening = match (self.predicate.get(&id), &self.oracle) {
+            (Some(opening), _) => std::borrow::Cow::Borrowed(opening),
+            (None, Some(oracle)) => std::borrow::Cow::Owned(oracle.predicate.open(id)?),
+            (None, None) => {
+                return Err(invalid(
+                    "term-less resolution: prover shipped no predicate Merkle opening for this id",
+                ))
+            }
+        };
+        self.consumed.record(true, id);
+        Ok(opening)
+    }
+
+    /// PROVER-ONLY: a lazy opener over ONE term-bearing base view's two dictionary trees. A
+    /// dry-run verifier pointed at it consumes whatever openings it needs; [`Self::consumed_witness`]
+    /// then mints exactly those. Every opening is still re-checked by `verify_opening` during the
+    /// dry run, so an oracle never makes a proof verify that its shipped witness would not.
+    pub(crate) fn oracle(view: VerifierCommitmentRef<'_>) -> io::Result<Self> {
+        view.require_terms_present("building a resolution-openings oracle")?;
+        if view.state.parent_state_root.is_some() {
+            return Err(invalid("a resolution-openings oracle is built over one base layer"));
+        }
+        let node_value = build_node_value_tree(
+            view.node_value_catalog,
+            view.state.parent_node_value_count,
+            view.state.node_value_count,
+        )?;
+        let predicate = build_predicate_tree(
+            view.predicate_catalog,
+            view.state.parent_predicate_count,
+            view.state.predicate_count,
+        )?;
+        if node_value.root() != view.nv_merkle_root || predicate.root() != view.pred_merkle_root {
+            return Err(invalid("oracle trees do not reproduce the root-bound merkle roots"));
+        }
+        Ok(Self {
+            oracle: Some(std::sync::Arc::new(OpeningOracle { node_value, predicate })),
+            ..Self::default()
         })
+    }
+
+    /// PROVER-ONLY: the exact shippable witness for the ids consumed so far from an oracle — one
+    /// opening per consumed id, nothing else. `Err` on a non-oracle carrier.
+    pub(crate) fn consumed_witness(&self) -> io::Result<Self> {
+        let oracle = self
+            .oracle
+            .as_ref()
+            .ok_or_else(|| invalid("consumed_witness needs an oracle carrier"))?;
+        let (node_value_ids, predicate_ids) = self.consumed.snapshot();
+        let mut out = Self::default();
+        for id in node_value_ids {
+            out.insert_node_value(oracle.node_value.open(id)?);
+        }
+        for id in predicate_ids {
+            out.insert_predicate(oracle.predicate.open(id)?);
+        }
+        Ok(out)
+    }
+
+    /// A copy of the shipped openings with an EMPTY consumption record, so one verification's
+    /// bookkeeping never leaks into another's.
+    pub(crate) fn fresh_tracked(&self) -> Self {
+        Self {
+            node_value: self.node_value.clone(),
+            predicate: self.predicate.clone(),
+            consumed: ConsumedIds::default(),
+            oracle: self.oracle.clone(),
+        }
+    }
+
+    /// Fail closed unless the verifier consumed EVERY shipped opening (and nothing else could have
+    /// been consumed: a lookup of an unshipped id already failed). Rejects padding a witness with
+    /// openings the statement never needed. Never applies to an oracle carrier.
+    pub(crate) fn require_exactly_consumed(&self) -> io::Result<()> {
+        if self.oracle.is_some() {
+            return Err(invalid("an oracle carrier is never a shipped witness"));
+        }
+        let (node_value_ids, predicate_ids) = self.consumed.snapshot();
+        if !node_value_ids.iter().eq(self.node_value.keys())
+            || !predicate_ids.iter().eq(self.predicate.keys())
+        {
+            return Err(invalid(
+                "term-less resolution witness carries openings the verifier did not consume",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `true` for a prover-side oracle carrier (never shippable).
+    pub(crate) fn is_oracle(&self) -> bool {
+        self.oracle.is_some()
     }
 
     /// Insert a node/value opening (keyed by its own id). Prover/wire constructor. Merkle-dict

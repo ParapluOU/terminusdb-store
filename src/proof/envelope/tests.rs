@@ -3856,7 +3856,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
             lref.iter().map(|l| l.verifier_view()).collect();
         let other_id = super::reconciled::resolve_combined_node_id(&bearing_views, iri("cell1").as_bytes());
         let forged = crate::proof::commitment::build_resolution_openings(&bearing_views, &[other_id], &[]).unwrap();
-        let forged_opening = forged.node_value_opening(other_id).unwrap().clone();
+        let forged_opening = forged.node_value_opening(other_id).unwrap().into_owned();
         let mut forged_proof = proof.clone();
         forged_proof.seed_opening = Some(forged_opening);
         assert!(
@@ -4420,7 +4420,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         // (ii) FORGED nil opening for a NON-nil real id (`a`) -> the belt-hash rejects the terminator.
         let forged = crate::proof::commitment::build_resolution_openings(&bearing_views, &[a_id], &[])
             .unwrap();
-        let forged_nil = forged.node_value_opening(a_id).unwrap().clone();
+        let forged_nil = forged.node_value_opening(a_id).unwrap().into_owned();
         let mut forged_proof = proof.clone();
         forged_proof.nil_opening = Some(forged_nil);
         assert!(
@@ -5145,7 +5145,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
         // term does not hash to hash_object(Node(sys:Array)) -> type-check bypass blocked).
         let forged = crate::proof::commitment::build_resolution_openings(&bearing_views, &[cell_id], &[])
             .unwrap();
-        let forged_sa = forged.node_value_opening(cell_id).unwrap().clone();
+        let forged_sa = forged.node_value_opening(cell_id).unwrap().into_owned();
         let mut forged_proof = proof.clone();
         forged_proof.sys_array_opening = Some(forged_sa);
         assert!(
@@ -5770,7 +5770,7 @@ use crate::proof::{CanonicalDatatype, CanonicalObject, ProofHash};
             let mut p = proof.clone();
             let mut op = p.value_openings.clone().unwrap();
             let vid = p.value_ids[0];
-            let mut tampered = op.node_value_opening(vid).unwrap().clone();
+            let mut tampered = op.node_value_opening(vid).unwrap().into_owned();
             tampered.term_bytes = iri("EVIL-FORGED").into_bytes();
             op.insert_node_value(tampered);
             p.value_openings = Some(op);

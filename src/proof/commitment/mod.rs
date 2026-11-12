@@ -167,6 +167,8 @@ pub use dict_merkle::{DictOpening, ResolutionOpenings};
 // term-less producer mints openings; the anti-forge coupling is S4's mandatory belt-hash, not a
 // compile-time gate).
 pub(crate) use dict_merkle::build_resolution_openings;
+// The single-layer term-less envelope's carried witness: one-carrier selection + the layer wrapper.
+pub(crate) use state::{effective_openings, TermlessWithOpenings};
 pub(crate) use legacy::decode_legacy_v3;
 pub(crate) use setup::{
     construction_commitment_scratch_bytes, matrix_dims, prover_setup, setup_parameter_id,

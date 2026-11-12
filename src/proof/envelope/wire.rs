@@ -1079,6 +1079,10 @@ wire_struct!(DictOpening {
 // trusted root.
 impl Wire for ResolutionOpenings {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        // A prover-side oracle opens lazily; only its minted `consumed_witness` is shippable.
+        if self.is_oracle() {
+            return Err(invalid("a resolution-openings oracle is not a shippable witness"));
+        }
         let nv: Vec<&DictOpening> = self.node_value_openings().collect();
         let pred: Vec<&DictOpening> = self.predicate_openings().collect();
         if nv.len() > MAX_ITEMS || pred.len() > MAX_ITEMS {

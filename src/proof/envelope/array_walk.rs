@@ -1901,7 +1901,7 @@ pub fn attach_termless_array_walk_openings(
     proof.value_openings = Some(build_resolution_openings(&views, value_ids, &[])?);
     // The single sys:Array class opening (routed to its introducing layer, opened positionally).
     let sys_array_openings = build_resolution_openings(&views, &[sys_array_id], &[])?;
-    proof.sys_array_opening = Some(sys_array_openings.node_value_opening(sys_array_id)?.clone());
+    proof.sys_array_opening = Some(sys_array_openings.node_value_opening(sys_array_id)?.into_owned());
     // The C2a index value re-pin witness: the per-cell index id column + openings over its distinct
     // non-zero ids (same builder the present-range arm uses for its object column).
     let index_column: Vec<ArkFr> = index_ids.iter().map(|id| ArkFr::from_u64(*id)).collect();

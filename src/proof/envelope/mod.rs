@@ -81,6 +81,7 @@ mod list_walk;
 mod plan;
 mod reconciled;
 mod recursive;
+mod termless;
 mod wire;
 
 // ---------------------------------------------------------------------------
@@ -102,6 +103,8 @@ pub use plan::{
 };
 
 pub use layer_bgp::LayerBgpEnvelope;
+// The single-layer TERM-LESS recursive envelope (O(result) witness beside the O(1) commitment).
+pub use termless::{require_termless_plan, TermlessRelationEnvelope};
 pub use bag_union::BagUnionEnvelope;
 pub use left_anti::LeftAntiJoinEnvelope;
 pub use left_outer::LeftOuterJoinEnvelope;
@@ -149,3 +152,6 @@ pub use array_walk::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod termless_tests;

@@ -87,6 +87,7 @@ fn resolve_node_value_result_objects_impl(
     columns: &[Vec<ArkFr>],
     openings: Option<&ResolutionOpenings>,
 ) -> io::Result<Vec<Vec<CanonicalObject>>> {
+    let openings = crate::proof::commitment::effective_openings(source, openings)?;
     let layer = source.verifier_view();
     if layer.resolution_root() != trusted_resolution_root {
         return Err(invalid(
@@ -178,17 +179,19 @@ pub(crate) fn resolve_node_value_id_via_merkle(
 ) -> io::Result<CanonicalObject> {
     let raw = canonical_dictionary_id(id)?;
     let rebuilt;
+    let shipped;
     let opening: &DictOpening = if layer.terms_present {
         let tree = tree
             .ok_or_else(|| invalid("node/value merkle tree unavailable for resolution"))?;
         rebuilt = tree.open(raw)?;
         &rebuilt
     } else {
-        openings
+        shipped = openings
             .ok_or_else(|| {
                 invalid("term-less node/value resolution requires prover-shipped Merkle openings")
             })?
-            .node_value_opening(raw)?
+            .node_value_opening(raw)?;
+        &shipped
     };
     verify_opening(
         &layer.nv_merkle_root,
@@ -324,17 +327,19 @@ fn resolve_predicate_id_via_merkle(
 ) -> io::Result<CanonicalObject> {
     let raw = canonical_dictionary_id(id)?;
     let rebuilt;
+    let shipped;
     let opening: &DictOpening = if layer.terms_present {
         let tree = tree
             .ok_or_else(|| invalid("predicate merkle tree unavailable for resolution"))?;
         rebuilt = tree.open(raw)?;
         &rebuilt
     } else {
-        openings
+        shipped = openings
             .ok_or_else(|| {
                 invalid("term-less predicate resolution requires prover-shipped Merkle openings")
             })?
-            .predicate_opening(raw)?
+            .predicate_opening(raw)?;
+        &shipped
     };
     verify_opening(
         &layer.pred_merkle_root,
@@ -445,6 +450,9 @@ fn resolve_result_values_impl(
     descriptors: &[ResultColumnDescriptor],
     openings: Option<&ResolutionOpenings>,
 ) -> io::Result<Vec<Vec<CanonicalResultValue>>> {
+    // One witness carrier: a proof-embedded `openings` or the layer-carried term-less envelope
+    // witness (`None` for every ordinary layer, so the existing paths are unchanged).
+    let openings = crate::proof::commitment::effective_openings(source, openings)?;
     let layer = source.verifier_view();
     if columns.len() != descriptors.len() {
         return Err(invalid("result column descriptor shape mismatch"));

@@ -1742,7 +1742,7 @@ pub fn attach_termless_list_walk_openings(
     proof.element_openings = Some(build_resolution_openings(&views, element_ids, &[])?);
     // The single rdf:nil opening (routed to its introducing layer, opened positionally).
     let nil_openings = build_resolution_openings(&views, &[nil_id], &[])?;
-    proof.nil_opening = Some(nil_openings.node_value_opening(nil_id)?.clone());
+    proof.nil_opening = Some(nil_openings.node_value_opening(nil_id)?.into_owned());
 
     // C4 fully-term-less RENDER belt over the delivered element ids: a root-bound `id → hash` lookup
     // (against the reconciliation's combined dict) so a chain whose head AND ancestors are ALL

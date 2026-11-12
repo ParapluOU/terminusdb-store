@@ -512,7 +512,9 @@ pub fn verify_layer_bgp(
         result_coms,
         m,
         proof,
-        proof.openings.as_ref(),
+        // One witness carrier: the proof-embedded openings, or the term-less envelope's
+        // layer-carried witness (both present fails closed).
+        crate::proof::commitment::effective_openings(source, proof.openings.as_ref())?,
     )
 }
 
@@ -926,7 +928,7 @@ fn belt_hash_node_value_constant(
         layer.state.parent_node_value_count,
         layer.state.node_value_count,
         id,
-        opening,
+        &opening,
     )?;
     if hash_object(&opened) != hash_object(constant) {
         return Err(invalid(
@@ -960,7 +962,7 @@ fn belt_hash_predicate_constant(
         layer.state.parent_predicate_count,
         layer.state.predicate_count,
         id,
-        opening,
+        &opening,
     )?;
     let iri = match &opened {
         CanonicalObject::Node(bytes) => bytes.as_slice(),

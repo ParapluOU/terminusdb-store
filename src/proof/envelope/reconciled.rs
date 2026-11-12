@@ -475,7 +475,7 @@ pub fn attach_termless_closure_openings(
     // The prover holds term-bearing catalogs: resolve the seed by the scan, then open it.
     let seed_id = resolve_combined_node_id(&views, seed_iri);
     let seed_openings = build_resolution_openings(&views, &[seed_id], &[])?;
-    proof.seed_opening = Some(seed_openings.node_value_opening(seed_id)?.clone());
+    proof.seed_opening = Some(seed_openings.node_value_opening(seed_id)?.into_owned());
     proof.reachable_openings = Some(build_resolution_openings(&views, reachable_ids, &[])?);
     Ok(())
 }

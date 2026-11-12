@@ -2651,6 +2651,33 @@ impl RecursiveRelationEnvelope {
                 }
                 let view = layer.verifier_view();
                 let resolve_id = |field: ArkFr, namespace: ResultIdNamespace| -> io::Result<u64> {
+                    // TERM-LESS view (no catalog): a base layer's ids are exactly the dense
+                    // interval `(parent, count]` the catalog scan below finds (catalog validation
+                    // enforces that bijection), so check the interval instead; the node-end
+                    // resolution then authenticates every delivered id by a Merkle opening
+                    // against the root-bound root.
+                    if !view.terms_present {
+                        let (parent, count) = match namespace {
+                            ResultIdNamespace::Predicate => {
+                                (view.state.parent_predicate_count, view.state.predicate_count)
+                            }
+                            ResultIdNamespace::NodeValue => (
+                                view.state.parent_node_value_count,
+                                view.state.node_value_count,
+                            ),
+                            ResultIdNamespace::GeneratedDecimalU64
+                            | ResultIdNamespace::GeneratedDecimalI64 => {
+                                return Err(invalid("distinct output id absent from planned namespace"))
+                            }
+                        };
+                        let id = generated_decimal_u64_value(field)
+                            .map_err(|_| invalid("distinct output id absent from planned namespace"))?;
+                        return if id > parent && id <= count {
+                            Ok(id)
+                        } else {
+                            Err(invalid("distinct output id absent from planned namespace"))
+                        };
+                    }
                     match namespace {
                         ResultIdNamespace::Predicate => view
                             .predicate_catalog

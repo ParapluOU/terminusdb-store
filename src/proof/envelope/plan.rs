@@ -611,6 +611,10 @@ pub fn resolve_relation_equality_constraint(
     let layer = source.verifier_view();
     match constraint {
         RelationEqualityPlan::ColumnConstant { column, value, .. } => {
+            // A constant is mapped to its id by a catalog SCAN, and an absent constant maps to an
+            // impossible id. A TERM-LESS view has an empty catalog, so every constant would look
+            // absent (equality under-reports, a disequality over-reports) — fail closed.
+            layer.require_terms_present("equality against a constant (catalog term->id lookup)")?;
             layer.validate()?;
             let id = layer
                 .node_value_catalog
@@ -726,6 +730,21 @@ pub fn resolve_tuple_disequality_pairs(
     pairs: &[TupleDisequalityPairPlan],
 ) -> io::Result<Vec<DisequalityPair>> {
     let layer = source.verifier_view();
+    // Constant node IRIs resolve by a catalog SCAN (absent => impossible id). A TERM-LESS view has
+    // an empty catalog, so a present constant would read as absent — fail closed when any is used.
+    let has_constant = pairs.iter().any(|pair| {
+        let mut nodes = vec![&pair.a0, &pair.a1, &pair.b0, &pair.b1];
+        if let Some((left, right)) = &pair.predicate {
+            nodes.push(left);
+            nodes.push(right);
+        }
+        nodes
+            .into_iter()
+            .any(|node| matches!(node, TupleDisequalityNode::Constant(_)))
+    });
+    if has_constant {
+        layer.require_terms_present("tuple disequality against a constant (catalog term->id lookup)")?;
+    }
     layer.validate()?;
     let resolve = |node: &TupleDisequalityNode| -> DisequalityNode {
         match node {
