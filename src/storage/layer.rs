@@ -38,6 +38,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use async_trait::async_trait;
 
+/// The depth the fork once capped every layer-chain walk at (bb363e4). Walks are no longer
+/// capped — cycle detection alone guarantees they end, as upstream's walks do without either —
+/// because the system graph gains a layer per database create or delete and grows past any
+/// fixed depth. Kept as the depth tests go beyond to show long chains load.
 pub const MAX_LAYER_CHAIN_DEPTH: usize = 1024;
 
 /// Version line of a rollup record written without id validation (also what
@@ -129,12 +133,6 @@ macro_rules! walk_backwards_from_disk {
                     "cycle in layer parent chain",
                 ));
             }
-            if seen.len() > $crate::storage::layer::MAX_LAYER_CHAIN_DEPTH {
-                break Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "layer parent chain exceeds depth limit",
-                ));
-            }
             $body
 
             if let Some(parent) = $store.get_layer_parent_name($current).await? {
@@ -160,12 +158,6 @@ macro_rules! walk_backwards_from_disk_upto {
                 break Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "cycle in layer parent chain",
-                ));
-            }
-            if seen.len() > $crate::storage::layer::MAX_LAYER_CHAIN_DEPTH {
-                break Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "layer parent chain exceeds depth limit",
                 ));
             }
 
@@ -2083,12 +2075,6 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                     "cycle in layer or rollup chain",
                 ));
             }
-            if visited.len() > MAX_LAYER_CHAIN_DEPTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "layer or rollup chain exceeds depth limit",
-                ));
-            }
 
             match cache.get_layer_from_cache(current_layer) {
                 Some(layer) => {
@@ -2232,12 +2218,6 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "cycle in unrolled layer ancestry",
-                ));
-            }
-            if visited.len() > MAX_LAYER_CHAIN_DEPTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unrolled layer ancestry exceeds depth limit",
                 ));
             }
             names.push(current);
@@ -3172,12 +3152,6 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                     "cycle in layer ancestry",
                 ));
             }
-            if visited.len() > MAX_LAYER_CHAIN_DEPTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "layer ancestry exceeds depth limit",
-                ));
-            }
             if ancestor == descendant {
                 return Ok(true);
             }
@@ -3460,12 +3434,6 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                         "cycle in layer parent chain",
                     ));
                 }
-                if seen.len() > MAX_LAYER_CHAIN_DEPTH {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "layer parent chain exceeds depth limit",
-                    ));
-                }
                 result.push(parent);
             } else {
                 result.reverse();
@@ -3499,12 +3467,6 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "cycle in layer parent chain",
-                    ));
-                }
-                if seen.len() > MAX_LAYER_CHAIN_DEPTH {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "layer parent chain exceeds depth limit",
                     ));
                 }
                 result.push(parent);
@@ -5135,7 +5097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn layer_name_traversal_rejects_depth_before_unbounded_growth() {
+    async fn layer_name_traversal_walks_a_chain_deeper_than_the_old_cap() {
         let store = MemoryLayerStore::new();
         let ids: Vec<_> = (0..=MAX_LAYER_CHAIN_DEPTH)
             .map(|position| [3, 0, 0, 0, position as u32])
@@ -5146,14 +5108,9 @@ mod tests {
         for pair in ids.windows(2) {
             store.write_parent_file(pair[0], pair[1]).await.unwrap();
         }
-        assert_eq!(
-            io::ErrorKind::InvalidData,
-            store
-                .retrieve_layer_stack_names(ids[0])
-                .await
-                .unwrap_err()
-                .kind()
-        );
+        let names = store.retrieve_layer_stack_names(ids[0]).await.unwrap();
+        assert_eq!(names.len(), ids.len(), "every layer of the chain, base first");
+        assert_eq!(names.first(), ids.last());
     }
 
     async fn fault_store_chain() -> (
