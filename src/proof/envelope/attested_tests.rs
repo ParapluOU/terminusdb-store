@@ -417,3 +417,53 @@ fn attested_nan_guard_reads_the_root_facts() {
         let _ = ArkFr::zero();
     });
 }
+
+/// The TRUST BOUNDARY of `Attested`: it relies on the root's well-formedness completely and
+/// checks none of it. A malformed root — here a term-sorted index that maps key(a) to id(b) —
+/// makes `?x knows ?y, ?x == a` verify with the rows of `b` under `Attested`, only because the
+/// caller vouches for that root; the same artifact rejects under `Bare`. This is why the only
+/// roots verified as attested are the ledger's (`LedgerAttestedRoot`), recorded only after a
+/// k-of-n quorum of staked supernodes recomputed them (catalog-write / admission acks).
+#[test]
+fn attested_trusts_the_root_it_is_given_and_bare_does_not() {
+    big_stack("attested-trust-boundary", || {
+        let base = layer("", 0);
+        let id_of = |name: &str| {
+            base.node_value_catalog
+                .iter()
+                .find(|r| r.triple.object == CanonicalObject::Node(iri(name).into_bytes()))
+                .unwrap()
+                .object_id
+        };
+        let (id_a, id_b) = (id_of("a"), id_of("b"));
+        // Forged sorted index: a and b swap ids.
+        let mut forged_catalog = base.node_value_catalog.clone();
+        for r in forged_catalog.iter_mut() {
+            if r.object_id == id_a { r.object_id = id_b } else if r.object_id == id_b { r.object_id = id_a }
+        }
+        let forged_tree = crate::proof::commitment::SortedIndexTree::node_value(&forged_catalog).unwrap();
+        let mut commitment = base.verifier_commitment_termless().unwrap();
+        commitment.dict_index.as_mut().unwrap().nv_sorted_root = forged_tree.root();
+        commitment.validate().unwrap();
+        let forged_root = commitment.resolution_root();
+        // Honest proof of `?x == b`, re-keyed as a lookup of `a`.
+        let honest_b = Attested::new(base.clone(), equality_plan("b"));
+        let key_a = node_value_sort_key(&CanonicalObject::Node(iri("a").into_bytes()));
+        let key_b = node_value_sort_key(&CanonicalObject::Node(iri("b").into_bytes()));
+        let forged = honest_b.with_sorted(|m| {
+            m.remove(&(SortedNamespace::NodeValue, key_b)).unwrap();
+            m.insert((SortedNamespace::NodeValue, key_a), forged_tree.lookup(&key_a));
+        });
+        // Round-trip through bytes like a remote verifier.
+        let forged = TermlessRelationEnvelope::decode(&forged.encode().unwrap()).unwrap();
+        let commitment = VerifierCommitment::decode(&commitment.encode().unwrap()).unwrap();
+        let plan_a = equality_plan("a");
+        // Honest answer for ?x == a is the single row (a, b); the accepted one is (b, c): a
+        // malformed root the caller vouches for is believed.
+        forged
+            .verify(&commitment, TrustedRoot::Attested(forged_root), &plan_a)
+            .expect("Attested believes the root it is given, malformed or not");
+        // Under Bare the same artifact rejects.
+        assert!(forged.verify(&commitment, TrustedRoot::Bare(forged_root), &plan_a).is_err());
+    });
+}
