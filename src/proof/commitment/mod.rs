@@ -108,7 +108,10 @@ const VERIFIER_COMMITMENT_MAGIC: &[u8; 8] = b"TSPCV0\0\0";
 /// On-disk format tag for the compact verifier-only [`VerifierCommitment`]
 /// artifact. Bumped in lockstep with the prover format; decoding rejects any
 /// other value. See the version-history comment above for each bump.
-pub const VERIFIER_COMMITMENT_FORMAT_VERSION: u32 = 4;
+// Bumped 4 → 5 (result-sized proofs): a BASE artifact carries its dictionary facts byte and the
+// two term-sorted index roots after the Merkle roots, and anchors with `resolution_root` v2. The
+// `commitment_root` DOMAIN/STRUCTURE is unchanged.
+pub const VERIFIER_COMMITMENT_FORMAT_VERSION: u32 = 5;
 
 /// Number of committed columns per layer: additions (S,P,O) then removals
 /// (S,P,O), in that fixed order.
@@ -130,6 +133,7 @@ const MAX_SETUP_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 mod catalog;
 mod columns;
+mod dict_index;
 mod dict_merkle;
 mod legacy;
 mod op_value;
@@ -147,7 +151,12 @@ pub use state::{
     CommitmentState, LayerCommitment, VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
 };
 pub use root::{database_root, validate_database_root};
-pub use dict_merkle::resolution_root;
+pub use dict_merkle::{resolution_root, resolution_root_v2};
+pub use dict_index::{
+    node_value_sort_key, predicate_sort_key, DictFacts, DictIndex, SortedLeaf, SortedLeafOpening,
+    SortedLookup, SortedNamespace,
+};
+pub(crate) use dict_index::{verify_sorted_lookup, SortedIndexTree};
 pub use op_value::{node_value_op_value, NODE_DATATYPE_TAG};
 
 // Crate-internal surface (sibling proof modules + storage plumbing, and the
@@ -168,7 +177,10 @@ pub use dict_merkle::{DictOpening, ResolutionOpenings};
 // compile-time gate).
 pub(crate) use dict_merkle::build_resolution_openings;
 // The single-layer term-less envelope's carried witness: one-carrier selection + the layer wrapper.
-pub(crate) use state::{effective_openings, TermlessWithOpenings};
+pub(crate) use state::{
+    effective_openings, node_value_id_term, node_value_term_id, predicate_term_id,
+    TermlessWithOpenings,
+};
 pub(crate) use legacy::decode_legacy_v3;
 pub(crate) use setup::{
     construction_commitment_scratch_bytes, matrix_dims, prover_setup, setup_parameter_id,

@@ -7,6 +7,7 @@ use super::plan::{RelationEqualityPlan, RelationProofPlan, RelationProofPlanKind
 use super::recursive::RecursiveRelationEnvelope;
 use super::termless::{
     require_termless_plan, single_layer_envelope_form, SingleLayerEnvelopeForm, TermlessRelationEnvelope,
+    TrustedRoot,
     TERMLESS_TREE_MAGIC, TERMLESS_TREE_VERSION,
 };
 use super::wire::{plan_digest, Wire, CHECKSUM_BYTES};
@@ -124,7 +125,7 @@ fn fixture(layer: LayerCommitment, plan: RelationProofPlan) -> Fixture {
     let term_bearing = RecursiveRelationEnvelope::prove(&layer, &plan).unwrap();
     term_bearing.verify(&layer, layer.state.commitment_root, &plan).unwrap();
     let termless =
-        TermlessRelationEnvelope::from_envelope(term_bearing.clone(), &layer, &plan).unwrap();
+        TermlessRelationEnvelope::from_envelope(term_bearing.clone(), &layer, &plan, TrustedRoot::Bare(layer.resolution_root())).unwrap();
     let commitment = layer.verifier_commitment_termless().unwrap();
     Fixture { layer, plan, term_bearing, termless, commitment }
 }
@@ -138,7 +139,7 @@ impl Fixture {
         let commitment = crate::proof::commitment::VerifierCommitment::decode(
             &self.commitment.encode().unwrap(),
         )?;
-        TermlessRelationEnvelope::decode(bytes)?.verify(&commitment, self.root(), &self.plan)
+        TermlessRelationEnvelope::decode(bytes)?.verify(&commitment, TrustedRoot::Bare(self.root()), &self.plan)
     }
     fn with_openings(&self, nv: Vec<DictOpening>, pred: Vec<DictOpening>) -> TermlessRelationEnvelope {
         TermlessRelationEnvelope {
@@ -164,6 +165,8 @@ fn frame(envelope: &RecursiveRelationEnvelope, nv: &[DictOpening], pred: &[DictO
     envelope.put_bounded(&mut out, 1, &mut nodes).unwrap();
     nv.to_vec().put(&mut out).unwrap();
     pred.to_vec().put(&mut out).unwrap();
+    // v2: no term-sorted index lookups.
+    0usize.put(&mut out).unwrap();
     let checksum = Sha256::digest(&out);
     out.extend_from_slice(&checksum);
     out
@@ -181,8 +184,8 @@ fn termless_envelope_roundtrips_and_matches_term_bearing_results() {
             assert_eq!(decoded.envelope.result_values, f.term_bearing.result_values);
             assert!(!decoded.envelope.result_values.is_empty());
             // A verified envelope verifies again (the consumption record is per verification).
-            decoded.verify(&f.commitment, f.root(), &f.plan).unwrap();
-            decoded.verify(&f.commitment, f.root(), &f.plan).unwrap();
+            decoded.verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).unwrap();
+            decoded.verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).unwrap();
         }
     });
 }
@@ -224,25 +227,25 @@ fn termless_rejects_forged_and_foreign_openings() {
         let mut nv = f.nv();
         let other = nv[1].term_bytes.clone();
         nv[0].term_bytes = other;
-        assert!(f.with_openings(nv, f.pred()).verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(f.with_openings(nv, f.pred()).verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // (b) Wrong id for a correct term: relabel opening 0 with an unused id.
         let mut nv = f.nv();
         let free = (1..=f.layer.state.node_value_count)
             .find(|id| nv.iter().all(|o| o.id != *id))
             .unwrap();
         nv[0].id = free;
-        assert!(f.with_openings(nv, f.pred()).verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(f.with_openings(nv, f.pred()).verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // (c) Openings against another root: the same query over a different catalog (same ids,
         //     different terms) — every opening is honest for ITS tree, none for this root.
         let foreign = fixture(layer_with("B_", 3), join_plan());
         assert_eq!(foreign.nv().iter().map(|o| o.id).collect::<Vec<_>>(), f.nv().iter().map(|o| o.id).collect::<Vec<_>>());
-        assert!(f.with_openings(foreign.nv(), foreign.pred()).verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(f.with_openings(foreign.nv(), foreign.pred()).verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // Predicate opening forged (the predicate IRI is shared, so swap in a node opening's term).
         let mut pred = f.pred();
         pred[0].term_bytes = f.nv()[0].term_bytes.clone();
-        assert!(f.with_openings(f.nv(), pred).verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(f.with_openings(f.nv(), pred).verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // The honest witness still verifies (the mutations above were the only difference).
-        f.with_openings(f.nv(), f.pred()).verify(&f.commitment, f.root(), &f.plan).unwrap();
+        f.with_openings(f.nv(), f.pred()).verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).unwrap();
     });
 }
 
@@ -254,11 +257,11 @@ fn termless_rejects_dropped_extra_and_duplicated_openings() {
         for i in 0..f.nv().len() {
             let mut nv = f.nv();
             nv.remove(i);
-            assert!(f.with_openings(nv, f.pred()).verify(&f.commitment, f.root(), &f.plan).is_err());
+            assert!(f.with_openings(nv, f.pred()).verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         }
-        assert!(f.with_openings(f.nv(), Vec::new()).verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(f.with_openings(f.nv(), Vec::new()).verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // Stripped entirely.
-        assert!(f.with_openings(Vec::new(), Vec::new()).verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(f.with_openings(Vec::new(), Vec::new()).verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // Extra: an HONEST opening for an id the statement never resolves.
         let oracle = ResolutionOpenings::oracle(f.layer.verifier_view()).unwrap();
         let unused = (1..=f.layer.state.node_value_count)
@@ -268,7 +271,7 @@ fn termless_rejects_dropped_extra_and_duplicated_openings() {
         let mut nv = f.nv();
         nv.push(extra);
         let padded = f.with_openings(nv.clone(), f.pred());
-        assert!(padded.verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(padded.verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         assert!(f.verify_bytes(&padded.encode().unwrap()).is_err());
         // Duplicated: the same id twice in the wire list is malformed at decode.
         let mut dup = f.nv();
@@ -311,16 +314,16 @@ fn termless_rejects_swapped_rows_and_tampered_terms() {
         for column in swapped.envelope.result_values.iter_mut() {
             column.swap(0, 1);
         }
-        assert!(swapped.verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(swapped.verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // Swap only the delivered TERMS (ids intact): the opened terms disagree.
         let mut terms = f.termless.clone();
         terms.envelope.result_values[1].swap(0, 1);
-        assert!(terms.verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(terms.verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // Replace a delivered term with an attacker term.
         let mut evil = f.termless.clone();
         evil.envelope.result_values[0][0] =
             CanonicalResultValue::Object(CanonicalObject::Node(iri("Evil").into_bytes()));
-        assert!(evil.verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(evil.verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
     });
 }
 
@@ -331,16 +334,16 @@ fn termless_rejects_wrong_commitment_root_and_carrier() {
         // A term-BEARING commitment substituted for the term-less one.
         let term_bearing = f.layer.verifier_commitment().unwrap();
         assert!(term_bearing.terms_present);
-        assert!(f.termless.verify(&term_bearing, f.root(), &f.plan).is_err());
+        assert!(f.termless.verify(&term_bearing, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // Another layer's term-less commitment (and its own root).
         let other = layer_with("B_", 3);
         let other_commitment = other.verifier_commitment_termless().unwrap();
-        assert!(f.termless.verify(&other_commitment, other.resolution_root(), &f.plan).is_err());
-        assert!(f.termless.verify(&other_commitment, f.root(), &f.plan).is_err());
+        assert!(f.termless.verify(&other_commitment, TrustedRoot::Bare(other.resolution_root()), &f.plan).is_err());
+        assert!(f.termless.verify(&other_commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // The right commitment, the wrong trusted root.
-        assert!(f.termless.verify(&f.commitment, other.resolution_root(), &f.plan).is_err());
+        assert!(f.termless.verify(&f.commitment, TrustedRoot::Bare(other.resolution_root()), &f.plan).is_err());
         // A different plan (anti-substitution).
-        assert!(f.termless.verify(&f.commitment, f.root(), &constant_plan("A_")).is_err());
+        assert!(f.termless.verify(&f.commitment, TrustedRoot::Bare(f.root()), &constant_plan("A_")).is_err());
         // Two carriers: a leaf that ALSO embeds the openings.
         let mut double = f.termless.clone();
         if let super::recursive::RecursiveRelationProof::Bgp(leaf) = &mut double.envelope.proof {
@@ -348,7 +351,7 @@ fn termless_rejects_wrong_commitment_root_and_carrier() {
         } else {
             panic!("single plan proves a Bgp leaf");
         }
-        assert!(double.verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(double.verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
         // A term-less commitment fed to the TERM-BEARING envelope path still fails closed.
         assert!(f.term_bearing.verify(&f.commitment, f.layer.state.commitment_root, &f.plan).is_err());
         // An oracle carrier is never encodable or acceptable as a witness.
@@ -356,7 +359,7 @@ fn termless_rejects_wrong_commitment_root_and_carrier() {
         let mut out = Vec::new();
         assert!(oracle.put(&mut out).is_err());
         let with_oracle = TermlessRelationEnvelope { envelope: f.termless.envelope.clone(), openings: oracle };
-        assert!(with_oracle.verify(&f.commitment, f.root(), &f.plan).is_err());
+        assert!(with_oracle.verify(&f.commitment, TrustedRoot::Bare(f.root()), &f.plan).is_err());
     });
 }
 

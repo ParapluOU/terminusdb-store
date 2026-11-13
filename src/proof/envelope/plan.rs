@@ -614,13 +614,11 @@ pub fn resolve_relation_equality_constraint(
             // A constant is mapped to its id by a catalog SCAN, and an absent constant maps to an
             // impossible id. A TERM-LESS view has an empty catalog, so every constant would look
             // absent (equality under-reports, a disequality over-reports) — fail closed.
-            layer.require_terms_present("equality against a constant (catalog term->id lookup)")?;
+            // ATTESTED term-less: the id comes from the term-sorted index (membership, or a proven
+            // absence mapping to the same impossible id), opened for the verifier-computed key.
+            layer.require_terms_or_attested("equality against a constant (catalog term->id lookup)")?;
             layer.validate()?;
-            let id = layer
-                .node_value_catalog
-                .iter()
-                .find(|record| &record.triple.object == value)
-                .map(|record| record.object_id)
+            let id = crate::proof::commitment::node_value_term_id(source, value)?
                 .unwrap_or_else(|| layer.state.node_value_count.saturating_add(1));
             Ok(RelationEqualityConstraint::ColumnConstant {
                 column: *column,
@@ -743,35 +741,31 @@ pub fn resolve_tuple_disequality_pairs(
             .any(|node| matches!(node, TupleDisequalityNode::Constant(_)))
     });
     if has_constant {
-        layer.require_terms_present("tuple disequality against a constant (catalog term->id lookup)")?;
+        // ATTESTED term-less: constants resolve through the term-sorted index (see
+        // `resolve_relation_equality_constraint`).
+        layer.require_terms_or_attested(
+            "tuple disequality against a constant (catalog term->id lookup)",
+        )?;
     }
     layer.validate()?;
-    let resolve = |node: &TupleDisequalityNode| -> DisequalityNode {
-        match node {
+    let resolve = |node: &TupleDisequalityNode| -> io::Result<DisequalityNode> {
+        Ok(match node {
             TupleDisequalityNode::Column(column) => DisequalityNode::Column(*column),
             TupleDisequalityNode::Constant(value) => {
-                let id = layer
-                    .node_value_catalog
-                    .iter()
-                    .find(|record| &record.triple.object == value)
-                    .map(|record| record.object_id)
+                let id = crate::proof::commitment::node_value_term_id(source, value)?
                     .unwrap_or_else(|| layer.state.node_value_count.saturating_add(1));
                 DisequalityNode::Constant(ArkFr::from_u64(id))
             }
-        }
+        })
     };
     // A full-triple predicate position: a column carries verbatim; a predicate-IRI constant resolves
     // through the PREDICATE dictionary (a not-present predicate maps to `predicate_count + 1` — an
     // impossible id → fail-closed), mirroring `resolve` over the node/value dictionary.
-    let resolve_predicate = |node: &TupleDisequalityNode| -> DisequalityNode {
-        match node {
+    let resolve_predicate = |node: &TupleDisequalityNode| -> io::Result<DisequalityNode> {
+        Ok(match node {
             TupleDisequalityNode::Column(column) => DisequalityNode::Column(*column),
             TupleDisequalityNode::Constant(CanonicalObject::Node(iri)) => {
-                let id = layer
-                    .predicate_catalog
-                    .iter()
-                    .find(|record| &record.triple.predicate == iri)
-                    .map(|record| record.predicate_id)
+                let id = crate::proof::commitment::predicate_term_id(source, iri)?
                     .unwrap_or_else(|| layer.state.predicate_count.saturating_add(1));
                 DisequalityNode::Constant(ArkFr::from_u64(id))
             }
@@ -780,21 +774,26 @@ pub fn resolve_tuple_disequality_pairs(
             TupleDisequalityNode::Constant(_) => {
                 DisequalityNode::Constant(ArkFr::from_u64(layer.state.predicate_count.saturating_add(1)))
             }
-        }
-    };
-    Ok(pairs
-        .iter()
-        .map(|pair| DisequalityPair {
-            a0: resolve(&pair.a0),
-            a1: resolve(&pair.a1),
-            b0: resolve(&pair.b0),
-            b1: resolve(&pair.b1),
-            predicate: pair
-                .predicate
-                .as_ref()
-                .map(|(pa, pb)| (resolve_predicate(pa), resolve_predicate(pb))),
         })
-        .collect())
+    };
+    pairs
+        .iter()
+        .map(|pair| {
+            Ok(DisequalityPair {
+                a0: resolve(&pair.a0)?,
+                a1: resolve(&pair.a1)?,
+                b0: resolve(&pair.b0)?,
+                b1: resolve(&pair.b1)?,
+                predicate: pair
+                    .predicate
+                    .as_ref()
+                    .map(|(pa, pb)| -> io::Result<_> {
+                        Ok((resolve_predicate(pa)?, resolve_predicate(pb)?))
+                    })
+                    .transpose()?,
+            })
+        })
+        .collect()
 }
 
 impl RelationProofPlan {

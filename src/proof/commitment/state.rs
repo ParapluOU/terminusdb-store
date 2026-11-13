@@ -130,6 +130,11 @@ pub struct LayerCommitment {
     /// Root of the id-indexed SHA-256 Merkle tree over `predicate_catalog`
     /// (separate id namespace). Same additive discipline as `nv_merkle_root`.
     pub pred_merkle_root: ProofHash,
+    /// BASE/ROLLUP/SQUASH layers only (`None` on a delta): the whole-dictionary facts and the two
+    /// term-sorted index roots (`super::dict_index`). A deterministic function of the complete
+    /// catalogs — computed at build/decode (never persisted in the sidecar), re-checked by
+    /// `validate`, NOT folded into `commitment_root`; bound by `resolution_root` v2.
+    pub dict_index: Option<DictIndex>,
 }
 
 /// Compact, verifier-only projection of a validated PF4 v4 layer commitment.
@@ -174,6 +179,11 @@ pub struct VerifierCommitment {
     /// [`LayerCommitment::nv_merkle_root`].
     pub nv_merkle_root: ProofHash,
     pub pred_merkle_root: ProofHash,
+    /// Facts + term-sorted index roots of a BASE layer (`None` on a delta); see
+    /// [`LayerCommitment::dict_index`]. Carried by both framings; a term-bearing artifact
+    /// recomputes it from its catalogs in `validate`, a term-less one is bound only through
+    /// `resolution_root` v2.
+    pub dict_index: Option<DictIndex>,
 }
 
 /// Borrowed verifier view shared by full PF4 sidecars and compact artifacts.
@@ -196,6 +206,18 @@ pub struct VerifierCommitmentRef<'a> {
     /// are carried by value, keeping the view `Copy`.
     pub nv_merkle_root: ProofHash,
     pub pred_merkle_root: ProofHash,
+    /// Facts + term-sorted index roots (base layers only); see [`LayerCommitment::dict_index`].
+    pub dict_index: Option<DictIndex>,
+    /// TRUST MODE of this verification: `true` only when the caller vouched for the
+    /// WELL-FORMEDNESS of the trusted root this view is anchored to
+    /// ([`TrustedRoot::Attested`](crate::proof::envelope::TrustedRoot) — a root the validators
+    /// recomputed from the data). Then every root-bound commitment is the canonical function of
+    /// the root-bound terms (the value/datatype columns are authentic), the facts are true, and
+    /// the sorted index is sorted and agrees with the id-indexed trees — so a TERM-LESS view may
+    /// answer value-, fact- and term-lookup-reading statements without the clear catalogs. Never
+    /// set by decoding an artifact: every artifact/sidecar view is `false`; only the
+    /// single-layer term-less envelope's attested verification sets it.
+    pub attested: bool,
 }
 
 /// Common verifier-facing interface. It intentionally contains no raw-table
@@ -267,6 +289,8 @@ impl VerifierLayer for LayerCommitment {
             node_value_dict_range_commitments: &self.node_value_dict_range_commitments,
             nv_merkle_root: self.nv_merkle_root,
             pred_merkle_root: self.pred_merkle_root,
+            dict_index: self.dict_index,
+            attested: false,
         }
     }
 }
@@ -285,6 +309,8 @@ impl VerifierLayer for VerifierCommitment {
             node_value_dict_range_commitments: &self.node_value_dict_range_commitments,
             nv_merkle_root: self.nv_merkle_root,
             pred_merkle_root: self.pred_merkle_root,
+            dict_index: self.dict_index,
+            attested: false,
         }
     }
 }
@@ -311,11 +337,13 @@ impl<T: VerifierLayer + ?Sized> VerifierLayer for std::sync::Arc<T> {
 pub(crate) struct TermlessWithOpenings<'a> {
     pub(crate) commitment: &'a VerifierCommitment,
     pub(crate) openings: &'a ResolutionOpenings,
+    /// The caller's trust mode ([`VerifierCommitmentRef::attested`]).
+    pub(crate) attested: bool,
 }
 
 impl VerifierLayer for TermlessWithOpenings<'_> {
     fn verifier_view(&self) -> VerifierCommitmentRef<'_> {
-        self.commitment.verifier_view()
+        VerifierCommitmentRef { attested: self.attested, ..self.commitment.verifier_view() }
     }
     fn shipped_openings(&self) -> Option<&ResolutionOpenings> {
         Some(self.openings)
@@ -376,6 +404,13 @@ impl VerifierCommitmentRef<'_> {
                 return Err(invalid("term-less verifier commitment must not carry catalogs"));
             }
         }
+        validate_dict_index(
+            self.state,
+            self.terms_present,
+            self.node_value_catalog,
+            self.predicate_catalog,
+            self.dict_index.as_ref(),
+        )?;
         if self.recomputed_commitment_root()? != self.state.commitment_root {
             return Err(invalid("verifier commitment root mismatch"));
         }
@@ -407,12 +442,38 @@ impl VerifierCommitmentRef<'_> {
     /// The two-hash resolution anchor for this layer: it binds `commitment_root`
     /// (and thereby every id-authentication gadget) to the two dictionary Merkle
     /// roots that succinct id->term resolution opens against.
+    ///
+    /// A BASE/ROLLUP/SQUASH layer (it carries a [`DictIndex`]) anchors with `resolution_root` v2,
+    /// which additionally binds the facts and the two term-sorted index roots; a delta keeps v1.
     pub fn resolution_root(self) -> ProofHash {
-        resolution_root(
-            &self.state.commitment_root,
-            &self.nv_merkle_root,
-            &self.pred_merkle_root,
-        )
+        match &self.dict_index {
+            Some(index) => resolution_root_v2(
+                &self.state.commitment_root,
+                &self.nv_merkle_root,
+                &self.pred_merkle_root,
+                index,
+            ),
+            None => resolution_root(
+                &self.state.commitment_root,
+                &self.nv_merkle_root,
+                &self.pred_merkle_root,
+            ),
+        }
+    }
+
+    /// The attested-mode NaN guard: on an ATTESTED view read the root-bound facts; otherwise scan
+    /// the clear catalog exactly as before (a term-less, non-attested view has none and keeps its
+    /// own per-gadget path). Returns `Err` when the datatype is a float with a NaN entry.
+    pub(crate) fn reject_nan_whole_catalog(self, datatype_tag: ArkFr) -> io::Result<()> {
+        if self.attested {
+            crate::proof::query::require_base_layer_for_query(self.state)?;
+            return self
+                .dict_index
+                .ok_or_else(|| invalid("an attested base layer must carry its dictionary facts"))?
+                .facts
+                .reject_nan(datatype_tag);
+        }
+        reject_nan_catalog(self.node_value_catalog, datatype_tag)
     }
 
     /// Recompute `commitment_root` from the carried commitments and counts alone
@@ -446,6 +507,18 @@ impl VerifierCommitmentRef<'_> {
             )));
         }
         Ok(())
+    }
+
+    /// The fail-close BELT, relaxed for an ATTESTED view: a term-bearing view, or a term-less view
+    /// whose caller vouched for the root's well-formedness, passes; a term-less BARE view rejects
+    /// exactly as [`Self::require_terms_present`]. A site guarded by this must, on an attested
+    /// term-less view, read only root-bound data (commitments, facts, sorted-index or id-indexed
+    /// openings) — never the (empty) clear catalogs.
+    pub fn require_terms_or_attested(self, what: &str) -> io::Result<()> {
+        if self.attested {
+            return Ok(());
+        }
+        self.require_terms_present(what)
     }
 
     /// Rebuild the padded node/value-dictionary `(hash, id)` columns. Merkle-dict I2b S2:
@@ -516,6 +589,7 @@ impl LayerCommitment {
             node_value_dict_range_commitments: self.node_value_dict_range_commitments,
             nv_merkle_root: self.nv_merkle_root,
             pred_merkle_root: self.pred_merkle_root,
+            dict_index: self.dict_index,
         };
         artifact.validate()?;
         Ok(artifact)
@@ -554,6 +628,7 @@ impl LayerCommitment {
             node_value_dict_range_commitments: self.node_value_dict_range_commitments,
             nv_merkle_root: self.nv_merkle_root,
             pred_merkle_root: self.pred_merkle_root,
+            dict_index: self.dict_index,
         };
         artifact.validate()?;
         Ok(artifact)
@@ -699,6 +774,9 @@ impl LayerCommitment {
         )?;
         let pred_merkle_root =
             predicate_merkle_root(&predicate_catalog, parent_predicate_count, predicate_count)?;
+        // Base/rollup/squash only: the facts + term-sorted index roots (resolution_root v2).
+        let dict_index =
+            DictIndex::for_layer(parent_state_root, &node_value_catalog, &predicate_catalog)?;
 
         let state = CommitmentState {
             parent_state_root,
@@ -725,6 +803,7 @@ impl LayerCommitment {
             node_value_dict_range_commitments,
             nv_merkle_root,
             pred_merkle_root,
+            dict_index,
         };
         layer.state.commitment_root = layer.compute_commitment_root()?;
         layer.validate()?;
@@ -886,6 +965,13 @@ impl LayerCommitment {
         {
             return Err(invalid("dictionary merkle root mismatch"));
         }
+        validate_dict_index(
+            &self.state,
+            true,
+            &self.node_value_catalog,
+            &self.predicate_catalog,
+            self.dict_index.as_ref(),
+        )?;
         if self.compute_commitment_root()? != self.state.commitment_root {
             return Err(invalid("commitment root mismatch"));
         }
@@ -1024,6 +1110,9 @@ impl LayerCommitment {
             .collect::<io::Result<Vec<_>>>()?;
         let [_, predicate_catalog, node_value_catalog] =
             build_dictionary_catalogs_from_maps(node_value_mappings, predicate_mappings)?;
+        // Not persisted: a deterministic function of the decoded catalogs (base layers only).
+        let dict_index =
+            DictIndex::for_layer(parent_state_root, &node_value_catalog, &predicate_catalog)?;
 
         let state = CommitmentState {
             parent_state_root,
@@ -1050,6 +1139,7 @@ impl LayerCommitment {
             node_value_dict_range_commitments,
             nv_merkle_root,
             pred_merkle_root,
+            dict_index,
         };
         layer.validate()?;
         Ok(layer)
@@ -1404,6 +1494,13 @@ impl VerifierCommitment {
                 return Err(invalid("term-less verifier commitment must not carry catalogs"));
             }
         }
+        validate_dict_index(
+            &self.state,
+            self.terms_present,
+            &self.node_value_catalog,
+            &self.predicate_catalog,
+            self.dict_index.as_ref(),
+        )?;
         if self.recomputed_commitment_root()? != self.state.commitment_root {
             return Err(invalid("verifier commitment root mismatch"));
         }
@@ -1473,6 +1570,13 @@ impl VerifierCommitment {
         // I1: two id-indexed dictionary Merkle roots, before the trailing root.
         put_hash(&mut out, &self.nv_merkle_root);
         put_hash(&mut out, &self.pred_merkle_root);
+        // v5: a BASE artifact carries its facts byte + the two term-sorted index roots (a delta
+        // carries none; which applies is fixed by the parent tag above).
+        if let Some(index) = &self.dict_index {
+            out.push(index.facts.to_byte());
+            put_hash(&mut out, &index.nv_sorted_root);
+            put_hash(&mut out, &index.pred_sorted_root);
+        }
         put_hash(&mut out, &self.state.commitment_root);
         let checksum = file_checksum(&out);
         out.extend_from_slice(&checksum);
@@ -1566,6 +1670,15 @@ impl VerifierCommitment {
         // `validate` against the decoded catalogs below).
         let nv_merkle_root = r.hash()?;
         let pred_merkle_root = r.hash()?;
+        let dict_index = if state.parent_state_root.is_none() {
+            Some(DictIndex {
+                facts: DictFacts::from_byte(r.u8()?)?,
+                nv_sorted_root: r.hash()?,
+                pred_sorted_root: r.hash()?,
+            })
+        } else {
+            None
+        };
         if !r.done() {
             return Err(invalid("trailing verifier commitment bytes"));
         }
@@ -1581,9 +1694,133 @@ impl VerifierCommitment {
             node_value_dict_range_commitments,
             nv_merkle_root,
             pred_merkle_root,
+            dict_index,
         };
         artifact.validate()?;
         Ok(artifact)
     }
 }
 
+
+/// The [`DictIndex`] invariant shared by every commitment kind: a BASE layer carries one, a delta
+/// none; a TERM-BEARING carrier's index must equal the one recomputed from its (complete, base)
+/// catalogs. A TERM-LESS base carrier's index is bound only through `resolution_root` v2 (its
+/// well-formedness is what an ATTESTED caller vouches for).
+pub(super) fn validate_dict_index(
+    state: &CommitmentState,
+    terms_present: bool,
+    node_value_catalog: &[ProofRecord],
+    predicate_catalog: &[ProofRecord],
+    dict_index: Option<&DictIndex>,
+) -> io::Result<()> {
+    match (state.parent_state_root, dict_index) {
+        (None, None) => Err(invalid("a base layer commitment must carry its dictionary index")),
+        (Some(_), Some(_)) => Err(invalid("a delta layer commitment carries no dictionary index")),
+        (Some(_), None) => Ok(()),
+        (None, Some(index)) => {
+            if terms_present
+                && DictIndex::from_catalogs(node_value_catalog, predicate_catalog)? != *index
+            {
+                return Err(invalid("dictionary facts / sorted index mismatch"));
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// term <-> id over ONE base view, for both trust modes.
+//
+// TERM-BEARING: the clear-catalog scan every verifier site always used (unchanged semantics).
+// ATTESTED term-less: through the envelope-carried openings, each verified against a root-bound
+// tree — the TERM-SORTED index for `term -> id` (membership or absence), the id-indexed tree for
+// `id -> term`. The key is derived by the verifier from the PUBLIC term and the id is read from the
+// authenticated leaf, so the id is never a separately prover-claimed value; no transcript is
+// touched. BARE term-less: `Err` (fail-closed, as before).
+// ---------------------------------------------------------------------------------------------
+
+/// `term -> id` in the node/value dictionary of one base view: `Some(id)` present, `None` absent.
+pub(crate) fn node_value_term_id(
+    source: &(impl VerifierLayer + ?Sized),
+    object: &CanonicalObject,
+) -> io::Result<Option<u64>> {
+    let view = source.verifier_view();
+    if view.terms_present {
+        return Ok(view
+            .node_value_catalog
+            .iter()
+            .find(|record| &record.triple.object == object)
+            .map(|record| record.object_id));
+    }
+    attested_sorted_lookup(source, SortedNamespace::NodeValue, &node_value_sort_key(object))
+}
+
+/// `term -> id` in the predicate dictionary of one base view: `Some(id)` present, `None` absent.
+pub(crate) fn predicate_term_id(
+    source: &(impl VerifierLayer + ?Sized),
+    iri: &[u8],
+) -> io::Result<Option<u64>> {
+    let view = source.verifier_view();
+    if view.terms_present {
+        return Ok(view
+            .predicate_catalog
+            .iter()
+            .find(|record| record.triple.predicate == iri)
+            .map(|record| record.predicate_id));
+    }
+    attested_sorted_lookup(source, SortedNamespace::Predicate, &predicate_sort_key(iri))
+}
+
+fn attested_sorted_lookup(
+    source: &(impl VerifierLayer + ?Sized),
+    namespace: SortedNamespace,
+    key: &ProofHash,
+) -> io::Result<Option<u64>> {
+    let view = source.verifier_view();
+    view.require_terms_or_attested("a dictionary term lookup (term -> id)")?;
+    crate::proof::query::require_base_layer_for_query(view.state)?;
+    let index = view
+        .dict_index
+        .ok_or_else(|| invalid("an attested base layer must carry its sorted dictionary index"))?;
+    let openings = source.shipped_openings().ok_or_else(|| {
+        invalid("an attested term lookup requires the envelope-carried sorted-index openings")
+    })?;
+    let lookup = openings.sorted_lookup(namespace, key)?;
+    let (root, n) = match namespace {
+        SortedNamespace::NodeValue => (index.nv_sorted_root, view.state.node_value_count),
+        SortedNamespace::Predicate => (index.pred_sorted_root, view.state.predicate_count),
+    };
+    verify_sorted_lookup(&root, n, key, &lookup)
+}
+
+/// `id -> term` in the node/value dictionary of one base view: `Some(term)` for an id of the
+/// dictionary, `None` for an id outside it.
+pub(crate) fn node_value_id_term(
+    source: &(impl VerifierLayer + ?Sized),
+    id: u64,
+) -> io::Result<Option<CanonicalObject>> {
+    let view = source.verifier_view();
+    if view.terms_present {
+        return Ok(view
+            .node_value_catalog
+            .iter()
+            .find(|record| record.object_id == id)
+            .map(|record| record.triple.object.clone()));
+    }
+    view.require_terms_or_attested("a dictionary id resolution (id -> term)")?;
+    crate::proof::query::require_base_layer_for_query(view.state)?;
+    if id <= view.state.parent_node_value_count || id > view.state.node_value_count {
+        return Ok(None);
+    }
+    let openings = source.shipped_openings().ok_or_else(|| {
+        invalid("an attested id resolution requires the envelope-carried Merkle openings")
+    })?;
+    let opening = openings.node_value_opening(id)?;
+    Ok(Some(verify_opening(
+        &view.nv_merkle_root,
+        view.state.parent_node_value_count,
+        view.state.node_value_count,
+        id,
+        &opening,
+    )?))
+}

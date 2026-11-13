@@ -105,7 +105,8 @@ pub use plan::{
 pub use layer_bgp::LayerBgpEnvelope;
 // The single-layer TERM-LESS recursive envelope (O(result) witness beside the O(1) commitment).
 pub use termless::{
-    require_termless_plan, single_layer_envelope_form, SingleLayerEnvelopeForm,
+    require_attested_termless_plan, require_termless_plan, single_layer_envelope_form,
+    SingleLayerEnvelopeForm, TrustedRoot,
     TermlessRelationEnvelope,
 };
 pub use bag_union::BagUnionEnvelope;
@@ -158,3 +159,5 @@ mod tests;
 
 #[cfg(test)]
 mod termless_tests;
+#[cfg(test)]
+mod attested_tests;

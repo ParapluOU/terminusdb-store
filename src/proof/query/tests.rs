@@ -3391,18 +3391,22 @@
     fn resolution_root_wraps_without_touching_commitment_root() {
         let lc = mixed_layer();
         let view = lc.verifier_view();
+        // A base layer anchors with resolution_root v2 (it also binds the dictionary facts and
+        // the two term-sorted index roots).
+        let index = lc.dict_index.expect("a base layer carries its dictionary index");
         assert_eq!(
             view.resolution_root(),
-            crate::proof::resolution_root(
+            crate::proof::commitment::resolution_root_v2(
                 &lc.state.commitment_root,
                 &lc.nv_merkle_root,
                 &lc.pred_merkle_root,
+                &index,
             )
         );
         let anchor = view.resolution_root();
         // Perturbing a Merkle root moves the anchor...
         assert_ne!(
-            crate::proof::resolution_root(&lc.state.commitment_root, &[9u8; 32], &lc.pred_merkle_root),
+            crate::proof::commitment::resolution_root_v2(&lc.state.commitment_root, &[9u8; 32], &lc.pred_merkle_root, &index),
             anchor
         );
         // ...but `commitment_root` is computed independently of the Merkle roots and is

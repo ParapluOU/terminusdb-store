@@ -803,47 +803,39 @@ pub(crate) fn has_ground_result_unit(plan: &LayerBgpPlan) -> bool {
     !plan.atoms.is_empty() && is_all_ground(plan)
 }
 
+/// The FIRST constant of `plan` (atom order; predicate, subject, object within an atom) that the
+/// layer's dictionaries omit, or `None` when every constant is present. TERM-BEARING: the catalog
+/// scans. ATTESTED term-less: one term-sorted index opening per constant up to and including the
+/// first absent one (membership or a bracketing absence pair). BARE term-less: `Err`.
 pub(super) fn dictionary_absence(
     source: &impl VerifierLayer,
     plan: &LayerBgpPlan,
-) -> Option<DictionaryAbsence> {
-    let layer = source.verifier_view();
+) -> io::Result<Option<DictionaryAbsence>> {
     for (atom_index, atom) in plan.atoms.iter().enumerate() {
         if !atom.predicate_variable
-            && !layer
-                .predicate_catalog
-                .iter()
-                .any(|record| record.triple.predicate == atom.predicate_term)
+            && crate::proof::commitment::predicate_term_id(source, &atom.predicate_term)?.is_none()
         {
-            return Some(DictionaryAbsence {
+            return Ok(Some(DictionaryAbsence {
                 atom_index,
                 position: DictionaryAbsencePosition::Predicate,
-            });
+            }));
         }
         if let Some(subject) = atom_term_object(&atom.subject) {
-            if !layer
-                .node_value_catalog
-                .iter()
-                .any(|record| record.triple.object == subject)
-            {
-                return Some(DictionaryAbsence {
+            if crate::proof::commitment::node_value_term_id(source, &subject)?.is_none() {
+                return Ok(Some(DictionaryAbsence {
                     atom_index,
                     position: DictionaryAbsencePosition::Subject,
-                });
+                }));
             }
         }
         if let Some(object) = atom_term_object(&atom.object) {
-            if !layer
-                .node_value_catalog
-                .iter()
-                .any(|record| record.triple.object == object)
-            {
-                return Some(DictionaryAbsence {
+            if crate::proof::commitment::node_value_term_id(source, &object)?.is_none() {
+                return Ok(Some(DictionaryAbsence {
                     atom_index,
                     position: DictionaryAbsencePosition::Object,
-                });
+                }));
             }
         }
     }
-    None
+    Ok(None)
 }

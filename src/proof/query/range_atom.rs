@@ -463,6 +463,19 @@ pub(super) fn verify_ranged_atom(
     //     delta layer is rejected by `require_base_layer_for_query`, upstream and re-asserted here).
     if layer.terms_present {
         reject_nan_catalog(layer.node_value_catalog, range.datatype)?;
+    } else if layer.attested {
+        // ATTESTED term-less: the caller vouched for the root's well-formedness, so the
+        // root-bound VALUE/DATATYPE commitments ARE the canonical columns of the real terms (the
+        // validators' recomputation stands in for `validate()`'s per-query re-MSM). No `oid` /
+        // per-row value openings are needed — and none may ride (one canonical witness). The
+        // whole-catalog NaN guard reads the root-bound facts instead of scanning.
+        require_base_layer_for_query(layer.state)?;
+        if !sub.oid.is_empty() || sub.value_openings.is_some() {
+            return Err(invalid(
+                "an attested range proof carries no per-row value openings",
+            ));
+        }
+        layer.reject_nan_whole_catalog(range.datatype)?;
     } else {
         require_base_layer_for_query(layer.state)?;
         let value_openings = sub.value_openings.as_ref().ok_or_else(|| {

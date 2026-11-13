@@ -319,6 +319,21 @@ pub(super) fn integral_catalog_value(
     })
 }
 
+/// The node/value dictionary entry a result field names: `(id, term)`, or `None` when the field is
+/// not an id of the dictionary. TERM-BEARING: the clear-catalog scan these aggregates always used;
+/// ATTESTED term-less: the envelope-carried id-indexed opening, verified against the root-bound
+/// `nv_merkle_root` (the aggregate's input ids are a verified operator result, so this is
+/// O(input rows), never O(catalog)).
+fn dictionary_object(
+    layer: &impl VerifierLayer,
+    field: ArkFr,
+) -> io::Result<Option<(u64, CanonicalObject)>> {
+    let Ok(id) = crate::proof::query::canonical_dictionary_id(&field) else {
+        return Ok(None);
+    };
+    Ok(crate::proof::commitment::node_value_id_term(layer, id)?.map(|object| (id, object)))
+}
+
 pub(super) fn grouped_node_rows(
     layer: &impl VerifierLayer,
     input: &RecursiveRelationEnvelope,
@@ -326,7 +341,7 @@ pub(super) fn grouped_node_rows(
 ) -> io::Result<std::collections::BTreeMap<Vec<Vec<u8>>, (Vec<u64>, Vec<usize>)>> {
     // Merkle-dict I2b S2 fail-close: aggregation over the clear catalog (verifier-recompute) —
     // resolves group-key node ids to their catalog terms, which a TERM-LESS artifact drops.
-    layer.verifier_view().require_terms_present("GroupBy key resolution (aggregation)")?;
+    layer.verifier_view().require_terms_or_attested("GroupBy key resolution (aggregation)")?;
     if key_columns.is_empty()
         || key_columns.len() > 2
         || (key_columns.len() == 2 && key_columns[0] == key_columns[1])
@@ -365,15 +380,12 @@ pub(super) fn grouped_node_rows(
             .iter()
             .map(|column| {
                 let field = column[row];
-                let record = view
-                    .node_value_catalog
-                    .iter()
-                    .find(|record| ArkFr::from_u64(record.object_id) == field)
+                let (id, object) = dictionary_object(layer, field)?
                     .ok_or_else(|| invalid("group key is absent from the node dictionary"))?;
-                let CanonicalObject::Node(iri) = &record.triple.object else {
+                let CanonicalObject::Node(iri) = object else {
                     return Err(invalid("group key is not a node IRI"));
                 };
-                Ok((iri.clone(), record.object_id))
+                Ok((iri, id))
             })
             .collect::<io::Result<Vec<_>>>()?;
         let canonical_key = resolved.iter().map(|(iri, _)| iri.clone()).collect::<Vec<_>>();
@@ -398,7 +410,7 @@ pub(super) fn derived_group_sum_columns(
 ) -> io::Result<Vec<Vec<ArkFr>>> {
     // Merkle-dict I2b S2 fail-close: sums each row's dictionary VALUE (verifier-recompute over
     // the clear catalog), which a TERM-LESS artifact drops.
-    layer.verifier_view().require_terms_present("GroupBy Sum over dictionary values")?;
+    layer.verifier_view().require_terms_or_attested("GroupBy Sum over dictionary values")?;
     let values = input
         .result_columns
         .get(value_column)
@@ -409,12 +421,9 @@ pub(super) fn derived_group_sum_columns(
     let view = layer.verifier_view();
     view.validate()?;
     let resolve_value = |field: ArkFr| -> io::Result<GroupSumValue> {
-        let record = view
-            .node_value_catalog
-            .iter()
-            .find(|record| ArkFr::from_u64(record.object_id) == field)
+        let (_, object) = dictionary_object(layer, field)?
             .ok_or_else(|| invalid("group-sum value id is absent from the authenticated dictionary"))?;
-        integral_catalog_value(&record.triple.object, datatype)
+        integral_catalog_value(&object, datatype)
     };
     if key_columns.is_empty() {
         if input.result_len == 0 {
@@ -486,7 +495,7 @@ pub(super) fn derived_collection_sum_column(
 ) -> io::Result<Vec<Vec<ArkFr>>> {
     // Merkle-dict I2b S2 fail-close: the `Column` template sums each row's dictionary VALUE
     // (verifier-recompute over the clear catalog), which a TERM-LESS artifact drops.
-    layer.verifier_view().require_terms_present("collection Sum over dictionary values")?;
+    layer.verifier_view().require_terms_or_attested("collection Sum over dictionary values")?;
     let mut sum = GroupSumValue::zero(datatype)?;
     match template {
         CollectionSumTemplate::Column(column) => {
@@ -500,14 +509,10 @@ pub(super) fn derived_collection_sum_column(
             let view = layer.verifier_view();
             view.validate()?;
             for field in values.iter().take(input.result_len) {
-                let record = view
-                    .node_value_catalog
-                    .iter()
-                    .find(|record| ArkFr::from_u64(record.object_id) == *field)
-                    .ok_or_else(|| {
-                        invalid("collection-sum value id is absent from the authenticated dictionary")
-                    })?;
-                sum = sum.checked_add(integral_catalog_value(&record.triple.object, datatype)?)?;
+                let (_, object) = dictionary_object(layer, *field)?.ok_or_else(|| {
+                    invalid("collection-sum value id is absent from the authenticated dictionary")
+                })?;
+                sum = sum.checked_add(integral_catalog_value(&object, datatype)?)?;
             }
         }
         CollectionSumTemplate::UnsignedConstant(value) => {
@@ -533,7 +538,7 @@ pub(super) fn derived_collection_extrema_column(
 ) -> io::Result<Vec<Vec<ArkFr>>> {
     // Merkle-dict I2b S2 fail-close: collection Min/Max over the order-preserving dictionary
     // VALUE (`node_value_op_value`), untied to terms on a TERM-LESS artifact.
-    layer.verifier_view().require_terms_present("collection Min/Max over dictionary values")?;
+    layer.verifier_view().require_terms_or_attested("collection Min/Max over dictionary values")?;
     // Defense-in-depth: `node_value_op_value` also encodes Float32/64, whose total-order NaN
     // placement diverges from Prolog's IEEE comparison. Assert the integral OP subset here so a
     // future loosening of the `shape_bounded` gate cannot silently admit floating extrema.
@@ -553,21 +558,18 @@ pub(super) fn derived_collection_extrema_column(
     view.validate()?;
     let mut selected: Option<(ArkFr, ark_bn254::Fr)> = None;
     for field in values.iter().take(input.result_len) {
-        let record = view
-            .node_value_catalog
-            .iter()
-            .find(|record| ArkFr::from_u64(record.object_id) == *field)
+        let (_, object) = dictionary_object(layer, *field)?
             .ok_or_else(|| invalid("collection-extrema value is absent from the catalog"))?;
         let CanonicalObject::Value {
             datatype: actual, ..
-        } = &record.triple.object
+        } = &object
         else {
             return Err(invalid("collection-extrema value is not a typed literal"));
         };
         if *actual != datatype {
             return Err(invalid("collection-extrema value has the wrong exact datatype"));
         }
-        let encoding = crate::proof::commitment::node_value_op_value(&record.triple.object)?.0;
+        let encoding = crate::proof::commitment::node_value_op_value(&object)?.0;
         let replace = selected.as_ref().is_none_or(|(_, current)| match kind {
             GroupExtremaKind::Min => encoding.into_bigint() < current.into_bigint(),
             GroupExtremaKind::Max => encoding.into_bigint() > current.into_bigint(),
@@ -589,7 +591,7 @@ pub(super) fn derived_group_extrema_columns(
 ) -> io::Result<Vec<Vec<ArkFr>>> {
     // Merkle-dict I2b S2 fail-close: GroupBy Min/Max over the order-preserving dictionary VALUE
     // (`node_value_op_value`), untied to terms on a TERM-LESS artifact.
-    layer.verifier_view().require_terms_present("GroupBy Min/Max over dictionary values")?;
+    layer.verifier_view().require_terms_or_attested("GroupBy Min/Max over dictionary values")?;
     // Defense-in-depth: reject floating (NaN-divergent) extrema at derivation time, independent
     // of the `shape_bounded` integral gate. `integral_catalog_value` also enforces this per value.
     if !integral_op_datatype(datatype) {
@@ -607,14 +609,11 @@ pub(super) fn derived_group_extrema_columns(
     let view = layer.verifier_view();
     view.validate()?;
     let resolve = |field: ArkFr| -> io::Result<ark_bn254::Fr> {
-        let record = view
-            .node_value_catalog
-            .iter()
-            .find(|record| ArkFr::from_u64(record.object_id) == field)
+        let (_, object) = dictionary_object(layer, field)?
             .ok_or_else(|| invalid("group-extrema value is absent from the catalog"))?;
         // This enforces both the exact integral datatype and its canonical width.
-        integral_catalog_value(&record.triple.object, datatype)?;
-        Ok(crate::proof::commitment::node_value_op_value(&record.triple.object)?.0)
+        integral_catalog_value(&object, datatype)?;
+        Ok(crate::proof::commitment::node_value_op_value(&object)?.0)
     };
     let choose = |rows: &[usize]| -> io::Result<Option<ArkFr>> {
         let mut selected: Option<(ArkFr, ark_bn254::Fr)> = None;

@@ -508,7 +508,15 @@ pub fn verify_exact_scalar_order(
     // terms, forcing `lookup.com_v_val`/`lookup.com_v_dt` == OP-encode(real term) at every row —
     // the SAME columns the sort key (`sort_commitment`) and datatype mask below consume. Runs
     // BEFORE the (transcript-consuming) lookup; it is itself transcript-free.
-    if !layer.terms_present {
+    if !layer.terms_present && layer.attested {
+        // ATTESTED term-less: the root-bound value/datatype columns are authentic (the caller
+        // vouched for the root's well-formedness); the whole-catalog NaN guard reads the facts.
+        // No `oid`/value openings may ride.
+        if !proof.oid.is_empty() || proof.value_openings.is_some() {
+            return Err(invalid("an attested scalar OrderBy carries no per-row value openings"));
+        }
+        layer.reject_nan_whole_catalog(ArkFr::from_u64(datatype as u64))?;
+    } else if !layer.terms_present {
         let value_openings = proof.value_openings.as_ref().ok_or_else(|| {
             invalid(
                 "term-less exact scalar OrderBy requires the prover-shipped value↔term Merkle openings",

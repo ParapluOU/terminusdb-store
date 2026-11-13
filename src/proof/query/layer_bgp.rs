@@ -63,7 +63,7 @@ pub fn prove_layer_bgp_with_result_and_context(
     // column domain and the dictionary-absence zero column.
     let (_s0, _p0, _o0, n0) = source_layer_columns(layer, plan.source)?;
 
-    if let Some(absence) = dictionary_absence(layer, plan) {
+    if let Some(absence) = dictionary_absence(layer, plan)? {
         // A root-authenticated dictionary omits one public constant, so the atom and the
         // whole conjunction are empty. Emit canonical zero commitments at the layer table
         // domain, preserving either the public relational arity or the hidden ground UNIT.
@@ -585,12 +585,17 @@ fn verify_layer_bgp_impl(
         // constant would appear absent (a fail-OPEN forgery: certify a present term as absent).
         // Reject before scanning. (Term-less is base/rollup-only, but the base BGP path IS
         // term-less-queryable for point lookups/joins, so this branch is reachable and must guard.)
-        layer.require_terms_present("dictionary-absence proof (catalog nonmembership scan)")?;
+        //
+        // ATTESTED term-less: the absence (and the presence of every earlier constant) is opened
+        // from the root-bound TERM-SORTED index instead — membership leaves / bracketing adjacent
+        // pairs for verifier-computed keys — which a well-formed root makes exactly the catalog's
+        // answer.
+        layer.require_terms_or_attested("dictionary-absence proof (catalog nonmembership scan)")?;
         // Recommit every clear catalog/table before using catalog nonmembership. This
         // turns the scan below into an opening of the externally trusted layer root,
         // rather than trusting an unauthenticated convenience catalog.
         layer.validate()?;
-        if dictionary_absence(&layer, plan) != Some(claimed_absence) {
+        if dictionary_absence(source, plan)? != Some(claimed_absence) {
             return Err(invalid(
                 "claimed dictionary absence is not authentic",
             ));

@@ -107,17 +107,24 @@ fn resolve_values(source: &impl VerifierLayer, columns: &[Vec<ArkFr>], n: usize,
     // Merkle-dict I2b S2 fail-close: multi-column OrderBy resolves each key id to its dict VALUE
     // (`node_value_op_value`) for the lexicographic comparison — tied to real terms only by the
     // catalog re-MSM a TERM-LESS artifact drops. Reject before reading the (empty) catalog.
-    view.require_terms_present("exact multi-column OrderBy (dictionary-value sort keys)")?;
+    // ATTESTED term-less: each key id resolves through its envelope-carried id-indexed opening
+    // (the output ids are the result rows, opened anyway to render them) — the same term the
+    // catalog scan finds on a well-formed root.
+    view.require_terms_or_attested("exact multi-column OrderBy (dictionary-value sort keys)")?;
     view.validate()?;
     columns.iter().zip(datatypes).map(|(column, datatype)| {
         if column.len() < n { return Err(invalid("multi-order output column too short")); }
         let mut values = Vec::with_capacity(domain);
         for id in &column[..n] {
-            let record = view.node_value_catalog.iter().find(|record| ArkFr::from_u64(record.object_id) == *id)
+            let object = canonical_dictionary_id(id)
+                .ok()
+                .map(|id| crate::proof::commitment::node_value_id_term(source, id))
+                .transpose()?
+                .flatten()
                 .ok_or_else(|| invalid("multi-order ID absent from root catalog"))?;
-            let actual = match &record.triple.object { CanonicalObject::Value { datatype, .. } => *datatype, _ => return Err(invalid("multi-order key is not a value")) };
+            let actual = match &object { CanonicalObject::Value { datatype, .. } => *datatype, _ => return Err(invalid("multi-order key is not a value")) };
             if actual != *datatype { return Err(invalid("multi-order datatype mask is not complete")); }
-            values.push(node_value_op_value(&record.triple.object)?);
+            values.push(node_value_op_value(&object)?);
         }
         values.resize(domain, ArkFr::zero()); Ok(values)
     }).collect()
@@ -257,6 +264,11 @@ pub fn verify_exact_multi_order(source: &impl VerifierLayer, input: &RelationCom
     // terms via the prover-shipped openings and tie each column to its root-bound output-id
     // commitment. Missing openings ⇒ Err (fail-closed). DELTA order stays fail-closed.
     let values = if view.terms_present {
+        resolve_values(source, output_columns, output_len, datatypes, domain)?
+    } else if view.attested {
+        if proof.value_openings.is_some() {
+            return Err(invalid("an attested multi-column OrderBy carries no proof-embedded openings"));
+        }
         resolve_values(source, output_columns, output_len, datatypes, domain)?
     } else {
         resolve_values_termless(view, output_columns, output_commitments, output_len, datatypes, domain, proof)?

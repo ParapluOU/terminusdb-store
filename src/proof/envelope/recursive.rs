@@ -394,14 +394,14 @@ pub(super) fn closure_transcript(root: &ProofHash, digest: &ProofHash, step: u64
 /// Resolve the bound seed node `a` to its layer node/value dictionary id, failing CLOSED if the node
 /// is absent (a seed that is not a real dictionary node cannot begin an authenticated traversal). Both
 /// prover and verifier resolve identically, so the reconstructed `{a}` commitment is fully pinned.
+///
+/// TERM-BEARING: the catalog scan. ATTESTED term-less: the term-sorted index membership opening for
+/// the seed (an absence opening fails closed exactly like the scan's miss). BARE term-less: `Err`.
 pub(super) fn resolve_closure_seed_id(
-    view: &crate::proof::VerifierCommitmentRef<'_>,
+    source: &(impl VerifierLayer + ?Sized),
     seed: &CanonicalObject,
 ) -> io::Result<u64> {
-    view.node_value_catalog
-        .iter()
-        .find(|record| &record.triple.object == seed)
-        .map(|record| record.object_id)
+    crate::proof::commitment::node_value_term_id(source, seed)?
         .ok_or_else(|| invalid("transitive closure seed node is absent from the layer dictionary"))
 }
 
@@ -3176,7 +3176,7 @@ impl RecursiveRelationEnvelope {
         let edge_commit = edge_env.relation_commit(None)?;
 
         // (2) Reconstruct the constant seed `{a}` from the trusted seed node (single-layer dictionary).
-        let seed_id = resolve_closure_seed_id(&layer.verifier_view(), seed_obj)?;
+        let seed_id = resolve_closure_seed_id(layer, seed_obj)?;
 
         // (3)-(5) The SOURCE-AGNOSTIC seed + rounds + fixpoint replay (shared with the reconciled closure).
         verify_closure_rounds(

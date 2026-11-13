@@ -55,7 +55,10 @@ use crate::proof::anti::{
 };
 use crate::proof::argument::{commit_column, ColumnOpening, StoreProverContext, SumcheckProof, Transcript254};
 use crate::proof::bgp::{BgpChainProof, BgpStageProof, JoinStep, RelationCommit, RelationWitness};
-use crate::proof::commitment::{DictOpening, LayerCommitment, ResolutionOpenings, VerifierLayer};
+use crate::proof::commitment::{
+    DictOpening, LayerCommitment, ResolutionOpenings, SortedLeaf, SortedLeafOpening, SortedLookup,
+    SortedNamespace, VerifierLayer,
+};
 use crate::proof::count::CountProof;
 use crate::proof::dict::DictProof;
 use crate::proof::logup_gkr::{GkrFractionProof, GkrLayerProof};
@@ -1083,8 +1086,30 @@ impl Wire for ResolutionOpenings {
         if self.is_oracle() {
             return Err(invalid("a resolution-openings oracle is not a shippable witness"));
         }
-        let nv: Vec<&DictOpening> = self.node_value_openings().collect();
-        let pred: Vec<&DictOpening> = self.predicate_openings().collect();
+        // Sorted-index lookups ride ONLY in the single-layer term-less envelope (its own framing,
+        // `put_sorted_lookups`); every other carrier's wire format is unchanged and refuses them.
+        if self.sorted_lookups().next().is_some() {
+            return Err(invalid("sorted-index lookups are carried only by the term-less envelope"));
+        }
+        put_id_openings(self, out)
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        let node_value: Vec<DictOpening> = Wire::get(reader)?;
+        let predicate: Vec<DictOpening> = Wire::get(reader)?;
+        ResolutionOpenings::from_wire(node_value, predicate)
+    }
+}
+
+/// The id-indexed openings of a witness (node/value then predicate lists), in the format every
+/// carrier uses; the term-less envelope appends its sorted-index lookups after them.
+pub(super) fn put_id_openings(openings: &ResolutionOpenings, out: &mut Vec<u8>) -> io::Result<()> {
+    {
+        let this = openings;
+        if this.is_oracle() {
+            return Err(invalid("a resolution-openings oracle is not a shippable witness"));
+        }
+        let nv: Vec<&DictOpening> = this.node_value_openings().collect();
+        let pred: Vec<&DictOpening> = this.predicate_openings().collect();
         if nv.len() > MAX_ITEMS || pred.len() > MAX_ITEMS {
             return Err(invalid("too many resolution openings"));
         }
@@ -1097,11 +1122,6 @@ impl Wire for ResolutionOpenings {
             opening.put(out)?;
         }
         Ok(())
-    }
-    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
-        let node_value: Vec<DictOpening> = Wire::get(reader)?;
-        let predicate: Vec<DictOpening> = Wire::get(reader)?;
-        ResolutionOpenings::from_wire(node_value, predicate)
     }
 }
 // Merkle-dict I2b S5: `openings` carries the term-less resolution witness (`None` on term-bearing
@@ -2136,4 +2156,93 @@ pub fn plan_digest(plan: &LayerBgpPlan) -> io::Result<ProofHash> {
     hasher.update(b"terminus-store/query-proof-plan/v2");
     hasher.update(&bytes);
     Ok(hasher.finalize().into())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Term-sorted index lookups (single-layer term-less envelope v2 only).
+// ---------------------------------------------------------------------------------------------
+
+impl Wire for SortedLeafOpening {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self.leaf {
+            SortedLeaf::Low => 0u8.put(out)?,
+            SortedLeaf::Real { key, id } => {
+                1u8.put(out)?;
+                key.put(out)?;
+                id.put(out)?;
+            }
+            SortedLeaf::High => 2u8.put(out)?,
+        }
+        self.position.put(out)?;
+        self.siblings.put(out)
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        let leaf = match u8::get(reader)? {
+            0 => SortedLeaf::Low,
+            1 => SortedLeaf::Real { key: Wire::get(reader)?, id: Wire::get(reader)? },
+            2 => SortedLeaf::High,
+            _ => return Err(invalid("unknown sorted-index leaf kind")),
+        };
+        Ok(Self { leaf, position: Wire::get(reader)?, siblings: Wire::get(reader)? })
+    }
+}
+
+impl Wire for SortedLookup {
+    fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            SortedLookup::Member(opening) => {
+                0u8.put(out)?;
+                opening.put(out)
+            }
+            SortedLookup::Absent(left, right) => {
+                1u8.put(out)?;
+                left.put(out)?;
+                right.put(out)
+            }
+        }
+    }
+    fn get(reader: &mut Reader<'_>) -> io::Result<Self> {
+        match u8::get(reader)? {
+            0 => Ok(SortedLookup::Member(Wire::get(reader)?)),
+            1 => Ok(SortedLookup::Absent(Wire::get(reader)?, Wire::get(reader)?)),
+            _ => Err(invalid("unknown sorted-index lookup kind")),
+        }
+    }
+}
+
+/// Encode the sorted-index lookups of a term-less envelope's witness (key order).
+pub(super) fn put_sorted_lookups(openings: &ResolutionOpenings, out: &mut Vec<u8>) -> io::Result<()> {
+    let lookups: Vec<_> = openings.sorted_lookups().collect();
+    if lookups.len() > MAX_ITEMS {
+        return Err(invalid("too many sorted-index lookups"));
+    }
+    lookups.len().put(out)?;
+    for ((namespace, key), lookup) in lookups {
+        match namespace {
+            SortedNamespace::NodeValue => 0u8.put(out)?,
+            SortedNamespace::Predicate => 1u8.put(out)?,
+        }
+        key.put(out)?;
+        lookup.put(out)?;
+    }
+    Ok(())
+}
+
+/// Decode the sorted-index lookups into `openings` (parsing only; duplicates rejected).
+pub(super) fn get_sorted_lookups(openings: &mut ResolutionOpenings, reader: &mut Reader<'_>) -> io::Result<()> {
+    let count = usize::get(reader)?;
+    if count > MAX_ITEMS {
+        return Err(invalid("too many sorted-index lookups"));
+    }
+    for _ in 0..count {
+        let namespace = match u8::get(reader)? {
+            0 => SortedNamespace::NodeValue,
+            1 => SortedNamespace::Predicate,
+            _ => return Err(invalid("unknown sorted-index namespace")),
+        };
+        let key: ProofHash = Wire::get(reader)?;
+        let lookup: SortedLookup = Wire::get(reader)?;
+        openings.insert_sorted_from_wire(namespace, key, lookup)?;
+    }
+    Ok(())
 }

@@ -317,8 +317,10 @@ fn commitment_format_version_is_six() {
     // date-free layer still hashes to a BYTE-IDENTICAL root.
     assert_eq!(COMMITMENT_FORMAT_VERSION, 6);
     // v4 == the compact artifact gained the I2b S1 `terms_present` flag byte and made
-    // the two clear catalogs optional (term-less variant). `commitment_root` unchanged.
-    assert_eq!(VERIFIER_COMMITMENT_FORMAT_VERSION, 4);
+    // the two clear catalogs optional (term-less variant); v5 == a base artifact carries its
+    // dictionary facts + term-sorted index roots (resolution_root v2). `commitment_root`
+    // unchanged.
+    assert_eq!(VERIFIER_COMMITMENT_FORMAT_VERSION, 5);
 }
 
 #[test]
@@ -1375,7 +1377,7 @@ fn term_bearing_artifact_is_v4_and_reports_terms_present() {
             .unwrap(),
     );
     assert_eq!(v, VERIFIER_COMMITMENT_FORMAT_VERSION);
-    assert_eq!(v, 4);
+    assert_eq!(v, 5);
     let decoded = VerifierCommitment::decode(&bytes).unwrap();
     assert!(decoded.terms_present);
     assert_eq!(decoded.predicate_catalog, layer.predicate_catalog);

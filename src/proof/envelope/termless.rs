@@ -21,12 +21,24 @@
 //! own (anti-substitution), and the envelope is accepted only against a term-less, base, validated
 //! commitment whose `resolution_root` equals the trusted root.
 //!
-//! # Scope
+//! # Scope and trust mode
 //!
-//! Only operators whose verification reads ids (never dictionary VALUES or clear catalogs) are
-//! admitted — see [`require_termless_plan`]. Everything that needs the term-bearing value/datatype
-//! columns or a catalog scan (range/kind filters, order, group/aggregate over values, closures from
-//! a constant seed, walks, dictionary absence, constant equality) fails closed here.
+//! The verifier names its trust in the anchor ([`TrustedRoot`]):
+//!
+//! * [`TrustedRoot::Bare`] — the root is authentic but nothing vouches for its WELL-FORMEDNESS.
+//!   Only operators whose verification reads ids (never dictionary VALUES or clear catalogs) are
+//!   admitted — see [`require_termless_plan`]. Everything that needs the term-bearing value/datatype
+//!   columns or a catalog scan (range/kind filters, order, group/aggregate over values, closures
+//!   from a constant seed, walks, dictionary absence, constant equality) fails closed.
+//! * [`TrustedRoot::Attested`] — the caller vouches that the root is well-formed: every commitment
+//!   it binds is the canonical function of the terms it binds, its facts are true and its
+//!   term-sorted index is sorted and agrees with the id-indexed trees. That is exactly what the
+//!   ledger's validators establish for a squashed catalog head by recomputing it from the data
+//!   (`squashed_roots`), once per head instead of once per query. Then the value/datatype columns
+//!   are authentic (no per-row value openings), whole-catalog guards read the root-bound facts, and
+//!   constant lookups / absences open the term-sorted index — so every single-layer statement
+//!   ([`require_attested_termless_plan`]) verifies term-less, with openings only for the ids it
+//!   resolves and the constants it looks up.
 
 use super::plan::*;
 use super::recursive::RecursiveRelationEnvelope;
@@ -45,8 +57,91 @@ use crate::proof::ProofHash;
 /// Framing magic for the single-layer term-less recursive envelope — a permanent wire-format
 /// constant; never change these bytes (see `MAGIC` in `wire`).
 pub(super) const TERMLESS_TREE_MAGIC: &[u8; 12] = b"TDBWQTLTREE\0";
-/// Wire-format version of the term-less recursive envelope body (accepted exactly).
-pub(super) const TERMLESS_TREE_VERSION: u32 = 1;
+/// Wire-format version of the term-less recursive envelope body (accepted exactly). v2 appends the
+/// term-sorted index lookups after the id-indexed openings.
+pub(super) const TERMLESS_TREE_VERSION: u32 = 2;
+
+/// The verifier's trust in the root it anchors a single-layer term-less envelope to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TrustedRoot {
+    /// A root whose WELL-FORMEDNESS the caller vouches for (the ledger's squashed head: the
+    /// validation quorum recomputed it from the data). Only such a caller may pass this.
+    Attested(ProofHash),
+    /// A root that is authentic but not vouched well-formed (local roots, today's behaviour).
+    Bare(ProofHash),
+}
+
+impl TrustedRoot {
+    /// The trusted `resolution_root` itself.
+    pub fn root(self) -> ProofHash {
+        match self {
+            TrustedRoot::Attested(root) | TrustedRoot::Bare(root) => root,
+        }
+    }
+
+    /// `true` for [`TrustedRoot::Attested`].
+    pub fn is_attested(self) -> bool {
+        matches!(self, TrustedRoot::Attested(_))
+    }
+
+    /// The statement gate of this trust mode: [`require_attested_termless_plan`] or
+    /// [`require_termless_plan`].
+    pub fn require_plan(self, plan: &RelationProofPlan) -> io::Result<()> {
+        match self {
+            TrustedRoot::Attested(_) => require_attested_termless_plan(plan),
+            TrustedRoot::Bare(_) => require_termless_plan(plan),
+        }
+    }
+}
+
+/// The term-less scope over an ATTESTED root: every single-layer statement except a two-root
+/// cross-root join (not a single-layer statement) and the document list/array walks (their
+/// verifiers still read the clear catalogs; they are proved by `ReadDocument`, never by a proven
+/// read, and keep the term-bearing form). Depth-bounded like every plan walk.
+pub fn require_attested_termless_plan(plan: &RelationProofPlan) -> io::Result<()> {
+    fn walk(plan: &RelationProofPlan, depth: usize) -> io::Result<()> {
+        if depth > MAX_RELATION_PROOF_DEPTH {
+            return Err(invalid("term-less plan exceeds structural limits"));
+        }
+        match &plan.kind {
+            RelationProofPlanKind::Bgp(_) | RelationProofPlanKind::LayerTripleCount => Ok(()),
+            RelationProofPlanKind::GeneratedU64Filter { input, .. }
+            | RelationProofPlanKind::GeneratedI64Filter { input, .. }
+            | RelationProofPlanKind::CollectionCount { input }
+            | RelationProofPlanKind::BagProjection { input, .. }
+            | RelationProofPlanKind::Distinct { input, .. }
+            | RelationProofPlanKind::Equality { input, .. }
+            | RelationProofPlanKind::ExactTupleDisequality { input, .. }
+            | RelationProofPlanKind::GroupSum { input, .. }
+            | RelationProofPlanKind::GroupCount { input, .. }
+            | RelationProofPlanKind::CollectionSum { input, .. }
+            | RelationProofPlanKind::CollectionExtrema { input, .. }
+            | RelationProofPlanKind::GroupExtrema { input, .. }
+            | RelationProofPlanKind::ExactScalarOrder { input, .. }
+            | RelationProofPlanKind::ExactMultiOrder { input, .. }
+            | RelationProofPlanKind::ExactOrderedSlice { input, .. } => walk(input, depth + 1),
+            RelationProofPlanKind::BagUnion { branches, .. } => {
+                branches.iter().try_for_each(|branch| walk(branch, depth + 1))
+            }
+            RelationProofPlanKind::LeftAnti { left, right, .. }
+            | RelationProofPlanKind::InnerJoin { left, right, .. }
+            | RelationProofPlanKind::LeftOuter { left, right, .. } => {
+                walk(left, depth + 1)?;
+                walk(right, depth + 1)
+            }
+            RelationProofPlanKind::TransitiveClosure { edge, .. }
+            | RelationProofPlanKind::TransitiveClosurePairs { edge, .. } => walk(edge, depth + 1),
+            RelationProofPlanKind::CrossRootHashJoin { .. } => Err(invalid(
+                "a cross-root join is not a single-layer statement (no term-less form)",
+            )),
+            RelationProofPlanKind::OrderedListWalk { .. }
+            | RelationProofPlanKind::OrderedArrayWalk { .. } => Err(invalid(
+                "an ordered list/array walk is not provable over a term-less commitment",
+            )),
+        }
+    }
+    walk(plan, 1)
+}
 
 /// A single-layer recursive envelope plus its term-less resolution witness.
 #[derive(Clone, Debug)]
@@ -195,17 +290,29 @@ impl TermlessRelationEnvelope {
     /// lazy opener over `layer`'s trees, records every id it opens, and ships exactly those
     /// openings — so the shipped witness is complete and minimal by construction (the dry run is
     /// the verifier). `plan` must be the plan the envelope was proven for.
+    ///
+    /// `trusted` names the trust mode the shipped witness is minted for (its root must be `layer`'s
+    /// own): an [`TrustedRoot::Attested`] dry run admits every single-layer statement and records
+    /// the sorted-index lookups it consumes; a [`TrustedRoot::Bare`] one is today's id-only scope.
     pub fn from_envelope(
         envelope: RecursiveRelationEnvelope,
         layer: &LayerCommitment,
         plan: &RelationProofPlan,
+        trusted: TrustedRoot,
     ) -> io::Result<Self> {
-        require_termless_plan(plan)?;
+        trusted.require_plan(plan)?;
         let commitment = layer.verifier_commitment_termless()?;
-        let commitment_root = termless_anchor(&commitment, layer.resolution_root())?;
+        if trusted.root() != layer.resolution_root() {
+            return Err(invalid("the term-less witness is minted against the layer's own root"));
+        }
+        let commitment_root = termless_anchor(&commitment, trusted.root())?;
         let oracle = ResolutionOpenings::oracle(layer.verifier_view())?;
         envelope.verify(
-            &TermlessWithOpenings { commitment: &commitment, openings: &oracle },
+            &TermlessWithOpenings {
+                commitment: &commitment,
+                openings: &oracle,
+                attested: trusted.is_attested(),
+            },
             commitment_root,
             plan,
         )?;
@@ -217,14 +324,18 @@ impl TermlessRelationEnvelope {
     /// `resolution_root`, and the caller's OWN `plan`. Every result term is resolved through the
     /// shipped openings (each re-verified against the root-bound Merkle roots), and the verifier
     /// must consume every shipped opening. `Ok(())` means the envelope's delivered result is sound.
+    ///
+    /// Under [`TrustedRoot::Attested`] the verifier relies on the root's well-formedness (see the
+    /// module doc) and admits [`require_attested_termless_plan`]; under [`TrustedRoot::Bare`] it is
+    /// exactly the id-only verification it always was ([`require_termless_plan`]).
     pub fn verify(
         &self,
         commitment: &VerifierCommitment,
-        trusted_resolution_root: ProofHash,
+        trusted: TrustedRoot,
         plan: &RelationProofPlan,
     ) -> io::Result<()> {
-        require_termless_plan(plan)?;
-        let commitment_root = termless_anchor(commitment, trusted_resolution_root)?;
+        trusted.require_plan(plan)?;
+        let commitment_root = termless_anchor(commitment, trusted.root())?;
         if self.openings.is_oracle() {
             return Err(invalid("an oracle carrier is never a shipped witness"));
         }
@@ -232,7 +343,7 @@ impl TermlessRelationEnvelope {
         // verification's bookkeeping into another).
         let openings = self.openings.fresh_tracked();
         self.envelope.verify(
-            &TermlessWithOpenings { commitment, openings: &openings },
+            &TermlessWithOpenings { commitment, openings: &openings, attested: trusted.is_attested() },
             commitment_root,
             plan,
         )?;
@@ -247,7 +358,8 @@ impl TermlessRelationEnvelope {
         out.extend_from_slice(&TERMLESS_TREE_VERSION.to_le_bytes());
         let mut nodes = 0;
         self.envelope.put_bounded(&mut out, 1, &mut nodes)?;
-        self.openings.put(&mut out)?;
+        put_id_openings(&self.openings, &mut out)?;
+        put_sorted_lookups(&self.openings, &mut out)?;
         if out.len().checked_add(CHECKSUM_BYTES).map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES) {
             return Err(invalid("term-less relation envelope too large"));
         }
@@ -277,7 +389,8 @@ impl TermlessRelationEnvelope {
         }
         let mut nodes = 0;
         let envelope = RecursiveRelationEnvelope::get_bounded(&mut reader, 1, &mut nodes)?;
-        let openings = ResolutionOpenings::get(&mut reader)?;
+        let mut openings = ResolutionOpenings::get(&mut reader)?;
+        get_sorted_lookups(&mut openings, &mut reader)?;
         reader.finish()?;
         Ok(Self { envelope, openings })
     }

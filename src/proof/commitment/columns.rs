@@ -243,7 +243,7 @@ pub(super) fn commit_node_value_dictionary_with_context(
 /// the `Float32`/`Float64` tag; any other tag returns `false`). Shared by
 /// [`reject_nan_catalog`] (term-bearing, whole catalog) and [`reject_nan_objects`]
 /// (Merkle-dict I2b step-3 TERM-LESS, the opened touched terms).
-fn object_is_selected_nan(object: &CanonicalObject, datatype_tag: ArkFr) -> bool {
+pub(super) fn object_is_selected_nan(object: &CanonicalObject, datatype_tag: ArkFr) -> bool {
     let f32_tag = ArkFr::from_u64(CanonicalDatatype::Float32 as u64);
     let f64_tag = ArkFr::from_u64(CanonicalDatatype::Float64 as u64);
     match object {
