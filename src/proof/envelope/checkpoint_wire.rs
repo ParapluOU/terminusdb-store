@@ -17,6 +17,9 @@ use crate::proof::checkpoint::{
     PaddingProof, MAX_CHECKPOINT_TRIPLES,
 };
 use crate::proof::checkpoint::{
+    CheckpointRecord, MAX_CHECKPOINT_RECORD_BYTES, MAX_CHECKPOINT_RECORD_DELTAS,
+};
+use crate::proof::checkpoint::{
     DeltaTriples, WriteDiff, WriteTransition, WriteTransitionWitness, MAX_TRANSITION_DELTAS,
     MAX_WRITE_TRANSITION_BYTES,
 };
@@ -33,6 +36,8 @@ pub(crate) const GENESIS_PROOF_MAGIC: &[u8; 12] = b"TDBWQCKPG\0\0\0";
 pub(crate) const CHECKPOINT_VIEW_MAGIC: &[u8; 12] = b"TDBWQCKPV\0\0\0";
 /// Framing magic of a [`WriteTransition`] — permanent; never change these bytes.
 pub(crate) const WRITE_TRANSITION_MAGIC: &[u8; 12] = b"TDBWQCKPW\0\0\0";
+/// Framing magic of a [`CheckpointRecord`] — permanent; never change these bytes.
+pub(crate) const CHECKPOINT_RECORD_MAGIC: &[u8; 12] = b"TDBWQCKPR\0\0\0";
 /// Wire-format versions (accepted exactly; bump on any layout change).
 /// The artifact is v2 since its dictionary columns became segment lists.
 pub(crate) const CHECKPOINT_ARTIFACT_VERSION: u32 = 2;
@@ -40,6 +45,7 @@ pub(crate) const CHECKPOINT_PROOF_VERSION: u32 = 1;
 pub(crate) const GENESIS_PROOF_VERSION: u32 = 1;
 pub(crate) const CHECKPOINT_VIEW_VERSION: u32 = 1;
 pub(crate) const WRITE_TRANSITION_VERSION: u32 = 1;
+pub(crate) const CHECKPOINT_RECORD_VERSION: u32 = 1;
 
 impl Wire for [u64; 3] {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
@@ -318,6 +324,51 @@ impl WriteTransition {
             let diff = WriteDiff::get(reader)?;
             let witness = WriteTransitionWitness::get(reader)?;
             Ok(WriteTransition { checkpoint, deltas, diff, witness })
+        })
+    }
+}
+
+impl CheckpointRecord {
+    /// Frame the record for shipping: `C_j`'s artifact, the deltas as framed verifier commitments
+    /// (blobs), `C_k`'s artifact and the proof, under [`MAX_CHECKPOINT_RECORD_BYTES`].
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        if self.deltas.len() > MAX_CHECKPOINT_RECORD_DELTAS {
+            return Err(invalid("checkpoint record spans too many deltas"));
+        }
+        let out = frame(CHECKPOINT_RECORD_MAGIC, CHECKPOINT_RECORD_VERSION, |out| {
+            self.prev.put(out)?;
+            self.deltas.len().put(out)?;
+            for delta in &self.deltas {
+                super::wire::put_blob(&delta.encode()?, out)?;
+            }
+            self.next.put(out)?;
+            self.proof.put(out)
+        })?;
+        if out.len() > MAX_CHECKPOINT_RECORD_BYTES {
+            return Err(invalid("checkpoint record exceeds its byte cap"));
+        }
+        Ok(out)
+    }
+
+    /// Parse a framed record (no trust checks; [`CheckpointRecord::verify`] checks it). The byte
+    /// cap bounds every allocation and all decode work by the input size.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() > MAX_CHECKPOINT_RECORD_BYTES {
+            return Err(invalid("checkpoint record exceeds its byte cap"));
+        }
+        unframe(bytes, CHECKPOINT_RECORD_MAGIC, CHECKPOINT_RECORD_VERSION, "checkpoint record", |reader| {
+            let prev = CheckpointArtifact::get(reader)?;
+            let count = usize::get(reader)?;
+            if count > MAX_CHECKPOINT_RECORD_DELTAS {
+                return Err(invalid("checkpoint record spans too many deltas"));
+            }
+            let mut deltas = Vec::new();
+            for _ in 0..count {
+                deltas.push(VerifierCommitment::decode(super::wire::get_blob(reader)?)?);
+            }
+            let next = CheckpointArtifact::get(reader)?;
+            let proof = CheckpointProof::get(reader)?;
+            Ok(CheckpointRecord { prev, deltas, next, proof })
         })
     }
 }

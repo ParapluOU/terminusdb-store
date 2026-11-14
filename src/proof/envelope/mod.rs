@@ -106,7 +106,8 @@ pub use plan::{
 
 pub use layer_bgp::LayerBgpEnvelope;
 pub use checkpoint_read::{
-    decode_and_verify_checkpoint_delta_read, decode_and_verify_checkpoint_read,
+    decode_and_verify_checkpoint_delta_read, decode_and_verify_checkpoint_read, decode_and_verify_checkpoint_read_over_view,
+    verify_checkpoint_read_view,
     CheckpointRelationEnvelope,
 };
 // The single-layer TERM-LESS recursive envelope (O(result) witness beside the O(1) commitment).

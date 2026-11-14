@@ -218,3 +218,58 @@ pub fn decode_and_verify_checkpoint_delta_read(
     envelope.verify(&view, plan)?;
     Ok(envelope)
 }
+
+/// Verify, ONCE PER HEAD, the checkpoint view every query at that head reads — the part of
+/// [`decode_and_verify_checkpoint_read`] / [`decode_and_verify_checkpoint_delta_read`] that does not
+/// depend on the query — so a verifier can cache the result per `(trusted_checkpoint_root,
+/// trusted_head_root)` and check each query with [`decode_and_verify_checkpoint_read_over_view`].
+///
+/// With no `head` (no deltas since): the checkpoint artifact must carry the trusted checkpoint root
+/// and be OF the trusted head, and `delta_views` must be empty. With `head = (artifact, proof)`: the
+/// head checkpoint `C'` is verified from the trusted checkpoint, the deltas' term-bearing verifier
+/// commitments (chain order) and the trusted head root. Then the view proof of the head checkpoint.
+pub fn verify_checkpoint_read_view(
+    checkpoint_artifact: &[u8],
+    trusted_checkpoint_root: ProofHash,
+    delta_views: &[&[u8]],
+    trusted_head_root: ProofHash,
+    head: Option<(&[u8], &[u8])>,
+    view_proof: &[u8],
+) -> io::Result<VerifiedCheckpointView> {
+    let head = match head {
+        None => {
+            if !delta_views.is_empty() {
+                return Err(invalid("a checkpoint read with deltas since needs the head checkpoint proof"));
+            }
+            let artifact = CheckpointArtifact::decode(checkpoint_artifact)?;
+            if artifact.checkpoint_root != trusted_checkpoint_root {
+                return Err(invalid("checkpoint is not the trusted one"));
+            }
+            if artifact.head_root != trusted_head_root {
+                return Err(invalid("checkpoint is not of the trusted head"));
+            }
+            artifact
+        }
+        Some((head_artifact, head_proof)) => decode_and_verify_checkpoint(
+            trusted_checkpoint_root,
+            checkpoint_artifact,
+            delta_views,
+            trusted_head_root,
+            head_artifact,
+            head_proof,
+        )?,
+    };
+    verify_checkpoint_view(&head, head.checkpoint_root, &CheckpointViewProof::decode(view_proof)?)
+}
+
+/// Verify one query's envelope against a view already verified by [`verify_checkpoint_read_view`]
+/// (e.g. from a per-head cache), against the caller's OWN `plan`.
+pub fn decode_and_verify_checkpoint_read_over_view(
+    envelope: &[u8],
+    view: &VerifiedCheckpointView,
+    plan: &RelationProofPlan,
+) -> io::Result<CheckpointRelationEnvelope> {
+    let envelope = CheckpointRelationEnvelope::decode(envelope)?;
+    envelope.verify(view, plan)?;
+    Ok(envelope)
+}

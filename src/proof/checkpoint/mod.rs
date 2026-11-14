@@ -56,6 +56,9 @@ pub mod smt;
 mod state;
 pub mod term_tree;
 pub mod transition;
+mod record;
+#[cfg(test)]
+mod record_tests;
 #[cfg(test)]
 mod transition_tests;
 #[cfg(test)]
@@ -70,6 +73,10 @@ pub use transition::{
     decode_and_verify_write_transition, prove_write_transition, verify_write_transition, DeltaTriples, WriteDiff,
     WriteTransition, WriteTransitionWitness, MAX_TRANSITION_DELTAS, MAX_TRANSITION_DIFF_TRIPLES,
     MAX_WRITE_TRANSITION_BYTES,
+};
+pub use record::{
+    decode_and_verify_checkpoint_record, CheckpointRecord, VerifiedCheckpointRecord, MAX_CHECKPOINT_RECORD_BYTES,
+    MAX_CHECKPOINT_RECORD_DELTAS,
 };
 pub use view::{
     prove_checkpoint_view, verify_checkpoint_view, CheckpointQueryLayer, CheckpointViewProof,
