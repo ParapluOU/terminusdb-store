@@ -509,7 +509,7 @@ pub(super) fn prove_group_hash(
 /// (`base_g = g·2^working_log`) — no committed multiplicity (the reciprocal column is gone), so
 /// there is NO `committed × public-Chi` mask (no GAP-1, no auxiliary Identity); within-block and
 /// padding-block rows self-annihilate (`p = 0`).
-pub(super) fn reconcile_link_instance(
+pub(crate) fn reconcile_link_instance(
     alpha: ArkFr,
     beta: ArkFr,
     lens: &[usize],

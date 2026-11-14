@@ -863,6 +863,7 @@ pub mod primer;
 pub mod anti;
 pub mod argument;
 pub mod bgp;
+pub mod checkpoint;
 pub mod count;
 pub mod dict;
 pub mod dicthash;

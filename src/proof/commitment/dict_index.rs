@@ -72,6 +72,27 @@ impl DictFacts {
         facts
     }
 
+    /// The facts of a set of node/value terms (the checkpoint's append: the facts of the new
+    /// entries, OR-ed into the facts of the dictionary they extend).
+    pub(crate) fn from_objects<'a>(objects: impl IntoIterator<Item = &'a CanonicalObject>) -> Self {
+        let f32_tag = ArkFr::from_u64(CanonicalDatatype::Float32 as u64);
+        let f64_tag = ArkFr::from_u64(CanonicalDatatype::Float64 as u64);
+        let mut facts = Self::default();
+        for object in objects {
+            facts.float32_nan |= object_is_selected_nan(object, f32_tag);
+            facts.float64_nan |= object_is_selected_nan(object, f64_tag);
+        }
+        facts
+    }
+
+    /// The facts of the union of two dictionaries.
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self {
+            float32_nan: self.float32_nan | other.float32_nan,
+            float64_nan: self.float64_nan | other.float64_nan,
+        }
+    }
+
     /// The one-byte wire/hash form: bit 0 = float32 NaN, bit 1 = float64 NaN.
     pub(crate) fn to_byte(self) -> u8 {
         (self.float32_nan as u8) | ((self.float64_nan as u8) << 1)

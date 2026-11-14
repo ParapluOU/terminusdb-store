@@ -73,6 +73,7 @@
 
 mod array_walk;
 mod bag_union;
+mod checkpoint_wire;
 mod columns;
 mod layer_bgp;
 mod left_anti;
