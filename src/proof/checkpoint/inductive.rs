@@ -137,6 +137,46 @@ pub(super) fn new_terms(state: &CommitmentState, nv_catalog: &[ProofRecord], pre
     Ok((nv, pred))
 }
 
+/// A delta's clear id triples are its committed records: counts agree, each table is strictly
+/// SPO-sorted with ids inside the delta's dictionary, the tables are disjoint, and each column
+/// re-commits to the delta's root-bound column commitment.
+pub(super) fn check_delta_records(
+    view: &VerifierCommitmentRef<'_>,
+    additions: &[IdTriple],
+    removals: &[IdTriple],
+) -> io::Result<()> {
+    let state = view.state;
+    if additions.len() as u64 != state.addition_count || removals.len() as u64 != state.removal_count {
+        return Err(invalid("checkpoint delta records disagree with the delta's counts"));
+    }
+    for table in [additions, removals] {
+        if table.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(invalid("checkpoint delta records are not strictly SPO-sorted"));
+        }
+        if table.iter().any(|t| {
+            t[0] == 0 || t[1] == 0 || t[2] == 0
+                || t[0] > state.node_value_count
+                || t[2] > state.node_value_count
+                || t[1] > state.predicate_count
+        }) {
+            return Err(invalid("checkpoint delta record id lies outside the dictionary"));
+        }
+    }
+    let removal_set: BTreeSet<&IdTriple> = removals.iter().collect();
+    if additions.iter().any(|t| removal_set.contains(t)) {
+        return Err(invalid("checkpoint delta adds and removes the same triple"));
+    }
+    let column = |table: &[IdTriple], c: usize| -> Vec<u64> { table.iter().map(|t| t[c]).collect() };
+    for c in 0..3 {
+        if commit_layer_id_column(&column(additions, c))? != view.column_commitments[c]
+            || commit_layer_id_column(&column(removals, c))? != view.column_commitments[3 + c]
+        {
+            return Err(invalid("checkpoint delta records are not the delta's committed records"));
+        }
+    }
+    Ok(())
+}
+
 fn id_triples(records: &[ProofRecord]) -> Vec<IdTriple> {
     records.iter().map(|r| [r.subject_id, r.predicate_id, r.object_id]).collect()
 }
@@ -595,39 +635,10 @@ pub fn verify_checkpoint(
     let mut all_additions = Vec::new();
     let mut all_removals = Vec::new();
     for (view, update) in deltas.iter().zip(&proof.deltas) {
-        let state = view.state;
-        if update.additions.len() as u64 != state.addition_count
-            || update.removals.len() as u64 != state.removal_count
-            || update.removal_paths.len() != update.removals.len()
-            || update.addition_paths.len() != update.additions.len()
-        {
+        if update.removal_paths.len() != update.removals.len() || update.addition_paths.len() != update.additions.len() {
             return Err(invalid("checkpoint delta records disagree with the delta's counts"));
         }
-        for table in [&update.additions, &update.removals] {
-            if table.windows(2).any(|w| w[0] >= w[1]) {
-                return Err(invalid("checkpoint delta records are not strictly SPO-sorted"));
-            }
-            if table.iter().any(|t| {
-                t[0] == 0 || t[1] == 0 || t[2] == 0
-                    || t[0] > state.node_value_count
-                    || t[2] > state.node_value_count
-                    || t[1] > state.predicate_count
-            }) {
-                return Err(invalid("checkpoint delta record id lies outside the dictionary"));
-            }
-        }
-        let removal_set: BTreeSet<&IdTriple> = update.removals.iter().collect();
-        if update.additions.iter().any(|t| removal_set.contains(t)) {
-            return Err(invalid("checkpoint delta adds and removes the same triple"));
-        }
-        let column = |table: &[IdTriple], c: usize| -> Vec<u64> { table.iter().map(|t| t[c]).collect() };
-        for c in 0..3 {
-            if commit_layer_id_column(&column(&update.additions, c))? != view.column_commitments[c]
-                || commit_layer_id_column(&column(&update.removals, c))? != view.column_commitments[3 + c]
-            {
-                return Err(invalid("checkpoint delta records are not the delta's committed records"));
-            }
-        }
+        check_delta_records(view, &update.additions, &update.removals)?;
         all_additions.extend_from_slice(&update.additions);
         all_removals.extend_from_slice(&update.removals);
     }

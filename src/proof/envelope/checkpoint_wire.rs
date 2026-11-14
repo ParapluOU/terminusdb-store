@@ -16,7 +16,12 @@ use crate::proof::checkpoint::{
     CheckpointArtifact, CheckpointProof, CheckpointViewProof, DeltaUpdateProof, GenesisProof, IdTriple,
     PaddingProof, MAX_CHECKPOINT_TRIPLES,
 };
-use crate::proof::commitment::DictFacts;
+use crate::proof::checkpoint::{
+    DeltaTriples, WriteDiff, WriteTransition, WriteTransitionWitness, MAX_TRANSITION_DELTAS,
+    MAX_WRITE_TRANSITION_BYTES,
+};
+use crate::proof::commitment::{DictFacts, VerifierCommitment};
+use crate::proof::CanonicalTriple;
 
 /// Framing magic of a [`CheckpointArtifact`] — permanent; never change these bytes.
 pub(crate) const CHECKPOINT_ARTIFACT_MAGIC: &[u8; 12] = b"TDBWQCKPT\0\0\0";
@@ -26,12 +31,15 @@ pub(crate) const CHECKPOINT_PROOF_MAGIC: &[u8; 12] = b"TDBWQCKPP\0\0\0";
 pub(crate) const GENESIS_PROOF_MAGIC: &[u8; 12] = b"TDBWQCKPG\0\0\0";
 /// Framing magic of a [`CheckpointViewProof`] — permanent; never change these bytes.
 pub(crate) const CHECKPOINT_VIEW_MAGIC: &[u8; 12] = b"TDBWQCKPV\0\0\0";
+/// Framing magic of a [`WriteTransition`] — permanent; never change these bytes.
+pub(crate) const WRITE_TRANSITION_MAGIC: &[u8; 12] = b"TDBWQCKPW\0\0\0";
 /// Wire-format versions (accepted exactly; bump on any layout change).
 /// The artifact is v2 since its dictionary columns became segment lists.
 pub(crate) const CHECKPOINT_ARTIFACT_VERSION: u32 = 2;
 pub(crate) const CHECKPOINT_PROOF_VERSION: u32 = 1;
 pub(crate) const GENESIS_PROOF_VERSION: u32 = 1;
 pub(crate) const CHECKPOINT_VIEW_VERSION: u32 = 1;
+pub(crate) const WRITE_TRANSITION_VERSION: u32 = 1;
 
 impl Wire for [u64; 3] {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
@@ -114,6 +122,10 @@ wire_struct!(SmtPath { siblings, terminal });
 wire_struct!(SmtDeleteProof { path, sibling });
 wire_struct!(DeltaUpdateProof { additions, removals, removal_paths, addition_paths });
 wire_struct!(PaddingProof { sumcheck, opening });
+wire_struct!(CanonicalTriple { subject, predicate, object });
+wire_struct!(WriteDiff { additions, removals });
+wire_struct!(DeltaTriples { additions, removals });
+wire_struct!(WriteTransitionWitness { deltas, nv_term_paths, pred_term_paths, triple_paths });
 wire_struct!(CheckpointProof {
     deltas,
     nv_tree_frontier,
@@ -261,6 +273,51 @@ impl GenesisProof {
                 present.push(Wire::get(reader)?);
             }
             Ok(GenesisProof { present })
+        })
+    }
+}
+
+impl WriteTransition {
+    /// Frame the transition for shipping: the checkpoint artifact, the deltas since as framed
+    /// verifier commitments (blobs), the diff and the witness, under [`MAX_WRITE_TRANSITION_BYTES`].
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        if self.deltas.len() > MAX_TRANSITION_DELTAS {
+            return Err(invalid("write transition spans too many deltas"));
+        }
+        let out = frame(WRITE_TRANSITION_MAGIC, WRITE_TRANSITION_VERSION, |out| {
+            self.checkpoint.put(out)?;
+            self.deltas.len().put(out)?;
+            for delta in &self.deltas {
+                super::wire::put_blob(&delta.encode()?, out)?;
+            }
+            self.diff.put(out)?;
+            self.witness.put(out)
+        })?;
+        if out.len() > MAX_WRITE_TRANSITION_BYTES {
+            return Err(invalid("write transition exceeds its byte cap"));
+        }
+        Ok(out)
+    }
+
+    /// Parse a framed transition (no trust checks; [`WriteTransition::verify`] checks it). The
+    /// byte cap bounds every allocation and all decode work by the input size.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() > MAX_WRITE_TRANSITION_BYTES {
+            return Err(invalid("write transition exceeds its byte cap"));
+        }
+        unframe(bytes, WRITE_TRANSITION_MAGIC, WRITE_TRANSITION_VERSION, "write transition", |reader| {
+            let checkpoint = CheckpointArtifact::get(reader)?;
+            let count = usize::get(reader)?;
+            if count > MAX_TRANSITION_DELTAS {
+                return Err(invalid("write transition spans too many deltas"));
+            }
+            let mut deltas = Vec::new();
+            for _ in 0..count {
+                deltas.push(VerifierCommitment::decode(super::wire::get_blob(reader)?)?);
+            }
+            let diff = WriteDiff::get(reader)?;
+            let witness = WriteTransitionWitness::get(reader)?;
+            Ok(WriteTransition { checkpoint, deltas, diff, witness })
         })
     }
 }

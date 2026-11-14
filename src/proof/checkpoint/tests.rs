@@ -15,27 +15,27 @@ use crate::proof::commitment::{LayerCommitment, VerifierCommitment, VerifierLaye
 use crate::proof::{CanonicalObject, CanonicalTriple, ProofRecord};
 use crate::store::sync::{open_sync_memory_store, SyncStoreLayer};
 
-fn iri(s: &str) -> String {
+pub(super) fn iri(s: &str) -> String {
     format!("http://ex/{s}")
 }
 
-fn node(s: &str, p: &str, o: &str) -> ValueTriple {
+pub(super) fn node(s: &str, p: &str, o: &str) -> ValueTriple {
     ValueTriple::new_node(&iri(s), &iri(p), &iri(o))
 }
 
-enum Op {
+pub(super) enum Op {
     Add(ValueTriple),
     Remove(ValueTriple),
 }
 
 /// A real store chain: a base layer plus deltas, with each layer's store handle and sidecar.
-struct Chain {
-    layers: Vec<SyncStoreLayer>,
-    commitments: Vec<Arc<LayerCommitment>>,
+pub(super) struct Chain {
+    pub(super) layers: Vec<SyncStoreLayer>,
+    pub(super) commitments: Vec<Arc<LayerCommitment>>,
 }
 
 impl Chain {
-    fn new(base: Vec<ValueTriple>) -> Self {
+    pub(super) fn new(base: Vec<ValueTriple>) -> Self {
         let store = open_sync_memory_store();
         let builder = store.create_base_layer().unwrap();
         for t in base {
@@ -46,7 +46,7 @@ impl Chain {
         Chain { layers: vec![layer], commitments: vec![commitment] }
     }
 
-    fn push(&mut self, ops: Vec<Op>) {
+    pub(super) fn push(&mut self, ops: Vec<Op>) {
         let builder = self.layers.last().unwrap().open_write().unwrap();
         for op in ops {
             match op {
@@ -59,23 +59,23 @@ impl Chain {
         self.layers.push(layer);
     }
 
-    fn deltas(&self, from: usize, to: usize) -> Vec<&LayerCommitment> {
+    pub(super) fn deltas(&self, from: usize, to: usize) -> Vec<&LayerCommitment> {
         self.commitments[from + 1..=to].iter().map(|c| c.as_ref()).collect()
     }
 
-    fn root(&self, i: usize) -> ProofHash {
+    pub(super) fn root(&self, i: usize) -> ProofHash {
         self.commitments[i].resolution_root()
     }
 }
 
-fn genesis(chain: &Chain) -> CheckpointState {
+pub(super) fn genesis(chain: &Chain) -> CheckpointState {
     let (state, proof) = genesis_checkpoint(&chain.commitments[0]).unwrap();
     let view = chain.commitments[0].verifier_commitment().unwrap();
     verify_genesis_checkpoint(view.verifier_view(), chain.root(0), &state.artifact, &proof).unwrap();
     state
 }
 
-fn views(deltas: &[&LayerCommitment]) -> Vec<VerifierCommitment> {
+pub(super) fn views(deltas: &[&LayerCommitment]) -> Vec<VerifierCommitment> {
     deltas.iter().map(|d| d.verifier_commitment().unwrap()).collect()
 }
 
@@ -92,7 +92,7 @@ fn verify(
 }
 
 /// Prove and verify `from -> to`.
-fn step(chain: &Chain, prev: &CheckpointState, from: usize, to: usize) -> (CheckpointState, CheckpointProof) {
+pub(super) fn step(chain: &Chain, prev: &CheckpointState, from: usize, to: usize) -> (CheckpointState, CheckpointProof) {
     let deltas = chain.deltas(from, to);
     let (next, proof) = prove_checkpoint(prev, &deltas).unwrap();
     verify(&prev.artifact, &deltas, chain.root(to), &next.artifact, &proof).unwrap();
@@ -127,7 +127,7 @@ fn assert_same_state(a: &CheckpointArtifact, b: &CheckpointArtifact) {
 }
 
 /// base (with values) and seven deltas: removals, re-adds, new predicates, values, an empty delta.
-fn rich_chain() -> Chain {
+pub(super) fn rich_chain() -> Chain {
     let mut chain = Chain::new(vec![
         node("a1", "p1", "b1"),
         node("a2", "p1", "b2"),

@@ -55,6 +55,9 @@ mod inductive;
 pub mod smt;
 mod state;
 pub mod term_tree;
+pub mod transition;
+#[cfg(test)]
+mod transition_tests;
 #[cfg(test)]
 mod query_tests;
 #[cfg(test)]
@@ -63,6 +66,11 @@ pub mod view;
 
 pub use genesis::{genesis_checkpoint, genesis_checkpoint_with_context, verify_genesis_checkpoint};
 pub use inductive::{prove_checkpoint, prove_checkpoint_with_context, verify_checkpoint};
+pub use transition::{
+    decode_and_verify_write_transition, prove_write_transition, verify_write_transition, DeltaTriples, WriteDiff,
+    WriteTransition, WriteTransitionWitness, MAX_TRANSITION_DELTAS, MAX_TRANSITION_DIFF_TRIPLES,
+    MAX_WRITE_TRANSITION_BYTES,
+};
 pub use view::{
     prove_checkpoint_view, verify_checkpoint_view, CheckpointQueryLayer, CheckpointViewProof,
     VerifiedCheckpointView,
