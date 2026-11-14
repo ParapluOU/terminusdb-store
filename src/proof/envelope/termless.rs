@@ -358,6 +358,9 @@ impl TermlessRelationEnvelope {
         out.extend_from_slice(&TERMLESS_TREE_VERSION.to_le_bytes());
         let mut nodes = 0;
         self.envelope.put_bounded(&mut out, 1, &mut nodes)?;
+        if self.openings.keyed_lookups().next().is_some() {
+            return Err(invalid("a term-less envelope carries no checkpoint term-index lookups"));
+        }
         put_id_openings(&self.openings, &mut out)?;
         put_sorted_lookups(&self.openings, &mut out)?;
         if out.len().checked_add(CHECKSUM_BYTES).map_or(true, |len| len > MAX_QUERY_ENVELOPE_BYTES) {

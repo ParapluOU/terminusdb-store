@@ -218,6 +218,15 @@ pub struct VerifierCommitmentRef<'a> {
     /// set by decoding an artifact: every artifact/sidecar view is `false`; only the
     /// single-layer term-less envelope's attested verification sets it.
     pub attested: bool,
+    /// `true` only for the view of a PROVEN CHECKPOINT (`crate::proof::checkpoint::view`): a
+    /// term-less base view whose commitments, facts and dictionary structures are the ones the
+    /// checkpoint's inductive proof and its view proof bind (so it is also `attested` — every
+    /// well-formedness fact an attested view assumes is proven, not vouched for). Its two
+    /// "Merkle roots" are then the checkpoint's id-indexed TERM-TREE roots and its two "sorted
+    /// roots" the checkpoint's keyed TERM-INDEX roots: `id -> term` opens the term tree and
+    /// `term -> id` opens the keyed index ([`open_node_value_id`], [`node_value_term_id`]). Never
+    /// set by decoding an artifact.
+    pub checkpoint: bool,
 }
 
 /// Common verifier-facing interface. It intentionally contains no raw-table
@@ -291,6 +300,7 @@ impl VerifierLayer for LayerCommitment {
             pred_merkle_root: self.pred_merkle_root,
             dict_index: self.dict_index,
             attested: false,
+            checkpoint: false,
         }
     }
 }
@@ -311,6 +321,7 @@ impl VerifierLayer for VerifierCommitment {
             pred_merkle_root: self.pred_merkle_root,
             dict_index: self.dict_index,
             attested: false,
+            checkpoint: false,
         }
     }
 }
@@ -1413,6 +1424,119 @@ impl LayerCommitment {
     }
 }
 
+/// The commitments a proven checkpoint's QUERY VIEW exposes to the single-layer gadgets
+/// (`crate::proof::checkpoint::view`): the checkpoint's present S, P, O commitments and its
+/// dictionary columns in the standard layout, rows in CHAIN-ID order (`id - 1`), as a base layer
+/// commits them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointViewCommitments {
+    pub node_value_count: u64,
+    pub predicate_count: u64,
+    pub materialized_count: u64,
+    pub materialized_column_commitments: [ArkGT; MATERIALIZED_COLUMN_COUNT],
+    pub predicate_dict_commitments: (ArkGT, ArkGT),
+    pub node_value_dict_commitments: (ArkGT, ArkGT),
+    pub node_value_dict_range_commitments: (ArkGT, ArkGT),
+}
+
+impl CheckpointViewCommitments {
+    /// The base-layer summary of the view (no parent, no delta columns).
+    fn state(&self) -> io::Result<(CommitmentState, [ArkGT; COLUMN_COUNT])> {
+        let columns = [<ArkGT as Group>::identity(); COLUMN_COUNT];
+        let mut state = CommitmentState {
+            parent_state_root: None,
+            addition_count: 0,
+            removal_count: 0,
+            materialized_count: self.materialized_count,
+            parent_node_value_count: 0,
+            parent_predicate_count: 0,
+            node_value_count: self.node_value_count,
+            predicate_count: self.predicate_count,
+            commitment_root: [0; 32],
+        };
+        state.commitment_root = compute_commitment_root_from_parts(
+            &state,
+            &columns,
+            &self.materialized_column_commitments,
+            &self.predicate_dict_commitments,
+            &self.node_value_dict_commitments,
+            &self.node_value_dict_range_commitments,
+        )?;
+        Ok((state, columns))
+    }
+}
+
+impl LayerCommitment {
+    /// PROVER: the term-bearing base sidecar of a checkpoint's query view — its catalogs in
+    /// CHAIN-ID order (so every column rebuilt from them is the view's id-ordered column), its
+    /// materialized table the checkpoint's present triples, its commitments the view's. Its Merkle
+    /// roots and dictionary index are the canonical ones of these catalogs (the prover's own
+    /// re-validation recomputes them); the VERIFIER's view of the same commitments carries the
+    /// checkpoint's term trees and indexes instead (`VerifierCommitment::checkpoint_view`). Both
+    /// share `commitment_root`, the root every query transcript is bound to.
+    pub(crate) fn checkpoint_view_layer(
+        commitments: &CheckpointViewCommitments,
+        materialized: Vec<ProofRecord>,
+        node_value_catalog: Vec<ProofRecord>,
+        predicate_catalog: Vec<ProofRecord>,
+    ) -> io::Result<Self> {
+        let (state, column_commitments) = commitments.state()?;
+        let nv_merkle_root = node_value_merkle_root(&node_value_catalog, 0, state.node_value_count)?;
+        let pred_merkle_root = predicate_merkle_root(&predicate_catalog, 0, state.predicate_count)?;
+        let dict_index = DictIndex::for_layer(None, &node_value_catalog, &predicate_catalog)?;
+        Ok(Self {
+            state,
+            additions: Vec::new(),
+            removals: Vec::new(),
+            materialized,
+            predicate_catalog,
+            node_value_catalog,
+            column_commitments,
+            materialized_column_commitments: commitments.materialized_column_commitments,
+            predicate_dict_commitments: commitments.predicate_dict_commitments,
+            node_value_dict_commitments: commitments.node_value_dict_commitments,
+            node_value_dict_range_commitments: commitments.node_value_dict_range_commitments,
+            nv_merkle_root,
+            pred_merkle_root,
+            dict_index,
+        })
+    }
+}
+
+impl VerifierCommitment {
+    /// VERIFIER: the TERM-LESS base commitment a proven checkpoint's query view verifies against.
+    /// Its "Merkle roots" are the checkpoint's term-tree roots and its "sorted roots" the
+    /// checkpoint's keyed term-index roots; only a view with `checkpoint = true` reads them as
+    /// such (`VerifierCommitmentRef::checkpoint`). Built by the verifier from a verified
+    /// checkpoint artifact and a verified view proof, never decoded.
+    pub(crate) fn checkpoint_view(
+        commitments: &CheckpointViewCommitments,
+        term_tree_roots: (ProofHash, ProofHash),
+        term_index_roots: (ProofHash, ProofHash),
+        facts: DictFacts,
+    ) -> io::Result<Self> {
+        let (state, column_commitments) = commitments.state()?;
+        Ok(Self {
+            state,
+            terms_present: false,
+            predicate_catalog: Vec::new(),
+            node_value_catalog: Vec::new(),
+            column_commitments,
+            materialized_column_commitments: commitments.materialized_column_commitments,
+            predicate_dict_commitments: commitments.predicate_dict_commitments,
+            node_value_dict_commitments: commitments.node_value_dict_commitments,
+            node_value_dict_range_commitments: commitments.node_value_dict_range_commitments,
+            nv_merkle_root: term_tree_roots.0,
+            pred_merkle_root: term_tree_roots.1,
+            dict_index: Some(DictIndex {
+                facts,
+                nv_sorted_root: term_index_roots.0,
+                pred_sorted_root: term_index_roots.1,
+            }),
+        })
+    }
+}
+
 impl VerifierCommitment {
     /// β re-anchor: the artifact's two-hash `resolution_root` anchor (binds `commitment_root`
     /// AND both id-indexed dictionary Merkle roots). Inherent convenience mirroring
@@ -1785,12 +1909,83 @@ fn attested_sorted_lookup(
     let openings = source.shipped_openings().ok_or_else(|| {
         invalid("an attested term lookup requires the envelope-carried sorted-index openings")
     })?;
-    let lookup = openings.sorted_lookup(namespace, key)?;
     let (root, n) = match namespace {
         SortedNamespace::NodeValue => (index.nv_sorted_root, view.state.node_value_count),
         SortedNamespace::Predicate => (index.pred_sorted_root, view.state.predicate_count),
     };
+    if view.checkpoint {
+        // A checkpoint's keyed term index: membership gives the id from the authenticated leaf,
+        // a non-membership path proves the absence.
+        let path = openings.keyed_lookup(namespace, key)?;
+        let index_namespace = match namespace {
+            SortedNamespace::NodeValue => crate::proof::checkpoint::smt::NS_NV_INDEX,
+            SortedNamespace::Predicate => crate::proof::checkpoint::smt::NS_PRED_INDEX,
+        };
+        return match &path.terminal {
+            crate::proof::checkpoint::smt::SmtTerminal::Leaf { key: found, .. } if found == key => {
+                let id = crate::proof::checkpoint::smt::verify_membership(index_namespace, &root, key, &path)?;
+                if id == 0 || id > n {
+                    return Err(invalid("checkpoint term index maps a term outside the dictionary"));
+                }
+                Ok(Some(id))
+            }
+            _ => {
+                crate::proof::checkpoint::smt::verify_non_membership(index_namespace, &root, key, &path)?;
+                Ok(None)
+            }
+        };
+    }
+    let lookup = openings.sorted_lookup(namespace, key)?;
     verify_sorted_lookup(&root, n, key, &lookup)
+}
+
+/// Verify a node/value `id -> term` opening against `view`'s root-bound id-indexed structure: the
+/// layer's dictionary Merkle tree, or a checkpoint view's term tree.
+pub(crate) fn open_node_value_id(
+    view: VerifierCommitmentRef<'_>,
+    id: u64,
+    opening: &DictOpening,
+) -> io::Result<CanonicalObject> {
+    if view.checkpoint {
+        return crate::proof::checkpoint::term_tree::verify_term_opening(
+            crate::proof::checkpoint::term_tree::NS_NODE_VALUE,
+            &view.nv_merkle_root,
+            view.state.node_value_count,
+            id,
+            opening,
+        );
+    }
+    verify_opening(
+        &view.nv_merkle_root,
+        view.state.parent_node_value_count,
+        view.state.node_value_count,
+        id,
+        opening,
+    )
+}
+
+/// The predicate counterpart of [`open_node_value_id`] (the term is the IRI as a `Node`).
+pub(crate) fn open_predicate_id(
+    view: VerifierCommitmentRef<'_>,
+    id: u64,
+    opening: &DictOpening,
+) -> io::Result<CanonicalObject> {
+    if view.checkpoint {
+        return crate::proof::checkpoint::term_tree::verify_term_opening(
+            crate::proof::checkpoint::term_tree::NS_PREDICATE,
+            &view.pred_merkle_root,
+            view.state.predicate_count,
+            id,
+            opening,
+        );
+    }
+    verify_opening(
+        &view.pred_merkle_root,
+        view.state.parent_predicate_count,
+        view.state.predicate_count,
+        id,
+        opening,
+    )
 }
 
 /// `id -> term` in the node/value dictionary of one base view: `Some(term)` for an id of the
@@ -1816,11 +2011,5 @@ pub(crate) fn node_value_id_term(
         invalid("an attested id resolution requires the envelope-carried Merkle openings")
     })?;
     let opening = openings.node_value_opening(id)?;
-    Ok(Some(verify_opening(
-        &view.nv_merkle_root,
-        view.state.parent_node_value_count,
-        view.state.node_value_count,
-        id,
-        &opening,
-    )?))
+    Ok(Some(open_node_value_id(view, id, &opening)?))
 }

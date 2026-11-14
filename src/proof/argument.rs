@@ -1104,6 +1104,176 @@ pub fn prove_column_openings_with_context(
     Ok(proof)
 }
 
+// ---------------------------------------------------------------------------
+// Prefix-sparse batched opening: the dense opener's exact proof for columns whose nonzero entries
+// all lie in a short prefix of a large domain (a checkpoint dictionary segment opened at its
+// 24-variable fixed layout). Only the nonzero matrix rows are ever touched; the Dory rounds run
+// over the `2^sigma`-column layout as always. Byte-identical to `prove_column_openings` over the
+// zero-padded columns (tested), so `verify_column_openings` verifies it unchanged.
+// ---------------------------------------------------------------------------
+
+/// `MLE(v zero-padded to 2^point.len())(point)` in `O(v.len())`, folding LSB-first.
+pub(crate) fn prefix_mle_eval(values: &[ArkFr], point: &[ArkFr]) -> ArkFr {
+    if values.is_empty() {
+        return f0();
+    }
+    let mut layer: Vec<ArkFr> = values.to_vec();
+    for r in point {
+        let next_len = layer.len().div_ceil(2);
+        let mut next = Vec::with_capacity(next_len);
+        for pair in layer.chunks(2) {
+            let low = pair[0];
+            let high = if pair.len() == 2 { pair[1] } else { f0() };
+            next.push(low + (high - low) * *r);
+        }
+        layer = next;
+    }
+    layer[0]
+}
+
+/// A multilinear polynomial over `2^num_vars` coefficients of which only `coefficients` (a
+/// prefix) may be nonzero.
+struct PrefixPolynomial {
+    coefficients: Vec<ArkFr>,
+    num_vars: usize,
+}
+
+impl Polynomial<ArkFr> for PrefixPolynomial {
+    fn num_vars(&self) -> usize {
+        self.num_vars
+    }
+
+    fn evaluate(&self, point: &[ArkFr]) -> ArkFr {
+        prefix_mle_eval(&self.coefficients, point)
+    }
+
+    fn commit<E, Mo, M1>(
+        &self,
+        nu: usize,
+        sigma: usize,
+        setup: &dory_pcs::ProverSetup<E>,
+    ) -> Result<(E::GT, Vec<E::G1>, ArkFr), dory_pcs::DoryError>
+    where
+        E: dory_pcs::primitives::arithmetic::PairingCurve,
+        Mo: dory_pcs::Mode,
+        M1: dory_pcs::primitives::arithmetic::DoryRoutines<E::G1>,
+        E::G1: Group<Scalar = ArkFr>,
+        E::GT: Group<Scalar = ArkFr>,
+    {
+        self.commit_with_backend::<E, Mo, _>(nu, sigma, setup, &RoutineBackend::<M1>::new())
+    }
+
+    fn commit_with_backend<E, Mo, B1>(
+        &self,
+        nu: usize,
+        sigma: usize,
+        setup: &dory_pcs::ProverSetup<E>,
+        backend: &B1,
+    ) -> Result<(E::GT, Vec<E::G1>, ArkFr), dory_pcs::DoryError>
+    where
+        E: dory_pcs::primitives::arithmetic::PairingCurve,
+        Mo: dory_pcs::Mode,
+        B1: ProverBackend<E::G1>,
+        E::G1: Group<Scalar = ArkFr>,
+        E::GT: Group<Scalar = ArkFr>,
+    {
+        let rows = prefix_row_commitments::<E::G1, B1>(&self.coefficients, nu, sigma, &setup.g1_vec, backend);
+        let used = self.coefficients.len().div_ceil(1 << sigma);
+        let tier_2 = E::multi_pair_g2_setup(&rows[..used], &setup.g2_vec[..used]);
+        let blind: ArkFr = Mo::sample();
+        Ok((Mo::mask(tier_2, &setup.ht, &blind), rows, blind))
+    }
+}
+
+impl dory_pcs::MultilinearLagrange<ArkFr> for PrefixPolynomial {
+    fn vector_matrix_product(&self, left_vec: &[ArkFr], _nu: usize, sigma: usize) -> Vec<ArkFr> {
+        let width = 1usize << sigma;
+        let mut out = vec![f0(); width];
+        for (row, chunk) in self.coefficients.chunks(width).enumerate() {
+            let weight = left_vec[row];
+            for (slot, value) in out.iter_mut().zip(chunk) {
+                *slot = *slot + weight * *value;
+            }
+        }
+        out
+    }
+}
+
+/// The `2^nu` Dory row commitments of a prefix column: an MSM per nonzero row, the identity for
+/// every other row.
+fn prefix_row_commitments<G, B>(coefficients: &[ArkFr], nu: usize, sigma: usize, g1: &[G], backend: &B) -> Vec<G>
+where
+    G: Group<Scalar = ArkFr>,
+    B: ProverBackend<G>,
+{
+    let width = 1usize << sigma;
+    let mut padded: Vec<Vec<ArkFr>> = Vec::new();
+    for chunk in coefficients.chunks(width) {
+        let mut row = chunk.to_vec();
+        row.resize(width, f0());
+        padded.push(row);
+    }
+    let refs: Vec<&[ArkFr]> = padded.iter().map(Vec::as_slice).collect();
+    let mut rows = backend.batch_msm_same_bases(&g1[..width], &refs);
+    rows.resize(1 << nu, G::identity());
+    rows
+}
+
+/// [`prove_column_openings_with_context`] for columns that are zero beyond their given prefix, at a
+/// point of `r.len()` variables, without materializing the `2^r.len()` domain. The caller supplies
+/// the columns' commitments (the commitments of the zero-padded columns), which the transcript
+/// absorbs exactly as the dense opener absorbs its recomputed ones. Prover cost: `O(prefix)` field
+/// and MSM work plus the fixed `2^sigma`-wide Dory rounds.
+pub(crate) fn prove_prefix_column_openings_with_context(
+    context: &StoreProverContext<'_>,
+    columns: &[&[ArkFr]],
+    commitments: &[ArkGT],
+    r: &[ArkFr],
+    transcript: &mut Transcript254,
+) -> io::Result<ColumnOpening> {
+    let size = 1usize
+        .checked_shl(r.len() as u32)
+        .ok_or_else(|| invalid("prefix opening domain overflows"))?;
+    if columns.len() != commitments.len() || columns.iter().any(|c| c.len() > size) {
+        return Err(invalid("prefix opening columns do not fit the evaluation point"));
+    }
+    let (nu, sigma) = column_dims(size)?;
+    transcript.append_bytes(b"pow/dory/parameter-set", &setup_parameter_id(r.len())?);
+    transcript.append_bytes(LABEL_DORY_COMMIT_COUNT, &(columns.len() as u64).to_le_bytes());
+    for com in commitments {
+        transcript.append_group(LABEL_DORY_COMMIT, com);
+    }
+    transcript.append_bytes(LABEL_DORY_EVAL_COUNT, &(columns.len() as u64).to_le_bytes());
+    for column in columns {
+        transcript.append_field(LABEL_DORY_EVAL, &prefix_mle_eval(column, r));
+    }
+    let gamma = transcript.challenge_scalar(LABEL_DORY_GAMMA);
+    let gammas = powers(gamma, columns.len());
+    let len = columns.iter().map(|c| c.len()).max().unwrap_or(0).max(1);
+    let mut combined = vec![f0(); len];
+    for (column, gj) in columns.iter().zip(gammas.iter()) {
+        for (slot, value) in combined.iter_mut().zip(column.iter()) {
+            *slot = *slot + *value * *gj;
+        }
+    }
+    let setup = prover_setup(r.len())?;
+    let rows = prefix_row_commitments(&combined, nu, sigma, &setup.g1_vec, context.inner.g1());
+    let poly = PrefixPolynomial { coefficients: combined, num_vars: r.len() };
+    let (proof, _) = prove_with_context::<_, BN254, _, _, _, _, Transparent>(
+        &poly,
+        r,
+        rows,
+        f0(),
+        nu,
+        sigma,
+        setup,
+        &context.inner,
+        transcript,
+    )
+    .map_err(|error| invalid(format!("dory prefix opening proof failed: {error}")))?;
+    Ok(proof)
+}
+
 /// Verifier side of the batched opening: draw `gamma`, homomorphically combine
 /// the per-column commitments and claimed evals, and verify the single Dory
 /// opening at `r`.
@@ -1179,6 +1349,31 @@ mod tests {
 
     fn transcript() -> Transcript254 {
         Transcript254::new(b"parture-argument-test")
+    }
+
+    #[test]
+    fn prefix_opening_is_the_dense_opening_of_the_padded_columns() {
+        let k = 6;
+        let point: Vec<ArkFr> = (0..k).map(|j| fr(13 * j as u64 + 5)).collect();
+        for len in [1usize, 7, 8, 9, 33, 64] {
+            let a: Vec<ArkFr> = (0..len as u64).map(|i| fr(3 * i + 1)).collect();
+            let b: Vec<ArkFr> = (0..(len as u64).min(5)).map(|i| fr(11 * i + 2)).collect();
+            let pad = |v: &[ArkFr]| { let mut v = v.to_vec(); v.resize(1 << k, f0()); v };
+            let (pa, pb) = (pad(&a), pad(&b));
+            assert_eq!(prefix_mle_eval(&a, &point), mle_full_eval(&pa, &point));
+            let coms = [commit_column(&pa).unwrap(), commit_column(&pb).unwrap()];
+            let mut t_dense = transcript();
+            let dense = prove_column_openings(&[pa.clone(), pb.clone()], &point, &mut t_dense).unwrap();
+            let mut t_sparse = transcript();
+            let sparse = prove_prefix_column_openings_with_context(
+                &StoreProverContext::cpu(), &[&a, &b], &coms, &point, &mut t_sparse,
+            )
+            .unwrap();
+            let bytes = |p: &ColumnOpening| { let mut out = Vec::new(); p.serialize_compressed(&mut out).unwrap(); out };
+            assert_eq!(bytes(&dense), bytes(&sparse), "len {len}");
+            let evals = [mle_full_eval(&pa, &point), mle_full_eval(&pb, &point)];
+            verify_column_openings(&coms, &point, &evals, &sparse, &mut transcript()).unwrap();
+        }
     }
 
     #[test]

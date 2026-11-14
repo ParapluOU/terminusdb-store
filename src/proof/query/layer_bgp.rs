@@ -928,13 +928,7 @@ fn belt_hash_node_value_constant(
             )
         })?
         .node_value_opening(id)?;
-    let opened = verify_opening(
-        &layer.nv_merkle_root,
-        layer.state.parent_node_value_count,
-        layer.state.node_value_count,
-        id,
-        &opening,
-    )?;
+    let opened = crate::proof::commitment::open_node_value_id(layer, id, &opening)?;
     if hash_object(&opened) != hash_object(constant) {
         return Err(invalid(
             "term-less BGP belt-hash: opened node/value term does not match the matched constant",
@@ -962,13 +956,7 @@ fn belt_hash_predicate_constant(
             )
         })?
         .predicate_opening(id)?;
-    let opened = verify_opening(
-        &layer.pred_merkle_root,
-        layer.state.parent_predicate_count,
-        layer.state.predicate_count,
-        id,
-        &opening,
-    )?;
+    let opened = crate::proof::commitment::open_predicate_id(layer, id, &opening)?;
     let iri = match &opened {
         CanonicalObject::Node(bytes) => bytes.as_slice(),
         _ => {

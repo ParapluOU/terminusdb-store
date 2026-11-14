@@ -56,10 +56,17 @@ pub mod smt;
 mod state;
 pub mod term_tree;
 #[cfg(test)]
+mod query_tests;
+#[cfg(test)]
 mod tests;
+pub mod view;
 
 pub use genesis::{genesis_checkpoint, genesis_checkpoint_with_context, verify_genesis_checkpoint};
 pub use inductive::{prove_checkpoint, prove_checkpoint_with_context, verify_checkpoint};
+pub use view::{
+    prove_checkpoint_view, verify_checkpoint_view, CheckpointQueryLayer, CheckpointViewProof,
+    VerifiedCheckpointView,
+};
 pub use state::{
     nv_term_leaf, pred_term_leaf, present_domain_log, triple_key, CheckpointArtifact,
     CheckpointState, MAX_CHECKPOINT_TRIPLES, TRIPLE_PRESENT,

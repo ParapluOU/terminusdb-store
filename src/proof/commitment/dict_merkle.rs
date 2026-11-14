@@ -446,6 +446,9 @@ pub struct ResolutionOpenings {
     /// Term-sorted index lookups (`term -> id` membership or absence), keyed by namespace and the
     /// verifier-computed sort key of the looked-up term. Consumed only by an ATTESTED verifier.
     sorted: std::collections::BTreeMap<(SortedNamespace, ProofHash), SortedLookup>,
+    /// A CHECKPOINT view's keyed term-index lookups (`term -> id` membership or absence), keyed by
+    /// namespace and the verifier-computed key. Consumed only by a checkpoint view.
+    keyed: std::collections::BTreeMap<(SortedNamespace, ProofHash), crate::proof::checkpoint::smt::SmtPath>,
     /// Which ids a verifier actually looked up (node/value, predicate). Pure bookkeeping — it
     /// never influences a lookup's result. The single-layer term-less envelope uses it to reject a
     /// carrier that ships an opening the verifier never consumed (an EXACT witness, no padding).
@@ -463,6 +466,7 @@ struct Consumed {
     node_value: std::collections::BTreeSet<u64>,
     predicate: std::collections::BTreeSet<u64>,
     sorted: std::collections::BTreeSet<(SortedNamespace, ProofHash)>,
+    keyed: std::collections::BTreeSet<(SortedNamespace, ProofHash)>,
 }
 
 #[derive(Debug, Default)]
@@ -502,23 +506,59 @@ impl ConsumedIds {
             consumed.sorted.insert((namespace, key));
         })
     }
+    fn record_keyed(&self, namespace: SortedNamespace, key: ProofHash) {
+        self.with(|consumed| {
+            consumed.keyed.insert((namespace, key));
+        })
+    }
 }
 
 /// The prover's term-bearing dictionary trees, opened on demand while a dry-run verifier walks
 /// a term-less proof — so the shipped witness is exactly the ids that verifier consumes.
-struct OpeningOracle {
-    node_value: DictMerkleTree,
-    predicate: DictMerkleTree,
-    /// The term-sorted index trees (base layers carry them; built with the oracle).
-    nv_sorted: SortedIndexTree,
-    pred_sorted: SortedIndexTree,
+enum OpeningOracle {
+    Layer {
+        node_value: DictMerkleTree,
+        predicate: DictMerkleTree,
+        /// The term-sorted index trees (base layers carry them; built with the oracle).
+        nv_sorted: SortedIndexTree,
+        pred_sorted: SortedIndexTree,
+    },
+    /// A proven checkpoint's term trees and keyed term indexes.
+    Checkpoint(std::sync::Arc<crate::proof::checkpoint::CheckpointState>),
 }
 
 impl OpeningOracle {
-    fn sorted_lookup(&self, namespace: SortedNamespace, key: &ProofHash) -> SortedLookup {
-        match namespace {
-            SortedNamespace::NodeValue => self.nv_sorted.lookup(key),
-            SortedNamespace::Predicate => self.pred_sorted.lookup(key),
+    fn sorted_lookup(&self, namespace: SortedNamespace, key: &ProofHash) -> io::Result<SortedLookup> {
+        match self {
+            OpeningOracle::Layer { nv_sorted, pred_sorted, .. } => Ok(match namespace {
+                SortedNamespace::NodeValue => nv_sorted.lookup(key),
+                SortedNamespace::Predicate => pred_sorted.lookup(key),
+            }),
+            OpeningOracle::Checkpoint(_) => {
+                Err(invalid("a checkpoint view answers term lookups from its keyed index"))
+            }
+        }
+    }
+    fn keyed_lookup(
+        &self,
+        namespace: SortedNamespace,
+        key: &ProofHash,
+    ) -> io::Result<crate::proof::checkpoint::smt::SmtPath> {
+        match self {
+            OpeningOracle::Checkpoint(state) => Ok(state.index_path(namespace == SortedNamespace::Predicate, key)),
+            OpeningOracle::Layer { .. } => Err(invalid("a layer view has no keyed term index")),
+        }
+    }
+    fn node_value(&self, id: u64) -> io::Result<DictOpening> {
+        match self {
+            OpeningOracle::Layer { node_value, .. } => node_value.open(id),
+            OpeningOracle::Checkpoint(state) => state.term_opening(false, id),
+        }
+    }
+    fn predicate(&self, id: u64) -> io::Result<DictOpening> {
+        match self {
+            OpeningOracle::Layer { predicate, .. } => predicate.open(id),
+            OpeningOracle::Checkpoint(state) => state.term_opening(true, id),
         }
     }
 }
@@ -540,7 +580,7 @@ impl ResolutionOpenings {
     ) -> io::Result<std::borrow::Cow<'_, DictOpening>> {
         let opening = match (self.node_value.get(&id), &self.oracle) {
             (Some(opening), _) => std::borrow::Cow::Borrowed(opening),
-            (None, Some(oracle)) => std::borrow::Cow::Owned(oracle.node_value.open(id)?),
+            (None, Some(oracle)) => std::borrow::Cow::Owned(oracle.node_value(id)?),
             (None, None) => {
                 return Err(invalid(
                     "term-less resolution: prover shipped no node/value Merkle opening for this id",
@@ -558,7 +598,7 @@ impl ResolutionOpenings {
     ) -> io::Result<std::borrow::Cow<'_, DictOpening>> {
         let opening = match (self.predicate.get(&id), &self.oracle) {
             (Some(opening), _) => std::borrow::Cow::Borrowed(opening),
-            (None, Some(oracle)) => std::borrow::Cow::Owned(oracle.predicate.open(id)?),
+            (None, Some(oracle)) => std::borrow::Cow::Owned(oracle.predicate(id)?),
             (None, None) => {
                 return Err(invalid(
                     "term-less resolution: prover shipped no predicate Merkle opening for this id",
@@ -580,7 +620,7 @@ impl ResolutionOpenings {
     ) -> io::Result<std::borrow::Cow<'_, SortedLookup>> {
         let lookup = match (self.sorted.get(&(namespace, *key)), &self.oracle) {
             (Some(lookup), _) => std::borrow::Cow::Borrowed(lookup),
-            (None, Some(oracle)) => std::borrow::Cow::Owned(oracle.sorted_lookup(namespace, key)),
+            (None, Some(oracle)) => std::borrow::Cow::Owned(oracle.sorted_lookup(namespace, key)?),
             (None, None) => {
                 return Err(invalid(
                     "attested term lookup: prover shipped no sorted-index opening for this term",
@@ -622,7 +662,7 @@ impl ResolutionOpenings {
             return Err(invalid("oracle sorted trees do not reproduce the root-bound sorted roots"));
         }
         Ok(Self {
-            oracle: Some(std::sync::Arc::new(OpeningOracle {
+            oracle: Some(std::sync::Arc::new(OpeningOracle::Layer {
                 node_value,
                 predicate,
                 nv_sorted,
@@ -630,6 +670,33 @@ impl ResolutionOpenings {
             })),
             ..Self::default()
         })
+    }
+
+    /// PROVER-ONLY: a lazy opener over a proven checkpoint's term trees and keyed term indexes
+    /// (the checkpoint-view counterpart of [`Self::oracle`]).
+    pub(crate) fn checkpoint_oracle(state: std::sync::Arc<crate::proof::checkpoint::CheckpointState>) -> Self {
+        Self { oracle: Some(std::sync::Arc::new(OpeningOracle::Checkpoint(state))), ..Self::default() }
+    }
+
+    /// The shipped keyed term-index path for the verifier-computed `key` in `namespace`, or `Err`
+    /// (fail-closed) if the prover shipped none. The caller verifies it against the checkpoint
+    /// view's root-bound index root. Records the consumption.
+    pub(crate) fn keyed_lookup(
+        &self,
+        namespace: SortedNamespace,
+        key: &ProofHash,
+    ) -> io::Result<std::borrow::Cow<'_, crate::proof::checkpoint::smt::SmtPath>> {
+        let path = match (self.keyed.get(&(namespace, *key)), &self.oracle) {
+            (Some(path), _) => std::borrow::Cow::Borrowed(path),
+            (None, Some(oracle)) => std::borrow::Cow::Owned(oracle.keyed_lookup(namespace, key)?),
+            (None, None) => {
+                return Err(invalid(
+                    "checkpoint term lookup: prover shipped no term-index path for this term",
+                ))
+            }
+        };
+        self.consumed.record_keyed(namespace, *key);
+        Ok(path)
     }
 
     /// PROVER-ONLY: the exact shippable witness for the ids consumed so far from an oracle — one
@@ -642,13 +709,16 @@ impl ResolutionOpenings {
         let consumed = self.consumed.snapshot();
         let mut out = Self::default();
         for id in consumed.node_value {
-            out.insert_node_value(oracle.node_value.open(id)?);
+            out.insert_node_value(oracle.node_value(id)?);
         }
         for id in consumed.predicate {
-            out.insert_predicate(oracle.predicate.open(id)?);
+            out.insert_predicate(oracle.predicate(id)?);
         }
         for (namespace, key) in consumed.sorted {
-            out.sorted.insert((namespace, key), oracle.sorted_lookup(namespace, &key));
+            out.sorted.insert((namespace, key), oracle.sorted_lookup(namespace, &key)?);
+        }
+        for (namespace, key) in consumed.keyed {
+            out.keyed.insert((namespace, key), oracle.keyed_lookup(namespace, &key)?);
         }
         Ok(out)
     }
@@ -660,6 +730,7 @@ impl ResolutionOpenings {
             node_value: self.node_value.clone(),
             predicate: self.predicate.clone(),
             sorted: self.sorted.clone(),
+            keyed: self.keyed.clone(),
             consumed: ConsumedIds::default(),
             oracle: self.oracle.clone(),
         }
@@ -676,6 +747,7 @@ impl ResolutionOpenings {
         if !consumed.node_value.iter().eq(self.node_value.keys())
             || !consumed.predicate.iter().eq(self.predicate.keys())
             || !consumed.sorted.iter().eq(self.sorted.keys())
+            || !consumed.keyed.iter().eq(self.keyed.keys())
         {
             return Err(invalid(
                 "term-less resolution witness carries openings the verifier did not consume",
@@ -718,6 +790,41 @@ impl ResolutionOpenings {
         &mut self,
     ) -> &mut std::collections::BTreeMap<(SortedNamespace, ProofHash), SortedLookup> {
         &mut self.sorted
+    }
+
+    /// Test-only: mutable access to the keyed term-index lookups (forgery tests).
+    #[cfg(test)]
+    pub(crate) fn keyed_map_for_test(
+        &mut self,
+    ) -> &mut std::collections::BTreeMap<(SortedNamespace, ProofHash), crate::proof::checkpoint::smt::SmtPath> {
+        &mut self.keyed
+    }
+
+    /// Test-only: mutable access to the node/value openings (forgery tests).
+    #[cfg(test)]
+    pub(crate) fn node_value_map_for_test(&mut self) -> &mut std::collections::BTreeMap<u64, DictOpening> {
+        &mut self.node_value
+    }
+
+    /// Wire (checkpoint envelope only): the keyed term-index lookups in deterministic key order.
+    pub(crate) fn keyed_lookups(
+        &self,
+    ) -> impl Iterator<Item = (&(SortedNamespace, ProofHash), &crate::proof::checkpoint::smt::SmtPath)> {
+        self.keyed.iter()
+    }
+
+    /// Wire (checkpoint envelope only): attach a decoded keyed lookup. A duplicate key is
+    /// malformed. Parsing only — verified at consume time.
+    pub(crate) fn insert_keyed_from_wire(
+        &mut self,
+        namespace: SortedNamespace,
+        key: ProofHash,
+        path: crate::proof::checkpoint::smt::SmtPath,
+    ) -> io::Result<()> {
+        if self.keyed.insert((namespace, key), path).is_some() {
+            return Err(invalid("duplicate keyed term-index lookup in resolution openings"));
+        }
+        Ok(())
     }
 
     /// Wire (term-less envelope only): the sorted-index lookups in deterministic key order.

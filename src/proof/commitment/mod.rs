@@ -148,7 +148,7 @@ mod tests;
 // module exposed; only their definition site moved into the submodules above.
 // ---------------------------------------------------------------------------
 pub use state::{
-    CommitmentState, LayerCommitment, VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
+    CheckpointViewCommitments, CommitmentState, LayerCommitment, VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
 };
 pub use root::{database_root, validate_database_root};
 pub use dict_merkle::{resolution_root, resolution_root_v2};
@@ -178,8 +178,8 @@ pub use dict_merkle::{DictOpening, ResolutionOpenings};
 pub(crate) use dict_merkle::build_resolution_openings;
 // The single-layer term-less envelope's carried witness: one-carrier selection + the layer wrapper.
 pub(crate) use state::{
-    effective_openings, node_value_id_term, node_value_term_id, predicate_term_id,
-    TermlessWithOpenings,
+    effective_openings, node_value_id_term, node_value_term_id, open_node_value_id,
+    open_predicate_id, predicate_term_id, TermlessWithOpenings,
 };
 pub(crate) use legacy::decode_legacy_v3;
 pub(crate) use setup::{

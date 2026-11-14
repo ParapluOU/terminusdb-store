@@ -73,6 +73,7 @@
 
 mod array_walk;
 mod bag_union;
+mod checkpoint_read;
 mod checkpoint_wire;
 mod columns;
 mod layer_bgp;
@@ -104,6 +105,10 @@ pub use plan::{
 };
 
 pub use layer_bgp::LayerBgpEnvelope;
+pub use checkpoint_read::{
+    decode_and_verify_checkpoint_delta_read, decode_and_verify_checkpoint_read,
+    CheckpointRelationEnvelope,
+};
 // The single-layer TERM-LESS recursive envelope (O(result) witness beside the O(1) commitment).
 pub use termless::{
     require_attested_termless_plan, require_termless_plan, single_layer_envelope_form,

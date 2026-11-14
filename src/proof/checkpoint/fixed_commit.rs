@@ -84,6 +84,68 @@ pub fn append_fixed(old: &ArkGT, offset: usize, segment: &[ArkFr]) -> io::Result
     Ok(old.add(&commit_fixed_segment(offset, segment)?))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Segmented columns: no cap below 2^32 entries.
+//
+// One fixed layout holds `2^SETUP_MAX_LOG_N` entries. A checkpoint dictionary column of any
+// length is a LIST of such fixed-layout commitments, segment `k` committing rows
+// `k·DICT_SEGMENT_LEN .. (k+1)·DICT_SEGMENT_LEN` at local offsets `0..DICT_SEGMENT_LEN`. An
+// append fills the last segment and opens new ones as needed — each touched segment gains the
+// commitment of its part at its local offset, so the cost stays `O(new entries)` plus one pairing
+// per touched row. The segment count is `ceil(len / DICT_SEGMENT_LEN)` (none for an empty
+// column), so the list is a function of the length and the checkpoint root binds it entirely.
+// ---------------------------------------------------------------------------------------------
+
+/// Rows per dictionary segment: one full fixed layout.
+pub const DICT_SEGMENT_LEN: usize = FIXED_MAX_LEN;
+
+/// Largest dictionary a checkpoint commits: the term trees' id space (`2^32 - 1` ids).
+pub const MAX_DICT_LEN: u64 = (1u64 << super::term_tree::TERM_TREE_DEPTH) - 1;
+
+/// Number of segments of a column of `len` rows.
+pub fn segment_count(len: u64, segment_len: usize) -> usize {
+    len.div_ceil(segment_len as u64) as usize
+}
+
+/// The segment commitments of a whole column written from row 0.
+pub fn commit_segmented(values: &[ArkFr], segment_len: usize) -> io::Result<Vec<ArkGT>> {
+    append_segmented(&[], 0, values, segment_len)
+}
+
+/// Append `values` at row `offset` of a segmented column whose commitments are `old` (which must
+/// be exactly the segments of an `offset`-row column), returning the segments of the
+/// `offset + values.len()`-row column.
+pub fn append_segmented(
+    old: &[ArkGT],
+    offset: usize,
+    values: &[ArkFr],
+    segment_len: usize,
+) -> io::Result<Vec<ArkGT>> {
+    if segment_len == 0 || segment_len > FIXED_MAX_LEN {
+        return Err(invalid("checkpoint dictionary segment length is outside the fixed layout"));
+    }
+    if old.len() != segment_count(offset as u64, segment_len) {
+        return Err(invalid("checkpoint dictionary segments do not match the column length"));
+    }
+    let end = offset
+        .checked_add(values.len())
+        .filter(|end| *end as u64 <= MAX_DICT_LEN)
+        .ok_or_else(|| invalid("checkpoint dictionary column exceeds its id space"))?;
+    let mut out = old.to_vec();
+    out.resize(segment_count(end as u64, segment_len), <ArkGT as Group>::identity());
+    let mut position = offset;
+    let mut taken = 0usize;
+    while taken < values.len() {
+        let segment = position / segment_len;
+        let local = position % segment_len;
+        let count = (segment_len - local).min(values.len() - taken);
+        out[segment] = append_fixed(&out[segment], local, &values[taken..taken + count])?;
+        position += count;
+        taken += count;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +177,34 @@ mod tests {
         }
         assert_eq!(at, full.len());
         assert_eq!(acc, scratch);
+    }
+
+    #[test]
+    fn segmented_appends_fill_the_last_segment_then_open_new_ones() {
+        // A small segment length exercises the boundary logic; production uses 2^24.
+        let seg = 4096 + 7;
+        let full = column(3 * seg + 11, 4);
+        let scratch = commit_segmented(&full, seg).unwrap();
+        assert_eq!(scratch.len(), 4);
+        for (k, chunk) in full.chunks(seg).enumerate() {
+            assert_eq!(scratch[k], commit_fixed_column(chunk).unwrap(), "segment {k}");
+        }
+        // Appends across every boundary, one of them spanning two whole segments.
+        let mut acc = Vec::new();
+        let mut at = 0;
+        for len in [1usize, seg - 2, 1, 2 * seg + 3, 0, full.len() - (1 + seg - 2 + 1 + 2 * seg + 3)] {
+            acc = append_segmented(&acc, at, &full[at..at + len], seg).unwrap();
+            at += len;
+            assert_eq!(acc.len(), segment_count(at as u64, seg));
+        }
+        assert_eq!(acc, scratch);
+        // The old segment list must belong to the offset.
+        assert!(append_segmented(&scratch[..3], full.len(), &[ArkFr::one()], seg).is_err());
+        assert!(append_segmented(&scratch, 3 * seg, &[ArkFr::one()], seg).is_err());
+        assert_eq!(segment_count(0, DICT_SEGMENT_LEN), 0);
+        assert_eq!(segment_count(1 << 24, DICT_SEGMENT_LEN), 1);
+        assert_eq!(segment_count((1 << 24) + 1, DICT_SEGMENT_LEN), 2);
+        assert_eq!(segment_count(MAX_DICT_LEN, DICT_SEGMENT_LEN), 256);
     }
 
     #[test]

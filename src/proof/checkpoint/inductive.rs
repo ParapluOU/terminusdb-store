@@ -18,7 +18,7 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::{Field, Group};
 use dory_pcs::primitives::transcript::Transcript;
 
-use super::fixed_commit::append_fixed;
+use super::fixed_commit::{append_segmented, DICT_SEGMENT_LEN};
 use super::genesis::{node_values_by_id, predicates_by_id};
 use super::smt::{verify_delete, verify_insert, SmtTerminal, NS_NV_INDEX, NS_PRED_INDEX, NS_TRIPLE_INDEX};
 use super::state::{
@@ -377,7 +377,7 @@ pub(crate) fn prove_checkpoint_inner(
     }
 
     // Dictionary commitments (homomorphic append) and facts.
-    let (mut nv_dict_commitments, pred_dict_commitment) =
+    let (mut nv_dict_segments, pred_dict_segments) =
         append_dictionary(&prev.artifact, &new_nv, &new_pred)?;
     if matches!(forgery, Forgery::NvDictValue | Forgery::NvDictOffset | Forgery::NvDictExtra) {
         let mut segment = nv_dict_segment(&new_nv)?;
@@ -391,9 +391,17 @@ pub(crate) fn prove_checkpoint_inner(
                 }
             }
         }
+        let mut columns: [Vec<ArkGT>; 3] = Default::default();
         for c in 0..3 {
-            nv_dict_commitments[c] = append_fixed(&prev.artifact.nv_dict_commitments[c], offset, &segment[c])?;
+            let old: Vec<ArkGT> = prev.artifact.nv_dict_segments.iter().map(|s| s[c]).collect();
+            // The forged rows may overrun the honest length by one: commit them past it.
+            let mut old = old;
+            if old.len() < super::fixed_commit::segment_count(offset as u64, DICT_SEGMENT_LEN) {
+                old.push(<ArkGT as Group>::identity());
+            }
+            columns[c] = append_segmented(&old, offset, &segment[c], DICT_SEGMENT_LEN)?;
         }
+        nv_dict_segments = (0..columns[0].len()).map(|k| [columns[0][k], columns[1][k], columns[2][k]]).collect();
     }
     let mut facts = prev.artifact.facts.union(DictFacts::from_objects(new_nv.iter()));
     if *forgery == Forgery::FlipNanFact {
@@ -427,8 +435,8 @@ pub(crate) fn prove_checkpoint_inner(
         node_value_count: head.state.node_value_count,
         predicate_count: head.state.predicate_count,
         present_commitments,
-        nv_dict_commitments,
-        pred_dict_commitment,
+        nv_dict_segments,
+        pred_dict_segments,
         nv_term_tree_root: nv_tree.root(),
         pred_term_tree_root: pred_tree.root(),
         nv_term_index_root: nv_index.root(),
@@ -647,7 +655,7 @@ pub fn verify_checkpoint(
         new_pred.extend(pred);
     }
     let (nv_dict, pred_dict) = append_dictionary(prev, &new_nv, &new_pred)?;
-    if nv_dict != next.nv_dict_commitments || pred_dict != next.pred_dict_commitment {
+    if nv_dict != next.nv_dict_segments || pred_dict != next.pred_dict_segments {
         return Err(invalid("checkpoint dictionary append does not commit the deltas' new terms"));
     }
     let mut nv_tree = Accumulator::from_frontier(

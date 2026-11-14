@@ -8,7 +8,7 @@ use dory_pcs::backends::arkworks::{ArkFr, ArkGT};
 use dory_pcs::primitives::arithmetic::{Field, Group};
 use sha2::{Digest, Sha256};
 
-use super::fixed_commit::{append_fixed, commit_fixed_column, FIXED_MAX_LEN};
+use super::fixed_commit::{append_segmented, segment_count, DICT_SEGMENT_LEN, MAX_DICT_LEN};
 use super::smt::{Smt, SmtKey, NS_NV_INDEX, NS_PRED_INDEX, NS_TRIPLE_INDEX};
 use super::term_tree::{object_leaf_parts, term_leaf, TermTree, NS_NODE_VALUE, NS_PREDICATE, TERM_TREE_DEPTH};
 use super::IdTriple;
@@ -19,7 +19,7 @@ use crate::proof::commitment::{
 use crate::proof::dict::{hash_object, hash_term};
 use crate::proof::{invalid, CanonicalObject, ProofHash};
 
-const CHECKPOINT_ROOT_DOMAIN: &[u8] = b"terminus-store/pow/checkpoint-root/v1";
+const CHECKPOINT_ROOT_DOMAIN: &[u8] = b"terminus-store/pow/checkpoint-root/v2";
 const TRIPLE_KEY_DOMAIN: &[u8] = b"terminus-store/pow/checkpoint/triple-key/v1";
 
 /// A checkpoint `C_k`: commitments to the materialized state of the layer chain at head `X_k`.
@@ -45,10 +45,11 @@ pub struct CheckpointArtifact {
     /// Present S, P, O id columns, SPO-sorted, each committed with `commit_column` zero-padded to
     /// [`present_domain_log`]; identities when empty.
     pub present_commitments: [ArkGT; 3],
-    /// Node/value dictionary columns `hash`, `value`, `datatype` (row `id - 1`), fixed layout.
-    pub nv_dict_commitments: [ArkGT; 3],
-    /// Predicate dictionary `hash` column (row `id - 1`), fixed layout.
-    pub pred_dict_commitment: ArkGT,
+    /// Node/value dictionary columns `hash`, `value`, `datatype` (row `id - 1`), one fixed-layout
+    /// commitment per segment of [`DICT_SEGMENT_LEN`] rows (`fixed_commit`), segment-major.
+    pub nv_dict_segments: Vec<[ArkGT; 3]>,
+    /// Predicate dictionary `hash` column (row `id - 1`), segmented likewise.
+    pub pred_dict_segments: Vec<ArkGT>,
     /// Id-indexed append-only term trees.
     pub nv_term_tree_root: ProofHash,
     pub pred_term_tree_root: ProofHash,
@@ -91,12 +92,17 @@ impl CheckpointArtifact {
         for count in [self.present_count, self.node_value_count, self.predicate_count] {
             hasher.update(count.to_be_bytes());
         }
-        for commitment in self
-            .present_commitments
-            .iter()
-            .chain(self.nv_dict_commitments.iter())
-            .chain(std::iter::once(&self.pred_dict_commitment))
-        {
+        for commitment in &self.present_commitments {
+            put_gt(&mut hasher, commitment)?;
+        }
+        hasher.update((self.nv_dict_segments.len() as u64).to_be_bytes());
+        for segment in &self.nv_dict_segments {
+            for commitment in segment {
+                put_gt(&mut hasher, commitment)?;
+            }
+        }
+        hasher.update((self.pred_dict_segments.len() as u64).to_be_bytes());
+        for commitment in &self.pred_dict_segments {
             put_gt(&mut hasher, commitment)?;
         }
         for root in [
@@ -119,12 +125,13 @@ impl CheckpointArtifact {
             return Err(invalid("checkpoint root does not recompute from the artifact"));
         }
         let tree_cap = (1u64 << TERM_TREE_DEPTH) - 1;
-        if self.node_value_count > tree_cap
-            || self.predicate_count > tree_cap
-            || self.node_value_count as u128 > FIXED_MAX_LEN as u128
-            || self.predicate_count as u128 > FIXED_MAX_LEN as u128
-        {
+        if self.node_value_count > tree_cap.min(MAX_DICT_LEN) || self.predicate_count > tree_cap.min(MAX_DICT_LEN) {
             return Err(invalid("checkpoint dictionary exceeds its committed structures"));
+        }
+        if self.nv_dict_segments.len() != segment_count(self.node_value_count, DICT_SEGMENT_LEN)
+            || self.pred_dict_segments.len() != segment_count(self.predicate_count, DICT_SEGMENT_LEN)
+        {
+            return Err(invalid("checkpoint dictionary segment count does not match its length"));
         }
         present_domain_log(self.present_count)?;
         let identity = <ArkGT as Group>::identity();
@@ -135,6 +142,30 @@ impl CheckpointArtifact {
             return Err(invalid("checkpoint has triples but an empty dictionary"));
         }
         Ok(())
+    }
+
+    /// An artifact of an empty dictionary — the starting point the dictionary of a from-scratch
+    /// checkpoint is appended to. Only its counts and segments are meaningful.
+    pub(crate) fn empty_dictionary() -> Self {
+        let identity = <ArkGT as Group>::identity();
+        CheckpointArtifact {
+            head_root: [0; 32],
+            head_commitment_root: [0; 32],
+            prev_checkpoint_root: None,
+            present_count: 0,
+            node_value_count: 0,
+            predicate_count: 0,
+            present_commitments: [identity; 3],
+            nv_dict_segments: Vec::new(),
+            pred_dict_segments: Vec::new(),
+            nv_term_tree_root: [0; 32],
+            pred_term_tree_root: [0; 32],
+            nv_term_index_root: [0; 32],
+            pred_term_index_root: [0; 32],
+            triple_index_root: [0; 32],
+            facts: DictFacts::default(),
+            checkpoint_root: [0; 32],
+        }
     }
 
     /// Every field except the chaining (`prev_checkpoint_root`, `checkpoint_root`): two
@@ -269,13 +300,8 @@ impl CheckpointState {
         {
             return Err(invalid("checkpoint present triple id lies outside the dictionary"));
         }
-        let [nv_hash, nv_value, nv_datatype] = nv_dict_segment(&nv_terms)?;
-        let nv_dict_commitments = [
-            commit_fixed_column(&nv_hash)?,
-            commit_fixed_column(&nv_value)?,
-            commit_fixed_column(&nv_datatype)?,
-        ];
-        let pred_dict_commitment = commit_fixed_column(&pred_dict_segment(&pred_terms))?;
+        let empty = CheckpointArtifact::empty_dictionary();
+        let (nv_dict_segments, pred_dict_segments) = append_dictionary(&empty, &nv_terms, &pred_terms)?;
         let mut nv_tree = TermTree::new(NS_NODE_VALUE);
         for (i, object) in nv_terms.iter().enumerate() {
             nv_tree.push(nv_term_leaf(i as u64 + 1, object))?;
@@ -304,8 +330,8 @@ impl CheckpointState {
             node_value_count: nv_count,
             predicate_count: pred_count,
             present_commitments,
-            nv_dict_commitments,
-            pred_dict_commitment,
+            nv_dict_segments,
+            pred_dict_segments,
             nv_term_tree_root: nv_tree.root(),
             pred_term_tree_root: pred_tree.root(),
             nv_term_index_root: nv_index.root(),
@@ -329,29 +355,69 @@ impl CheckpointState {
         id.checked_sub(1).and_then(|i| self.nv_terms.get(i as usize))
     }
 
+    /// The term-tree opening of chain id `id` in the node/value (`predicate = false`) or predicate
+    /// namespace.
+    pub(crate) fn term_opening(&self, predicate: bool, id: u64) -> io::Result<crate::proof::commitment::DictOpening> {
+        let (tag, bytes, tree) = if predicate {
+            let iri = self.predicate(id).ok_or_else(|| invalid("checkpoint has no predicate with this id"))?;
+            (NODE_DATATYPE_TAG as u8, iri.to_vec(), &self.pred_tree)
+        } else {
+            let object = self.node_value(id).ok_or_else(|| invalid("checkpoint has no node/value with this id"))?;
+            let (tag, bytes) = object_leaf_parts(object);
+            (tag, bytes.to_vec(), &self.nv_tree)
+        };
+        Ok(crate::proof::commitment::DictOpening {
+            id,
+            datatype_tag: tag,
+            term_bytes: bytes,
+            position: (id - 1) as usize,
+            siblings: tree.siblings(id - 1)?,
+        })
+    }
+
+    /// The keyed term-index path of `key` in the node/value (`predicate = false`) or predicate
+    /// index (a membership or a non-membership path).
+    pub(crate) fn index_path(&self, predicate: bool, key: &SmtKey) -> super::smt::SmtPath {
+        if predicate { self.pred_index.path(key) } else { self.nv_index.path(key) }
+    }
+
     /// The predicate IRI of chain id `id`.
     pub fn predicate(&self, id: u64) -> Option<&[u8]> {
         id.checked_sub(1).and_then(|i| self.pred_terms.get(i as usize)).map(|p| p.as_slice())
     }
 }
 
-/// Append the dictionary segments of new terms to the previous fixed-layout commitments.
+/// The checkpoint dictionary commitments after appending new terms: the previous segments with
+/// each new row committed at its segment-local offset (see `fixed_commit`).
 pub fn append_dictionary(
     prev: &CheckpointArtifact,
     new_nv: &[CanonicalObject],
     new_pred: &[Vec<u8>],
-) -> io::Result<([ArkGT; 3], ArkGT)> {
+) -> io::Result<(Vec<[ArkGT; 3]>, Vec<ArkGT>)> {
+    append_dictionary_segmented(prev, new_nv, new_pred, DICT_SEGMENT_LEN)
+}
+
+/// [`append_dictionary`] at an explicit segment length (tests exercise segment boundaries with a
+/// short length; production is [`DICT_SEGMENT_LEN`]).
+pub(crate) fn append_dictionary_segmented(
+    prev: &CheckpointArtifact,
+    new_nv: &[CanonicalObject],
+    new_pred: &[Vec<u8>],
+    segment_len: usize,
+) -> io::Result<(Vec<[ArkGT; 3]>, Vec<ArkGT>)> {
     let nv_offset = prev.node_value_count as usize;
-    let segment = nv_dict_segment(new_nv)?;
-    let nv = [
-        append_fixed(&prev.nv_dict_commitments[0], nv_offset, &segment[0])?,
-        append_fixed(&prev.nv_dict_commitments[1], nv_offset, &segment[1])?,
-        append_fixed(&prev.nv_dict_commitments[2], nv_offset, &segment[2])?,
-    ];
-    let pred = append_fixed(
-        &prev.pred_dict_commitment,
+    let rows = nv_dict_segment(new_nv)?;
+    let mut columns: [Vec<ArkGT>; 3] = Default::default();
+    for (c, column) in columns.iter_mut().enumerate() {
+        let old: Vec<ArkGT> = prev.nv_dict_segments.iter().map(|s| s[c]).collect();
+        *column = append_segmented(&old, nv_offset, &rows[c], segment_len)?;
+    }
+    let nv = (0..columns[0].len()).map(|k| [columns[0][k], columns[1][k], columns[2][k]]).collect();
+    let pred = append_segmented(
+        &prev.pred_dict_segments,
         prev.predicate_count as usize,
         &pred_dict_segment(new_pred),
+        segment_len,
     )?;
     Ok((nv, pred))
 }

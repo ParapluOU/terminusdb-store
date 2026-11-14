@@ -1091,6 +1091,9 @@ impl Wire for ResolutionOpenings {
         if self.sorted_lookups().next().is_some() {
             return Err(invalid("sorted-index lookups are carried only by the term-less envelope"));
         }
+        if self.keyed_lookups().next().is_some() {
+            return Err(invalid("keyed term-index lookups are carried only by the checkpoint envelope"));
+        }
         put_id_openings(self, out)
     }
     fn get(reader: &mut Reader<'_>) -> io::Result<Self> {

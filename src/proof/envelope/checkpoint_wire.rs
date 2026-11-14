@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use super::wire::{invalid, wire_struct, Reader, Wire, CHECKSUM_BYTES, MAX_QUERY_ENVELOPE_BYTES};
 use crate::proof::checkpoint::smt::{SmtDeleteProof, SmtPath, SmtSibling, SmtTerminal};
 use crate::proof::checkpoint::{
-    CheckpointArtifact, CheckpointProof, DeltaUpdateProof, GenesisProof, IdTriple, PaddingProof,
-    MAX_CHECKPOINT_TRIPLES,
+    CheckpointArtifact, CheckpointProof, CheckpointViewProof, DeltaUpdateProof, GenesisProof, IdTriple,
+    PaddingProof, MAX_CHECKPOINT_TRIPLES,
 };
 use crate::proof::commitment::DictFacts;
 
@@ -24,10 +24,14 @@ pub(crate) const CHECKPOINT_ARTIFACT_MAGIC: &[u8; 12] = b"TDBWQCKPT\0\0\0";
 pub(crate) const CHECKPOINT_PROOF_MAGIC: &[u8; 12] = b"TDBWQCKPP\0\0\0";
 /// Framing magic of a [`GenesisProof`] — permanent; never change these bytes.
 pub(crate) const GENESIS_PROOF_MAGIC: &[u8; 12] = b"TDBWQCKPG\0\0\0";
+/// Framing magic of a [`CheckpointViewProof`] — permanent; never change these bytes.
+pub(crate) const CHECKPOINT_VIEW_MAGIC: &[u8; 12] = b"TDBWQCKPV\0\0\0";
 /// Wire-format versions (accepted exactly; bump on any layout change).
-pub(crate) const CHECKPOINT_ARTIFACT_VERSION: u32 = 1;
+/// The artifact is v2 since its dictionary columns became segment lists.
+pub(crate) const CHECKPOINT_ARTIFACT_VERSION: u32 = 2;
 pub(crate) const CHECKPOINT_PROOF_VERSION: u32 = 1;
 pub(crate) const GENESIS_PROOF_VERSION: u32 = 1;
+pub(crate) const CHECKPOINT_VIEW_VERSION: u32 = 1;
 
 impl Wire for [u64; 3] {
     fn put(&self, out: &mut Vec<u8>) -> io::Result<()> {
@@ -125,6 +129,15 @@ wire_struct!(CheckpointProof {
     padding,
     sorted,
 });
+wire_struct!(CheckpointViewProof {
+    nv_commitments,
+    pred_commitments,
+    nv_evals,
+    pred_evals,
+    nv_opening,
+    pred_opening,
+    fixed_opening,
+});
 wire_struct!(CheckpointArtifact {
     head_root,
     head_commitment_root,
@@ -133,8 +146,8 @@ wire_struct!(CheckpointArtifact {
     node_value_count,
     predicate_count,
     present_commitments,
-    nv_dict_commitments,
-    pred_dict_commitment,
+    nv_dict_segments,
+    pred_dict_segments,
     nv_term_tree_root,
     pred_term_tree_root,
     nv_term_index_root,
@@ -204,6 +217,18 @@ impl CheckpointProof {
     /// Parse a framed proof (no trust checks).
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         unframe(bytes, CHECKPOINT_PROOF_MAGIC, CHECKPOINT_PROOF_VERSION, "checkpoint proof", |r| Self::get(r))
+    }
+}
+
+impl CheckpointViewProof {
+    /// Frame the view proof for shipping.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        frame(CHECKPOINT_VIEW_MAGIC, CHECKPOINT_VIEW_VERSION, |out| self.put(out))
+    }
+
+    /// Parse a framed view proof (no trust checks; `verify_checkpoint_view` checks it).
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        unframe(bytes, CHECKPOINT_VIEW_MAGIC, CHECKPOINT_VIEW_VERSION, "checkpoint view proof", |r| Self::get(r))
     }
 }
 

@@ -37,7 +37,7 @@ use super::bgp::{
 };
 use super::commitment::{
     build_node_value_tree, build_predicate_tree, node_value_op_value, reject_nan_catalog,
-    reject_nan_objects, verify_opening, CommitmentState, DictMerkleTree, DictOpening,
+    reject_nan_objects, CommitmentState, DictMerkleTree, DictOpening,
     LayerCommitment, ResolutionOpenings, VerifierCommitmentRef, VerifierLayer, NODE_DATATYPE_TAG,
 };
 use super::dict::{

@@ -193,13 +193,7 @@ pub(crate) fn resolve_node_value_id_via_merkle(
             .node_value_opening(raw)?;
         &shipped
     };
-    verify_opening(
-        &layer.nv_merkle_root,
-        layer.state.parent_node_value_count,
-        layer.state.node_value_count,
-        raw,
-        opening,
-    )
+    crate::proof::commitment::open_node_value_id(layer, raw, opening)
 }
 
 /// Merkle-dict I2b step 3 (value↔term consistency, Option B). Tie the committed
@@ -341,13 +335,7 @@ fn resolve_predicate_id_via_merkle(
             .predicate_opening(raw)?;
         &shipped
     };
-    verify_opening(
-        &layer.pred_merkle_root,
-        layer.state.parent_predicate_count,
-        layer.state.predicate_count,
-        raw,
-        opening,
-    )
+    crate::proof::commitment::open_predicate_id(layer, raw, opening)
 }
 
 /// Resolve result columns through their explicitly declared, plan-derived Store ID

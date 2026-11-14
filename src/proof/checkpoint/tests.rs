@@ -293,7 +293,7 @@ fn chained_checkpoints_equal_a_from_scratch_checkpoint() {
     let direct = scratch(&chain, 7);
     assert_same_state(&c7.artifact, &direct);
     assert_eq!(c7.artifact.present_commitments, direct.present_commitments);
-    assert_eq!(c7.artifact.nv_dict_commitments, direct.nv_dict_commitments);
+    assert_eq!(c7.artifact.nv_dict_segments, direct.nv_dict_segments);
     assert_eq!(c7.artifact.triple_index_root, direct.triple_index_root);
     assert_eq!(c7.artifact.prev_checkpoint_root, Some(c3.artifact.checkpoint_root));
     // The verifier of C_3 -> C_7 never sees C_0 or the deltas before 3.

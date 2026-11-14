@@ -8,6 +8,7 @@
 //! new leaves (`O(m + depth)` hashes), exactly as an incremental Merkle accumulator does. Fixed
 //! depth means the root never re-shapes as the tree grows, so no append ever rehashes old leaves.
 
+use std::convert::TryFrom;
 use std::io;
 
 use sha2::{Digest, Sha256};
@@ -204,6 +205,86 @@ impl TermTree {
     }
 }
 
+impl TermTree {
+    /// The root of the height-`level` subtree at index `index` (complete, partial or empty).
+    fn subtree(&self, level: usize, index: u64, empty: &[ProofHash; TERM_TREE_DEPTH + 1]) -> ProofHash {
+        let len = self.len();
+        let start = index << level;
+        if start >= len {
+            return empty[level];
+        }
+        if (index + 1) << level <= len {
+            return self.levels[level][index as usize];
+        }
+        node(
+            self.namespace,
+            &self.subtree(level - 1, 2 * index, empty),
+            &self.subtree(level - 1, 2 * index + 1, empty),
+        )
+    }
+
+    /// The opening of the leaf at `position` (`id - 1`): the [`TERM_TREE_DEPTH`] siblings from the
+    /// leaf level up.
+    pub fn siblings(&self, position: u64) -> io::Result<Vec<ProofHash>> {
+        if position >= self.len() {
+            return Err(invalid("checkpoint term tree has no leaf at this position"));
+        }
+        let empty = empty_hashes(self.namespace);
+        Ok((0..TERM_TREE_DEPTH).map(|level| self.subtree(level, (position >> level) ^ 1, &empty)).collect())
+    }
+}
+
+/// The inverse of [`object_leaf_parts`].
+pub fn object_from_leaf_parts(tag: u8, bytes: Vec<u8>) -> io::Result<CanonicalObject> {
+    if tag as u64 == NODE_DATATYPE_TAG {
+        Ok(CanonicalObject::Node(bytes))
+    } else {
+        Ok(CanonicalObject::Value { datatype: crate::proof::CanonicalDatatype::try_from(tag)?, lexical: bytes })
+    }
+}
+
+/// Verify the opening of chain id `id` in the term tree of `namespace` with `root` and `count`
+/// leaves, returning the authenticated term (a predicate's as a `Node`).
+///
+/// The opening must name `id` at position `id - 1` with `id` in `1..=count`, carry exactly
+/// [`TERM_TREE_DEPTH`] siblings, and fold from the re-hashed leaf to `root`. A slot beyond `count`
+/// is never opened (and holds the empty leaf, whose preimage is domain-separated from a term's).
+pub fn verify_term_opening(
+    namespace: u8,
+    root: &ProofHash,
+    count: u64,
+    id: u64,
+    opening: &crate::proof::commitment::DictOpening,
+) -> io::Result<CanonicalObject> {
+    if opening.id != id {
+        return Err(invalid("checkpoint term opening names another id"));
+    }
+    if id == 0 || id > count {
+        return Err(invalid("checkpoint term opening id lies outside the dictionary"));
+    }
+    if opening.position as u64 != id - 1 {
+        return Err(invalid("checkpoint term opening position is not id - 1"));
+    }
+    if opening.siblings.len() != TERM_TREE_DEPTH {
+        return Err(invalid("checkpoint term opening has the wrong depth"));
+    }
+    if namespace == NS_PREDICATE && opening.datatype_tag as u64 != NODE_DATATYPE_TAG {
+        return Err(invalid("checkpoint predicate opening is not an IRI"));
+    }
+    let mut current = term_leaf(namespace, id, opening.datatype_tag, &opening.term_bytes);
+    for (level, sibling) in opening.siblings.iter().enumerate() {
+        current = if (id - 1) >> level & 1 == 0 {
+            node(namespace, &current, sibling)
+        } else {
+            node(namespace, sibling, &current)
+        };
+    }
+    if &current != root {
+        return Err(invalid("checkpoint term opening does not open the term-tree root"));
+    }
+    object_from_leaf_parts(opening.datatype_tag, opening.term_bytes.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +333,35 @@ mod tests {
                 acc.push(*l).unwrap();
             }
             assert_eq!(acc.root(), naive_root(&leaves));
+        }
+    }
+
+    #[test]
+    fn openings_verify_at_every_size_and_reject_forgeries() {
+        use crate::proof::commitment::DictOpening;
+        let mut tree = TermTree::new(NS_NODE_VALUE);
+        for size in 1..=19u64 {
+            tree.push(term_leaf(NS_NODE_VALUE, size, 0, &size.to_be_bytes())).unwrap();
+            let root = tree.root();
+            for id in 1..=size {
+                let opening = DictOpening {
+                    id,
+                    datatype_tag: 0,
+                    term_bytes: id.to_be_bytes().to_vec(),
+                    position: (id - 1) as usize,
+                    siblings: tree.siblings(id - 1).unwrap(),
+                };
+                verify_term_opening(NS_NODE_VALUE, &root, size, id, &opening).unwrap();
+                let mut wrong = opening.clone();
+                wrong.term_bytes[7] ^= 1;
+                assert!(verify_term_opening(NS_NODE_VALUE, &root, size, id, &wrong).is_err());
+                assert!(verify_term_opening(NS_NODE_VALUE, &root, id - 1, id, &opening).is_err());
+                assert!(verify_term_opening(NS_PREDICATE, &root, size, id, &opening).is_err());
+                let mut short = opening.clone();
+                short.siblings.pop();
+                assert!(verify_term_opening(NS_NODE_VALUE, &root, size, id, &short).is_err());
+            }
+            assert!(tree.siblings(size).is_err());
         }
     }
 
