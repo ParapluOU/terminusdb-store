@@ -19,7 +19,7 @@ use crate::proof::commitment::{
 use crate::proof::dict::{hash_object, hash_term};
 use crate::proof::{invalid, CanonicalObject, ProofHash};
 
-const CHECKPOINT_ROOT_DOMAIN: &[u8] = b"terminus-store/pow/checkpoint-root/v2";
+const CHECKPOINT_ROOT_DOMAIN: &[u8] = b"terminus-store/pow/checkpoint-root/v3";
 const TRIPLE_KEY_DOMAIN: &[u8] = b"terminus-store/pow/checkpoint/triple-key/v1";
 
 /// A checkpoint `C_k`: commitments to the materialized state of the layer chain at head `X_k`.

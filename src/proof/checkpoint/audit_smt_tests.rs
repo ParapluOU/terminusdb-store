@@ -341,7 +341,7 @@ fn term_opening_bounds_and_empty_slots_reject() {
     // empty leaf is not any term's preimage, so nothing opens there.
     let mut grown = tree.clone();
     grown.push(term_tree_empty_leaf(ns)).unwrap();
-    assert_eq!(grown.root(), root, "an empty leaf appended leaves the root unchanged");
+    assert_ne!(grown.root(), root, "the root binds its size: an empty leaf appended changes it");
     for tag in [0u8, 1, NODE_DATATYPE_TAG as u8] {
         for bytes in [&b""[..], &6u64.to_be_bytes()[..], &[0u8; 32][..]] {
             let o = opening(&grown, 6, tag, bytes);
@@ -386,12 +386,10 @@ fn frontier_is_bound_for_the_true_size() {
     }
 }
 
-/// LOW (defense in depth): the term-tree root does not bind its leaf count. A frontier claiming
-/// `n + 1` leaves whose last leaf is the EMPTY leaf opens the root of the `n`-leaf tree. Not
-/// exploitable today — every caller takes the size from a root-bound artifact count — but an
-/// `Accumulator` taken alone authenticates a wrong size.
+/// LOW (defense in depth, FIXED in step 6): the term-tree root binds its leaf count, so a frontier
+/// claiming `n + 1` leaves whose last leaf is the EMPTY leaf no longer opens the root of the
+/// `n`-leaf tree (it once did: the bare Merkle root is unchanged by an empty-leaf append).
 #[test]
-#[ignore = "audit finding: term-tree root does not bind its size (empty-leaf padding opens as n+1)"]
 fn term_tree_frontier_for_an_inflated_size_rejects() {
     let ns = NS_NODE_VALUE;
     let mut tree = TermTree::new(ns);

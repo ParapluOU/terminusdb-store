@@ -133,7 +133,7 @@ pub(super) fn rich_chain() -> Chain {
         node("a2", "p1", "b2"),
         node("a3", "p1", "b3"),
         node("a4", "p2", "b4"),
-        ValueTriple::new_value(&iri("a1"), &iri("age"), u32::make_entry(&30)),
+        ValueTriple::new_value(&iri("a1"), &iri("age"), u32::make_entry(&30u32)),
         ValueTriple::new_string_value(&iri("a2"), &iri("name"), "Ann"),
     ]);
     // d1: remove inherited, add with new terms.
@@ -146,8 +146,8 @@ pub(super) fn rich_chain() -> Chain {
     // d2: a brand-new predicate and new values.
     chain.push(vec![
         Op::Add(node("a7", "p3", "b8")),
-        Op::Add(ValueTriple::new_value(&iri("a7"), &iri("age"), u32::make_entry(&41))),
-        Op::Add(ValueTriple::new_value(&iri("a7"), &iri("score"), f64::make_entry(&2.5))),
+        Op::Add(ValueTriple::new_value(&iri("a7"), &iri("age"), u32::make_entry(&41u32))),
+        Op::Add(ValueTriple::new_value(&iri("a7"), &iri("score"), f64::make_entry(&2.5f64))),
     ]);
     // d3: remove what d2 added, re-add what d1 removed.
     chain.push(vec![
@@ -181,12 +181,12 @@ fn delta_new_ids_are_assigned_in_sorted_term_order() {
         Op::Add(node("zeta", "q2", "alpha")),
         Op::Add(ValueTriple::new_string_value(&iri("m"), &iri("q1"), "zz")),
         Op::Add(ValueTriple::new_string_value(&iri("m"), &iri("q1"), "aa")),
-        Op::Add(ValueTriple::new_value(&iri("m"), &iri("q0"), u32::make_entry(&9))),
-        Op::Add(ValueTriple::new_value(&iri("m"), &iri("q0"), u32::make_entry(&2))),
+        Op::Add(ValueTriple::new_value(&iri("m"), &iri("q0"), u32::make_entry(&9u32))),
+        Op::Add(ValueTriple::new_value(&iri("m"), &iri("q0"), u32::make_entry(&2u32))),
         Op::Add(ValueTriple::new_value(&iri("m"), &iri("q3"), i64::make_entry(&-7))),
-        Op::Add(ValueTriple::new_value(&iri("m"), &iri("q3"), i64::make_entry(&5))),
+        Op::Add(ValueTriple::new_value(&iri("m"), &iri("q3"), i64::make_entry(&5i64))),
         Op::Add(ValueTriple::new_value(&iri("m"), &iri("q4"), f64::make_entry(&-1.5))),
-        Op::Add(ValueTriple::new_value(&iri("m"), &iri("q4"), f64::make_entry(&0.25))),
+        Op::Add(ValueTriple::new_value(&iri("m"), &iri("q4"), f64::make_entry(&0.25f64))),
         Op::Add(ValueTriple::new_value(&iri("m"), &iri("q5"), bool::make_entry(&true))),
         Op::Add(node("beta", "q2", "m")),
     ]);

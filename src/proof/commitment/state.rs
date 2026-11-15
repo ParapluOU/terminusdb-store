@@ -208,25 +208,36 @@ pub struct VerifierCommitmentRef<'a> {
     pub pred_merkle_root: ProofHash,
     /// Facts + term-sorted index roots (base layers only); see [`LayerCommitment::dict_index`].
     pub dict_index: Option<DictIndex>,
-    /// TRUST MODE of this verification: `true` only when the caller vouched for the
-    /// WELL-FORMEDNESS of the trusted root this view is anchored to
-    /// ([`TrustedRoot::Attested`](crate::proof::envelope::TrustedRoot) — a root the validators
-    /// recomputed from the data). Then every root-bound commitment is the canonical function of
-    /// the root-bound terms (the value/datatype columns are authentic), the facts are true, and
-    /// the sorted index is sorted and agrees with the id-indexed trees — so a TERM-LESS view may
-    /// answer value-, fact- and term-lookup-reading statements without the clear catalogs. Never
-    /// set by decoding an artifact: every artifact/sidecar view is `false`; only the
-    /// single-layer term-less envelope's attested verification sets it.
-    pub attested: bool,
+    /// TRUST MODE of this verification: `true` only when every root-bound commitment is the
+    /// canonical function of the root-bound terms (the value/datatype columns are authentic), the
+    /// facts are true and the keyed term structures agree with the id-indexed ones — so a
+    /// TERM-LESS view may answer value-, fact- and term-lookup-reading statements without the
+    /// clear catalogs. Only a PROVEN CHECKPOINT's view (`crate::proof::checkpoint::view`) sets it,
+    /// where those facts are proven by the checkpoint's inductive and view proofs. Never set by
+    /// decoding an artifact, and `pub(crate)`: no caller outside this crate can set it (read it
+    /// with [`Self::is_attested`]).
+    pub(crate) attested: bool,
     /// `true` only for the view of a PROVEN CHECKPOINT (`crate::proof::checkpoint::view`): a
     /// term-less base view whose commitments, facts and dictionary structures are the ones the
-    /// checkpoint's inductive proof and its view proof bind (so it is also `attested` — every
-    /// well-formedness fact an attested view assumes is proven, not vouched for). Its two
+    /// checkpoint's inductive proof and its view proof bind (so it is also `attested`). Its two
     /// "Merkle roots" are then the checkpoint's id-indexed TERM-TREE roots and its two "sorted
     /// roots" the checkpoint's keyed TERM-INDEX roots: `id -> term` opens the term tree and
     /// `term -> id` opens the keyed index ([`open_node_value_id`], [`node_value_term_id`]). Never
-    /// set by decoding an artifact.
-    pub checkpoint: bool,
+    /// set by decoding an artifact; `pub(crate)` like `attested` (read it with
+    /// [`Self::is_checkpoint`]).
+    pub(crate) checkpoint: bool,
+}
+
+impl VerifierCommitmentRef<'_> {
+    /// Whether this view is attested (see the `attested` field): only a proven checkpoint's view.
+    pub fn is_attested(&self) -> bool {
+        self.attested
+    }
+
+    /// Whether this view is a proven checkpoint's view (see the `checkpoint` field).
+    pub fn is_checkpoint(&self) -> bool {
+        self.checkpoint
+    }
 }
 
 /// Common verifier-facing interface. It intentionally contains no raw-table

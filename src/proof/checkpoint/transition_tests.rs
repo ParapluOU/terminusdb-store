@@ -78,7 +78,7 @@ fn write_right_after_the_genesis_checkpoint_with_new_terms_values_and_removals()
         Op::Add(node("brand-new", "p-new", "b1")),
         Op::Add(node("a2", "p2", "b3")),
         Op::Add(ValueTriple::new_string_value(&iri("a2"), &iri("name"), "Bea")),
-        Op::Add(ValueTriple::new_value(&iri("a3"), &iri("age"), u32::make_entry(&7))),
+        Op::Add(ValueTriple::new_value(&iri("a3"), &iri("age"), u32::make_entry(&7u32))),
         Op::Add(ValueTriple::new_value(&iri("a3"), &iri("score"), f64::make_entry(&-0.5))),
         Op::Add(ValueTriple::new_value(&iri("a3"), &iri("delta"), i64::make_entry(&-3))),
         Op::Add(ValueTriple::new_value(&iri("a3"), &iri("flag"), bool::make_entry(&true))),
@@ -366,7 +366,7 @@ fn a_witness_for_another_checkpoint_or_chain_rejects() {
         node("a2", "p1", "b2"),
         node("a3", "p1", "b3"),
         node("a4", "p2", "b4"),
-        ValueTriple::new_value(&iri("a1"), &iri("age"), u32::make_entry(&30)),
+        ValueTriple::new_value(&iri("a1"), &iri("age"), u32::make_entry(&30u32)),
         ValueTriple::new_string_value(&iri("a2"), &iri("name"), "Ann"),
         node("zz", "p1", "zz"),
     ]);

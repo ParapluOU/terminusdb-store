@@ -22,6 +22,7 @@ pub const TERM_TREE_DEPTH: usize = 32;
 const LEAF_DOMAIN: &[u8] = b"terminus-store/pow/checkpoint/term-tree-leaf/v1";
 const EMPTY_DOMAIN: &[u8] = b"terminus-store/pow/checkpoint/term-tree-empty/v1";
 const NODE_DOMAIN: &[u8] = b"terminus-store/pow/checkpoint/term-tree-node/v1";
+const ROOT_DOMAIN: &[u8] = b"terminus-store/pow/checkpoint/term-tree-root/v1";
 
 /// Node/value namespace tag.
 pub const NS_NODE_VALUE: u8 = 1;
@@ -55,6 +56,18 @@ fn node(namespace: u8, left: &ProofHash, right: &ProofHash) -> ProofHash {
     hasher.update([namespace]);
     hasher.update(left);
     hasher.update(right);
+    hasher.finalize().into()
+}
+
+/// The term-tree ROOT: `SHA256(ROOT ‖ ns ‖ size ‖ merkle_root)`. Binding the leaf count makes the
+/// root name its size, so a frontier claiming another size (e.g. `n + 1` with an empty last leaf,
+/// which leaves the Merkle root unchanged) never opens it.
+fn bind_size(namespace: u8, size: u64, merkle_root: &ProofHash) -> ProofHash {
+    let mut hasher = Sha256::new();
+    hasher.update(ROOT_DOMAIN);
+    hasher.update([namespace]);
+    hasher.update(size.to_be_bytes());
+    hasher.update(merkle_root);
     hasher.finalize().into()
 }
 
@@ -127,8 +140,13 @@ impl Accumulator {
         Ok(())
     }
 
-    /// The root of the current tree.
+    /// The root of the current tree (its Merkle root bound to its size, [`bind_size`]).
     pub fn root(&self) -> ProofHash {
+        bind_size(self.namespace, self.size, &self.merkle_root())
+    }
+
+    /// The bare Merkle root over the fixed-depth tree (no size binding).
+    fn merkle_root(&self) -> ProofHash {
         let mut current = self.empty[0];
         for level in 0..TERM_TREE_DEPTH {
             current = if self.size >> level & 1 == 1 {
@@ -244,7 +262,7 @@ pub fn object_from_leaf_parts(tag: u8, bytes: Vec<u8>) -> io::Result<CanonicalOb
 }
 
 /// Verify the opening of chain id `id` in the term tree of `namespace` with `root` and `count`
-/// leaves, returning the authenticated term (a predicate's as a `Node`).
+/// leaves (the root binds `count`, so a caller passing another count rejects), returning the authenticated term (a predicate's as a `Node`).
 ///
 /// The opening must name `id` at position `id - 1` with `id` in `1..=count`, carry exactly
 /// [`TERM_TREE_DEPTH`] siblings, and fold from the re-hashed leaf to `root`. A slot beyond `count`
@@ -279,7 +297,7 @@ pub fn verify_term_opening(
             node(namespace, sibling, &current)
         };
     }
-    if &current != root {
+    if &bind_size(namespace, count, &current) != root {
         return Err(invalid("checkpoint term opening does not open the term-tree root"));
     }
     object_from_leaf_parts(opening.datatype_tag, opening.term_bytes.clone())
@@ -308,7 +326,7 @@ mod tests {
             }
             level = next;
         }
-        level[0]
+        bind_size(NS_NODE_VALUE, leaves.len() as u64, &level[0])
     }
 
     #[test]

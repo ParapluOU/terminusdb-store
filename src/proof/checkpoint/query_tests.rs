@@ -250,6 +250,7 @@ impl Read {
             &artifact.encode()?,
             &self.query.view_proof().encode()?,
             artifact.checkpoint_root,
+            artifact.head_root,
             &self.plan,
         )
     }
@@ -282,6 +283,20 @@ fn checkpoint_reads_equal_the_term_bearing_reference() {
             if name == "order" {
                 assert_eq!(got.envelope.result_values, expected.result_values, "order is positional");
             }
+            // The no-deltas read binds the trusted head: another head root rejects.
+            let artifact = read.query.artifact();
+            assert!(
+                decode_and_verify_checkpoint_read(
+                    &read.envelope.encode().unwrap(),
+                    &artifact.encode().unwrap(),
+                    &read.query.view_proof().encode().unwrap(),
+                    artifact.checkpoint_root,
+                    chain.root(2),
+                    &plan,
+                )
+                .is_err(),
+                "{name} (a): a checkpoint read verified against another head"
+            );
 
             // (b) C_0 + the deltas since: the head checkpoint is the ephemeral C'.
             let got = decode_and_verify_checkpoint_delta_read(
@@ -559,7 +574,7 @@ fn checkpoint_query_measurements() {
                     let artifact = query.artifact().encode().unwrap();
                     let t = Instant::now();
                     if label.starts_with('a') {
-                        decode_and_verify_checkpoint_read(&bytes, &artifact, &view_bytes, query.artifact().checkpoint_root, &plan).unwrap();
+                        decode_and_verify_checkpoint_read(&bytes, &artifact, &view_bytes, query.artifact().checkpoint_root, query.artifact().head_root, &plan).unwrap();
                     } else {
                         let views = chain.delta_view_bytes(0, 1);
                         let refs: Vec<&[u8]> = views.iter().map(Vec::as_slice).collect();

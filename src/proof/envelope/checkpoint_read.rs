@@ -165,17 +165,22 @@ impl CheckpointRelationEnvelope {
 }
 
 /// DB-free byte-in verification of a query over a checkpoint with NO deltas since: decode the
-/// checkpoint artifact (which must carry the chain-recorded `trusted_checkpoint_root`), its view
-/// proof and the envelope, verify the view, then the envelope against the caller's OWN `plan`.
-/// Returns the verified envelope (its result is the answer).
+/// checkpoint artifact (which must carry the chain-recorded `trusted_checkpoint_root` and be OF the
+/// trusted head `trusted_head_root`, as [`verify_checkpoint_read_view`] requires), its view proof
+/// and the envelope, verify the view, then the envelope against the caller's OWN `plan`. Returns
+/// the verified envelope (its result is the answer).
 pub fn decode_and_verify_checkpoint_read(
     envelope: &[u8],
     artifact: &[u8],
     view_proof: &[u8],
     trusted_checkpoint_root: ProofHash,
+    trusted_head_root: ProofHash,
     plan: &RelationProofPlan,
 ) -> io::Result<CheckpointRelationEnvelope> {
     let artifact = CheckpointArtifact::decode(artifact)?;
+    if artifact.head_root != trusted_head_root {
+        return Err(invalid("checkpoint is not of the trusted head"));
+    }
     let view = verify_checkpoint_view(&artifact, trusted_checkpoint_root, &CheckpointViewProof::decode(view_proof)?)?;
     let envelope = CheckpointRelationEnvelope::decode(envelope)?;
     envelope.verify(&view, plan)?;
