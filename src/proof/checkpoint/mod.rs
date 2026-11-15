@@ -65,6 +65,14 @@ mod transition_tests;
 mod query_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod audit_inductive_tests;
+#[cfg(test)]
+mod audit_smt_tests;
+#[cfg(test)]
+mod audit_view_tests;
+#[cfg(test)]
+mod audit_transition_tests;
 pub mod view;
 
 pub use genesis::{genesis_checkpoint, genesis_checkpoint_with_context, verify_genesis_checkpoint};
