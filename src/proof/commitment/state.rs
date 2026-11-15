@@ -1853,14 +1853,14 @@ pub(super) fn validate_dict_index(
 }
 
 // ---------------------------------------------------------------------------------------------
-// term <-> id over ONE base view, for both trust modes.
+// term <-> id over ONE base view.
 //
 // TERM-BEARING: the clear-catalog scan every verifier site always used (unchanged semantics).
-// ATTESTED term-less: through the envelope-carried openings, each verified against a root-bound
-// tree — the TERM-SORTED index for `term -> id` (membership or absence), the id-indexed tree for
-// `id -> term`. The key is derived by the verifier from the PUBLIC term and the id is read from the
-// authenticated leaf, so the id is never a separately prover-claimed value; no transcript is
-// touched. BARE term-less: `Err` (fail-closed, as before).
+// CHECKPOINT (term-less, attested): through the envelope-carried paths, each verified against a
+// root-bound structure — the keyed term index for `term -> id` (membership or absence), the term
+// tree for `id -> term`. The key is derived by the verifier from the PUBLIC term and the id is read
+// from the authenticated leaf, so the id is never a separately prover-claimed value; no transcript
+// is touched. Any other term-less view: `Err` (fail-closed).
 // ---------------------------------------------------------------------------------------------
 
 /// `term -> id` in the node/value dictionary of one base view: `Some(id)` present, `None` absent.
@@ -1876,7 +1876,7 @@ pub(crate) fn node_value_term_id(
             .find(|record| &record.triple.object == object)
             .map(|record| record.object_id));
     }
-    attested_sorted_lookup(source, SortedNamespace::NodeValue, &node_value_sort_key(object))
+    checkpoint_term_lookup(source, SortedNamespace::NodeValue, &node_value_sort_key(object))
 }
 
 /// `term -> id` in the predicate dictionary of one base view: `Some(id)` present, `None` absent.
@@ -1892,51 +1892,51 @@ pub(crate) fn predicate_term_id(
             .find(|record| record.triple.predicate == iri)
             .map(|record| record.predicate_id));
     }
-    attested_sorted_lookup(source, SortedNamespace::Predicate, &predicate_sort_key(iri))
+    checkpoint_term_lookup(source, SortedNamespace::Predicate, &predicate_sort_key(iri))
 }
 
-fn attested_sorted_lookup(
+fn checkpoint_term_lookup(
     source: &(impl VerifierLayer + ?Sized),
     namespace: SortedNamespace,
     key: &ProofHash,
 ) -> io::Result<Option<u64>> {
     let view = source.verifier_view();
     view.require_terms_or_attested("a dictionary term lookup (term -> id)")?;
+    if !view.checkpoint {
+        return Err(invalid("a term-less term lookup (term -> id) needs a proven checkpoint's keyed term index"));
+    }
     crate::proof::query::require_base_layer_for_query(view.state)?;
+    // A checkpoint view carries its keyed term-index roots in the dictionary-index slots.
     let index = view
         .dict_index
-        .ok_or_else(|| invalid("an attested base layer must carry its sorted dictionary index"))?;
-    let openings = source.shipped_openings().ok_or_else(|| {
-        invalid("an attested term lookup requires the envelope-carried sorted-index openings")
-    })?;
+        .ok_or_else(|| invalid("a checkpoint view must carry its keyed term-index roots"))?;
+    let openings = source
+        .shipped_openings()
+        .ok_or_else(|| invalid("a checkpoint term lookup requires the envelope-carried keyed paths"))?;
     let (root, n) = match namespace {
         SortedNamespace::NodeValue => (index.nv_sorted_root, view.state.node_value_count),
         SortedNamespace::Predicate => (index.pred_sorted_root, view.state.predicate_count),
     };
-    if view.checkpoint {
-        // A checkpoint's keyed term index: membership gives the id from the authenticated leaf,
-        // a non-membership path proves the absence.
-        let path = openings.keyed_lookup(namespace, key)?;
-        let index_namespace = match namespace {
-            SortedNamespace::NodeValue => crate::proof::checkpoint::smt::NS_NV_INDEX,
-            SortedNamespace::Predicate => crate::proof::checkpoint::smt::NS_PRED_INDEX,
-        };
-        return match &path.terminal {
-            crate::proof::checkpoint::smt::SmtTerminal::Leaf { key: found, .. } if found == key => {
-                let id = crate::proof::checkpoint::smt::verify_membership(index_namespace, &root, key, &path)?;
-                if id == 0 || id > n {
-                    return Err(invalid("checkpoint term index maps a term outside the dictionary"));
-                }
-                Ok(Some(id))
+    // A checkpoint's keyed term index: membership gives the id from the authenticated leaf,
+    // a non-membership path proves the absence.
+    let path = openings.keyed_lookup(namespace, key)?;
+    let index_namespace = match namespace {
+        SortedNamespace::NodeValue => crate::proof::checkpoint::smt::NS_NV_INDEX,
+        SortedNamespace::Predicate => crate::proof::checkpoint::smt::NS_PRED_INDEX,
+    };
+    match &path.terminal {
+        crate::proof::checkpoint::smt::SmtTerminal::Leaf { key: found, .. } if found == key => {
+            let id = crate::proof::checkpoint::smt::verify_membership(index_namespace, &root, key, &path)?;
+            if id == 0 || id > n {
+                return Err(invalid("checkpoint term index maps a term outside the dictionary"));
             }
-            _ => {
-                crate::proof::checkpoint::smt::verify_non_membership(index_namespace, &root, key, &path)?;
-                Ok(None)
-            }
-        };
+            Ok(Some(id))
+        }
+        _ => {
+            crate::proof::checkpoint::smt::verify_non_membership(index_namespace, &root, key, &path)?;
+            Ok(None)
+        }
     }
-    let lookup = openings.sorted_lookup(namespace, key)?;
-    verify_sorted_lookup(&root, n, key, &lookup)
 }
 
 /// Verify a node/value `id -> term` opening against `view`'s root-bound id-indexed structure: the

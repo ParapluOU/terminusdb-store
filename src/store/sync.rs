@@ -187,19 +187,6 @@ impl SyncStoreLayer {
         inner.map(SyncStoreLayer::wrap)
     }
 
-    /// Squash into a base layer whose files and proof roots are a pure
-    /// function of the logical state; returns the layer, its
-    /// `commitment_root` and its `resolution_root`. See
-    /// [`StoreLayer::squash_deterministic`].
-    pub fn squash_deterministic(&self) -> io::Result<(SyncStoreLayer, ProofHash, ProofHash)> {
-        let squash = task_sync(self.inner.squash_deterministic())?;
-        Ok((
-            SyncStoreLayer::wrap(squash.layer),
-            squash.commitment_root,
-            squash.resolution_root,
-        ))
-    }
-
     /// Create a new rollup layer which rolls up all triples in this layer, as well as all its ancestors.
     ///
     /// It is a good idea to keep layer stacks small, meaning, to only
@@ -641,13 +628,6 @@ impl SyncStore {
     ) -> Result<[u32; 5], io::Error> {
         let inner = task_sync(self.inner.merge_base_layers(layers, temp_dir))?;
         Ok(inner)
-    }
-
-    /// The `(commitment_root, resolution_root)` a deterministic squash of
-    /// `head` has, computed without writing to this store. See
-    /// [`Store::squashed_roots`].
-    pub fn squashed_roots(&self, head: [u32; 5]) -> io::Result<(ProofHash, ProofHash)> {
-        task_sync(self.inner.squashed_roots(head))
     }
 
     /// Explicitly backfill intrinsic commitments for a legacy layer chain.

@@ -112,9 +112,7 @@ pub use checkpoint_read::{
 };
 // The single-layer TERM-LESS recursive envelope (O(result) witness beside the O(1) commitment).
 pub use termless::{
-    require_attested_termless_plan, require_termless_plan, single_layer_envelope_form,
-    SingleLayerEnvelopeForm, TrustedRoot,
-    TermlessRelationEnvelope,
+    require_attested_termless_plan, require_termless_plan, TermlessRelationEnvelope,
 };
 pub use bag_union::BagUnionEnvelope;
 pub use left_anti::LeftAntiJoinEnvelope;
@@ -166,5 +164,3 @@ mod tests;
 
 #[cfg(test)]
 mod termless_tests;
-#[cfg(test)]
-mod attested_tests;

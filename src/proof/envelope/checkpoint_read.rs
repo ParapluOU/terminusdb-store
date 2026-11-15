@@ -85,9 +85,6 @@ impl CheckpointRelationEnvelope {
         if self.openings.is_oracle() {
             return Err(invalid("an oracle carrier is never a shipped witness"));
         }
-        if self.openings.sorted_lookups().next().is_some() {
-            return Err(invalid("a checkpoint read carries no term-sorted index lookups"));
-        }
         let openings = self.openings.fresh_tracked();
         self.envelope.verify(
             &CheckpointQueryView { commitment: view.commitment(), openings: &openings },
@@ -100,9 +97,6 @@ impl CheckpointRelationEnvelope {
     /// Frame as BYTES: magic ‖ version ‖ (node-bounded envelope ‖ id openings ‖ keyed lookups) ‖
     /// SHA-256 checksum.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
-        if self.openings.sorted_lookups().next().is_some() {
-            return Err(invalid("a checkpoint read carries no term-sorted index lookups"));
-        }
         let mut out = Vec::new();
         out.extend_from_slice(CHECKPOINT_READ_MAGIC);
         out.extend_from_slice(&CHECKPOINT_READ_VERSION.to_le_bytes());

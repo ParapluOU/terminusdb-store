@@ -318,16 +318,6 @@ impl StoreLayerBuilder {
     }
 }
 
-/// The result of [`StoreLayer::squash_deterministic`]: the squashed base
-/// layer and its proof roots, which every store derives identically from the
-/// same logical state.
-#[derive(Clone)]
-pub struct DeterministicSquash {
-    pub layer: StoreLayer,
-    pub commitment_root: ProofHash,
-    pub resolution_root: ProofHash,
-}
-
 /// A layer that keeps track of the store it came out of, allowing the creation of a layer builder on top of this layer.
 ///
 /// This type of layer supports querying what was added and what was
@@ -427,33 +417,6 @@ impl StoreLayer {
             .get_layer_from_id(name)
             .await?
             .expect("layer that was just created doesn't exist"))
-    }
-
-    /// Squash this proof-carrying layer into a base layer whose content and
-    /// proof roots are a pure function of its logical triple set.
-    ///
-    /// Every store holding a head with the same logical state, whatever its
-    /// history (commit splits, removed-and-re-added triples, terms left behind
-    /// by removals, rollups, layers imported from packs), produces a base layer
-    /// with byte-identical files and sidecar, so the same `commitment_root` and
-    /// `resolution_root`: the squash keeps only the terms the state uses and
-    /// orders the dictionaries and triples canonically. Only the layer's name
-    /// differs between stores (names are random); identify a squash by its
-    /// roots. The head's chain is validated against its native files first.
-    pub async fn squash_deterministic(&self) -> io::Result<DeterministicSquash> {
-        if !self.store.layer_store.has_proof_layer(self.name()).await? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a deterministic squash needs a proof-carrying layer",
-            ));
-        }
-        let layer = self.squash().await?;
-        let proof = layer.proof_commitment().await?;
-        Ok(DeterministicSquash {
-            commitment_root: proof.state.commitment_root,
-            resolution_root: proof.resolution_root(),
-            layer,
-        })
     }
 
     /// Create a new rollup layer which rolls up all triples in this layer, as well as all its ancestors.
@@ -1067,23 +1030,6 @@ impl Store {
 
     /// Explicitly backfill intrinsic commitments for a legacy layer chain.
     /// This is the only operation that admits layers without PF4 data.
-    /// The `(commitment_root, resolution_root)` that
-    /// [`StoreLayer::squash_deterministic`] gives for `head`, computed in a
-    /// scratch in-memory store, so nothing is written here. A node checks a
-    /// squashed root recorded elsewhere (a ledger block) against this, and any
-    /// node holding the same logical state computes the same pair.
-    pub async fn squashed_roots(&self, head: [u32; 5]) -> io::Result<(ProofHash, ProofHash)> {
-        let layer = self
-            .layer_store
-            .get_layer(head)
-            .await?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "layer not found"))?;
-        let scratch = MemoryLayerStore::new();
-        let squashed = scratch.squash(layer).await?;
-        let proof = scratch.prepare_proof_layer(squashed).await?;
-        Ok((proof.state.commitment_root, proof.resolution_root()))
-    }
-
     pub async fn migrate_proof_chain(&self, layer: [u32; 5]) -> io::Result<CommitmentState> {
         self.layer_store.migrate_proof_chain(layer).await
     }
@@ -1288,9 +1234,6 @@ pub fn open_directory_store<P: Into<PathBuf>>(path: P) -> Store {
 
 #[cfg(test)]
 mod admission_tests;
-
-#[cfg(test)]
-mod squash_tests;
 
 #[cfg(test)]
 mod tests {

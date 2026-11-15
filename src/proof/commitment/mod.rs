@@ -153,10 +153,8 @@ pub use state::{
 pub use root::{database_root, validate_database_root};
 pub use dict_merkle::{resolution_root, resolution_root_v2};
 pub use dict_index::{
-    node_value_sort_key, predicate_sort_key, DictFacts, DictIndex, SortedLeaf, SortedLeafOpening,
-    SortedLookup, SortedNamespace,
+    node_value_sort_key, predicate_sort_key, DictFacts, DictIndex, SortedLeaf, SortedNamespace,
 };
-pub(crate) use dict_index::{verify_sorted_lookup, SortedIndexTree};
 pub use op_value::{node_value_op_value, NODE_DATATYPE_TAG};
 
 // Crate-internal surface (sibling proof modules + storage plumbing, and the
