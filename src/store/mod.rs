@@ -956,11 +956,16 @@ impl Store {
             layer_store: Arc::new(layer_store),
             lru_used_bytes_fn: None,
             lru_evict_fn: None,
-            proof_state: ProofStateMode::On,
+            // Proving is opt-in: off unless this process asked for it through
+            // `TERMINUSDB_PROOF_STATE`, and overridable per store with
+            // `with_proof_state`. A malformed setting is a configuration error
+            // that must not silently become "not proving", so it panics here.
+            proof_state: ProofStateMode::from_env_or_panic(),
         }
     }
 
-    /// Choose whether commits and pack imports write proof state (default on).
+    /// Choose whether commits and pack imports write proof state, overriding
+    /// `TERMINUSDB_PROOF_STATE` (which itself defaults to off).
     pub fn with_proof_state(mut self, mode: ProofStateMode) -> Self {
         self.proof_state = mode;
         self
@@ -1475,7 +1480,9 @@ mod tests {
 
     #[tokio::test]
     async fn proof_state_off_commits_without_sidecar_and_migrates_to_the_proven_state() {
-        let proven = open_memory_store();
+        // Proving is opt-in, so say so here rather than depending on what
+        // this process has in `TERMINUSDB_PROOF_STATE`.
+        let proven = open_memory_store().with_proof_state(ProofStateMode::On);
         assert_eq!(proven.proof_state(), ProofStateMode::On);
         let (_, proven_head) = create_stack(&proven).await;
         let proven_state = proven_head.proof_commitment().await.unwrap().state.clone();

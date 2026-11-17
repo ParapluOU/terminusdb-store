@@ -563,7 +563,8 @@ impl SyncStore {
         Self { inner }
     }
 
-    /// Choose whether commits and pack imports write proof state (default on).
+    /// Choose whether commits and pack imports write proof state, overriding
+    /// `TERMINUSDB_PROOF_STATE` (which itself defaults to off).
     pub fn with_proof_state(self, mode: ProofStateMode) -> Self {
         Self {
             inner: self.inner.with_proof_state(mode),

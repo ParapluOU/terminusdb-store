@@ -115,7 +115,13 @@ pub trait Packable {
     /// (and against its expected root, if one is supplied). A layer that
     /// arrives without one has its proof state computed when `proof_state` is
     /// on or an expected root is supplied for it, and is otherwise stored as is.
-    /// The other import methods import with proof state on.
+    /// The other import methods import under the process-wide mode
+    /// (`TERMINUSDB_PROOF_STATE`, off by default), this trait being on the bare
+    /// layer store, which has no store mode to consult: a process that does
+    /// not prove never computes a sidecar for a layer that arrives without
+    /// one. A layer that arrives *with* one is still validated and kept
+    /// whenever its ancestry carries proof state, and an entry in
+    /// `expected_roots` always forces the layer to be proven.
     async fn import_layers_with_proof_state(
         &self,
         pack: &[u8],
@@ -154,7 +160,7 @@ impl<T: PersistentLayerStore> Packable for T {
             layer_ids,
             HashMap::new(),
             PackImportLimits::default(),
-            ProofStateMode::On,
+            ProofStateMode::from_env_or_panic(),
         )
         .await
     }
@@ -171,7 +177,7 @@ impl<T: PersistentLayerStore> Packable for T {
             layer_ids,
             expected_roots,
             PackImportLimits::default(),
-            ProofStateMode::On,
+            ProofStateMode::from_env_or_panic(),
         )
         .await
     }
@@ -189,7 +195,7 @@ impl<T: PersistentLayerStore> Packable for T {
             layer_ids,
             expected_roots,
             limits,
-            ProofStateMode::On,
+            ProofStateMode::from_env_or_panic(),
         )
         .await
     }
@@ -1847,7 +1853,7 @@ mod tests {
 
         // Proofs on: the parent's proof state is computed first, then the
         // child's sidecar validates against it.
-        let on = open_memory_store();
+        let on = open_memory_store().with_proof_state(ProofStateMode::On);
         on.import_layers_with_expected_roots(
             &pack,
             Box::new(ids.clone().into_iter()),

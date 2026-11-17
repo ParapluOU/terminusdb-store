@@ -1,0 +1,10 @@
+# Writing per-layer proof state is opt-in (`ProofStateMode`, off unless asked),
+# so that this fork behaves like an unforked terminus-store for anyone who does
+# not prove reads: no per-commit commitment cost, and no commit refused onto a
+# chain that carries no proof state. This crate's own test suite is mostly the
+# proof system, and its stores are opened with the plain `open_*_store`
+# constructors, so turn proving on for everything cargo runs here. Tests that
+# are about the off path set `with_proof_state(ProofStateMode::Off)` explicitly,
+# which overrides this.
+[env]
+TERMINUSDB_PROOF_STATE = "on"
