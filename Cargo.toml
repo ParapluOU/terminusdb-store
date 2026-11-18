@@ -40,7 +40,7 @@ regex = "1.5"
 lru = "0.10"
 bitvec = "1.0"
 tempfile = "3.1"
-tdb-succinct = "0.1.2"
+tdb-succinct = "0.2"
 sha2 = "0.10"
 libc = "0.2"
 
@@ -77,5 +77,10 @@ blitzar-gpu = ["dory-pcs/blitzar-gpu"]
 # TerminusDB.  The dependency itself remains a crates.io dependency so a
 # TerminusDB workspace patch produces one Cargo source identity, rather than a
 # second incompatible copy reached through a direct git dependency.
+#
+# v0.2.1 is what TerminusDB 12.1.0-rc3 pins (it supersedes the 0.1.x
+# xbrl-json-iso-intervals rev this used to follow). Every consumer that builds
+# this crate must patch the same tag: the 0.2 line is not on crates.io, so a
+# bare `tdb-succinct = "0.2"` requirement resolves nowhere without it.
 [patch.crates-io]
-tdb-succinct = { git = "https://github.com/terminusdb-org/tdb-succinct", rev = "ec1519923e44e73cad17264f21534065855be6e0" }
+tdb-succinct = { git = "https://github.com/terminusdb-org/tdb-succinct", tag = "v0.2.1" }

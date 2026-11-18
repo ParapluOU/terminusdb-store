@@ -112,6 +112,10 @@ pub enum CanonicalDatatype {
     // Appended before proof format v4 when TerminusDB's pinned tdb-succinct
     // gained ISO interval values; existing datatype tags remain stable.
     DateTimeInterval,
+    // Appended on the move to tdb-succinct 0.2.1 (TerminusDB 12.1.0-rc3),
+    // which added xsd:SQName. Every tag above keeps its value, so commitment
+    // roots over data that predates this variant are unchanged.
+    SQName,
 }
 
 impl CanonicalDatatype {
@@ -166,6 +170,7 @@ impl CanonicalDatatype {
             Datatype::HexBinary => Self::HexBinary,
             Datatype::AnySimpleType => Self::AnySimpleType,
             Datatype::DateTimeInterval => Self::DateTimeInterval,
+            Datatype::SQName => Self::SQName,
         }
     }
 }
@@ -174,7 +179,7 @@ impl TryFrom<u8> for CanonicalDatatype {
     type Error = io::Error;
 
     fn try_from(value: u8) -> io::Result<Self> {
-        const ALL: [CanonicalDatatype; 47] = [
+        const ALL: [CanonicalDatatype; 48] = [
             CanonicalDatatype::String,
             CanonicalDatatype::UInt32,
             CanonicalDatatype::Int32,
@@ -222,6 +227,7 @@ impl TryFrom<u8> for CanonicalDatatype {
             CanonicalDatatype::HexBinary,
             CanonicalDatatype::AnySimpleType,
             CanonicalDatatype::DateTimeInterval,
+            CanonicalDatatype::SQName,
         ];
         ALL.get(value as usize)
             .copied()
