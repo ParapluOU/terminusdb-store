@@ -309,6 +309,15 @@ pub fn base_layer_memory_files() -> BaseLayerFiles<MemoryBackedStore> {
             blocks_file: MemoryBackedStore::new(),
             sblocks_file: MemoryBackedStore::new(),
         },
+
+        interval_index_files: IntervalIndexFiles {
+            rank_table_file: MemoryBackedStore::new(),
+            wavelet_files: BitIndexFiles {
+                bits_file: MemoryBackedStore::new(),
+                blocks_file: MemoryBackedStore::new(),
+                sblocks_file: MemoryBackedStore::new(),
+            },
+        },
     }
 }
 
@@ -405,6 +414,15 @@ pub fn child_layer_memory_files() -> ChildLayerFiles<MemoryBackedStore> {
             bits_file: MemoryBackedStore::new(),
             blocks_file: MemoryBackedStore::new(),
             sblocks_file: MemoryBackedStore::new(),
+        },
+
+        interval_index_files: IntervalIndexFiles {
+            rank_table_file: MemoryBackedStore::new(),
+            wavelet_files: BitIndexFiles {
+                bits_file: MemoryBackedStore::new(),
+                blocks_file: MemoryBackedStore::new(),
+                sblocks_file: MemoryBackedStore::new(),
+            },
         },
     }
 }

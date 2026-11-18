@@ -1,10 +1,10 @@
 [package]
 name = "terminus-store"
-# 0.21.8 (not 0.22.0) so a TerminusDB [patch.crates-io] accepts this fork as a
-# semver-compatible replacement of the 0.21.x consumers (store-prolog, grpc
-# label store). The breaking changes vs 0.21.7 are confined to proof-specific
-# APIs those consumers do not call; the base Store API is unchanged.
-version = "0.21.8"
+# Tracks the upstream release this fork is merged up to, so a TerminusDB
+# [patch.crates-io] accepts it as a semver-compatible replacement for the
+# upstream version its consumers ask for (12.1.0-rc3 asks for 0.23.x). The
+# fork's own additions are the proof APIs; the base Store API is upstream's.
+version = "0.23.1"
 authors = ["Matthijs van Otterdijk <matthijs@datachemist.com>", "Philippe Höij <philippe.hoij@dfrnt.com>"]
 edition = "2018"
 license = "Apache-2.0"
@@ -40,7 +40,10 @@ regex = "1.5"
 lru = "0.10"
 bitvec = "1.0"
 tempfile = "3.1"
-tdb-succinct = "0.2"
+# The same direct git dependency upstream 0.23.1 declares, spec-identical on
+# purpose: a consumer that patches crates-io tdb-succinct to this very tag then
+# resolves ONE package, rather than a second copy whose types do not unify.
+tdb-succinct = {git="https://github.com/terminusdb-org/tdb-succinct", tag="v0.2.1"}
 sha2 = "0.10"
 libc = "0.2"
 
@@ -63,6 +66,9 @@ ark-serialize = "0.5"
 rand_chacha = "0.3"
 # Blake2b hash-to-field for dictionary-binding (same fn on prover and verifier).
 blake2 = "0.10"
+
+[target.'cfg(not(unix))'.dependencies]
+atomicwrites = "0.4"
 
 [features]
 noreadlock = []

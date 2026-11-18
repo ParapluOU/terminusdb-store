@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+use tdb_succinct::tfc::lexical_interval::{AllenRelation, LexicalInterval};
 use tdb_succinct::{TdbDataType, TypedDictEntry};
 
 /// A layer containing dictionary entries and triples.
@@ -31,6 +32,72 @@ pub trait Layer: Send + Sync {
     fn object_value_id(&self, object: &TypedDictEntry) -> Option<u64>;
     /// The subject corresponding to a numerical id, or None if it cannot be found.
     fn id_subject(&self, id: u64) -> Option<String>;
+
+    /// The subjects whose name starts with `prefix`, as (subject id, name)
+    /// pairs. Node names live in a sorted front-coded dictionary per layer
+    /// band, so a prefix is a contiguous dictionary range. Names are
+    /// yielded in sorted order, deduplicated across bands; the yielded id
+    /// is the topmost band's.
+    fn subjects_with_prefix(&self, prefix: &str) -> Box<dyn Iterator<Item = (u64, String)> + Send>;
+
+    /// Count the subjects whose name starts with the given prefix.
+    ///
+    /// The default implementation counts via `subjects_with_prefix`.
+    /// `InternalLayer` overrides this with per-band dictionary seeks: child
+    /// dictionaries only contain newly introduced names, so band ranges are
+    /// disjoint and the count is a sum of range lengths.
+    fn count_subjects_with_prefix(&self, prefix: &str) -> usize {
+        self.subjects_with_prefix(prefix).count()
+    }
+
+    /// Count distinct subjects of triples matching (subject, predicate,
+    /// object in `objects`) whose name starts with `prefix`.
+    ///
+    /// The default implementation enumerates the prefix range and probes
+    /// `triple_exists` per (subject, object) pair. `InternalLayer` overrides
+    /// this with a member-side scan: each member's outer id locates its home
+    /// band, `outer_to_inner` gives the dictionary position, and a numeric
+    /// range check decides membership — no names are materialized.
+    fn count_triple_subjects_with_prefix(
+        &self,
+        prefix: &str,
+        predicate: u64,
+        objects: &std::collections::HashSet<u64>,
+    ) -> usize {
+        self.subjects_with_prefix(prefix)
+            .filter(|(subject, _)| {
+                objects
+                    .iter()
+                    .any(|o| self.triple_exists(*subject, predicate, *o))
+            })
+            .count()
+    }
+
+    /// The subjects named under `prefix` that carry a `(subject,
+    /// predicate, object in objects)` triple, as (subject id, name)
+    /// pairs in name order — the streaming form of
+    /// `count_triple_subjects_with_prefix`.
+    ///
+    /// The default implementation probes `triple_exists` per candidate.
+    /// `InternalLayer` overrides this with a merge-join over the bands'
+    /// subject-sorted member runs: each name band's member slices merge
+    /// by subject id (itself the dict position order), then the bands
+    /// merge by name — no membership set is materialized.
+    fn triple_subjects_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+        predicate: u64,
+        objects: &'a std::collections::HashSet<u64>,
+    ) -> Box<dyn Iterator<Item = (u64, String)> + Send + 'a> {
+        Box::new(
+            self.subjects_with_prefix(prefix)
+                .filter(move |(subject, _)| {
+                    objects
+                        .iter()
+                        .any(|o| self.triple_exists(*subject, predicate, *o))
+                }),
+        )
+    }
 
     /// The predicate corresponding to a numerical id, or None if it cannot be found.
     fn id_predicate(&self, id: u64) -> Option<String>;
@@ -98,8 +165,8 @@ pub trait Layer: Send + Sync {
         self.subject_id(&triple.subject).and_then(|subject| {
             self.predicate_id(&triple.predicate).and_then(|predicate| {
                 match &triple.object {
-                    ObjectType::Node(node) => self.object_node_id(&node),
-                    ObjectType::Value(value) => self.object_value_id(&value),
+                    ObjectType::Node(node) => self.object_node_id(node),
+                    ObjectType::Value(value) => self.object_value_id(value),
                 }
                 .map(|object| IdTriple {
                     subject,
@@ -135,6 +202,49 @@ pub trait Layer: Send + Sync {
         high: &TypedDictEntry,
     ) -> Box<dyn Iterator<Item = IdTriple> + Send>;
 
+    /// Object value ids that can satisfy `rel` against `reference` — a
+    /// superset usable as query candidates; callers verify semantically.
+    /// The default scans distinct objects; layers with interval indexes
+    /// override it with boundary probes.
+    fn interval_relation_object_ids(
+        &self,
+        rel: AllenRelation,
+        reference: &LexicalInterval,
+    ) -> Vec<u64> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for t in self.triples() {
+            if !seen.insert(t.object) {
+                continue;
+            }
+            if let Some(ObjectType::Value(e)) = self.id_object(t.object) {
+                if let Some(iv) = tdb_succinct::tfc::lexical_interval::entry_relation_bounds(&e) {
+                    if tdb_succinct::tfc::lexical_interval::interval_relation(&iv, rel, reference) {
+                        out.push(t.object);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Iterator over all triples whose object value can satisfy `rel`
+    /// against `reference`. Candidate generation may use indexes and is a
+    /// superset; semantic verification happens in the query layer.
+    fn triples_interval_relation(
+        &self,
+        rel: AllenRelation,
+        reference: &LexicalInterval,
+    ) -> Box<dyn Iterator<Item = IdTriple> + Send> {
+        let object_ids = self.interval_relation_object_ids(rel, reference);
+        let layer = self.clone_boxed();
+        Box::new(
+            object_ids
+                .into_iter()
+                .flat_map(move |oid| layer.triples_o(oid)),
+        )
+    }
+
     /// Convert all known strings in the given string triple to ids.
     fn value_triple_to_partially_resolved(&self, triple: ValueTriple) -> PartiallyResolvedTriple {
         PartiallyResolvedTriple {
@@ -148,11 +258,11 @@ pub trait Layer: Send + Sync {
                 .unwrap_or(PossiblyResolved::Unresolved(triple.predicate)),
             object: match &triple.object {
                 ObjectType::Node(node) => self
-                    .object_node_id(&node)
+                    .object_node_id(node)
                     .map(PossiblyResolved::Resolved)
                     .unwrap_or(PossiblyResolved::Unresolved(triple.object)),
                 ObjectType::Value(value) => self
-                    .object_value_id(&value)
+                    .object_value_id(value)
                     .map(PossiblyResolved::Resolved)
                     .unwrap_or(PossiblyResolved::Unresolved(triple.object)),
             },
@@ -181,6 +291,62 @@ pub trait Layer: Send + Sync {
     /// Returns the total amount of triples in this layer and all its parents.
     fn triple_count(&self) -> usize {
         self.triple_addition_count() - self.triple_removal_count()
+    }
+
+    /// Returns the number of distinct triples matching the given partially-bound
+    /// pattern that are visible at this layer (additions minus removals).
+    ///
+    /// Each `None` component acts as a wildcard. `Some(0)` counts nothing, as 0 is
+    /// never a valid id. The default implementation counts via the various triple
+    /// iterators; `InternalLayer` overrides this with index-derived counts that do
+    /// not materialize matching triples.
+    fn count_triples(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> usize {
+        match (subject, predicate, object) {
+            (None, None, None) => self.triple_count(),
+            (Some(subject), None, None) => self.triples_s(subject).count(),
+            (Some(subject), Some(predicate), None) => self.triples_sp(subject, predicate).count(),
+            (Some(subject), Some(predicate), Some(object)) => {
+                self.triple_exists(subject, predicate, object) as usize
+            }
+            (Some(subject), None, Some(object)) => self
+                .triples_s(subject)
+                .filter(move |t| t.object == object)
+                .count(),
+            (None, Some(predicate), None) => self.triples_p(predicate).count(),
+            (None, Some(predicate), Some(object)) => self
+                .triples_p(predicate)
+                .filter(move |t| t.object == object)
+                .count(),
+            (None, None, Some(object)) => self.triples_o(object).count(),
+        }
+    }
+
+    /// Returns the amount of triples whose object value falls in the half-open
+    /// range [low, high), optionally restricted to a subject and/or predicate.
+    ///
+    /// The default implementation counts via `triples_value_range`; `InternalLayer`
+    /// overrides this with index-derived counts.
+    fn count_triples_value_range(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> usize {
+        if low.datatype() != high.datatype() {
+            return 0;
+        }
+
+        self.triples_value_range(low, high)
+            .filter(move |t| {
+                subject.is_none_or(|s| t.subject == s) && predicate.is_none_or(|p| t.predicate == p)
+            })
+            .count()
     }
 
     fn single_triple_sp(&self, subject: u64, predicate: u64) -> Option<IdTriple>;
@@ -297,7 +463,7 @@ impl<T: Clone + PartialEq + Eq + PartialOrd + Ord + Hash> PossiblyResolved<T> {
     /// Return a PossiblyResolved with the inner value as a reference.
     pub fn as_ref(&self) -> PossiblyResolved<&T> {
         match self {
-            Self::Unresolved(u) => PossiblyResolved::Unresolved(&u),
+            Self::Unresolved(u) => PossiblyResolved::Unresolved(u),
             Self::Resolved(id) => PossiblyResolved::Resolved(*id),
         }
     }
@@ -453,8 +619,7 @@ mod tests {
         let base: Arc<InternalLayer> = Arc::new(
             BaseLayer::load_from_files([1, 2, 3, 4, 5], &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let files = child_layer_files();
@@ -466,8 +631,7 @@ mod tests {
         let child: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files([5, 4, 3, 2, 1], base.clone(), &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         // TODO why are we not using these results?
@@ -509,8 +673,7 @@ mod tests {
         let base: Arc<InternalLayer> = Arc::new(
             BaseLayer::load_from_files([1, 2, 3, 4, 5], &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let files = child_layer_files();
@@ -522,8 +685,7 @@ mod tests {
         let child: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files([5, 4, 3, 2, 1], base, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let files = child_layer_files();
@@ -535,8 +697,7 @@ mod tests {
         let child: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files([5, 4, 3, 2, 2], child, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let triples: Vec<_> = child
@@ -563,8 +724,7 @@ mod tests {
         let base: Arc<InternalLayer> = Arc::new(
             BaseLayer::load_from_files([1, 2, 3, 4, 5], &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let files = child_layer_files();
@@ -576,8 +736,7 @@ mod tests {
         let child: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files([5, 4, 3, 2, 1], base, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let files = child_layer_files();
@@ -589,8 +748,7 @@ mod tests {
         let child: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files([5, 4, 3, 2, 2], child, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let id_triple_1 = child
@@ -660,8 +818,7 @@ mod tests {
         let base: Arc<InternalLayer> = Arc::new(
             BaseLayer::load_from_files([1, 2, 3, 4, 5], &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let mut results: Vec<_> = base

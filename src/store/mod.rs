@@ -15,6 +15,7 @@ use crate::storage::{
     CachedLayerStore, LabelStore, LayerStore, LockingHashMapLayerCache, PackImportLimits,
     ProofMigrationOutcome, ProofStateMode,
 };
+use tdb_succinct::tfc::lexical_interval::{AllenRelation, LexicalInterval};
 use tdb_succinct::TypedDictEntry;
 
 use std::io;
@@ -157,12 +158,10 @@ impl StoreLayerBuilder {
         }
 
         match builder {
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "builder has already been committed",
-                ))
-            }
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "builder has already been committed",
+            )),
             Some(builder) => {
                 let id = builder.name();
                 let result = async {
@@ -675,7 +674,7 @@ impl StoreLayer {
 }
 
 impl PartialEq for StoreLayer {
-    #[allow(clippy::vtable_address_comparisons)]
+    #[allow(ambiguous_wide_pointer_comparisons)]
     fn eq(&self, other: &StoreLayer) -> bool {
         Arc::ptr_eq(&self.layer, &other.layer)
     }
@@ -719,6 +718,34 @@ impl Layer for StoreLayer {
 
     fn id_subject(&self, id: u64) -> Option<String> {
         self.layer.id_subject(id)
+    }
+
+    fn subjects_with_prefix(&self, prefix: &str) -> Box<dyn Iterator<Item = (u64, String)> + Send> {
+        self.layer.subjects_with_prefix(prefix)
+    }
+
+    fn count_subjects_with_prefix(&self, prefix: &str) -> usize {
+        self.layer.count_subjects_with_prefix(prefix)
+    }
+
+    fn count_triple_subjects_with_prefix(
+        &self,
+        prefix: &str,
+        predicate: u64,
+        objects: &std::collections::HashSet<u64>,
+    ) -> usize {
+        self.layer
+            .count_triple_subjects_with_prefix(prefix, predicate, objects)
+    }
+
+    fn triple_subjects_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+        predicate: u64,
+        objects: &'a std::collections::HashSet<u64>,
+    ) -> Box<dyn Iterator<Item = (u64, String)> + Send + 'a> {
+        self.layer
+            .triple_subjects_with_prefix(prefix, predicate, objects)
     }
 
     fn id_predicate(&self, id: u64) -> Option<String> {
@@ -777,6 +804,22 @@ impl Layer for StoreLayer {
         self.layer.triples_value_range_rev(low, high)
     }
 
+    fn interval_relation_object_ids(
+        &self,
+        rel: AllenRelation,
+        reference: &LexicalInterval,
+    ) -> Vec<u64> {
+        self.layer.interval_relation_object_ids(rel, reference)
+    }
+
+    fn triples_interval_relation(
+        &self,
+        rel: AllenRelation,
+        reference: &LexicalInterval,
+    ) -> Box<dyn Iterator<Item = IdTriple> + Send> {
+        self.layer.triples_interval_relation(rel, reference)
+    }
+
     fn clone_boxed(&self) -> Box<dyn Layer> {
         Box::new(self.clone())
     }
@@ -787,6 +830,26 @@ impl Layer for StoreLayer {
 
     fn triple_removal_count(&self) -> usize {
         self.layer.triple_removal_count()
+    }
+
+    fn count_triples(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> usize {
+        self.layer.count_triples(subject, predicate, object)
+    }
+
+    fn count_triples_value_range(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> usize {
+        self.layer
+            .count_triples_value_range(subject, predicate, low, high)
     }
 
     fn all_counts(&self) -> LayerCounts {
@@ -2499,7 +2562,7 @@ mod tests {
 
         let rebase_builder = layer2.open_write().await.unwrap();
 
-        let _ = rebase_builder.apply_delta(&delta).await.unwrap();
+        rebase_builder.apply_delta(&delta).await.unwrap();
 
         let rebase_layer = rebase_builder.commit().await.unwrap();
 

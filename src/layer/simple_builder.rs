@@ -10,7 +10,7 @@
 //! memory, then does the required sorting and id conversion on
 //! commit.
 use super::internal::*;
-use super::layer::*;
+use super::traits::*;
 use crate::storage::*;
 use std::collections::HashMap;
 use std::io;
@@ -453,7 +453,7 @@ mod tests {
         builder.commit().await.unwrap();
 
         let layer = BaseLayer::load_from_files(name, &files).await.unwrap();
-        Arc::new(layer.into())
+        Arc::new(layer)
     }
 
     #[tokio::test]
@@ -515,8 +515,7 @@ mod tests {
         let layer2: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name2, base_layer, &files2)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let name3 = [0, 0, 0, 0, 1];
@@ -530,8 +529,7 @@ mod tests {
         let layer3: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name3, layer2, &files3)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         let name4 = [0, 0, 0, 0, 1];
@@ -543,8 +541,7 @@ mod tests {
         let layer4: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name4, layer3, &files4)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         assert!(layer4.value_triple_exists(&ValueTriple::new_string_value("cow", "says", "moo")));
@@ -569,12 +566,8 @@ mod tests {
         builder.add_value_triple(ValueTriple::new_string_value("crow", "says", "caw"));
 
         builder.commit().await.unwrap();
-        let base_layer: Arc<InternalLayer> = Arc::new(
-            BaseLayer::load_from_files(name, &files)
-                .await
-                .unwrap()
-                .into(),
-        );
+        let base_layer: Arc<InternalLayer> =
+            Arc::new(BaseLayer::load_from_files(name, &files).await.unwrap());
 
         assert!(
             !base_layer.value_triple_exists(&ValueTriple::new_string_value("crow", "says", "caw"))
@@ -591,12 +584,8 @@ mod tests {
         builder.remove_value_triple(ValueTriple::new_string_value("crow", "says", "caw"));
 
         builder.commit().await.unwrap();
-        let base_layer: Arc<InternalLayer> = Arc::new(
-            BaseLayer::load_from_files(name, &files)
-                .await
-                .unwrap()
-                .into(),
-        );
+        let base_layer: Arc<InternalLayer> =
+            Arc::new(BaseLayer::load_from_files(name, &files).await.unwrap());
 
         assert!(
             !base_layer.value_triple_exists(&ValueTriple::new_string_value("crow", "says", "caw"))
@@ -617,8 +606,7 @@ mod tests {
         let child_layer: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name, base_layer, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         assert!(
@@ -640,8 +628,7 @@ mod tests {
         let child_layer: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name, base_layer, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         assert!(
@@ -663,8 +650,7 @@ mod tests {
         let child_layer: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name, base_layer, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         assert!(
@@ -686,8 +672,7 @@ mod tests {
         let child_layer: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name, base_layer, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         assert!(
@@ -714,8 +699,7 @@ mod tests {
         let child_layer: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name, base_layer, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         assert!(
@@ -742,8 +726,7 @@ mod tests {
         let child_layer: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name, base_layer, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         assert!(
@@ -770,8 +753,7 @@ mod tests {
         let child_layer: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name, base_layer, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         assert!(
@@ -798,8 +780,7 @@ mod tests {
         let child_layer: Arc<InternalLayer> = Arc::new(
             ChildLayer::load_from_files(name, base_layer, &files)
                 .await
-                .unwrap()
-                .into(),
+                .unwrap(),
         );
 
         assert!(

@@ -161,7 +161,7 @@ impl DirectoryArchiveBackend {
         let mut p = self.path.clone();
         let name_str = name_to_string(name);
         p.push(&name_str[0..PREFIX_DIR_SIZE]);
-        p.push(&format!("{}.larch", name_str));
+        p.push(format!("{}.larch", name_str));
 
         p
     }
@@ -170,7 +170,7 @@ impl DirectoryArchiveBackend {
         let mut p = self.path.clone();
         let name_str = name_to_string(name);
         p.push(&name_str[0..PREFIX_DIR_SIZE]);
-        p.push(&format!("{}.rollup.hex", name_str));
+        p.push(format!("{}.rollup.hex", name_str));
 
         p
     }
@@ -836,7 +836,7 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
         let mut options = tokio::fs::OpenOptions::new();
         options.read(true);
         let mut file = options.open(path).await?;
-        let header = ArchiveFilePresenceHeader::new(file.read_u64().await?);
+        let header = ArchiveFilePresenceHeader::try_new(file.read_u64().await?)?;
 
         Ok(header.is_present(file_type))
     }
@@ -950,11 +950,14 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
     }
 }
 
+#[cfg(feature = "rollup_metadata_experimental")]
+type RollupCache = std::sync::RwLock<HashMap<[u32; 5], Option<[u32; 5]>>>;
+
 #[derive(Clone)]
 pub struct LruArchiveBackend<M, D> {
     cache: Arc<tokio::sync::Mutex<LruCache<[u32; 5], CacheEntry>>>,
     #[cfg(feature = "rollup_metadata_experimental")]
-    rollup_cache: Arc<std::sync::RwLock<HashMap<[u32; 5], Option<[u32; 5]>>>>,
+    rollup_cache: Arc<RollupCache>,
     limit: usize,
     current: Arc<AtomicUsize>,
     metadata_origin: M,
@@ -969,11 +972,7 @@ enum CacheEntry {
 
 impl CacheEntry {
     fn is_resolving(&self) -> bool {
-        if let Self::Resolving(_) = self {
-            true
-        } else {
-            false
-        }
+        matches!(self, Self::Resolving(_))
     }
 }
 
@@ -1052,7 +1051,7 @@ fn ensure_additional_cache_space(
             .expect("cache is empty but stored entries were expected");
         if peek.1.is_resolving() {
             // this is a resolving entry, we don't want to pop it.
-            let id = peek.0.clone();
+            let id = *peek.0;
             cache.promote(&id);
             continue;
         }
@@ -1142,7 +1141,7 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
                 match lookup {
                     Ok(bytes) => {
                         if ensure_enough_cache_space(
-                            &mut *cache,
+                            &mut cache,
                             self.limit_bytes(),
                             &self.current,
                             bytes.len(),
@@ -1154,12 +1153,12 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
                             self.current.fetch_add(bytes.len(), Ordering::Relaxed);
                         } else {
                             // this entry is uncachable. Just remove the resolving entry
-                            drop_from_cache(&mut *cache, id, &self.current);
+                            drop_from_cache(&mut cache, id, &self.current);
                         }
                         Ok(bytes)
                     }
                     Err(e) => {
-                        drop_from_cache(&mut *cache, id, &self.current);
+                        drop_from_cache(&mut cache, id, &self.current);
 
                         Err(e)
                     }
@@ -1174,7 +1173,7 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
     ) -> io::Result<Option<Bytes>> {
         if self.layer_fits_in_cache(id).await? {
             let bytes = self.get_layer_bytes(id).await?;
-            let archive = Archive::parse(bytes);
+            let archive = Archive::parse(bytes)?;
             Ok(archive.slice_for(file_type))
         } else {
             self.data_origin
@@ -1355,7 +1354,13 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
     }
     async fn layer_file_exists(&self, id: [u32; 5], file_type: LayerFileEnum) -> io::Result<bool> {
         if let Some(CacheEntry::Resolved(bytes)) = self.cache.lock().await.peek(&id) {
-            let header = ArchiveFilePresenceHeader::new(bytes.clone().get_u64());
+            if bytes.remaining() < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated archive file presence header",
+                ));
+            }
+            let header = ArchiveFilePresenceHeader::try_new(bytes.clone().get_u64())?;
             Ok(header.is_present(file_type))
         } else {
             self.metadata_origin.layer_file_exists(id, file_type).await
@@ -1367,7 +1372,7 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
         file_type: LayerFileEnum,
     ) -> io::Result<usize> {
         if let Some(CacheEntry::Resolved(bytes)) = self.cache.lock().await.peek(&id) {
-            let (header, _) = ArchiveHeader::parse(bytes.clone());
+            let (header, _) = ArchiveHeader::parse(bytes.clone())?;
 
             if let Some(size) = header.size_of(file_type) {
                 Ok(size)
@@ -1543,10 +1548,7 @@ impl AsyncWrite for ConstructionFile {
 
                 Poll::Ready(Ok(buf.len()))
             }
-            _ => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                "file already written",
-            ))),
+            _ => Poll::Ready(Err(io::Error::other("file already written"))),
         }
     }
 
@@ -1589,7 +1591,7 @@ impl SyncableFile for ConstructionFile {
             }
             _ => {
                 *guard = state;
-                Err(io::Error::new(io::ErrorKind::Other, "file already written"))
+                Err(io::Error::other("file already written"))
             }
         }
     }
@@ -1613,10 +1615,7 @@ impl AsyncRead for ConstructionFile {
 
                 Poll::Ready(Ok(()))
             }
-            _ => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                "file not yet written",
-            ))),
+            _ => Poll::Ready(Err(io::Error::other("file not yet written"))),
         }
     }
 }
@@ -1690,6 +1689,20 @@ impl ArchiveFilePresenceHeader {
         }
     }
 
+    /// Fallible variant of `new` for values read from storage. The
+    /// least-significant bit is reserved, so a set bit means the header
+    /// is corrupt.
+    pub fn try_new(val: u64) -> io::Result<Self> {
+        if val & 1 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt archive file presence header",
+            ));
+        }
+
+        Ok(Self::new(val))
+    }
+
     pub fn from_present<I: Iterator<Item = LayerFileEnum>>(present_files: I) -> Self {
         let mut val = 0;
 
@@ -1724,22 +1737,33 @@ pub struct ArchiveHeader {
 }
 
 impl ArchiveHeader {
-    pub fn parse(mut bytes: Bytes) -> (Self, Bytes) {
-        let file_presence = ArchiveFilePresenceHeader::new(bytes.get_u64());
-        let (file_offsets, remainder) = MonotonicLogArray::parse_header_first(bytes)
-            .expect("unable to parse structure offsets");
+    pub fn parse(mut bytes: Bytes) -> io::Result<(Self, Bytes)> {
+        if bytes.remaining() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated archive file presence header",
+            ));
+        }
+        let file_presence = ArchiveFilePresenceHeader::try_new(bytes.get_u64())?;
+        let (file_offsets, remainder) =
+            MonotonicLogArray::parse_header_first(bytes).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unable to parse archive structure offsets",
+                )
+            })?;
 
-        (
+        Ok((
             Self {
                 file_presence,
                 file_offsets,
             },
             remainder,
-        )
+        ))
     }
 
     pub async fn parse_from_reader<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
-        let file_presence = ArchiveFilePresenceHeader::new(reader.read_u64().await?);
+        let file_presence = ArchiveFilePresenceHeader::try_new(reader.read_u64().await?)?;
         let mut logarray_bytes = BytesMut::new();
         logarray_bytes.resize(8, 0);
         reader.read_exact(&mut logarray_bytes[0..8]).await?;
@@ -1786,10 +1810,10 @@ pub struct Archive {
 }
 
 impl Archive {
-    pub fn parse(bytes: Bytes) -> Self {
-        let (header, data) = ArchiveHeader::parse(bytes);
+    pub fn parse(bytes: Bytes) -> io::Result<Self> {
+        let (header, data) = ArchiveHeader::parse(bytes)?;
 
-        Self { header, data }
+        Ok(Self { header, data })
     }
 
     pub async fn parse_from_reader<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
@@ -1868,7 +1892,7 @@ impl AsyncRead for ArchiveSliceReader {
 
         let before_len = buf.filled().len();
         let read = AsyncRead::poll_read(Pin::new(&mut self.file), cx, buf);
-        if let Poll::Pending = read {
+        if read.is_pending() {
             return Poll::Pending;
         }
 
@@ -2305,12 +2329,12 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
     }
 
     async fn get_file(&self, directory: [u32; 5], name: &str) -> io::Result<Self::File> {
-        let file_type = FILENAME_ENUM_MAP.get(name).copied().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unknown archive layer structure",
-            )
-        })?;
+        let Some(&file_type) = FILENAME_ENUM_MAP.get(name) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown layer file name: {name}"),
+            ));
+        };
         if file_type == LayerFileEnum::Rollup {
             if !self.data_backend.layer_is_visible(directory).await? {
                 return Err(io::Error::new(
@@ -2351,12 +2375,9 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
     }
 
     async fn file_exists(&self, directory: [u32; 5], file: &str) -> io::Result<bool> {
-        let file_type = FILENAME_ENUM_MAP.get(file).copied().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unknown archive layer structure",
-            )
-        })?;
+        let Some(&file_type) = FILENAME_ENUM_MAP.get(file) else {
+            return Ok(false);
+        };
         if file_type == LayerFileEnum::Rollup {
             // special case! This is always coming out of the persistent metadata
             return Ok(self.metadata_backend.get_rollup(directory).await?.is_some());
@@ -2460,7 +2481,7 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
             ));
         }
         let expected = self.data_backend.get_layer_bytes(directory).await?;
-        let archive = Archive::parse(expected.clone());
+        let archive = Archive::parse(expected.clone())?;
         if archive.slice_for(LayerFileEnum::ProofState).is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -2499,7 +2520,7 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
             ));
         }
         let expected_archive = self.data_backend.get_layer_bytes(directory).await?;
-        let archive = Archive::parse(expected_archive.clone());
+        let archive = Archive::parse(expected_archive.clone())?;
         let current = archive
             .slice_for(LayerFileEnum::ProofState)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "proof state not found"))?;
@@ -2940,6 +2961,7 @@ mod tests {
         assert_eq!(failure.kind(), io::ErrorKind::AlreadyExists);
 
         Archive::parse(backend.get_layer_bytes(id).await.unwrap())
+            .unwrap()
             .slice_for(LayerFileEnum::ProofState)
             .unwrap()
     }
@@ -3103,6 +3125,24 @@ mod tests {
             assert_eq!(backend.get_layer_bytes(id).await.unwrap(), replacement);
         } else {
             assert!(!backend.layer_is_visible(id).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_file_name_is_not_found_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = DirectoryArchiveBackend::new(dir.path().to_path_buf());
+        let store = ArchiveLayerStore::new(backend.clone(), backend);
+        let layer = [1, 2, 3, 4, 5];
+
+        assert!(!store
+            .file_exists(layer, "future_index_bits.bitarray")
+            .await
+            .unwrap());
+
+        match store.get_file(layer, "future_index_bits.bitarray").await {
+            Err(e) => assert_eq!(io::ErrorKind::NotFound, e.kind()),
+            Ok(_) => panic!("expected NotFound for unknown file name"),
         }
     }
 

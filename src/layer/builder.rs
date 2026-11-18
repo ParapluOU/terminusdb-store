@@ -4,7 +4,7 @@ use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
 use rayon::prelude::*;
 
-use super::layer::*;
+use super::traits::*;
 use crate::{chrono_log, storage::*};
 use tdb_succinct::util::{heap_sorted_iter, stream_iter_ok};
 use tdb_succinct::*;
@@ -56,9 +56,7 @@ impl<F: 'static + FileLoad + FileStore> DictionarySetFileBuilder<F> {
     }
 
     pub fn add_node_bytes(&mut self, node: Bytes) -> u64 {
-        let id = self.node_dictionary_builder.add(node);
-
-        id
+        self.node_dictionary_builder.add(node)
     }
 
     /// Add a predicate string.
@@ -73,18 +71,14 @@ impl<F: 'static + FileLoad + FileStore> DictionarySetFileBuilder<F> {
     }
 
     pub fn add_predicate_bytes(&mut self, predicate: Bytes) -> u64 {
-        let id = self.predicate_dictionary_builder.add(predicate);
-
-        id
+        self.predicate_dictionary_builder.add(predicate)
     }
 
     /// Add a value string.
     ///
     /// Panics if the given value string is not a lexical successor of the previous value string.
     pub fn add_value(&mut self, value: TypedDictEntry) -> u64 {
-        let id = self.value_dictionary_builder.add(value);
-
-        id
+        self.value_dictionary_builder.add(value)
     }
 
     /// Add nodes from an iterable.
@@ -387,14 +381,14 @@ pub async fn build_object_index_from_direct_files<
         greatest_sp = sp;
         pairs.push((object, sp));
         tally += 1;
-        if tally % 10000000 == 0 {
+        if tally.is_multiple_of(10000000) {
             chrono_log!(
                 "collected {tally} pairs for o_ps index ({}%)",
                 (tally * 100 / count)
             );
         }
 
-        if tally % SINGLE_SORT_LIMIT == 0 {
+        if tally.is_multiple_of(SINGLE_SORT_LIMIT) {
             chrono_log!("collect currently gathered elements into a logarray");
             pairs.par_sort_unstable();
             let mut sp_file = BytesMut::with_capacity(0);
@@ -470,7 +464,7 @@ pub async fn build_object_index_from_direct_files<
         let mut objects = Vec::new();
         let mut last_object = 0;
         let mut object_ix = 0;
-        while let Some((object, sp)) = merged_iters.next() {
+        for (object, sp) in merged_iters.by_ref() {
             if object > last_object {
                 object_ix += 1;
                 last_object = object;
@@ -528,6 +522,45 @@ pub async fn build_predicate_index<FLoad: 'static + FileLoad, F: 'static + FileL
         destination_sblocks,
     )
     .await
+}
+
+/// Writes the interval end index files, or nothing when the dictionary
+/// holds an end outside the `(i64, u32)` rank domain — such layers open
+/// with the in-memory end index built from the dictionary itself.
+pub async fn build_interval_index<F: 'static + FileLoad + FileStore>(
+    dict: &TypedDict,
+    files: IntervalIndexFiles<F>,
+) -> io::Result<()> {
+    tdb_succinct::tfc::lexical_interval::build_interval_end_index_lexical(
+        dict,
+        files.rank_table_file,
+        files.wavelet_files.bits_file,
+        files.wavelet_files.blocks_file,
+        files.wavelet_files.sblocks_file,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Build the interval end index over a value dictionary that lives in files
+/// (rollups). The dictionary is upgraded in memory first so fixed-width
+/// interval entries merged in from old layers are indexed correctly.
+pub async fn build_interval_index_from_files<
+    FLoad: 'static + FileLoad + FileStore,
+    F: 'static + FileLoad + FileStore,
+>(
+    value_dictionary_files: &TypedDictionaryFiles<FLoad>,
+    interval_index_files: IntervalIndexFiles<F>,
+) -> io::Result<()> {
+    let maps = value_dictionary_files.map_all().await?;
+    let dict = TypedDict::from_parts(
+        maps.types_present_map,
+        maps.type_offsets_map,
+        maps.offsets_map,
+        maps.blocks_map,
+    )
+    .upgrade_lexical_intervals();
+    build_interval_index(&dict, interval_index_files).await
 }
 
 pub async fn build_indexes<FLoad: 'static + FileLoad, F: 'static + FileLoad + FileStore>(

@@ -52,11 +52,9 @@ impl Future for LockedFileLockFuture {
                     if exclusive {
                         file.lock_exclusive()
                             .expect("failed to acquire exclusive lock")
-                    } else {
-                        if !cfg!(feature = "noreadlock") {
-                            file.lock_shared()
-                                .expect("failed to acquire exclusive lock")
-                        }
+                    } else if !cfg!(feature = "noreadlock") {
+                        file.lock_shared()
+                            .expect("failed to acquire exclusive lock")
                     }
                 }));
             }
@@ -208,6 +206,14 @@ impl ExclusiveLockedFile {
             .as_mut()
             .expect("tried to truncate a dropped file");
         file.seek(pos).await
+    }
+
+    pub async fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.file
+            .as_ref()
+            .expect("tried to get metadata from dropped file")
+            .metadata()
+            .await
     }
 
     pub async fn truncate(&mut self) -> io::Result<()> {

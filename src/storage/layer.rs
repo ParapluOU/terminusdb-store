@@ -4,7 +4,7 @@ use super::delta::*;
 use super::file::*;
 use super::pack::Packable;
 use crate::layer::base_merge::merge_base_layers;
-use crate::layer::builder::DictionarySetFileBuilder;
+use crate::layer::builder::{build_interval_index_from_files, DictionarySetFileBuilder};
 use crate::layer::BaseLayerFileBuilder;
 use crate::layer::ChildLayerFileBuilderPhase2;
 use crate::layer::TripleChange;
@@ -593,6 +593,11 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
     async fn get_predicate_idmap(&self, name: [u32; 5]) -> io::Result<Option<IdMap>>;
 
     async fn create_base_layer(&self) -> io::Result<Box<dyn LayerBuilder>>;
+
+    /// Create an empty base layer with the given name.
+    ///
+    /// Fails if a layer with this name already exists.
+    async fn create_base_layer_with_name(&self, name: [u32; 5]) -> io::Result<()>;
     async fn create_child_layer_with_cache(
         &self,
         parent: [u32; 5],
@@ -997,6 +1002,10 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
             FILENAMES.base_predicate_wavelet_tree_bits,
             FILENAMES.base_predicate_wavelet_tree_bit_index_blocks,
             FILENAMES.base_predicate_wavelet_tree_bit_index_sblocks,
+            FILENAMES.interval_end_rank_table,
+            FILENAMES.interval_end_wavelet_tree_bits,
+            FILENAMES.interval_end_wavelet_tree_bit_index_blocks,
+            FILENAMES.interval_end_wavelet_tree_bit_index_sblocks,
         ];
 
         let mut files = Vec::with_capacity(filenames.len());
@@ -1066,6 +1075,15 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
                 blocks_file: files[29].clone(),
                 sblocks_file: files[30].clone(),
             },
+
+            interval_index_files: IntervalIndexFiles {
+                rank_table_file: files[31].clone(),
+                wavelet_files: BitIndexFiles {
+                    bits_file: files[32].clone(),
+                    blocks_file: files[33].clone(),
+                    sblocks_file: files[34].clone(),
+                },
+            },
         })
     }
 
@@ -1119,6 +1137,10 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
             FILENAMES.neg_predicate_wavelet_tree_bits,
             FILENAMES.neg_predicate_wavelet_tree_bit_index_blocks,
             FILENAMES.neg_predicate_wavelet_tree_bit_index_sblocks,
+            FILENAMES.interval_end_rank_table,
+            FILENAMES.interval_end_wavelet_tree_bits,
+            FILENAMES.interval_end_wavelet_tree_bit_index_blocks,
+            FILENAMES.interval_end_wavelet_tree_bit_index_sblocks,
         ];
 
         let mut files = Vec::with_capacity(filenames.len());
@@ -1217,6 +1239,15 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
                 bits_file: files[45].clone(),
                 blocks_file: files[46].clone(),
                 sblocks_file: files[47].clone(),
+            },
+
+            interval_index_files: IntervalIndexFiles {
+                rank_table_file: files[48].clone(),
+                wavelet_files: BitIndexFiles {
+                    bits_file: files[49].clone(),
+                    blocks_file: files[50].clone(),
+                    sblocks_file: files[51].clone(),
+                },
             },
         })
     }
@@ -2005,10 +2036,7 @@ pub fn name_to_string(name: [u32; 5]) -> String {
 
 pub fn string_to_name(string: &str) -> Result<[u32; 5], std::io::Error> {
     if string.len() != 40 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("string not len 40: {}", string),
-        ));
+        return Err(io::Error::other(format!("string not len 40: {}", string)));
     }
     let n1 = u32::from_str_radix(&string[..8], 16)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -2026,7 +2054,7 @@ pub fn string_to_name(string: &str) -> Result<[u32; 5], std::io::Error> {
 
 pub fn bytes_to_name(bytes: &[u8]) -> Result<[u32; 5], std::io::Error> {
     if bytes.len() != 40 {
-        Err(io::Error::new(io::ErrorKind::Other, "bytes not len 40"))
+        Err(io::Error::other("bytes not len 40"))
     } else {
         let string = String::from_utf8_lossy(bytes);
 
@@ -2114,12 +2142,11 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                             panic!("infinite rollup loop for layer {:?}", rollup);
                         }
 
-                        let original_parent;
-                        if self.layer_has_parent(current_layer).await? {
-                            original_parent = Some(self.read_parent_file(current_layer).await?);
+                        let original_parent = if self.layer_has_parent(current_layer).await? {
+                            Some(self.read_parent_file(current_layer).await?)
                         } else {
-                            original_parent = None;
-                        }
+                            None
+                        };
 
                         layers_to_load.pop().unwrap(); // we don't want to load this, we want to load the rollup instead!
                         layers_to_load.push((current_layer, Some((rollup, original_parent))));
@@ -2142,12 +2169,12 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                     let files = self.base_layer_files(base_id).await?;
                     let base_layer = BaseLayer::load_from_files(base_id, &files).await?;
 
-                    layer = Arc::new(base_layer.into());
+                    layer = Arc::new(base_layer);
                 }
                 Some((rollup_id, original_parent_id_option)) => {
                     let files = self.base_layer_files(rollup_id).await?;
                     let base_layer: Arc<InternalLayer> =
-                        Arc::new(BaseLayer::load_from_files(rollup_id, &files).await?.into());
+                        Arc::new(BaseLayer::load_from_files(rollup_id, &files).await?);
                     cache.cache_layer(base_layer.clone());
 
                     layer = Arc::new(
@@ -2175,18 +2202,15 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                     let files = self.child_layer_files(layer_id).await?;
                     let child_layer =
                         ChildLayer::load_from_files(layer_id, ancestor, &files).await?;
-                    layer = Arc::new(child_layer.into());
+                    layer = Arc::new(child_layer);
                 }
                 Some((rollup_id, original_parent_id_option)) => {
                     let original_parent_id = original_parent_id_option
                         .expect("child rollup layer should always have original parent id");
 
                     let files = self.child_layer_files(rollup_id).await?;
-                    let child_layer: Arc<InternalLayer> = Arc::new(
-                        ChildLayer::load_from_files(rollup_id, ancestor, &files)
-                            .await?
-                            .into(),
-                    );
+                    let child_layer: Arc<InternalLayer> =
+                        Arc::new(ChildLayer::load_from_files(rollup_id, ancestor, &files).await?);
                     cache.cache_layer(child_layer.clone());
 
                     layer = Arc::new(
@@ -2505,6 +2529,19 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                 Err(error)
             }
         }
+    }
+
+    async fn create_base_layer_with_name(&self, name: [u32; 5]) -> io::Result<()> {
+        if self.directory_exists(name).await? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("layer {} already exists", name_to_string(name)),
+            ));
+        }
+        let dir_name = self.create_named_directory(name).await?;
+        let files = self.base_layer_files(dir_name).await?;
+        SimpleLayerBuilder::new(dir_name, files).commit().await?;
+        self.finalize_layer(name).await
     }
 
     async fn create_child_layer_with_cache(
@@ -2858,9 +2895,9 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let mut base_pred_count = 0;
         let mut base_value_count = 0;
         walk_backwards_from_disk!(self, upto, current, {
-            base_node_count += self.get_node_count(current).await?.unwrap_or(0) as u64;
-            base_value_count += self.get_value_count(current).await?.unwrap_or(0) as u64;
-            base_pred_count += self.get_predicate_count(current).await?.unwrap_or(0) as u64;
+            base_node_count += self.get_node_count(current).await?.unwrap_or(0);
+            base_value_count += self.get_value_count(current).await?.unwrap_or(0);
+            base_pred_count += self.get_predicate_count(current).await?.unwrap_or(0);
         });
         let base_node_value_count = base_node_count + base_value_count;
         let mut node_value_count = base_node_value_count;
@@ -2901,8 +2938,8 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let stack_node_value_count = stack_node_count + stack_value_count;
 
         // figure out what keys are actually used through a prepass over all triples
-        let mut node_value_existences = bitvec![0;stack_node_value_count as usize+1];
-        let mut predicate_existences = bitvec![0;stack_pred_count as usize+1];
+        let mut node_value_existences = bitvec![0;stack_node_value_count+1];
+        let mut predicate_existences = bitvec![0;stack_pred_count+1];
         let mut num_triple_changes = 0;
         let layer_changes_upto = self.layer_changes_upto(layer.name(), upto).await?;
         for (change_type, triple) in layer_changes_upto.clone() {
@@ -3020,6 +3057,15 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
             builder.add_values(values.into_iter().map(|(x, _)| x));
             builder.finalize().await?;
 
+            // Upstream 0.23.1 builds the interval end index for every new
+            // layer; it is an index over the value dictionary, so it must be
+            // built before `child_layer_files` is moved into the builder.
+            build_interval_index_from_files(
+                &child_layer_files.value_dictionary_files,
+                child_layer_files.interval_index_files.clone(),
+            )
+            .await?;
+
             // TODO use more inner stuff to avoid parent checks as they are unnecessary here
             let mut builder = ChildLayerFileBuilderPhase2::new(
                 upto_layer,
@@ -3109,13 +3155,10 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         let mut layer_files = Vec::with_capacity(layers.len());
         for layer in layers {
             if self.layer_has_parent(*layer).await? {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "given layer is not a base layer: {}",
-                        name_to_string(*layer)
-                    ),
-                ));
+                return Err(io::Error::other(format!(
+                    "given layer is not a base layer: {}",
+                    name_to_string(*layer)
+                )));
             }
             layer_files.push(self.base_layer_files(*layer).await?);
         }
@@ -4116,6 +4159,42 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = DirectoryLayerStore::new(dir.path());
         base_layer_counts(&store, false).await.unwrap();
+    }
+
+    async fn base_layer_with_name<S: LayerStore>(store: &S) -> io::Result<()> {
+        let name = [1, 2, 3, 4, 5];
+        store.create_base_layer_with_name(name).await?;
+        // creating a layer with an existing name fails loudly
+        assert_eq!(
+            io::ErrorKind::AlreadyExists,
+            store
+                .create_base_layer_with_name(name)
+                .await
+                .unwrap_err()
+                .kind()
+        );
+
+        let layer = store.get_layer(name).await?.expect("layer should exist");
+        assert_eq!(0, layer.node_and_value_count());
+        assert_eq!(0, layer.predicate_count());
+        assert_eq!(0, store.triple_layer_addition_count(name).await?);
+        assert_eq!(0, store.triple_layer_removal_count(name).await?);
+        assert!(layer.parent_name().is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_base_layer_with_name() {
+        let store = MemoryLayerStore::new();
+        base_layer_with_name(&store).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn directory_base_layer_with_name() {
+        let dir = tempdir().unwrap();
+        let store = DirectoryLayerStore::new(dir.path());
+        base_layer_with_name(&store).await.unwrap();
     }
 
     async fn child_layer_counts<S: LayerStore>(store: &S, invalidate: bool) -> io::Result<()> {

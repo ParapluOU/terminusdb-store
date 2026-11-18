@@ -19,6 +19,7 @@ use crate::storage::{PackImportLimits, ProofMigrationOutcome, ProofStateMode};
 use crate::store::{
     open_directory_store, open_memory_store, NamedGraph, Store, StoreLayer, StoreLayerBuilder,
 };
+use tdb_succinct::tfc::lexical_interval::{AllenRelation, LexicalInterval};
 use tdb_succinct::TypedDictEntry;
 
 use super::{open_archive_store, open_raw_archive_store};
@@ -418,6 +419,34 @@ impl Layer for SyncStoreLayer {
         self.inner.id_subject(id)
     }
 
+    fn subjects_with_prefix(&self, prefix: &str) -> Box<dyn Iterator<Item = (u64, String)> + Send> {
+        self.inner.subjects_with_prefix(prefix)
+    }
+
+    fn count_subjects_with_prefix(&self, prefix: &str) -> usize {
+        self.inner.count_subjects_with_prefix(prefix)
+    }
+
+    fn count_triple_subjects_with_prefix(
+        &self,
+        prefix: &str,
+        predicate: u64,
+        objects: &std::collections::HashSet<u64>,
+    ) -> usize {
+        self.inner
+            .count_triple_subjects_with_prefix(prefix, predicate, objects)
+    }
+
+    fn triple_subjects_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+        predicate: u64,
+        objects: &'a std::collections::HashSet<u64>,
+    ) -> Box<dyn Iterator<Item = (u64, String)> + Send + 'a> {
+        self.inner
+            .triple_subjects_with_prefix(prefix, predicate, objects)
+    }
+
     fn id_predicate(&self, id: u64) -> Option<String> {
         self.inner.id_predicate(id)
     }
@@ -474,6 +503,22 @@ impl Layer for SyncStoreLayer {
         self.inner.triples_value_range_rev(low, high)
     }
 
+    fn interval_relation_object_ids(
+        &self,
+        rel: AllenRelation,
+        reference: &LexicalInterval,
+    ) -> Vec<u64> {
+        self.inner.interval_relation_object_ids(rel, reference)
+    }
+
+    fn triples_interval_relation(
+        &self,
+        rel: AllenRelation,
+        reference: &LexicalInterval,
+    ) -> Box<dyn Iterator<Item = IdTriple> + Send> {
+        self.inner.triples_interval_relation(rel, reference)
+    }
+
     fn clone_boxed(&self) -> Box<dyn Layer> {
         Box::new(self.clone())
     }
@@ -484,6 +529,26 @@ impl Layer for SyncStoreLayer {
 
     fn triple_removal_count(&self) -> usize {
         self.inner.triple_removal_count()
+    }
+
+    fn count_triples(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> usize {
+        self.inner.count_triples(subject, predicate, object)
+    }
+
+    fn count_triples_value_range(
+        &self,
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> usize {
+        self.inner
+            .count_triples_value_range(subject, predicate, low, high)
     }
 
     fn all_counts(&self) -> LayerCounts {
@@ -620,6 +685,13 @@ impl SyncStore {
         let inner = task_sync(self.inner.create_base_layer());
 
         inner.map(SyncStoreLayerBuilder::wrap)
+    }
+
+    /// Create an empty base layer with the given name.
+    ///
+    /// Fails if a layer with this name already exists.
+    pub fn create_named_base_layer(&self, name: [u32; 5]) -> io::Result<()> {
+        task_sync(self.inner.layer_store.create_base_layer_with_name(name))
     }
 
     pub fn merge_base_layers(

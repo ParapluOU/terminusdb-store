@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt::Display;
 use std::io::{self, Read, Seek, Write};
-use std::path::PathBuf;
+// `Component`/`Path`: upstream 0.23.1 validates pack entry paths with them.
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
@@ -1250,7 +1251,7 @@ async fn tar_append_file<S: PersistentLayerStore, W: io::Write>(
     store: &S,
     tar: &mut tar::Builder<W>,
     layer: [u32; 5],
-    layer_path: &PathBuf,
+    layer_path: &Path,
     file_name: &str,
     mtime: u64,
     budget: &mut PackBudget,
@@ -1304,7 +1305,7 @@ async fn tar_append_file_if_exists<S: PersistentLayerStore, W: io::Write>(
     store: &S,
     tar: &mut tar::Builder<W>,
     layer: [u32; 5],
-    layer_path: &PathBuf,
+    layer_path: &Path,
     file_name: &str,
     mtime: u64,
     budget: &mut PackBudget,
@@ -1568,6 +1569,7 @@ impl Packable for CachedLayerStore {
 mod tests {
     use super::*;
     use crate::layer::*;
+    use crate::storage::archive::{ArchiveLayerStore, DirectoryArchiveBackend};
     use crate::storage::directory::*;
     use crate::store::{open_archive_store, open_memory_store};
     use std::io::Cursor;

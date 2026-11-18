@@ -9,7 +9,10 @@ use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::{
     chrono_log,
-    layer::{builder::build_indexes, open_base_triple_stream, BaseLayerFileBuilderPhase2},
+    layer::{
+        builder::{build_indexes, build_interval_index_from_files},
+        open_base_triple_stream, BaseLayerFileBuilderPhase2,
+    },
     storage::{
         directory::DirectoryLayerStore, AdjacencyListFiles, BaseLayerFiles, DictionaryFiles,
         FileLoad, FileStore, PersistentLayerStore, TypedDictionaryFiles,
@@ -41,7 +44,7 @@ async fn dicts_to_map<
         let reader = input.blocks_file.open_read().await?;
         let stream = TfcDictStream::new(reader)
             .map_ok(|e| e.0)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+            .map_err(io::Error::other);
 
         streams.push(stream);
     }
@@ -66,8 +69,8 @@ async fn typed_dicts_to_map<
             input.types_present_file.map().await?,
             input.type_offsets_file.map().await?,
         )
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let stream = raw_stream.map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+        .map_err(io::Error::other)?;
+        let stream = raw_stream.map_err(io::Error::other);
 
         streams.push(stream);
     }
@@ -220,7 +223,7 @@ pub async fn merge_base_layers<F: FileLoad + FileStore + 'static, P: AsRef<Path>
     //test_write_typed_dict("/tmp/value_dict", &temp_output_files.value_dictionary_files).await?;
 
     let mut triple_streams = Vec::with_capacity(inputs.len());
-    for (ix, input) in inputs.into_iter().enumerate() {
+    for (ix, input) in inputs.iter().enumerate() {
         let raw_stream = open_base_triple_stream(
             input.s_p_adjacency_list_files.clone(),
             input.sp_o_adjacency_list_files.clone(),
@@ -262,7 +265,7 @@ pub async fn merge_base_layers<F: FileLoad + FileStore + 'static, P: AsRef<Path>
         last_triple = Some(triple);
         builder.add_triple(triple.0, triple.1, triple.2).await?;
         tally += 1;
-        if tally % 1000000 == 0 {
+        if tally.is_multiple_of(1000000) {
             chrono_log!("wrote {tally} triples");
         }
     }
@@ -283,6 +286,11 @@ pub async fn merge_base_layers<F: FileLoad + FileStore + 'static, P: AsRef<Path>
         o_ps_adjacency_list_files,
         None,
         predicate_wavelet_tree_files,
+    )
+    .await?;
+    build_interval_index_from_files(
+        &temp_output_files.value_dictionary_files,
+        temp_output_files.interval_index_files.clone(),
     )
     .await?;
     chrono_log!(" built indexes");

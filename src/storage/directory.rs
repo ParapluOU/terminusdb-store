@@ -3,9 +3,10 @@
 use fs2::FileExt as Fs2FileExt;
 use locking::*;
 use std::collections::HashMap;
-use std::io::{self, SeekFrom};
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -636,14 +637,165 @@ pub struct DirectoryLabelStore {
     path: PathBuf,
 }
 
+/// `*.label` files in `.tmp/` older than this are crash residue — a live
+/// writer holds the label lock while its tmp exists, so a fresh tmp is never
+/// swept.
+const LABEL_TMP_TTL: Duration = Duration::from_secs(60);
+
 impl DirectoryLabelStore {
     pub fn new<P: Into<PathBuf>>(path: P) -> DirectoryLabelStore {
-        DirectoryLabelStore { path: path.into() }
+        let path = path.into();
+        sweep_stale_label_tmps(&path);
+        DirectoryLabelStore { path }
     }
 }
 
+/// Tmp files live in `<dir>/.tmp/` with the label's own name — a filename
+/// suffix would overflow NAME_MAX at the 255-byte db-name boundary.
+fn label_tmp_path(path: &Path, name: &str) -> PathBuf {
+    path.join(".tmp").join(format!("{name}.label"))
+}
+
+fn sweep_stale_label_tmps(path: &Path) {
+    let tmp_dir = path.join(".tmp");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let entries = match std::fs::read_dir(tmp_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_str().is_none() {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                now.duration_since(t)
+                    .map(|d| d > LABEL_TMP_TTL)
+                    .unwrap_or(false) // mtime in the future: live file, keep
+            })
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// fsync that retries once then panics — durability is unknowable after a
+/// failed flush (postgres data_sync_retry semantics: crash, don't mask).
+#[allow(unused_variables)] // `first` is consumed by chrono_log!, a feature-gated macro
+async fn fsync_fatal(file: &fs::File) -> io::Result<()> {
+    match file.sync_all().await {
+        Err(first) => match file.sync_all().await {
+            Ok(()) => {
+                crate::chrono_log!("label fsync retried after transient failure: {first}");
+                Ok(())
+            }
+            Err(second) => {
+                panic!("fsync failed twice; label durability unknowable: {}", second)
+            }
+        },
+        ok => ok,
+    }
+}
+
+/// fsync the parent directory so the rename result is durable. Discrete
+/// joinable step — a future fsync queue batches commits onto this barrier.
+async fn fsync_parent_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let file = fs::File::open(dir).await?;
+        fsync_fatal(&file).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Create `p` as a new `0\n\n` label via tmp + hard link — atomic
+/// create-if-absent without the write-after-create crash window.
+/// Caller must have already established `p` does not exist.
+async fn create_label_file(p: &Path, tmp: &Path) -> io::Result<()> {
+    let mut file = fs::File::create(tmp).await?;
+    file.write_all(b"0\n\n").await?;
+    file.flush().await?;
+    fsync_fatal(&file).await?;
+    drop(file);
+
+    match fs::hard_link(tmp, p).await {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = fs::remove_file(tmp).await;
+            return match e.kind() {
+                io::ErrorKind::AlreadyExists => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "database already exists",
+                )),
+                _ => Err(e),
+            };
+        }
+    }
+    fs::remove_file(tmp).await
+}
+
+/// Write `contents` to `tmp`, fsync it, atomically replace `dest`, fsync the
+/// parent directory. Callers must hold the label file lock; the rename is the
+/// atomic commit point.
+async fn replace_file_durable(tmp: &Path, dest: &Path, dir: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = fs::File::create(tmp).await?;
+    file.write_all(contents).await?;
+    file.flush().await?;
+    fsync_fatal(&file).await?;
+    drop(file);
+
+    #[cfg(unix)]
+    fs::rename(tmp, dest).await?;
+    #[cfg(not(unix))]
+    atomicwrites::replace_atomic(tmp, dest)?;
+
+    fsync_parent_dir(dir).await
+}
+
+/// Whether two metadata objects describe the same filesystem object —
+/// `dev`+`ino` on unix, `file_index`+`volume_serial_number` on Windows.
+/// Used to detect that the path was renamed onto a different inode while we
+/// waited for a lock. On other platforms identity can't be checked — the
+/// lock recheck degrades to a no-op, same as the old behaviour.
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(windows)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    a.file_index() == b.file_index() && a.volume_serial_number() == b.volume_serial_number()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// Read and parse a label file by path — plain read, no flock. A shared lock
+/// here would self-deadlock when the caller already holds LOCK_EX.
+async fn get_label_from_path(path: &Path) -> io::Result<Label> {
+    let label = path.file_stem().unwrap().to_str().unwrap().to_owned();
+    let mut data = Vec::new();
+    fs::File::open(path).await?.read_to_end(&mut data).await?;
+
+    get_label_from_data(label, &data)
+}
+
 fn get_label_from_data(name: String, data: &[u8]) -> io::Result<Label> {
-    let s = String::from_utf8_lossy(&data);
+    let s = String::from_utf8_lossy(data);
     let lines: Vec<&str> = s.lines().collect();
     if lines.len() != 2 {
         return Err(io::Error::new(
@@ -658,7 +810,7 @@ fn get_label_from_data(name: String, data: &[u8]) -> io::Result<Label> {
     let version_str = &lines[0];
     let layer_str = &lines[1];
 
-    let version = u64::from_str_radix(version_str, 10);
+    let version = version_str.parse::<u64>();
     if version.is_err() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -696,22 +848,6 @@ async fn get_label_from_file<P: Into<PathBuf>>(path: P) -> io::Result<Label> {
     get_label_from_data(label, &data)
 }
 
-async fn get_label_from_exclusive_locked_file<P: Into<PathBuf>>(
-    path: P,
-) -> io::Result<(Label, ExclusiveLockedFile)> {
-    let path: PathBuf = path.into();
-    let label = path.file_stem().unwrap().to_str().unwrap().to_owned();
-
-    let mut file = ExclusiveLockedFile::open(path).await?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).await?;
-
-    let label = get_label_from_data(label, &data)?;
-    file.seek(SeekFrom::Start(0)).await?;
-
-    Ok((label, file))
-}
-
 #[async_trait]
 impl LabelStore for DirectoryLabelStore {
     async fn labels(&self) -> io::Result<Vec<Label>> {
@@ -739,7 +875,7 @@ impl LabelStore for DirectoryLabelStore {
     async fn create_label(&self, label: &str) -> io::Result<Label> {
         let mut p = self.path.clone();
         p.push(format!("{}.label", label));
-        let contents = "0\n\n".to_string().into_bytes();
+        let tmp = label_tmp_path(&self.path, label);
         match fs::metadata(&p).await {
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -747,10 +883,8 @@ impl LabelStore for DirectoryLabelStore {
             )),
             Err(e) => match e.kind() {
                 io::ErrorKind::NotFound => {
-                    let mut file = ExclusiveLockedFile::create_and_open(p).await?;
-                    file.write_all(&contents).await?;
-                    file.flush().await?;
-                    file.sync_all().await?;
+                    create_label_file(&p, &tmp).await?;
+                    fsync_parent_dir(&self.path).await?;
 
                     Ok(Label::new_empty(label))
                 }
@@ -787,13 +921,27 @@ impl LabelStore for DirectoryLabelStore {
 
         let mut p = self.path.clone();
         p.push(format!("{}.label", label.name));
-        let (retrieved_label, mut file) = get_label_from_exclusive_locked_file(p).await?;
+        let tmp = label_tmp_path(&self.path, &label.name);
+
+        // A rename moves the path to a new inode, so a lock acquired on a
+        // pre-rename inode serializes nothing: another contender can hold the
+        // new inode's lock at the same time. After the (blocking) acquire,
+        // verify the locked fd is still the path's current inode and retry
+        // until it is — then nobody can rename past us while we hold it.
+        let _guard = loop {
+            let guard = ExclusiveLockedFile::open(p.clone()).await?;
+            let fd_meta = guard.metadata().await?;
+            let path_meta = fs::metadata(&p).await?;
+            if same_file(&fd_meta, &path_meta) {
+                break guard;
+            }
+        };
+        // re-read the current label by path — a contender that renamed before
+        // our lock acquisition is found here and loses the compare
+        let retrieved_label = get_label_from_path(&p).await?;
         if retrieved_label == *label {
             // all good, let's a go
-            file.truncate().await?;
-            file.write_all(&contents).await?;
-            file.flush().await?;
-            file.sync_all().await?;
+            replace_file_durable(&tmp, &p, &self.path, &contents).await?;
             Ok(Some(new_label))
         } else {
             Ok(None)
@@ -813,6 +961,8 @@ impl LabelStore for DirectoryLabelStore {
         // though the file will be gone afterwards. This is
         // indistinguishable from the case where the read/write and
         // the remove happened in reverse order.
+        // crash-residue tmp of any writer is removed with the label
+        let _ = tokio::fs::remove_file(label_tmp_path(&self.path, name)).await;
         match tokio::fs::remove_file(p).await {
             Ok(()) => Ok(true),
             Err(e) => match e.kind() {
@@ -843,6 +993,7 @@ impl CachedDirectoryLabelStore {
     /// this is an async operation.
     pub async fn open<P: Into<PathBuf>>(path: P) -> io::Result<Self> {
         let path: PathBuf = path.into();
+        sweep_stale_label_tmps(&path);
         let labels = get_all_labels_from_dir(&path).await?;
 
         Ok(Self {
@@ -893,21 +1044,14 @@ impl LabelStore for CachedDirectoryLabelStore {
 
         let mut p = self.path.clone();
         p.push(format!("{}.label", label));
-        let contents = b"0\n\n";
         match fs::metadata(&p).await {
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
+            Ok(_) => Err(io::Error::other(
                 "label was not in cached map but was found on disk",
             )),
             Err(e) => match e.kind() {
                 io::ErrorKind::NotFound => {
-                    let mut options = fs::OpenOptions::new();
-                    options.create_new(true);
-                    options.write(true);
-                    let mut file = options.open(p).await?;
-                    file.write_all(contents).await?;
-                    file.flush().await?;
-                    file.sync_all().await?;
+                    create_label_file(&p, &label_tmp_path(&self.path, label)).await?;
+                    fsync_parent_dir(&self.path).await?;
 
                     let l = Label::new_empty(label);
                     labels.insert(label.to_string(), l.clone());
@@ -941,13 +1085,13 @@ impl LabelStore for CachedDirectoryLabelStore {
                 // all good, let's a go
                 let mut p = self.path.clone();
                 p.push(format!("{}.label", label.name));
-                let mut options = fs::OpenOptions::new();
-                options.create(false);
-                options.write(true);
-                let mut file = options.open(p).await?;
-                file.write_all(&contents).await?;
-                file.flush().await?;
-                file.sync_data().await?;
+                replace_file_durable(
+                    &label_tmp_path(&self.path, &label.name),
+                    &p,
+                    &self.path,
+                    &contents,
+                )
+                .await?;
 
                 labels.insert(label.name.clone(), new_label.clone());
                 Ok(Some(new_label))
@@ -1286,6 +1430,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn layer_directories_ignore_non_layer_dirs() {
+        let dir = tempdir().unwrap();
+        // the label store keeps its rename tmp files in `<store>/.tmp/` —
+        // layer enumeration must skip it, not error on the non-hex name
+        std::fs::create_dir(dir.path().join(".tmp")).unwrap();
+        let store = DirectoryLayerStore::new(dir.path());
+        assert_eq!(Vec::<[u32; 5]>::new(), store.directories().await.unwrap());
+    }
+
+    #[tokio::test]
     async fn write_and_map_file_backed() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("foo");
@@ -1297,7 +1451,7 @@ mod tests {
 
         let map = file.map().await.unwrap();
 
-        assert_eq!(&vec![1, 2, 3][..], &map.as_ref()[..]);
+        assert_eq!(&vec![1, 2, 3][..], map.as_ref());
     }
 
     #[tokio::test]
@@ -1309,7 +1463,7 @@ mod tests {
         let mut w = file.open_write().await.unwrap();
         let mut contents = vec![0u8; 4096 << 4];
         for i in 0..contents.capacity() {
-            contents[i] = (i as usize % 256) as u8;
+            contents[i] = (i % 256) as u8;
         }
 
         w.write_all(&contents).await.unwrap();
@@ -1717,5 +1871,95 @@ mod tests {
         let _f = ExclusiveLockedFile::open(label_path).await.unwrap();
 
         assert!(store.delete_label("foo").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn concurrent_label_updates_one_winner() {
+        let dir = tempdir().unwrap();
+        let stored = DirectoryLabelStore::new(dir.path())
+            .create_label("foo")
+            .await
+            .unwrap();
+
+        // two separate stores = two "processes" competing on the same file
+        let store_a = DirectoryLabelStore::new(dir.path());
+        let store_b = DirectoryLabelStore::new(dir.path());
+        let (a, b) = (
+            stored.clone(),
+            stored,
+        );
+
+        let (ra, rb) = tokio::join!(
+            store_a.set_label(&a, [1, 2, 3, 4, 5]),
+            store_b.set_label(&b, [6, 7, 8, 9, 10])
+        );
+
+        let landed = [ra.unwrap(), rb.unwrap()]
+            .iter()
+            .filter(|o| o.is_some())
+            .count();
+        assert_eq!(1, landed);
+
+        let final_label = store_a.get_label("foo").await.unwrap().unwrap();
+        assert_eq!(1, final_label.version);
+    }
+
+    #[tokio::test]
+    async fn concurrent_readers_never_see_torn_label() {
+        let dir = tempdir().unwrap();
+        let store = DirectoryLabelStore::new(dir.path());
+        let mut label = store.create_label("foo").await.unwrap();
+
+        let writer_store = store.clone();
+        let writer = tokio::spawn(async move {
+            for i in 0..20 {
+                label = writer_store
+                    .set_label(&label, [i, i, i, i, i])
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        });
+
+        let reader_store = DirectoryLabelStore::new(dir.path());
+        let reader = tokio::spawn(async move {
+            // unlocked reads must always see a complete label
+            for _ in 0..20 {
+                reader_store.get_label("foo").await.unwrap();
+            }
+        });
+
+        writer.await.unwrap();
+        reader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_tmp_residue_after_cas_failure() {
+        let dir = tempdir().unwrap();
+        let store = DirectoryLabelStore::new(dir.path());
+        let stored = store.create_label("foo").await.unwrap();
+
+        let updated = store.set_label(&stored, [1, 2, 3, 4, 5]).await.unwrap();
+        assert!(updated.is_some());
+        // losing CAS must not leave a .label.tmp
+        assert!(store.set_label(&stored, [9, 9, 9, 9, 9]).await.unwrap().is_none());
+        assert!(!dir.path().join(".tmp").join("foo.label").exists());
+    }
+
+    #[tokio::test]
+    async fn label_version_increments_monotonically() {
+        let dir = tempdir().unwrap();
+        let store = DirectoryLabelStore::new(dir.path());
+        let mut label = store.create_label("foo").await.unwrap();
+        assert_eq!(0, label.version);
+
+        for expected in 1..5 {
+            label = store
+                .set_label(&label, [expected as u32; 5])
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(expected, label.version);
+        }
     }
 }
