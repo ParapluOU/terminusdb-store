@@ -742,11 +742,17 @@ impl SyncStore {
     ///
     /// On success every requested layer is retrievable. Missing layers reject
     /// the whole import before any requested layer becomes visible.
+    ///
+    /// A requested layer that is already here is never overwritten: its native
+    /// files are verified against the pack's instead, and the ids whose
+    /// contents differ are returned, sorted. The same commit arriving twice is
+    /// the normal case for a fetch over overlapping history; a divergent one is
+    /// the caller's to act on.
     pub fn import_layers(
         &self,
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         task_sync(self.inner.import_layers(pack, layer_ids))
     }
 
@@ -756,7 +762,7 @@ impl SyncStore {
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         task_sync(self.inner.import_layers_with_expected_roots(
             pack,
             layer_ids,
@@ -771,7 +777,7 @@ impl SyncStore {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
         limits: crate::storage::pack::PackImportLimits,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         task_sync(self.inner.import_layers_with_limits(
             pack,
             layer_ids,

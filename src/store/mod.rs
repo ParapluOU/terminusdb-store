@@ -1151,11 +1151,17 @@ impl Store {
     ///
     /// On success every requested layer is retrievable. Missing layers reject
     /// the whole import before any requested layer becomes visible.
+    ///
+    /// A requested layer that is already here is never overwritten: its native
+    /// files are verified against the pack's instead, and the ids whose
+    /// contents differ are returned, sorted. The same commit arriving twice is
+    /// the normal case for a fetch over overlapping history; a divergent one is
+    /// the caller's to act on.
     pub async fn import_layers<'a>(
         &'a self,
         pack: &'a [u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         self.import_layers_with_limits(
             pack,
             layer_ids,
@@ -1171,7 +1177,7 @@ impl Store {
         pack: &'a [u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         self.import_layers_with_limits(
             pack,
             layer_ids,
@@ -1188,7 +1194,7 @@ impl Store {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: std::collections::HashMap<[u32; 5], ProofHash>,
         limits: crate::storage::pack::PackImportLimits,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         self.layer_store
             .import_layers_with_proof_state(
                 pack,

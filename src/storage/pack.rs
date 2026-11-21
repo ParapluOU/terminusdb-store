@@ -85,11 +85,17 @@ pub trait Packable {
     ///
     /// On success every requested layer is retrievable. Missing requested
     /// layers reject the entire import before any layer becomes visible.
+    ///
+    /// A requested layer that is already here is never overwritten: its native
+    /// files are verified against the pack's instead, and the ids whose
+    /// contents differ are returned, sorted. The same commit arriving twice is
+    /// the normal case for a fetch over overlapping history; a divergent one is
+    /// the caller's to act on.
     async fn import_layers(
         &self,
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()>;
+    ) -> io::Result<Vec<[u32; 5]>>;
 
     /// Import layers while optionally anchoring admitted commitment roots to
     /// roots obtained out of band from the pack producer.
@@ -98,7 +104,7 @@ pub trait Packable {
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: HashMap<[u32; 5], ProofHash>,
-    ) -> io::Result<()>;
+    ) -> io::Result<Vec<[u32; 5]>>;
 
     /// Import with explicit parser and staging budgets. Supplying an empty root
     /// map performs intrinsic native-delta/commitment validation without an
@@ -109,7 +115,7 @@ pub trait Packable {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: HashMap<[u32; 5], ProofHash>,
         limits: PackImportLimits,
-    ) -> io::Result<()>;
+    ) -> io::Result<Vec<[u32; 5]>>;
 
     /// Import under the importing store's proof-state mode. A layer that
     /// arrives with a proof sidecar has it validated against its native delta
@@ -130,7 +136,7 @@ pub trait Packable {
         expected_roots: HashMap<[u32; 5], ProofHash>,
         limits: PackImportLimits,
         proof_state: ProofStateMode,
-    ) -> io::Result<()>;
+    ) -> io::Result<Vec<[u32; 5]>>;
 }
 
 #[async_trait]
@@ -154,7 +160,7 @@ impl<T: PersistentLayerStore> Packable for T {
         &self,
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         import_pack(
             self,
             pack,
@@ -171,7 +177,7 @@ impl<T: PersistentLayerStore> Packable for T {
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: HashMap<[u32; 5], ProofHash>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         import_pack(
             self,
             pack,
@@ -189,7 +195,7 @@ impl<T: PersistentLayerStore> Packable for T {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: HashMap<[u32; 5], ProofHash>,
         limits: PackImportLimits,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         import_pack(
             self,
             pack,
@@ -208,7 +214,7 @@ impl<T: PersistentLayerStore> Packable for T {
         expected_roots: HashMap<[u32; 5], ProofHash>,
         limits: PackImportLimits,
         proof_state: ProofStateMode,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         import_pack(self, pack, layer_ids, expected_roots, limits, proof_state).await
     }
 }
@@ -1035,6 +1041,45 @@ impl PersistentLayerStore for PackValidationStore {
     }
 }
 
+/// Verify a layer that is already here against the pack's copy of it, file by
+/// file.
+///
+/// Proof state is deliberately not compared. It is derived from the native
+/// delta, and a store that does not prove strips it on import, so a proving
+/// and a non-proving replica of the same commit hold the same data and differ
+/// only in a sidecar. Identical native files are the claim being checked.
+/// (Rollups never reach here: `decode_pack` drops them, being a local
+/// optimisation rather than data.)
+async fn present_layer_matches<S: PersistentLayerStore>(
+    store: &S,
+    id: [u32; 5],
+    files: &HashMap<String, Bytes>,
+    peak: &mut PeakBudget,
+) -> io::Result<bool> {
+    for (name, expected) in files {
+        if name.as_str() == FILENAMES.proof_state {
+            continue;
+        }
+        if !store.file_exists(id, name).await? {
+            return Ok(false);
+        }
+        let file = store.get_file(id, name).await?;
+        let size = file.size().await?;
+        if size != expected.len() {
+            return Ok(false);
+        }
+        peak.set_transient(size)?;
+        let bytes = file.map().await?;
+        let identical = &*bytes == &expected[..];
+        drop(bytes);
+        peak.set_transient(0)?;
+        if !identical {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 async fn import_pack<S: PersistentLayerStore>(
     store: &S,
     pack: &[u8],
@@ -1042,7 +1087,7 @@ async fn import_pack<S: PersistentLayerStore>(
     expected_roots: HashMap<[u32; 5], ProofHash>,
     limits: PackImportLimits,
     proof_state: ProofStateMode,
-) -> io::Result<()> {
+) -> io::Result<Vec<[u32; 5]>> {
     if pack.len() > limits.max_compressed_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1070,14 +1115,32 @@ async fn import_pack<S: PersistentLayerStore>(
             "expected proof root supplied for an unrequested layer",
         ));
     }
+    // A requested layer that is already here is never overwritten. Its stored
+    // files are verified against the pack's below, and its id reported if they
+    // differ, which is what a fetch over overlapping history needs: the same
+    // commit arriving twice is the normal case, and a divergent one is the
+    // caller's to act on rather than this layer's to decide.
+    let mut present = HashSet::new();
     for id in &layer_ids {
         if store.directory_exists(*id).await? {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "refusing to import over an existing layer",
-            ));
+            present.insert(*id);
         }
     }
+    if let Some(id) = expected_roots.keys().find(|id| present.contains(*id)) {
+        // Anchoring a root means admitting a layer under it. A layer that is
+        // already here was admitted under whatever its own ancestry proved,
+        // and this import does not get to restate that.
+        let _ = id;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected proof root supplied for a layer that is already present",
+        ));
+    }
+    let fresh: Vec<[u32; 5]> = layer_ids
+        .iter()
+        .copied()
+        .filter(|id| !present.contains(id))
+        .collect();
 
     // Decompression and tar parsing are blocking/CPU-heavy. The owned worker
     // copy and its requested-id set are charged before allocation, then
@@ -1090,7 +1153,7 @@ async fn import_pack<S: PersistentLayerStore>(
     peak.retain(worker_overhead)?;
     let owned_pack = pack.to_vec();
     let requested_for_decode = requested.clone();
-    let (v2, imported, mut peak) = tokio::task::spawn_blocking(move || {
+    let (v2, mut imported, mut peak) = tokio::task::spawn_blocking(move || {
         let decoded = decode_pack(&owned_pack, &requested_for_decode, limits, &mut peak)?;
         peak.release(worker_overhead)?;
         Ok::<_, io::Error>((decoded.0, decoded.1, peak))
@@ -1107,7 +1170,20 @@ async fn import_pack<S: PersistentLayerStore>(
         validate_layer_file_set(files)?;
     }
 
-    let order = parents_first(&layer_ids, &imported)?;
+    // Layers already here are verified, not staged. They keep their own bytes
+    // whatever the pack says; a difference is reported to the caller.
+    let mut mismatched = Vec::new();
+    for id in &present {
+        let files = imported.remove(id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "requested layer disappeared")
+        })?;
+        if !present_layer_matches(store, *id, &files, &mut peak).await? {
+            mismatched.push(*id);
+        }
+    }
+    mismatched.sort_unstable();
+
+    let order = parents_first(&fresh, &imported)?;
     let mut pending: Vec<_> = imported
         .values()
         .map(parent_from_files)
@@ -1116,7 +1192,7 @@ async fn import_pack<S: PersistentLayerStore>(
         .flatten()
         .collect();
     let staging = PackValidationStore::new(imported);
-    let mut staged_ids = requested.clone();
+    let mut staged_ids: HashSet<[u32; 5]> = fresh.iter().copied().collect();
     let mut ancestry_bytes = 0usize;
     let mut ancestry_layers = 0usize;
     while let Some(parent) = pending.pop() {
@@ -1208,7 +1284,7 @@ async fn import_pack<S: PersistentLayerStore>(
     }
 
     let mut imported = staging.into_layers()?;
-    let publish = layer_ids
+    let publish = fresh
         .into_iter()
         .map(|id| {
             imported
@@ -1244,7 +1320,8 @@ async fn import_pack<S: PersistentLayerStore>(
     // Pre-existing ancestry was copied solely for independent validation and
     // must never be republished with the requested layers.
     drop(imported);
-    store.publish_imported_layers_shared(publish).await
+    store.publish_imported_layers_shared(publish).await?;
+    Ok(mismatched)
 }
 
 async fn tar_append_file<S: PersistentLayerStore, W: io::Write>(
@@ -1524,7 +1601,7 @@ impl Packable for CachedLayerStore {
         &self,
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         self.inner.import_layers(pack, layer_ids).await
     }
 
@@ -1533,7 +1610,7 @@ impl Packable for CachedLayerStore {
         pack: &[u8],
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: HashMap<[u32; 5], ProofHash>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         self.inner
             .import_layers_with_expected_roots(pack, layer_ids, expected_roots)
             .await
@@ -1545,7 +1622,7 @@ impl Packable for CachedLayerStore {
         layer_ids: Box<dyn Iterator<Item = [u32; 5]> + Send>,
         expected_roots: HashMap<[u32; 5], ProofHash>,
         limits: PackImportLimits,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         self.inner
             .import_layers_with_limits(pack, layer_ids, expected_roots, limits)
             .await
@@ -1558,7 +1635,7 @@ impl Packable for CachedLayerStore {
         expected_roots: HashMap<[u32; 5], ProofHash>,
         limits: PackImportLimits,
         proof_state: ProofStateMode,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<[u32; 5]>> {
         self.inner
             .import_layers_with_proof_state(pack, layer_ids, expected_roots, limits, proof_state)
             .await
@@ -1621,6 +1698,165 @@ mod tests {
         }
         let encoder = destination.into_inner().unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_layers_verifies_identical() {
+        let dir1 = tempdir().unwrap();
+        let store1 = Arc::new(DirectoryLayerStore::new(dir1.path()));
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+
+        let mut builder = store1.create_base_layer().await.unwrap();
+        let base_name = builder.name();
+        builder.add_value_triple(ValueTriple::new_node("cow", "likes", "duck"));
+        builder.add_value_triple(ValueTriple::new_node("duck", "hates", "cow"));
+        builder.commit_boxed().await.unwrap();
+
+        let export = store1
+            .export_layers(Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+
+        // an unknown layer is imported without mismatches
+        assert_eq!(
+            Vec::<[u32; 5]>::new(),
+            store2
+                .import_layers(&export, Box::new(vec![base_name].into_iter()))
+                .await
+                .unwrap()
+        );
+
+        // the same pack arriving a second time verifies cleanly against what
+        // is already here and is neither rejected nor rewritten
+        assert_eq!(
+            Vec::<[u32; 5]>::new(),
+            store2
+                .import_layers(&export, Box::new(vec![base_name].into_iter()))
+                .await
+                .unwrap()
+        );
+
+        let layer = store2.get_layer(base_name).await.unwrap().unwrap();
+        assert_eq!(2, layer.node_and_value_count());
+        assert!(layer.value_triple_exists(&ValueTriple::new_node("cow", "likes", "duck")));
+        assert!(layer.value_triple_exists(&ValueTriple::new_node("duck", "hates", "cow")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_layers_detects_mismatch() {
+        let dir1 = tempdir().unwrap();
+        let store1 = Arc::new(DirectoryLayerStore::new(dir1.path()));
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+
+        let mut builder = store1.create_base_layer().await.unwrap();
+        let base_name = builder.name();
+        builder.add_value_triple(ValueTriple::new_node("cow", "likes", "duck"));
+        builder.commit_boxed().await.unwrap();
+
+        let export = store1
+            .export_layers(Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+
+        // an empty layer with the same name has different contents
+        store2.create_base_layer_with_name(base_name).await.unwrap();
+
+        assert_eq!(
+            vec![base_name],
+            store2
+                .import_layers(&export, Box::new(vec![base_name].into_iter()))
+                .await
+                .unwrap()
+        );
+
+        // the existing layer was not overwritten
+        let layer = store2.get_layer(base_name).await.unwrap().unwrap();
+        assert_eq!(0, layer.node_and_value_count());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_layers_accepts_a_child_of_a_layer_already_here() {
+        // The shape a fetch over overlapping history takes: the pack carries
+        // the parent the destination already has plus the child it does not.
+        let dir1 = tempdir().unwrap();
+        let store1 = Arc::new(DirectoryLayerStore::new(dir1.path()));
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+
+        let mut builder = store1.create_base_layer().await.unwrap();
+        let base_name = builder.name();
+        builder.add_value_triple(ValueTriple::new_node("cow", "likes", "duck"));
+        builder.commit_boxed().await.unwrap();
+
+        let base_pack = store1
+            .export_layers(Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+        store2
+            .import_layers(&base_pack, Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+
+        let mut builder = store1.create_child_layer(base_name).await.unwrap();
+        let child_name = builder.name();
+        builder.add_value_triple(ValueTriple::new_node("duck", "hates", "cow"));
+        builder.commit_boxed().await.unwrap();
+
+        let pack = store1
+            .export_layers(Box::new(vec![base_name, child_name].into_iter()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Vec::<[u32; 5]>::new(),
+            store2
+                .import_layers(&pack, Box::new(vec![base_name, child_name].into_iter()))
+                .await
+                .unwrap()
+        );
+
+        let layer = store2.get_layer(child_name).await.unwrap().unwrap();
+        assert!(layer.value_triple_exists(&ValueTriple::new_node("cow", "likes", "duck")));
+        assert!(layer.value_triple_exists(&ValueTriple::new_node("duck", "hates", "cow")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expected_root_for_a_layer_already_here_is_refused() {
+        // Anchoring a root means admitting a layer under it. A layer that is
+        // already here was admitted under its own ancestry, and a verification
+        // pass does not get to restate that.
+        let dir1 = tempdir().unwrap();
+        let store1 = Arc::new(DirectoryLayerStore::new(dir1.path()));
+        let dir2 = tempdir().unwrap();
+        let store2 = Arc::new(DirectoryLayerStore::new(dir2.path()));
+
+        let mut builder = store1.create_base_layer().await.unwrap();
+        let base_name = builder.name();
+        builder.add_value_triple(ValueTriple::new_node("cow", "likes", "duck"));
+        builder.commit_boxed().await.unwrap();
+
+        let export = store1
+            .export_layers(Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+        store2
+            .import_layers(&export, Box::new(vec![base_name].into_iter()))
+            .await
+            .unwrap();
+
+        let mut expected = HashMap::new();
+        expected.insert(base_name, [0u8; 32]);
+        let error = store2
+            .import_layers_with_expected_roots(
+                &export,
+                Box::new(vec![base_name].into_iter()),
+                expected,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidInput, error.kind());
     }
 
     #[tokio::test(flavor = "multi_thread")]
