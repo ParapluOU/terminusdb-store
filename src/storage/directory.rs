@@ -1509,6 +1509,7 @@ mod tests {
         assert!(!layer.value_triple_exists(&ValueTriple::new_string_value("duck", "says", "quack")));
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test(flavor = "multi_thread")]
     async fn proof_state_publication_is_atomic_and_write_once() {
         let dir = tempdir().unwrap();
@@ -1744,6 +1745,10 @@ mod tests {
         // rollup below can read each ancestor's commitment instead of failing with
         // "run migrate_proof_chain once". Migration only writes proof metadata; it
         // does not alter the layers' triples, so the assertions below are unchanged.
+        // Seeding commitments is only possible, and only needed, when the
+        // `proof` feature is on; with it off no layer carries proof state and
+        // the rollup path below asks for none.
+        #[cfg(feature = "proof")]
         store.migrate_proof_chain(child_name).await.unwrap();
 
         let _rolled_id = store.clone().rollup(unrolled_layer).await.unwrap();
@@ -1803,6 +1808,10 @@ mod tests {
         // "run migrate_proof_chain once". Adds proof metadata only; triples (and thus
         // the assertions below) are unchanged. `child_name` here is the head
         // (grandchild) after the earlier shadowing, so the whole chain is migrated.
+        // Seeding commitments is only possible, and only needed, when the
+        // `proof` feature is on; with it off no layer carries proof state and
+        // the rollup path below asks for none.
+        #[cfg(feature = "proof")]
         store.migrate_proof_chain(child_name).await.unwrap();
 
         let _rolled_id = store

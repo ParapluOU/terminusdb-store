@@ -39,6 +39,18 @@ impl ProofStateMode {
     /// Empty means the default, `Off`.
     pub fn parse(value: &str) -> io::Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            // A build without the `proof` feature has no commitment scheme to
+            // prove with. Saying so here, at the one place the mode is chosen,
+            // is the difference between a loud startup failure and a store
+            // that silently never writes the sidecar its operator asked for.
+            #[cfg(not(feature = "proof"))]
+            "on" => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{PROOF_STATE_ENV}=on, but this terminus-store was built without the `proof` feature"
+                ),
+            )),
+            #[cfg(feature = "proof")]
             "on" => Ok(ProofStateMode::On),
             "" | "off" => Ok(ProofStateMode::Off),
             other => Err(io::Error::new(
@@ -77,7 +89,13 @@ mod tests {
     #[test]
     fn parses_on_and_off_only() {
         assert_eq!(ProofStateMode::parse("").unwrap(), ProofStateMode::Off);
+        #[cfg(feature = "proof")]
         assert_eq!(ProofStateMode::parse("on").unwrap(), ProofStateMode::On);
+        #[cfg(not(feature = "proof"))]
+        assert_eq!(
+            ProofStateMode::parse("on").unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
         assert_eq!(ProofStateMode::parse(" OFF ").unwrap(), ProofStateMode::Off);
         assert!(ProofStateMode::parse("false").is_err());
         assert!(ProofStateMode::parse("1").is_err());

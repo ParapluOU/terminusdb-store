@@ -148,8 +148,14 @@ mod tests;
 // module exposed; only their definition site moved into the submodules above.
 // ---------------------------------------------------------------------------
 pub use state::{
-    CheckpointViewCommitments, CommitmentState, LayerCommitment, VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
+    CheckpointViewCommitments, LayerCommitment, VerifierCommitment, VerifierCommitmentRef,
+    VerifierLayer,
 };
+// `CommitmentState` moved up to `proof` when the gadget tree became optional
+// (it carries no commitment, only counts and roots, and the storage plumbing
+// names it either way). Re-exported here so `proof::commitment::CommitmentState`
+// stays the path it has always been.
+pub use super::CommitmentState;
 pub use root::{database_root, validate_database_root};
 pub use dict_merkle::{resolution_root, resolution_root_v2};
 pub use dict_index::{

@@ -8,3 +8,11 @@
 # which overrides this.
 [env]
 TERMINUSDB_PROOF_STATE = "on"
+#
+# `proof` is an opt-in feature (it is not in `default`), so the suite that needs
+# this variable is `cargo test --features proof`. Without the feature there is
+# no scheme to prove with and asking for proving is a loud configuration error
+# rather than a silent "not proving", so that configuration is tested as
+# `TERMINUSDB_PROOF_STATE=off cargo test`. Cargo's `[env]` yields to a variable
+# the environment already carries (no `force = true`), so setting it on the
+# command line is enough.

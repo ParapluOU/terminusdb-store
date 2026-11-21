@@ -3,7 +3,7 @@ use std::convert::TryFrom;
 use std::fmt::Display;
 use std::io::{self, Read, Seek, Write};
 // `Component`/`Path`: upstream 0.23.1 validates pack entry paths with them.
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
@@ -1180,6 +1180,13 @@ async fn import_pack<S: PersistentLayerStore>(
         if !present_layer_matches(store, *id, &files, &mut peak).await? {
             mismatched.push(*id);
         }
+        // Verified and dropped: these bytes were charged against the peak by
+        // `decode_pack` and are not retained into staging, so a pack that is
+        // mostly history the destination already has leaves its whole budget
+        // to the layers that are actually new.
+        for bytes in files.values() {
+            peak.release(bytes.len().saturating_add(PACK_ENTRY_HEAP_OVERHEAD))?;
+        }
     }
     mismatched.sort_unstable();
 
@@ -1238,6 +1245,19 @@ async fn import_pack<S: PersistentLayerStore>(
         load_staged_layer_without_panicking(&staging, id).await?;
         let expected = expected_roots.get(&id);
         let state = if staging.file_exists(id, FILENAMES.proof_state).await? {
+            // A build without the `proof` feature cannot read a sidecar, let
+            // alone check one. Keeping an unvalidated one would let a later
+            // proving build trust bytes this one admitted blind, so it is
+            // dropped — the layer's data arrives intact either way, and
+            // `migrate_proof_chain` can rebuild the state from the native
+            // delta on a build that has the scheme. An `expected_roots` entry
+            // falls through instead, so a caller that demanded a root is told
+            // this build cannot honour it.
+            #[cfg(not(feature = "proof"))]
+            if expected.is_none() {
+                staging.remove_file(id, FILENAMES.proof_state)?;
+                continue;
+            }
             let parent_unproven = match staging.get_layer_parent_name(id).await? {
                 Some(parent) => !staging.has_proof_layer(parent).await?,
                 None => false,
@@ -1643,6 +1663,9 @@ impl Packable for CachedLayerStore {
 }
 
 #[cfg(test)]
+// Tests of the commitment scheme itself are gated on `proof`; with the
+// feature off their helpers go unused rather than being gated one by one.
+#[cfg_attr(not(feature = "proof"), allow(dead_code, unused_imports))]
 mod tests {
     use super::*;
     use crate::layer::*;
@@ -1859,6 +1882,7 @@ mod tests {
         assert_eq!(io::ErrorKind::InvalidInput, error.kind());
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test(flavor = "multi_thread")]
     async fn export_import_layer_with_rollup() {
         let dir1 = tempdir().unwrap();
@@ -1972,6 +1996,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test(flavor = "multi_thread")]
     async fn pack_validates_intrinsically_and_computes_missing_proof_state() {
         let source = open_memory_store();
@@ -2068,6 +2093,7 @@ mod tests {
         assert!(legacy.get_layer_from_id(id).await.unwrap().is_none());
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test(flavor = "multi_thread")]
     async fn pack_child_sidecar_over_an_unproven_parent() {
         let source = open_memory_store();
@@ -2186,6 +2212,7 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test(flavor = "multi_thread")]
     async fn proof_import_peak_needs_one_decoded_layer_not_two() {
         let source = open_memory_store();

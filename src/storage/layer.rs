@@ -3864,6 +3864,9 @@ pub(crate) async fn file_triple_layer_count<F: FileLoad + FileStore>(
 }
 
 #[cfg(test)]
+// Tests of the commitment scheme itself are gated on `proof`; with the
+// feature off their helpers go unused rather than being gated one by one.
+#[cfg_attr(not(feature = "proof"), allow(dead_code, unused_imports))]
 mod tests {
     use super::*;
     use crate::layer::{ObjectType, ValueTriple};
@@ -5203,18 +5206,30 @@ mod tests {
         let base_name = base.name();
         base.add_value_triple(ValueTriple::new_node("base", "p", "value"));
         base.commit_boxed().await.unwrap();
+        // Seeding commitments is only possible, and only needed, when the
+        // `proof` feature is on; with it off no layer carries proof state and
+        // the rollup path below asks for none.
+        #[cfg(feature = "proof")]
         store.prepare_proof_layer(base_name).await.unwrap();
         store.finalize_layer(base_name).await.unwrap();
         let mut middle = store.create_child_layer(base_name).await.unwrap();
         let middle_name = middle.name();
         middle.add_value_triple(ValueTriple::new_node("middle", "p", "value"));
         middle.commit_boxed().await.unwrap();
+        // Seeding commitments is only possible, and only needed, when the
+        // `proof` feature is on; with it off no layer carries proof state and
+        // the rollup path below asks for none.
+        #[cfg(feature = "proof")]
         store.prepare_proof_layer(middle_name).await.unwrap();
         store.finalize_layer(middle_name).await.unwrap();
         let mut head = store.create_child_layer(middle_name).await.unwrap();
         let head_name = head.name();
         head.add_value_triple(ValueTriple::new_node("head", "p", "value"));
         head.commit_boxed().await.unwrap();
+        // Seeding commitments is only possible, and only needed, when the
+        // `proof` feature is on; with it off no layer carries proof state and
+        // the rollup path below asks for none.
+        #[cfg(feature = "proof")]
         store.prepare_proof_layer(head_name).await.unwrap();
         store.finalize_layer(head_name).await.unwrap();
         let base = store.get_layer(base_name).await.unwrap().unwrap();
@@ -5230,6 +5245,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn physical_rollup_has_intrinsic_commitment() {
         let (store, _, head, _) = fault_store_chain().await;
@@ -5237,6 +5253,7 @@ mod tests {
         store.proof_layer(rollup).await.unwrap();
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn physical_precise_rollup_has_intrinsic_commitment() {
         let (store, base, head, _) = fault_store_chain().await;
@@ -5244,6 +5261,7 @@ mod tests {
         store.proof_layer(rollup).await.unwrap();
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn physical_imprecise_rollup_has_intrinsic_commitment() {
         let (store, base, head, _) = fault_store_chain().await;
@@ -5346,6 +5364,7 @@ mod tests {
     /// `layer.triples()` dump is gone) and commits ONLY the INCREMENTAL dictionary it
     /// introduced (∝ delta, not ∝ the full cumulative dictionary). A BASE layer is
     /// untouched — its `commitment_root` is pinned to the exact pre-diet value.
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn wave0_delta_commitment_is_o_delta_and_base_is_byte_identical() {
         let store = MemoryLayerStore::new();
@@ -5462,6 +5481,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "proof")]
     async fn install_v3_chain<S: LayerStore>(store: &S, head: [u32; 5]) -> Vec<[u32; 5]> {
         // Low-level test builders do not pass through Store's publication wrapper.
         store.migrate_proof_chain(head).await.unwrap();
@@ -5483,6 +5503,7 @@ mod tests {
         names
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn v3_migration_retries_after_partial_chain_and_is_idempotent() {
         let store = MemoryLayerStore::new();
@@ -5521,6 +5542,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn v3_migration_rejects_corruption_and_cas_mismatch_without_overwrite() {
         let store = MemoryLayerStore::new();
@@ -5559,6 +5581,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn archive_v3_migration_survives_reopen() {
         let directory = tempdir().unwrap();

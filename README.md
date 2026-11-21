@@ -2,6 +2,45 @@
 
 ## Proof-of-WOQL store support
 
+### The `proof` feature
+
+Proving is **opt-in at compile time**: `proof` is not a default feature. With it
+off this crate is upstream terminus-store — the same triples, the same layer
+files, none of the Dory/Arkworks stack (some 50 crates of field and curve
+arithmetic) in the dependency graph. That matters because most consumers reach
+this crate transitively, through TerminusDB's `terminusdb-store-prolog` or the
+grpc label-store client, and a transitive consumer cannot pass
+`default-features = false` on someone else's dependency declaration. Opting in,
+it can do:
+
+```toml
+terminus-store = { git = "...", branch = "parture-proof-of-woql", features = ["proof"] }
+```
+
+The storage API keeps its shape either way: `proof_layer`, `write_proof_layer`,
+`migrate_proof_chain` and `import_layers_with_expected_roots` are all still
+there with the feature off, and each fails with `io::ErrorKind::Unsupported` and
+a sentence naming the feature, rather than silently reporting a layer as
+unproven. `TERMINUSDB_PROOF_STATE=on` is likewise a startup error, not a quiet
+"not proving". The scheme-independent part — the canonical
+datatype/object/triple model, `ProofRecord`, the sidecar framing and its limits
+— is always compiled, since the storage plumbing names those types in
+signatures it keeps either way.
+
+A store that never proves is byte-identical either way: proof state is a
+separate file (`proof_state.pf4`), so a layer written by a feature-off build is
+exactly a layer an unforked terminus-store would have written, and a build that
+later turns the feature on can produce the sidecar from the native delta with
+`migrate_proof_chain`. A sidecar arriving in a pack on a feature-off build is
+dropped rather than kept unvalidated, so a later proving build never trusts
+bytes an earlier one admitted blind.
+
+This crate's own test suite is mostly the proof system; develop it with
+`cargo test --features proof` (or `make test`), and check the other
+configuration with `make test-bare`.
+
+### What this fork is
+
 This ParapluOU fork is the Store half of TerminusDB's Proof-of-WOQL capability.
 The current cross-repository design and status live in
 [`doc/proof-of-woql/overview.md`](../../doc/proof-of-woql/overview.md). The older

@@ -942,6 +942,9 @@ impl LayerStore for CachedLayerStore {
 }
 
 #[cfg(test)]
+// Tests of the commitment scheme itself are gated on `proof`; with the
+// feature off their helpers go unused rather than being gated one by one.
+#[cfg_attr(not(feature = "proof"), allow(dead_code, unused_imports))]
 pub mod tests {
     use super::*;
     use crate::storage::directory::*;
@@ -1054,6 +1057,7 @@ pub mod tests {
         assert_eq!(1, Arc::weak_count(&layer));
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn proof_layers_are_decoded_once_until_explicit_invalidation() {
         let store = CachedLayerStore::new(MemoryLayerStore::new(), LockingHashMapLayerCache::new());
@@ -1216,6 +1220,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test(flavor = "multi_thread")]
     async fn real_slow_proof_loads_share_same_key_and_queue_different_keys() {
         let (inner, first_name, second_name) = memory_store_with_two_proof_layers().await;
@@ -1265,6 +1270,7 @@ pub mod tests {
         assert_eq!(queued.loads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn proof_cache_evicts_lru_entry_at_entry_capacity() {
         let (inner, first_name, second_name) = memory_store_with_two_proof_layers().await;
@@ -1281,6 +1287,7 @@ pub mod tests {
         assert!(!Arc::ptr_eq(&first, &reloaded));
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn proof_cache_evicts_by_bytes_and_reports_an_upper_bound() {
         let (inner, first_name, second_name) = memory_store_with_two_proof_layers().await;
@@ -1305,6 +1312,7 @@ pub mod tests {
         assert_eq!(retained, LayerStore::proof_cache_memory_bytes(&store));
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn oversized_proof_is_served_but_not_retained() {
         let (inner, first_name, _) = memory_store_with_two_proof_layers().await;
@@ -1324,6 +1332,7 @@ pub mod tests {
         assert_eq!(cache.bytes, 0);
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn zero_entry_proof_cache_preserves_single_call_but_retains_nothing() {
         let (inner, first_name, _) = memory_store_with_two_proof_layers().await;
@@ -1337,6 +1346,7 @@ pub mod tests {
         assert_eq!(store.proof_cache.lock().unwrap().entries.len(), 0);
     }
 
+    #[cfg(feature = "proof")]
     #[test]
     fn unresolved_proof_cells_are_not_evicted_and_loads_are_bounded() {
         let mut cache = ProofLayerCache::new(0, 0, 1);
@@ -1361,6 +1371,7 @@ pub mod tests {
         drop((first, second));
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn failed_proof_load_can_retry_after_storage_is_repaired() {
         let directory = tempdir().unwrap();

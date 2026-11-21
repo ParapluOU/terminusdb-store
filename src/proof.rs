@@ -16,6 +16,13 @@
 //! [the developer primer](crate::proof::primer) first — every submodule links back
 //! to it rather than re-explaining the crypto.
 
+// With the `proof` feature off the gadget tree is gone and most of the framing
+// below has no caller left — it is kept compiled because the storage plumbing
+// names these types in signatures it keeps either way, and because a sidecar
+// written by a proving build must stay readable by this file's model the moment
+// the feature comes back.
+#![cfg_attr(not(feature = "proof"), allow(dead_code))]
+
 use std::cmp::Ordering;
 use std::convert::{TryFrom, TryInto};
 use std::io;
@@ -43,6 +50,41 @@ pub const MAX_PROOF_LAYER_BYTES: usize = 256 * 1024 * 1024;
 /// occupy. Charged incrementally while decoding (before each allocation), so a
 /// compact-but-explosive encoding fails closed before it can exhaust memory.
 pub const MAX_DECODED_PROOF_BYTES: usize = 512 * 1024 * 1024;
+
+/// Small authenticated summary of a layer's committed delta. Mirrors the
+/// fields the old Merkle `ProofLayerState` exposed, minus the per-index
+/// Merkle roots, plus a single `commitment_root`.
+///
+/// `PartialEq` is load-bearing: the storage plumbing compares a rebuilt
+/// state against the stored state in `validate_proof_chain_against_store`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitmentState {
+    pub parent_state_root: Option<ProofHash>,
+    pub addition_count: u64,
+    pub removal_count: u64,
+    pub materialized_count: u64,
+    pub parent_node_value_count: u64,
+    pub parent_predicate_count: u64,
+    pub node_value_count: u64,
+    pub predicate_count: u64,
+    pub commitment_root: ProofHash,
+}
+
+impl CommitmentState {
+    /// Check the summary's internal invariants: dictionary counts never shrink
+    /// below their parent counts, and a root layer (no parent root) starts both
+    /// parent counts at zero. Fails closed on any violation.
+    pub fn validate(&self) -> io::Result<()> {
+        if self.parent_node_value_count > self.node_value_count
+            || self.parent_predicate_count > self.predicate_count
+            || (self.parent_state_root.is_none()
+                && (self.parent_node_value_count != 0 || self.parent_predicate_count != 0))
+        {
+            return Err(invalid("invalid dictionary parent counts"));
+        }
+        Ok(())
+    }
+}
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -856,47 +898,94 @@ fn validate_construction_heap_budget(
     )
 }
 
+#[cfg(feature = "proof")]
 pub(crate) use commitment::decode_legacy_v3;
+#[cfg(feature = "proof")]
 pub use commitment::{
-    database_root, node_value_op_value, resolution_root, validate_database_root, CommitmentState,
-    DictOpening, LayerCommitment, ResolutionOpenings, VerifierCommitment, VerifierCommitmentRef,
-    VerifierLayer,
+    database_root, node_value_op_value, resolution_root, validate_database_root, DictOpening,
+    LayerCommitment, ResolutionOpenings, VerifierCommitment, VerifierCommitmentRef, VerifierLayer,
 };
+
+/// Stand-ins for the commitment sidecar when the `proof` feature is off, so the
+/// storage API keeps its shape and every proving operation fails with one
+/// sentence instead of not existing. See [`absent`].
+#[cfg(not(feature = "proof"))]
+mod absent;
+// The framing code reaches a couple of `commitment::` helpers by path; with the
+// feature off those resolve to the stand-ins instead.
+#[cfg(not(feature = "proof"))]
+use absent as commitment;
+#[cfg(not(feature = "proof"))]
+pub(crate) use absent::decode_legacy_v3;
+#[cfg(not(feature = "proof"))]
+pub use absent::LayerCommitment;
 
 /// Conceptual reference for the whole proof subsystem — read this first.
 /// Doc-only; other modules intra-doc-link here instead of re-explaining the crypto.
 pub mod primer;
+#[cfg(feature = "proof")]
 pub mod anti;
+#[cfg(feature = "proof")]
 pub mod argument;
+#[cfg(feature = "proof")]
 pub mod bgp;
+#[cfg(feature = "proof")]
 pub mod checkpoint;
+#[cfg(feature = "proof")]
 pub mod count;
+#[cfg(feature = "proof")]
 pub mod dict;
+#[cfg(feature = "proof")]
 pub mod dicthash;
+#[cfg(feature = "proof")]
 pub mod disequality;
+#[cfg(feature = "proof")]
 pub mod distinct;
+#[cfg(feature = "proof")]
 pub mod envelope;
+#[cfg(feature = "proof")]
 pub mod equality;
+#[cfg(feature = "proof")]
 pub mod group;
+#[cfg(feature = "proof")]
 pub mod filter;
+#[cfg(feature = "proof")]
 pub mod join;
+#[cfg(feature = "proof")]
 pub mod join2;
+#[cfg(feature = "proof")]
 pub mod join_link;
+#[cfg(feature = "proof")]
 pub mod logup;
+#[cfg(feature = "proof")]
 pub mod logup_gkr;
+#[cfg(feature = "proof")]
 pub mod membership;
+#[cfg(feature = "proof")]
 pub mod order;
+#[cfg(feature = "proof")]
 pub mod lexdistinct;
+#[cfg(feature = "proof")]
 pub mod lexsort;
+#[cfg(feature = "proof")]
 pub mod multiorder;
+#[cfg(feature = "proof")]
 pub mod pairs;
+#[cfg(feature = "proof")]
 pub mod permutation;
+#[cfg(feature = "proof")]
 pub mod query;
+#[cfg(feature = "proof")]
 pub mod range;
+#[cfg(feature = "proof")]
 pub mod reconcile;
+#[cfg(feature = "proof")]
 pub mod semijoin;
+#[cfg(feature = "proof")]
 pub mod relocate;
+#[cfg(feature = "proof")]
 pub mod sort;
+#[cfg(feature = "proof")]
 pub mod union;
 
 /// Per-layer sidecar payload for the Proof-of-WOQL commitment scheme.
@@ -908,12 +997,13 @@ pub mod union;
 /// column tables and their Dory commitments. `commitment_root` is the
 /// domain-separated digest that binds those commitments, dictionaries, counts,
 /// and parent root into the portable trust anchor.
+#[cfg(feature = "proof")]
 pub mod commitment;
 
 /// Independent smoke test that the `dory-pcs` BN254 commit/open/verify API works
 /// end-to-end and rejects a tampered evaluation. LayerCommitment integration is
 /// covered separately by the commitment and query-proof tests above.
-#[cfg(test)]
+#[cfg(all(test, feature = "proof"))]
 mod dory_smoke {
     use dory_pcs::backends::arkworks::{
         ArkFr, ArkworksPolynomial, Blake2bTranscript, G1Routines, G2Routines, BN254,

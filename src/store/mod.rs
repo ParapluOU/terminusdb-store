@@ -201,7 +201,7 @@ impl StoreLayerBuilder {
     }
 
     /// Build a pre-commitment layer fixture for migration tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "proof"))]
     pub(crate) async fn commit_legacy_for_test(&self) -> io::Result<StoreLayer> {
         let builder = self
             .builder
@@ -1307,9 +1307,13 @@ pub fn open_directory_store<P: Into<PathBuf>>(path: P) -> Store {
 }
 
 #[cfg(test)]
+#[cfg(feature = "proof")]
 mod admission_tests;
 
 #[cfg(test)]
+// Tests of the commitment scheme itself are gated on `proof`; with the
+// feature off their helpers go unused rather than being gated one by one.
+#[cfg_attr(not(feature = "proof"), allow(dead_code, unused_imports))]
 mod tests {
     use super::*;
     use crate::storage::{consts::FILENAMES, name_to_string};
@@ -1376,6 +1380,7 @@ mod tests {
         (head, state)
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn proof_squash_and_squash_upto_regenerate_valid_proof_state() {
         let store = open_memory_store();
@@ -1423,6 +1428,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn proof_rollup_keeps_original_proof_identity() {
         let store = open_memory_store();
@@ -1439,6 +1445,7 @@ mod tests {
         squashed.proof_commitment().await.unwrap();
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn merge_always_regenerates_valid_commitment() {
         let store = open_memory_store();
@@ -1461,6 +1468,7 @@ mod tests {
         merged.proof_commitment().await.unwrap();
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn intrinsic_commitment_archive_survives_reopen() {
         let dir = tempdir().unwrap();
@@ -1475,6 +1483,7 @@ mod tests {
         assert_eq!(head.proof_commitment().await.unwrap().state, state);
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn intrinsic_commitment_directory_survives_reopen() {
         let dir = tempdir().unwrap();
@@ -1489,6 +1498,7 @@ mod tests {
         assert_eq!(head.proof_commitment().await.unwrap().state, state);
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn proof_child_of_legacy_parent_fails_closed() {
         let store = open_memory_store();
@@ -1547,6 +1557,7 @@ mod tests {
         assert!(!head.value_triple_exists(&ValueTriple::new_node("a", "p", "one")));
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn proof_state_off_commits_without_sidecar_and_migrates_to_the_proven_state() {
         // Proving is opt-in, so say so here rather than depending on what
@@ -1592,6 +1603,7 @@ mod tests {
         assert!(next.proof_commitment().await.is_ok());
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn commit_without_proof_writes_no_sidecar_in_a_proof_store() {
         let store = open_memory_store();
@@ -1632,6 +1644,7 @@ mod tests {
         assert_eq!(squashed.triples().count(), 1);
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn pack_round_trips_with_and_without_proof_state() {
         let proven = open_memory_store();
@@ -1746,6 +1759,7 @@ mod tests {
         assert!(!off_anchored.layer_store.has_proof_layer(head.name()).await.unwrap());
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn explicit_archive_migration_indexes_legacy_chain_once() {
         let dir = tempdir().unwrap();
@@ -1782,6 +1796,7 @@ mod tests {
         assert_eq!(head.proof_commitment().await.unwrap().state, migrated);
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test]
     async fn lru_archive_migration_replaces_cached_legacy_bytes_immediately() {
         let dir = tempdir().unwrap();
@@ -1844,6 +1859,7 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    #[cfg(feature = "proof")]
     #[tokio::test(flavor = "multi_thread")]
     async fn proof_pack_import_validates_before_exposure() {
         let source = open_memory_store();

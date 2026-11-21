@@ -735,6 +735,10 @@ mod tests {
         // once". Migration only writes proof metadata; it does not alter any layer's
         // triples, so the callers' rollup equivalence/content assertions are
         // unchanged. All four callers of this helper are rollup tests that need it.
+        // Seeding commitments is only possible, and only needed, when the
+        // `proof` feature is on; with it off no layer carries proof state and
+        // the rollup path below asks for none.
+        #[cfg(feature = "proof")]
         store.migrate_proof_chain(child5_name).await.unwrap();
 
         vec![

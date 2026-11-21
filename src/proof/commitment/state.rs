@@ -33,41 +33,6 @@ pub(super) fn deserialize_commitment(bytes: &[u8]) -> io::Result<ArkGT> {
         .map_err(|error| invalid(format!("commitment deserialization failed: {error}")))
 }
 
-/// Small authenticated summary of a layer's committed delta. Mirrors the
-/// fields the old Merkle `ProofLayerState` exposed, minus the per-index
-/// Merkle roots, plus a single `commitment_root`.
-///
-/// `PartialEq` is load-bearing: the storage plumbing compares a rebuilt
-/// state against the stored state in `validate_proof_chain_against_store`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommitmentState {
-    pub parent_state_root: Option<ProofHash>,
-    pub addition_count: u64,
-    pub removal_count: u64,
-    pub materialized_count: u64,
-    pub parent_node_value_count: u64,
-    pub parent_predicate_count: u64,
-    pub node_value_count: u64,
-    pub predicate_count: u64,
-    pub commitment_root: ProofHash,
-}
-
-impl CommitmentState {
-    /// Check the summary's internal invariants: dictionary counts never shrink
-    /// below their parent counts, and a root layer (no parent root) starts both
-    /// parent counts at zero. Fails closed on any violation.
-    pub fn validate(&self) -> io::Result<()> {
-        if self.parent_node_value_count > self.node_value_count
-            || self.parent_predicate_count > self.predicate_count
-            || (self.parent_state_root.is_none()
-                && (self.parent_node_value_count != 0 || self.parent_predicate_count != 0))
-        {
-            return Err(invalid("invalid dictionary parent counts"));
-        }
-        Ok(())
-    }
-}
-
 /// Validated per-layer sidecar payload. Storage treats the encoded form as
 /// opaque bytes.
 #[derive(Clone, Debug)]
